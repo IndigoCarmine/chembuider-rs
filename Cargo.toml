@@ -1,0 +1,10 @@
+[package]
+name = "chembuider-rs"
+version = "0.1.0"
+edition = "2024"
+description = "An egui-based 2D chemical structure editor with MOL2 export"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.17.2"
