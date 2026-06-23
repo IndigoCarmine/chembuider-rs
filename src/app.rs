@@ -1,4 +1,4 @@
-use crate::molecule::{mol2::to_mol2_string, BondOrder};
+use crate::molecule::{mol2::to_mol2_string, cleanup::cleanup_2d, BondOrder};
 use crate::widget::{ChemStructEditor, Tool};
 use eframe::{egui, App};
 
@@ -78,6 +78,24 @@ impl App for Mol2App {
                     .clicked()
                 {
                     self.editor.current_bond_order = BondOrder::Triple;
+                }
+
+                ui.separator();
+
+                // Clean Up button (also Ctrl+K in the canvas)
+                if ui.button("✨ Clean Up").clicked() {
+                    cleanup_2d(&mut self.editor.molecule);
+                    self.status = "Structure cleaned up.".to_string();
+                }
+
+                ui.separator();
+
+                // Save Config
+                if ui.button("⚙ Save Config").clicked() {
+                    match self.editor.config.save() {
+                        Ok(_)  => self.status = "Config saved to chembuilder_config.json".to_string(),
+                        Err(e) => self.status = format!("Config save failed: {e}"),
+                    }
                 }
 
                 ui.separator();

@@ -1,0 +1,1 @@
+{ "name": "Et", "atoms": [{"element":"C","pos":[0.0,0.0],"charge":0},{"element":"C","pos":[1.0,0.0],"charge":0}], "bonds": [{"begin":0,"end":1,"order":"Single"}], "attach_idx": 0 }

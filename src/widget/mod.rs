@@ -1,6 +1,7 @@
 pub mod draw;
 pub mod interact;
 
+use crate::config::Config;
 use crate::molecule::{BondOrder, Molecule};
 use eframe::egui;
 use std::collections::HashSet;
@@ -50,6 +51,12 @@ pub struct ChemStructEditor {
 
     // Track drag origin to distinguish click vs drag
     pub drag_origin_screen: Option<egui::Pos2>,
+
+    /// The "active" atom for keyboard navigation (ChemDraw hotspot).
+    pub hotspot_atom: Option<u32>,
+
+    /// Loaded keyboard/fragment configuration (from JSON).
+    pub config: Config,
 }
 
 impl Default for ChemStructEditor {
@@ -70,6 +77,8 @@ impl Default for ChemStructEditor {
             hovered_bond: None,
             lasso_path: Vec::new(),
             drag_origin_screen: None,
+            hotspot_atom: None,
+            config: Config::load(),
         }
     }
 }
@@ -135,6 +144,80 @@ impl ChemStructEditor {
                 Some(dy.atan2(dx))
             })
             .collect()
+    }
+
+    /// Returns `(angle, flip)` for inserting a fragment at `atom_id`.
+    /// `angle` is the direction from the attach atom toward the fragment's next atom.
+    /// `flip`  is true when mirroring the fragment across that axis gives better clearance
+    /// from existing bonds (i.e. the bulk of the ring/group should go the other way).
+    pub fn best_fragment_placement(
+        &self,
+        atom_id: u32,
+        frag: &crate::molecule::fragment::Fragment,
+    ) -> (f32, bool) {
+        let base_angle = self.best_new_bond_angle(atom_id);
+
+        // Linear or trivial fragments: no flip needed.
+        if frag.atoms.len() <= 2 {
+            return (base_angle, false);
+        }
+
+        let attach_raw = frag.atoms[frag.attach_idx].pos;
+        let next_idx   = (frag.attach_idx + 1) % frag.atoms.len();
+        let next_raw   = frag.atoms[next_idx].pos;
+        let raw_angle  = (next_raw[1] - attach_raw[1]).atan2(next_raw[0] - attach_raw[0]);
+
+        // Centroid of the fragment in canonical frame (raw_angle = 0).
+        let n = frag.atoms.len() as f32;
+        let sum_dx: f32 = frag.atoms.iter().map(|a| a.pos[0] - attach_raw[0]).sum::<f32>() / n;
+        let sum_dy: f32 = frag.atoms.iter().map(|a| a.pos[1] - attach_raw[1]).sum::<f32>() / n;
+        let (sin_neg, cos_neg) = (-raw_angle).sin_cos();
+        let dx_c =  sum_dx * cos_neg - sum_dy * sin_neg;
+        let dy_c =  sum_dx * sin_neg + sum_dy * cos_neg;
+
+        // If the centroid is nearly on-axis, flipping has no effect.
+        if dy_c.abs() < 0.05 {
+            return (base_angle, false);
+        }
+
+        let src_pos = match self.molecule.atom_by_id(atom_id) {
+            Some(a) => a.pos,
+            None    => return (base_angle, false),
+        };
+        let (sin_a, cos_a) = base_angle.sin_cos();
+
+        // World position of centroid for normal and flipped orientations.
+        let center_normal = [
+            src_pos[0] + dx_c * cos_a - dy_c * sin_a,
+            src_pos[1] + dx_c * sin_a + dy_c * cos_a,
+        ];
+        let center_flip = [
+            src_pos[0] + dx_c * cos_a + dy_c * sin_a,  // dy_c negated
+            src_pos[1] + dx_c * sin_a - dy_c * cos_a,
+        ];
+
+        // Score: min squared distance from centroid to existing neighbor atoms.
+        // Larger score = more space = preferred.
+        let neighbors = self.molecule.neighbor_atom_ids(atom_id);
+        if neighbors.is_empty() {
+            return (base_angle, false);
+        }
+
+        let min_dist_sq = |cx: f32, cy: f32| -> f32 {
+            neighbors.iter()
+                .filter_map(|&nid| self.molecule.atom_by_id(nid))
+                .map(|nb| {
+                    let ddx = nb.pos[0] - cx;
+                    let ddy = nb.pos[1] - cy;
+                    ddx * ddx + ddy * ddy
+                })
+                .fold(f32::MAX, f32::min)
+        };
+
+        let score_normal = min_dist_sq(center_normal[0], center_normal[1]);
+        let score_flip   = min_dist_sq(center_flip[0],   center_flip[1]);
+
+        (base_angle, score_flip > score_normal)
     }
 
     pub fn best_new_bond_angle(&self, atom_id: u32) -> f32 {
@@ -219,7 +302,13 @@ impl ChemStructEditor {
             }
         }
 
-        let modified = match self.tool.clone() {
+        // Ctrl+K: clean up structure coordinates
+        let cleanup = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
+        if cleanup {
+            crate::molecule::cleanup::cleanup_2d(&mut self.molecule);
+        }
+
+        let modified = cleanup | match self.tool.clone() {
             Tool::Bond => interact::process_bond_tool(self, &response, center, ui),
             Tool::Select => interact::process_select_tool(self, &response, center, ui),
             Tool::Eraser => interact::process_eraser_tool(self, &response, center),
