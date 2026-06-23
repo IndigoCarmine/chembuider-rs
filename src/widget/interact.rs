@@ -389,7 +389,7 @@ fn apply_atom_action(editor: &mut ChemStructEditor, atom_id: u32, action: Resolv
     match action {
         ResolvedAtomAction::InsertFragment(frag) => {
             // Single-atom fragment with no bonds = change the element of the existing atom
-            // (ChemDraw behaviour: typing Br on a C atom turns it into Br, not C-Br)
+            // Change element in-place: typing Br on a C atom turns it into Br, not C-Br
             if frag.atoms.len() == 1 && frag.bonds.is_empty() {
                 if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
                     atom.element = frag.atoms[0].element.clone();

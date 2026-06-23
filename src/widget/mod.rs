@@ -52,7 +52,7 @@ pub struct ChemStructEditor {
     // Track drag origin to distinguish click vs drag
     pub drag_origin_screen: Option<egui::Pos2>,
 
-    /// The "active" atom for keyboard navigation (ChemDraw hotspot).
+    /// The "active" atom for keyboard navigation (hotspot).
     pub hotspot_atom: Option<u32>,
 
     /// Loaded keyboard/fragment configuration (from JSON).
