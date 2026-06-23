@@ -57,6 +57,13 @@ pub struct ChemStructEditor {
 
     /// Loaded keyboard/fragment configuration (from JSON).
     pub config: Config,
+
+    /// Label text-edit mode: (atom_id, current_text).
+    /// While Some, keyboard input goes to the text field instead of shortcuts.
+    pub label_edit: Option<(u32, String)>,
+
+    /// Undo history (molecule snapshots, newest at back).
+    pub undo_stack: Vec<crate::molecule::Molecule>,
 }
 
 impl Default for ChemStructEditor {
@@ -79,11 +86,37 @@ impl Default for ChemStructEditor {
             drag_origin_screen: None,
             hotspot_atom: None,
             config: Config::load(),
+            label_edit: None,
+            undo_stack: Vec::new(),
         }
     }
 }
 
 impl ChemStructEditor {
+    /// Push a snapshot of the current molecule state for undo.
+    /// Deduplicates: does nothing if the state is identical to the last snapshot.
+    pub fn push_undo(&mut self) {
+        let same = self.undo_stack.last().map_or(false, |s| s == &self.molecule);
+        if !same {
+            self.undo_stack.push(self.molecule.clone());
+            if self.undo_stack.len() > 50 {
+                self.undo_stack.remove(0);
+            }
+        }
+    }
+
+    /// Restore the previous molecule state.
+    pub fn undo(&mut self) -> bool {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.molecule = prev;
+            self.selected_atoms.clear();
+            self.hotspot_atom = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn mol_to_screen(&self, pos: [f32; 2], center: egui::Pos2) -> egui::Pos2 {
         egui::Pos2 {
             x: center.x + pos[0] * self.zoom * SCALE_FACTOR + self.pan.x,
@@ -302,17 +335,66 @@ impl ChemStructEditor {
             }
         }
 
+        // Ctrl+Z: undo
+        let did_undo = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
+        if did_undo { self.undo(); }
+
         // Ctrl+K: clean up structure coordinates
-        let cleanup = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
-        if cleanup {
+        let cleanup_modified = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
+        if cleanup_modified {
+            self.push_undo();
             crate::molecule::cleanup::cleanup_2d(&mut self.molecule);
         }
 
-        let modified = cleanup | match self.tool.clone() {
-            Tool::Bond => interact::process_bond_tool(self, &response, center, ui),
-            Tool::Select => interact::process_select_tool(self, &response, center, ui),
-            Tool::Eraser => interact::process_eraser_tool(self, &response, center),
+        // ── Label text-edit overlay ──────────────────────────────────────────
+        let mut label_confirmed = false;
+        // Extract what we need before the mutable borrow of label_edit
+        let label_state: Option<(u32, egui::Pos2)> = self.label_edit.as_ref().and_then(|(atom_id, _)| {
+            let pos = self.molecule.atom_by_id(*atom_id)?.pos;
+            Some((*atom_id, self.mol_to_screen(pos, center)))
+        });
+
+        if let (Some((edit_id, screen_pos)), Some((_, text))) =
+            (label_state, self.label_edit.as_mut())
+        {
+            let area_resp = egui::Area::new(egui::Id::new("label_edit_area"))
+                .fixed_pos(screen_pos + egui::vec2(12.0, -12.0))
+                .show(ui.ctx(), |ui| {
+                    let edit = egui::TextEdit::singleline(text)
+                        .desired_width(80.0)
+                        .font(egui::FontId::proportional(draw::ATOM_LABEL_SIZE));
+                    ui.add(edit)
+                });
+            area_resp.inner.request_focus();
+
+            let enter  = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if enter || area_resp.inner.lost_focus() {
+                let t = text.trim().to_string();
+                if !t.is_empty() {
+                    if let Some(a) = self.molecule.atom_by_id_mut(edit_id) {
+                        a.element = t;
+                    }
+                }
+                label_confirmed = true;
+            }
+            if escape { label_confirmed = true; }
+        } else if self.label_edit.is_some() {
+            label_confirmed = true; // atom no longer exists
+        }
+        if label_confirmed { self.label_edit = None; }
+        let label_editing = self.label_edit.is_some();
+
+        let tool_modified = if label_editing {
+            false
+        } else {
+            match self.tool.clone() {
+                Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
+                Tool::Select => interact::process_select_tool(self, &response, center, ui),
+                Tool::Eraser => interact::process_eraser_tool(self, &response, center),
+            }
         };
+        let modified = cleanup_modified | label_confirmed | tool_modified;
 
         draw::draw_bonds(self, &painter, center);
         draw::draw_atom_backgrounds(self, &painter, center);

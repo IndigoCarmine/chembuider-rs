@@ -18,6 +18,7 @@ pub fn process_bond_tool(
 
     // ── Drag tracking ────────────────────────────────────────────────────────
     if response.drag_started() {
+        editor.push_undo(); // snapshot before drag modifies positions
         editor.drag_origin_screen = Some(mouse);
         let hit = editor.hit_test_atom(mouse, center);
         editor.dragging_atom = hit;
@@ -75,6 +76,7 @@ pub fn process_bond_tool(
 
     // ── Click ────────────────────────────────────────────────────────────────
     if response.clicked() {
+        editor.push_undo();
         if let Some(atom_id) = editor.hovered_atom {
             let angle = editor.best_new_bond_angle(atom_id);
             let new_pos = {
@@ -192,6 +194,7 @@ pub fn process_select_tool(
     let delete_pressed =
         ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
     if delete_pressed && !editor.selected_atoms.is_empty() {
+        editor.push_undo();
         let ids: Vec<u32> = editor.selected_atoms.drain().collect();
         for id in ids { editor.molecule.remove_atom(id); }
         modified = true;
@@ -248,13 +251,37 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
             _ => {}
         }
 
+        // ExpandLabel: x key
+        if key == "x" {
+            let target = editor.hotspot_atom.or(editor.hovered_atom);
+            if let Some(atom_id) = target {
+                editor.push_undo();
+                if expand_label(editor, atom_id) { modified = true; }
+                continue;
+            }
+        }
+
+        // Open label-edit mode: backtick key
+        if key == "`" {
+            let target = editor.hotspot_atom.or(editor.hovered_atom);
+            if let Some(atom_id) = target {
+                let current = editor.molecule.atom_by_id(atom_id)
+                    .map(|a| a.element.clone())
+                    .unwrap_or_default();
+                editor.label_edit = Some((atom_id, current));
+                continue;
+            }
+        }
+
         // Determine target
         let atom_target = editor.hotspot_atom.or(editor.hovered_atom);
         let bond_target = if atom_target.is_none() { editor.hovered_bond } else { None };
 
         if let Some(atom_id) = atom_target {
+            editor.push_undo();
             if dispatch_atom_key(editor, atom_id, key) { modified = true; }
         } else if let Some(bond_id) = bond_target {
+            editor.push_undo();
             if dispatch_bond_key(editor, bond_id, key) { modified = true; }
         }
     }
@@ -647,6 +674,7 @@ fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
         Plus   => "+",
         Minus  => if shift { "_" } else { "-" },
         Equals => if shift { "+" } else { "=" },
+        Backtick => "`",
         ArrowRight => "ArrowRight",
         ArrowLeft  => "ArrowLeft",
         ArrowUp    => "ArrowUp",
@@ -662,6 +690,35 @@ fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Geometry / polygon helpers
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ExpandLabel
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Replace an atom whose element text matches a known fragment name with the
+/// full fragment structure, preserving all bonds to the rest of the molecule.
+fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
+    let element = match editor.molecule.atom_by_id(atom_id) {
+        Some(a) => a.element.clone(),
+        None    => return false,
+    };
+
+    let Some(frag) = editor.config.resolve_fragment(&element) else { return false };
+
+    // Change attach atom's element to match fragment's root atom
+    let root_elem   = frag.atoms[frag.attach_idx].element.clone();
+    let root_charge = frag.atoms[frag.attach_idx].charge;
+    if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
+        atom.element = root_elem;
+        atom.charge  = root_charge;
+    }
+
+    // Pick direction & flip, then insert the fragment in-place
+    let (angle, flip) = editor.best_fragment_placement(atom_id, &frag);
+    editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
+
+    true
+}
 
 fn find_or_create_atom(
     editor: &mut ChemStructEditor,

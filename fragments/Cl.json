@@ -1,0 +1,15 @@
+{
+  "name": "Cl",
+  "atoms": [
+    {
+      "element": "Cl",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [],
+  "attach_idx": 0
+}

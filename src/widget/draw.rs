@@ -4,7 +4,7 @@ use eframe::egui;
 
 const BOND_WIDTH: f32 = 1.5;
 const DOUBLE_BOND_OFFSET: f32 = 3.5;
-const ATOM_LABEL_SIZE: f32 = 13.0;
+pub const ATOM_LABEL_SIZE: f32 = 13.0;
 const ATOM_BG_RADIUS: f32 = 9.0;
 const WEDGE_HALF_WIDTH: f32 = 5.0;
 const HASH_COUNT: usize = 6;

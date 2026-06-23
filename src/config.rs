@@ -211,20 +211,29 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/Boc.json"),
     include_str!("../assets/fragments/Cbz.json"),
     include_str!("../assets/fragments/benzene.json"),
+    include_str!("../assets/fragments/BPin.json"),
+    include_str!("../assets/fragments/TMS.json"),
+    include_str!("../assets/fragments/TBS.json"),
 ];
 
-/// Load fragments: `fragments/` dir → inline JSON fallback → embedded defaults.
+/// Load fragments: embedded defaults as base, then merge inline + runtime dir (override by name).
+/// This ensures built-in fragments are always available even when a runtime `fragments/` dir exists.
 fn load_fragments(inline: Vec<FragmentDef>) -> Vec<FragmentDef> {
-    let from_dir = load_fragments_from_dir(std::path::Path::new("fragments"));
-    if !from_dir.is_empty() {
-        return from_dir;
-    }
-    if !inline.is_empty() {
-        return inline;
-    }
-    BUILTIN_FRAGMENT_STRS.iter()
+    let mut frags: Vec<FragmentDef> = BUILTIN_FRAGMENT_STRS.iter()
         .filter_map(|s| serde_json::from_str::<FragmentDef>(s).ok())
-        .collect()
+        .collect();
+    merge_fragments(&mut frags, inline);
+    merge_fragments(&mut frags, load_fragments_from_dir(std::path::Path::new("fragments")));
+    frags
+}
+
+fn merge_fragments(base: &mut Vec<FragmentDef>, additions: Vec<FragmentDef>) {
+    for frag in additions {
+        match base.iter_mut().find(|f| f.name == frag.name) {
+            Some(slot) => *slot = frag,
+            None       => base.push(frag),
+        }
+    }
 }
 
 /// Scan a directory for `*.json` fragment files, sorted alphabetically.

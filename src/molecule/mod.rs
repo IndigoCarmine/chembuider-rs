@@ -41,7 +41,7 @@ impl BondOrder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Atom {
     pub id: u32,
     pub element: String,
@@ -49,7 +49,7 @@ pub struct Atom {
     pub charge: i8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Bond {
     pub id: u32,
     pub begin: u32,
@@ -58,7 +58,7 @@ pub struct Bond {
     pub stereo: BondStereo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Molecule {
     pub name: String,
     pub atoms: Vec<Atom>,
