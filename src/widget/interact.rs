@@ -339,7 +339,7 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
 
         // ExpandLabel: x / X key — expands a label-named atom (e.g. "Bor") into its fragment
         if key == "x" || key == "X" {
-            let target = editor.hotspot_atom.or(editor.hovered_atom);
+            let target = editor.hovered_atom.or(editor.hotspot_atom);
             if let Some(atom_id) = target {
                 editor.push_undo();
                 if expand_label(editor, atom_id) { modified = true; }
@@ -349,7 +349,7 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
 
         // Open label-edit mode: backtick key
         if key == "`" {
-            let target = editor.hotspot_atom.or(editor.hovered_atom);
+            let target = editor.hovered_atom.or(editor.hotspot_atom);
             if let Some(atom_id) = target {
                 let current = editor.molecule.atom_by_id(atom_id)
                     .map(|a| a.element.clone())
@@ -360,7 +360,7 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
         }
 
         // Determine target
-        let atom_target = editor.hotspot_atom.or(editor.hovered_atom);
+        let atom_target = editor.hovered_atom.or(editor.hotspot_atom);
         let bond_target = if atom_target.is_none() { editor.hovered_bond } else { None };
 
         if let Some(atom_id) = atom_target {
@@ -421,7 +421,7 @@ fn handle_keys_select_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool
         }
 
         if !ctrl && !alt {
-            let atom_target = editor.hotspot_atom.or(editor.hovered_atom);
+            let atom_target = editor.hovered_atom.or(editor.hotspot_atom);
             if let Some(atom_id) = atom_target {
                 if dispatch_atom_key(editor, atom_id, key) { modified = true; }
             }
