@@ -97,28 +97,16 @@
       "zigzag": 4
     },
     {
-      "key": "o",
-      "ctrl": false,
-      "alt": false,
-      "fragment": "OH"
-    },
-    {
       "key": "q",
       "ctrl": false,
       "alt": false,
       "fragment": "OMe"
     },
     {
-      "key": "O",
+      "key": "o",
       "ctrl": false,
       "alt": false,
       "fragment": "O"
-    },
-    {
-      "key": "n",
-      "ctrl": false,
-      "alt": false,
-      "fragment": "NH2"
     },
     {
       "key": "w",
@@ -127,7 +115,7 @@
       "fragment": "NH2"
     },
     {
-      "key": "N",
+      "key": "n",
       "ctrl": false,
       "alt": false,
       "fragment": "N"
