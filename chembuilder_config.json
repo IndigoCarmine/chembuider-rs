@@ -489,5 +489,16 @@
       "action": "MoveDown"
     }
   ],
+  "style": {
+    "label_size": 16.0,
+    "bond_width": 1.5,
+    "double_bond_offset": 3.5,
+    "atom_bg_radius": 9.0,
+    "wedge_width": 5.0,
+    "bold_width": 4.0,
+    "dash_len": 5.0,
+    "dash_gap": 4.0,
+    "wavy_amplitude": 3.0
+  },
   "fragments": []
 }

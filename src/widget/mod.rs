@@ -465,6 +465,7 @@ impl ChemStructEditor {
         // ── Label text-edit overlay ──────────────────────────────────────────
         let mut label_confirmed = false;
         // Extract what we need before the mutable borrow of label_edit
+        let label_size = self.config.style.label_size;
         let label_state: Option<(u32, egui::Pos2)> = self.label_edit.as_ref().and_then(|(atom_id, _)| {
             let pos = self.molecule.atom_by_id(*atom_id)?.pos;
             Some((*atom_id, self.mol_to_screen(pos, center)))
@@ -478,7 +479,7 @@ impl ChemStructEditor {
                 .show(ui.ctx(), |ui| {
                     let edit = egui::TextEdit::singleline(text)
                         .desired_width(80.0)
-                        .font(egui::FontId::proportional(draw::ATOM_LABEL_SIZE));
+                        .font(egui::FontId::proportional(label_size));
                     ui.add(edit)
                 });
             area_resp.inner.request_focus();

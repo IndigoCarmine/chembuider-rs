@@ -2,20 +2,15 @@ use super::ChemStructEditor;
 use crate::molecule::{BondOrder, BondStereo};
 use eframe::egui;
 
-const BOND_WIDTH: f32 = 1.5;
-const DOUBLE_BOND_OFFSET: f32 = 3.5;
-pub const ATOM_LABEL_SIZE: f32 = 13.0;
-const ATOM_BG_RADIUS: f32 = 9.0;
-const WEDGE_HALF_WIDTH: f32 = 5.0;
+// Visual sizes (bond width, label size, etc.) are user-configurable via `config.style`
+// (see StyleConfig). These two only affect internal rendering detail and stay fixed.
 const HASH_COUNT: usize = 6;
-const DASH_LEN: f32 = 5.0;
-const DASH_GAP: f32 = 4.0;
 const WAVY_STEPS: usize = 16;
-const WAVY_AMPLITUDE: f32 = 3.0;
 
 // ─── Layer 0: bonds ──────────────────────────────────────────────────────────
 
 pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
+    let s = &editor.config.style;
     for bond in &editor.molecule.bonds {
         // Bonds to a folded terminal H are suppressed (the H is shown in the heavy atom's label).
         if is_folded_h(&editor.molecule, bond.begin) || is_folded_h(&editor.molecule, bond.end) {
@@ -31,15 +26,15 @@ pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: eg
         } else {
             egui::Color32::BLACK
         };
-        let stroke = egui::Stroke::new(BOND_WIDTH, color);
+        let stroke = egui::Stroke::new(s.bond_width, color);
 
         match &bond.stereo {
-            BondStereo::None => draw_bond_order(painter, p1, p2, &bond.order, stroke),
-            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color),
-            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color),
-            BondStereo::Bold => draw_bold(painter, p1, p2, color),
-            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke),
-            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke),
+            BondStereo::None => draw_bond_order(painter, p1, p2, &bond.order, stroke, s.double_bond_offset),
+            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color, s.wedge_width),
+            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color, s.wedge_width, s.bond_width),
+            BondStereo::Bold => draw_bold(painter, p1, p2, color, s.bold_width),
+            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke, s.dash_len, s.dash_gap),
+            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke, s.wavy_amplitude),
         }
     }
 }
@@ -50,6 +45,7 @@ fn draw_bond_order(
     p2: egui::Pos2,
     order: &BondOrder,
     stroke: egui::Stroke,
+    double_bond_offset: f32,
 ) {
     match order {
         BondOrder::Single => {
@@ -57,7 +53,7 @@ fn draw_bond_order(
         }
         BondOrder::Double => {
             let (nx, ny) = perp_normal(p1, p2);
-            let half = DOUBLE_BOND_OFFSET * 0.5;
+            let half = double_bond_offset * 0.5;
             let a1 = egui::Pos2::new(p1.x + nx * half, p1.y + ny * half);
             let a2 = egui::Pos2::new(p2.x + nx * half, p2.y + ny * half);
             let b1 = egui::Pos2::new(p1.x - nx * half, p1.y - ny * half);
@@ -68,7 +64,7 @@ fn draw_bond_order(
         BondOrder::Triple => {
             painter.line_segment([p1, p2], stroke);
             let (nx, ny) = perp_normal(p1, p2);
-            let off = DOUBLE_BOND_OFFSET;
+            let off = double_bond_offset;
             painter.line_segment([
                 egui::Pos2::new(p1.x + nx * off, p1.y + ny * off),
                 egui::Pos2::new(p2.x + nx * off, p2.y + ny * off),
@@ -82,10 +78,10 @@ fn draw_bond_order(
 }
 
 /// Solid filled wedge: narrow at p1 (begin), wide at p2 (end).
-fn draw_wedge_solid(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32) {
+fn draw_wedge_solid(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32, wedge_width: f32) {
     let (nx, ny) = perp_normal(p1, p2);
-    let w_a = egui::Pos2::new(p2.x + nx * WEDGE_HALF_WIDTH, p2.y + ny * WEDGE_HALF_WIDTH);
-    let w_b = egui::Pos2::new(p2.x - nx * WEDGE_HALF_WIDTH, p2.y - ny * WEDGE_HALF_WIDTH);
+    let w_a = egui::Pos2::new(p2.x + nx * wedge_width, p2.y + ny * wedge_width);
+    let w_b = egui::Pos2::new(p2.x - nx * wedge_width, p2.y - ny * wedge_width);
     painter.add(egui::Shape::convex_polygon(
         vec![p1, w_a, w_b],
         color,
@@ -94,27 +90,27 @@ fn draw_wedge_solid(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, col
 }
 
 /// Hash wedge: series of short lines widening from p1 to p2.
-fn draw_wedge_hash(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32) {
+fn draw_wedge_hash(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32, wedge_width: f32, line_width: f32) {
     let (nx, ny) = perp_normal(p1, p2);
     for i in 1..=HASH_COUNT {
         let t = i as f32 / HASH_COUNT as f32;
         let px = p1.x + (p2.x - p1.x) * t;
         let py = p1.y + (p2.y - p1.y) * t;
-        let half = WEDGE_HALF_WIDTH * t;
+        let half = wedge_width * t;
         painter.line_segment([
             egui::Pos2::new(px + nx * half, py + ny * half),
             egui::Pos2::new(px - nx * half, py - ny * half),
-        ], egui::Stroke::new(1.5, color));
+        ], egui::Stroke::new(line_width, color));
     }
 }
 
 /// Heavy/bold bond.
-fn draw_bold(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32) {
-    painter.line_segment([p1, p2], egui::Stroke::new(4.0, color));
+fn draw_bold(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32, bold_width: f32) {
+    painter.line_segment([p1, p2], egui::Stroke::new(bold_width, color));
 }
 
 /// Dashed line.
-fn draw_dashed(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke) {
+fn draw_dashed(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke, dash_len: f32, dash_gap: f32) {
     let dx = p2.x - p1.x;
     let dy = p2.y - p1.y;
     let total = (dx * dx + dy * dy).sqrt();
@@ -123,7 +119,7 @@ fn draw_dashed(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: 
     let mut t = 0.0_f32;
     let mut drawing = true;
     while t < total {
-        let seg = if drawing { DASH_LEN } else { DASH_GAP };
+        let seg = if drawing { dash_len } else { dash_gap };
         let end_t = (t + seg).min(total);
         if drawing {
             painter.line_segment([
@@ -137,14 +133,14 @@ fn draw_dashed(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: 
 }
 
 /// Wavy bond (sine-wave approximation).
-fn draw_wavy(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke) {
+fn draw_wavy(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke, wavy_amplitude: f32) {
     let (nx, ny) = perp_normal(p1, p2);
     let mut pts: Vec<egui::Pos2> = Vec::with_capacity(WAVY_STEPS + 1);
     for i in 0..=WAVY_STEPS {
         let t = i as f32 / WAVY_STEPS as f32;
         let px = p1.x + (p2.x - p1.x) * t;
         let py = p1.y + (p2.y - p1.y) * t;
-        let wave = (t * std::f32::consts::TAU * 2.0).sin() * WAVY_AMPLITUDE;
+        let wave = (t * std::f32::consts::TAU * 2.0).sin() * wavy_amplitude;
         pts.push(egui::Pos2::new(px + nx * wave, py + ny * wave));
     }
     for win in pts.windows(2) {
@@ -167,10 +163,11 @@ pub fn draw_atom_backgrounds(
     painter: &egui::Painter,
     center: egui::Pos2,
 ) {
+    let bg_radius = editor.config.style.atom_bg_radius;
     for atom in &editor.molecule.atoms {
         if should_show_label(editor, atom.id) {
             let sp = editor.mol_to_screen(atom.pos, center);
-            painter.circle_filled(sp, ATOM_BG_RADIUS, egui::Color32::WHITE);
+            painter.circle_filled(sp, bg_radius, egui::Color32::WHITE);
         }
     }
 }
@@ -178,6 +175,8 @@ pub fn draw_atom_backgrounds(
 // ─── Layer 2: atom labels + selection/hover/hotspot rings ────────────────────
 
 pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
+    let bg_radius = editor.config.style.atom_bg_radius;
+    let label_size = editor.config.style.label_size;
     for atom in &editor.molecule.atoms {
         let sp = editor.mol_to_screen(atom.pos, center);
         let is_hovered  = editor.hovered_atom  == Some(atom.id);
@@ -188,7 +187,7 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         if is_hotspot {
             painter.circle_stroke(
                 sp,
-                ATOM_BG_RADIUS + 9.0,
+                bg_radius + 9.0,
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 140, 0)),
             );
         }
@@ -196,7 +195,7 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         if is_selected {
             painter.circle_stroke(
                 sp,
-                ATOM_BG_RADIUS + 5.0,
+                bg_radius + 5.0,
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 130, 255)),
             );
         }
@@ -204,7 +203,7 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         if is_hovered {
             painter.circle_stroke(
                 sp,
-                ATOM_BG_RADIUS + 2.0,
+                bg_radius + 2.0,
                 egui::Stroke::new(1.5, egui::Color32::from_rgb(50, 180, 50)),
             );
         }
@@ -215,7 +214,7 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
                 sp,
                 egui::Align2::CENTER_CENTER,
                 &label,
-                egui::FontId::proportional(ATOM_LABEL_SIZE),
+                egui::FontId::proportional(label_size),
                 egui::Color32::BLACK,
             );
         }

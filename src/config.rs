@@ -121,6 +121,67 @@ impl FragmentDef {
     }
 }
 
+// ─── Drawing style (user-tunable appearance) ──────────────────────────────────
+
+/// All values are in screen pixels. Every field has a `#[serde(default)]`, so a user
+/// config may set only the parameters they care about (or omit the whole `style` block).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StyleConfig {
+    /// Atom label font size.
+    #[serde(default = "def_label_size")]
+    pub label_size: f32,
+    /// Bond line thickness.
+    #[serde(default = "def_bond_width")]
+    pub bond_width: f32,
+    /// Perpendicular spacing between the lines of a double/triple bond.
+    #[serde(default = "def_double_bond_offset")]
+    pub double_bond_offset: f32,
+    /// Radius of the white background circle drawn behind atom labels.
+    #[serde(default = "def_atom_bg_radius")]
+    pub atom_bg_radius: f32,
+    /// Half-width of the wide end of a stereo wedge (solid/hash).
+    #[serde(default = "def_wedge_width")]
+    pub wedge_width: f32,
+    /// Thickness of a bold/heavy bond.
+    #[serde(default = "def_bold_width")]
+    pub bold_width: f32,
+    /// Dash length for dashed bonds.
+    #[serde(default = "def_dash_len")]
+    pub dash_len: f32,
+    /// Gap length between dashes for dashed bonds.
+    #[serde(default = "def_dash_gap")]
+    pub dash_gap: f32,
+    /// Amplitude of a wavy bond.
+    #[serde(default = "def_wavy_amplitude")]
+    pub wavy_amplitude: f32,
+}
+
+fn def_label_size() -> f32 { 13.0 }
+fn def_bond_width() -> f32 { 1.5 }
+fn def_double_bond_offset() -> f32 { 3.5 }
+fn def_atom_bg_radius() -> f32 { 9.0 }
+fn def_wedge_width() -> f32 { 5.0 }
+fn def_bold_width() -> f32 { 4.0 }
+fn def_dash_len() -> f32 { 5.0 }
+fn def_dash_gap() -> f32 { 4.0 }
+fn def_wavy_amplitude() -> f32 { 3.0 }
+
+impl Default for StyleConfig {
+    fn default() -> Self {
+        Self {
+            label_size: def_label_size(),
+            bond_width: def_bond_width(),
+            double_bond_offset: def_double_bond_offset(),
+            atom_bg_radius: def_atom_bg_radius(),
+            wedge_width: def_wedge_width(),
+            bold_width: def_bold_width(),
+            dash_len: def_dash_len(),
+            dash_gap: def_dash_gap(),
+            wavy_amplitude: def_wavy_amplitude(),
+        }
+    }
+}
+
 // ─── Top-level Config ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -131,6 +192,9 @@ pub struct Config {
     pub bond_shortcuts: Vec<BondShortcut>,
     #[serde(default)]
     pub selection_shortcuts: Vec<SelectionShortcut>,
+    /// User-tunable drawing appearance (label size, bond width, …).
+    #[serde(default)]
+    pub style: StyleConfig,
     /// Inline fragments (legacy / override). Normally empty; loaded from fragments/ dir.
     #[serde(default)]
     pub fragments: Vec<FragmentDef>,
@@ -159,11 +223,12 @@ impl Config {
 
     /// Save shortcuts to `chembuilder_config.json` and each fragment to `fragments/<name>.json`.
     pub fn save(&self) -> std::io::Result<()> {
-        // Shortcuts only (fragments live in their own files)
+        // Shortcuts + style (fragments live in their own files)
         let shortcuts = Config {
             atom_shortcuts: self.atom_shortcuts.clone(),
             bond_shortcuts: self.bond_shortcuts.clone(),
             selection_shortcuts: self.selection_shortcuts.clone(),
+            style: self.style.clone(),
             fragments: Vec::new(),
         };
         std::fs::write(
