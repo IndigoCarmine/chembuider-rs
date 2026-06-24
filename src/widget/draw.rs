@@ -297,6 +297,11 @@ fn normal_valence(element: &str) -> Option<u8> {
 fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
     let Some(atom) = mol.atom_by_id(atom_id) else { return 0 };
     let Some(valence) = normal_valence(&atom.element) else { return 0 };
+    // A lone atom (no bonds yet) shows just its symbol — placing "O"/"N"/"S" at the cursor
+    // should read as O/N/S, not OH2/NH3/SH2. Implicit H appears once it gets a bond.
+    if mol.bonds_for_atom(atom_id).is_empty() {
+        return 0;
+    }
     let bond_sum_heavy: i16 = mol.bonds_for_atom(atom_id).iter()
         .filter(|b| {
             let other = if b.begin == atom_id { b.end } else { b.begin };
@@ -330,4 +335,43 @@ fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom
         c          => s.push_str(&format!("{}", c)),
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::molecule::{BondOrder, Molecule};
+
+    fn label(mol: &Molecule, id: u32) -> String {
+        atom_label_text(mol, mol.atom_by_id(id).unwrap())
+    }
+
+    /// A lone (unbonded) atom shows just its symbol — no implicit H (so placing O/N/S reads
+    /// as O/N/S, not OH2/NH3/SH2).
+    #[test]
+    fn lone_atoms_show_bare_symbol() {
+        let mut m = Molecule::default();
+        for el in ["O", "N", "S", "Br", "C", "P", "F"] {
+            let id = m.add_atom(el.to_string(), [0.0, 0.0], 0);
+            assert_eq!(label(&m, id), el, "lone {el} should render as '{el}'");
+        }
+    }
+
+    /// Once bonded, valence is filled with implicit H (hydroxyl/amine/thiol, etc.).
+    #[test]
+    fn bonded_heteroatoms_fill_valence_with_h() {
+        for (el, want) in [("O", "OH"), ("N", "NH2"), ("S", "SH"), ("Br", "Br"), ("P", "PH2")] {
+            let mut m = Molecule::default();
+            let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+            let x = m.add_atom(el.to_string(), [1.0, 0.0], 0);
+            m.add_bond(c, x, BondOrder::Single);
+            assert_eq!(label(&m, x), want, "C-{el} should render as '{want}'");
+        }
+        // Carbonyl: a double bond consumes two valences → no H.
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
+        m.add_bond(c, o, BondOrder::Double);
+        assert_eq!(label(&m, o), "O", "C=O oxygen should render as 'O'");
+    }
 }

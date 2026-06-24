@@ -359,19 +359,23 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
             }
         }
 
-        // Determine target
-        let atom_target = editor.hovered_atom.or(editor.hotspot_atom);
-        let bond_target = if atom_target.is_none() { editor.hovered_bond } else { None };
-
-        if let Some(atom_id) = atom_target {
+        // Target resolution, in priority order:
+        //  1. hovering an atom → act on it (change element / attach fragment)
+        //  2. else, a key that names an element → drop that atom at the cursor, ahead of any
+        //     stale hotspot (so O/N/S place a new atom rather than editing the hotspot)
+        //  3. else, a hotspot → build from it (chains, rings, fused fragments)
+        //  4. else, a hovered bond → bond key
+        if let Some(atom_id) = editor.hovered_atom {
             editor.push_undo();
             if dispatch_atom_key(editor, atom_id, key) { modified = true; }
-        } else if let Some(bond_id) = bond_target {
+        } else if place_element_at_cursor(editor, key) {
+            modified = true;
+        } else if let Some(atom_id) = editor.hotspot_atom {
+            editor.push_undo();
+            if dispatch_atom_key(editor, atom_id, key) { modified = true; }
+        } else if let Some(bond_id) = editor.hovered_bond {
             editor.push_undo();
             if dispatch_bond_key(editor, bond_id, key) { modified = true; }
-        } else {
-            // No atom or bond target: if key maps to a single-atom fragment, place at cursor
-            if place_element_at_cursor(editor, key) { modified = true; }
         }
     }
 
@@ -809,8 +813,11 @@ fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
     true
 }
 
-/// When no atom is targeted, check if the key maps to a single-atom fragment and place
-/// that element at the current cursor position (last_mouse_mol).
+/// If `key` names an element, drop a bare atom of it at the cursor (`last_mouse_mol`).
+/// Applies to single-atom fragments and to any fragment whose root (attach) atom is a
+/// heteroatom — so "O"/"o" (O, OH), "N"/"n" (N, NH2), "s" (SH), halogens, etc. all place
+/// that atom. Carbon-rooted fragments (chains, benzene, Me) are left to the
+/// build-from-hotspot path and return false here.
 fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
     let actions: Vec<crate::config::AtomAction> = editor.config.atom_shortcuts.iter()
         .filter(|s| s.key == key && !s.ctrl && !s.alt)
@@ -821,13 +828,14 @@ fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
         if let Some(crate::config::ResolvedAtomAction::InsertFragment(frag)) =
             editor.config.atom_action_to_fragment(action)
         {
-            if frag.atoms.len() == 1 && frag.bonds.is_empty() {
+            let root = &frag.atoms[frag.attach_idx];
+            let is_single = frag.atoms.len() == 1 && frag.bonds.is_empty();
+            if is_single || root.element != "C" {
                 editor.push_undo();
-                let pos = editor.last_mouse_mol;
                 let new_id = editor.molecule.add_atom(
-                    frag.atoms[0].element.clone(),
-                    pos,
-                    frag.atoms[0].charge,
+                    root.element.clone(),
+                    editor.last_mouse_mol,
+                    root.charge,
                 );
                 editor.hotspot_atom = Some(new_id);
                 return true;
@@ -835,6 +843,39 @@ fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Element keys (single-atom or heteroatom-rooted fragments) drop a lone atom of that
+    /// element at the cursor — no stray carbon, no attached H group.
+    #[test]
+    fn element_keys_place_bare_atom_at_cursor() {
+        for (key, want) in [("O", "O"), ("o", "O"), ("N", "N"), ("n", "N"), ("s", "S"), ("b", "Br")] {
+            let mut e = ChemStructEditor::default();
+            e.last_mouse_mol = [2.0, 3.0];
+            assert!(place_element_at_cursor(&mut e, key), "key '{key}' should place an atom");
+            assert_eq!(e.molecule.atoms.len(), 1, "key '{key}' must add exactly one atom");
+            let atom = &e.molecule.atoms[0];
+            assert_eq!(atom.element, want, "key '{key}' should place element {want}");
+            assert_eq!(atom.pos, [2.0, 3.0], "key '{key}' should place at the cursor");
+            assert!(e.molecule.bonds.is_empty(), "key '{key}' must not create bonds");
+        }
+    }
+
+    /// Multi-atom carbon-rooted fragments (benzene) and chains are NOT placed at the cursor;
+    /// they fall through to the build-from-hotspot path. (A single-carbon fragment like Me
+    /// still places a bare C — that's the normal single-atom case.)
+    #[test]
+    fn carbon_multi_fragments_do_not_place_at_cursor() {
+        for key in ["a", "3"] {
+            let mut e = ChemStructEditor::default();
+            assert!(!place_element_at_cursor(&mut e, key), "key '{key}' should not place at cursor");
+            assert!(e.molecule.atoms.is_empty());
+        }
+    }
 }
 
 fn find_or_create_atom(
