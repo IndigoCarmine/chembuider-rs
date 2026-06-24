@@ -209,16 +209,53 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         }
 
         if should_show_label(editor, atom.id) {
-            let label = atom_label_text(&editor.molecule, atom);
-            painter.text(
-                sp,
-                egui::Align2::CENTER_CENTER,
-                &label,
-                egui::FontId::proportional(label_size),
-                egui::Color32::BLACK,
-            );
+            let job = atom_label_job(&editor.molecule, atom, label_size, egui::Color32::BLACK);
+            let galley = painter.layout_job(job);
+            let pos = sp - galley.size() * 0.5; // center the laid-out label on the atom
+            painter.galley(pos, galley, egui::Color32::BLACK);
         }
     }
+}
+
+/// Build a laid-out atom label with the hydrogen count rendered as a subscript
+/// (e.g. CH₃, NH₂). The element symbol, the "H", and the charge are at the base
+/// size; only the multi-H count digit is smaller and bottom-aligned.
+fn atom_label_job(
+    mol: &crate::molecule::Molecule,
+    atom: &crate::molecule::Atom,
+    base_size: f32,
+    color: egui::Color32,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let normal = TextFormat {
+        font_id: egui::FontId::proportional(base_size),
+        color,
+        ..Default::default()
+    };
+    let subscript = TextFormat {
+        font_id: egui::FontId::proportional(base_size * 0.7),
+        color,
+        valign: egui::Align::BOTTOM,
+        ..Default::default()
+    };
+
+    job.append(&atom.element, 0.0, normal.clone());
+    let h = displayed_h_count(mol, atom.id);
+    if h >= 1 {
+        job.append("H", 0.0, normal.clone());
+        if h > 1 {
+            job.append(&h.to_string(), 0.0, subscript);
+        }
+    }
+    match atom.charge {
+        0 => {}
+        1 => job.append("+", 0.0, normal),
+        -1 => job.append("-", 0.0, normal),
+        c if c > 0 => job.append(&format!("{c}+"), 0.0, normal),
+        c => job.append(&format!("{c}"), 0.0, normal),
+    }
+    job
 }
 
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────
@@ -318,6 +355,9 @@ fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
     (effective - bond_sum_heavy).max(0) as u8
 }
 
+/// Plain-text label (no subscript) — the rendering path uses `atom_label_job`; this is the
+/// readable oracle used by tests.
+#[cfg(test)]
 fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom) -> String {
     let mut s = atom.element.clone();
     let h = displayed_h_count(mol, atom.id);
