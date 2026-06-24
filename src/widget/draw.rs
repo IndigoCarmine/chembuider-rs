@@ -207,6 +207,10 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
                 egui::Stroke::new(1.5, egui::Color32::from_rgb(50, 180, 50)),
             );
         }
+        // Over-valence warning (red dashed) — applies to all atoms, even unlabeled carbons.
+        if is_valence_invalid(&editor.molecule, atom.id) {
+            draw_dashed_circle(painter, sp, bg_radius + 7.0, egui::Color32::from_rgb(220, 30, 30));
+        }
 
         if should_show_label(editor, atom.id) {
             let job = atom_label_job(&editor.molecule, atom, label_size, egui::Color32::BLACK);
@@ -312,6 +316,40 @@ fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
     true
 }
 
+/// True when an atom is over-bonded: its total bond order exceeds what its element/charge
+/// allows (e.g. a carbon with more than 4 bond-orders, an oxygen with more than 2). Such
+/// atoms are marked with a red dashed warning ring. Under-bonded atoms are valid — the
+/// missing valence is shown as implicit H — and elements with no standard valence aren't checked.
+pub fn is_valence_invalid(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
+    let Some(atom) = mol.atom_by_id(atom_id) else { return false };
+    let Some(valence) = normal_valence(&atom.element) else { return false };
+    let bond_sum: i16 = mol.bonds_for_atom(atom_id).iter()
+        .map(|b| match b.order {
+            crate::molecule::BondOrder::Single => 1,
+            crate::molecule::BondOrder::Double => 2,
+            crate::molecule::BondOrder::Triple => 3,
+        })
+        .sum();
+    bond_sum > valence as i16 + atom.charge as i16
+}
+
+/// Draw a dashed circle (used as the over-valence warning ring).
+fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32) {
+    const SEGMENTS: usize = 20;
+    let stroke = egui::Stroke::new(1.5, color);
+    for i in (0..SEGMENTS).step_by(2) {
+        let a0 = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        painter.line_segment(
+            [
+                egui::pos2(center.x + radius * a0.cos(), center.y + radius * a0.sin()),
+                egui::pos2(center.x + radius * a1.cos(), center.y + radius * a1.sin()),
+            ],
+            stroke,
+        );
+    }
+}
+
 /// Standard organic valence for implicit H calculation.
 fn normal_valence(element: &str) -> Option<u8> {
     match element {
@@ -413,5 +451,30 @@ mod tests {
         let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
         m.add_bond(c, o, BondOrder::Double);
         assert_eq!(label(&m, o), "O", "C=O oxygen should render as 'O'");
+    }
+
+    #[test]
+    fn over_valence_is_flagged() {
+        // Carbon with 5 single bonds → invalid; 4 → valid; 3 → valid (CH).
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let mut ns = Vec::new();
+        for i in 0..5 {
+            let n = m.add_atom("H".to_string(), [i as f32 + 1.0, 0.0], 0);
+            m.add_bond(c, n, BondOrder::Single);
+            ns.push(n);
+        }
+        assert!(is_valence_invalid(&m, c), "pentavalent carbon must be flagged");
+        m.remove_atom(ns[4]);
+        assert!(!is_valence_invalid(&m, c), "tetravalent carbon is valid");
+        m.remove_atom(ns[3]);
+        assert!(!is_valence_invalid(&m, c), "under-valence carbon is valid (implicit H)");
+
+        // Oxygen with a triple bond → over-valence.
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
+        m.add_bond(a, o, BondOrder::Triple);
+        assert!(is_valence_invalid(&m, o), "O with a triple bond is over-valence");
     }
 }
