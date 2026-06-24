@@ -1,4 +1,4 @@
-use crate::molecule::{mol2::to_mol2_string, cleanup::cleanup_2d, BondOrder, BondStereo};
+use crate::molecule::{mol2::to_mol2_string, BondOrder, BondStereo};
 use crate::widget::{ChemStructEditor, Tool};
 use eframe::{egui, App};
 
@@ -105,10 +105,23 @@ impl App for Mol2App {
 
                 ui.separator();
 
-                // Clean Up button (also Ctrl+K in the canvas)
-                if ui.button("✨ Clean Up").clicked() {
-                    cleanup_2d(&mut self.editor.molecule);
-                    self.status = "Structure cleaned up.".to_string();
+                // Clean Up button (also Ctrl+K in the canvas).
+                // Runs on a background thread; turns red ("Stop") while computing so it can
+                // be cancelled and never freezes the UI.
+                let cleaning = self.editor.is_cleaning();
+                let button = if cleaning {
+                    egui::Button::new(egui::RichText::new("⛔ Stop").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(200, 50, 50))
+                } else {
+                    egui::Button::new("✨ Clean Up")
+                };
+                if ui.add(button).clicked() {
+                    self.editor.toggle_cleanup();
+                    self.status = if cleaning {
+                        "Cleanup stopped.".to_string()
+                    } else {
+                        "Cleaning up… (click Stop to cancel)".to_string()
+                    };
                 }
 
                 ui.separator();

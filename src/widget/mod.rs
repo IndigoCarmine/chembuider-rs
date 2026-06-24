@@ -70,6 +70,9 @@ pub struct ChemStructEditor {
 
     /// Last known mouse position in molecule coordinates (for no-target atom placement).
     pub last_mouse_mol: [f32; 2],
+
+    /// Active background cleanup computation, if any (None when idle).
+    pub cleanup_job: Option<crate::molecule::cleanup::CleanupJob>,
 }
 
 impl Default for ChemStructEditor {
@@ -96,6 +99,7 @@ impl Default for ChemStructEditor {
             undo_stack: VecDeque::new(),
             current_bond_stereo: BondStereo::None,
             last_mouse_mol: [0.0; 2],
+            cleanup_job: None,
         }
     }
 }
@@ -166,6 +170,43 @@ impl ChemStructEditor {
             None        => self.config.fragments.push(def),
         }
         Ok(ids.len())
+    }
+
+    /// True while a background cleanup computation is running.
+    pub fn is_cleaning(&self) -> bool {
+        self.cleanup_job.is_some()
+    }
+
+    /// Toggle the background cleanup: start it if idle, otherwise request it to stop.
+    /// Starting snapshots the current molecule into a worker thread so the UI never freezes.
+    pub fn toggle_cleanup(&mut self) {
+        match &self.cleanup_job {
+            Some(job) => job.cancel(),
+            None => {
+                if self.molecule.atoms.is_empty() {
+                    return;
+                }
+                self.push_undo();
+                self.cleanup_job = Some(crate::molecule::cleanup::CleanupJob::start(&self.molecule));
+            }
+        }
+    }
+
+    /// Pump the background cleanup once per frame: copy the latest positions in for a live
+    /// preview, and finalize (join the worker) once it reports done. Returns true while active.
+    pub fn poll_cleanup(&mut self) -> bool {
+        let Some(job) = &self.cleanup_job else { return false };
+        for (id, pos) in job.latest() {
+            if let Some(atom) = self.molecule.atom_by_id_mut(id) {
+                atom.pos = pos;
+            }
+        }
+        if job.is_done() {
+            self.cleanup_job.take().unwrap().join();
+            false
+        } else {
+            true
+        }
     }
 
     /// Restore the previous molecule state.
@@ -406,11 +447,19 @@ impl ChemStructEditor {
         let did_undo = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
         if did_undo { self.undo(); }
 
-        // Ctrl+K: clean up structure coordinates
-        let cleanup_modified = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
-        if cleanup_modified {
-            self.push_undo();
-            crate::molecule::cleanup::cleanup_2d(&mut self.molecule);
+        // Ctrl+K: toggle background clean-up (start, or stop if already running).
+        let cleanup_toggle = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
+        if cleanup_toggle {
+            self.toggle_cleanup();
+        }
+        // Pump the background job: live-preview positions, finalize when done.
+        let was_cleaning = self.is_cleaning();
+        let cleaning = self.poll_cleanup();
+        if cleaning || was_cleaning {
+            // Keep animating while the worker runs, and force one more frame on completion
+            // so the toolbar button reverts from "Stop" to "Clean Up" (egui is otherwise
+            // idle without input).
+            ui.ctx().request_repaint();
         }
 
         // ── Label text-edit overlay ──────────────────────────────────────────
@@ -454,8 +503,9 @@ impl ChemStructEditor {
 
         // Suppress canvas key/mouse handling whenever a text field (our label editor or a
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
-        // don't leak into atom/bond shortcuts.
-        let tool_modified = if label_editing || ui.ctx().wants_keyboard_input() {
+        // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
+        // positions (editing would fight the worker).
+        let tool_modified = if label_editing || cleaning || ui.ctx().wants_keyboard_input() {
             false
         } else {
             match self.tool.clone() {
@@ -464,7 +514,7 @@ impl ChemStructEditor {
                 Tool::Eraser => interact::process_eraser_tool(self, &response, center),
             }
         };
-        let modified = cleanup_modified | label_confirmed | tool_modified;
+        let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning;
 
         draw::draw_bonds(self, &painter, center);
         draw::draw_atom_backgrounds(self, &painter, center);

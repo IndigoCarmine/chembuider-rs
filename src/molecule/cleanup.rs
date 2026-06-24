@@ -2,7 +2,16 @@ use super::Molecule;
 use std::collections::{HashMap, HashSet};
 
 const L: f32 = 1.5;
-const FORCE_THRESHOLD: f32 = 1e-3;
+
+// Convergence is based on motion, not force: stop once atoms have effectively stopped
+// moving.  Every MSD_WINDOW steps the mean squared displacement (MSD) of all atoms relative
+// to a reference snapshot taken MSD_WINDOW steps earlier is measured; when it drops below
+// MSD_THRESHOLD the structure is considered stationary.  Using a window rather than a single
+// step avoids false positives from momentary stalls (e.g. just after a FIRE velocity reset,
+// when dt is small and one step's drift is tiny regardless of the remaining force).
+// MSD_THRESHOLD = (1e-3)^2 ⇒ atoms move < ~1e-3 length-units over the whole window.
+const MSD_WINDOW: usize = 50;
+const MSD_THRESHOLD: f32 = 1e-6;
 
 // FIRE (Fast Inertial Relaxation Engine) hyperparameters — Bitzek et al. 2006
 // Using Velocity Verlet (VV) integration: energy-conserving, fewer spurious P<0 events.
@@ -236,6 +245,10 @@ pub struct CleanupState {
     // Friction is applied only for cyclic molecules (ring oscillations need damping);
     // acyclic spanning trees converge faster without friction.
     has_rings: bool,
+    // Motion-based convergence: reference snapshot (in atom_ids order) and steps elapsed
+    // since it was taken.  See MSD_WINDOW / MSD_THRESHOLD.
+    ref_pos: Vec<[f32; 2]>,
+    steps_since_ref: usize,
 }
 
 impl CleanupState {
@@ -266,6 +279,8 @@ impl CleanupState {
         // Pre-compute initial forces so the first VV half-kick uses real forces, not zeros.
         compute_forces(&pos, &bonds, &adj, &atom_ids, &bonded, &PARAMS, &mut forces);
 
+        let ref_pos: Vec<[f32; 2]> = atom_ids.iter().map(|id| pos[id]).collect();
+
         CleanupState {
             pos, vel, atom_ids, forces, bonds, adj, bonded,
             cycles,
@@ -273,6 +288,8 @@ impl CleanupState {
             alpha: ALPHA_START,
             n_pos: 0,
             has_rings,
+            ref_pos,
+            steps_since_ref: 0,
         }
     }
 
@@ -288,6 +305,11 @@ impl CleanupState {
         self.dt = PARAMS.dt_init;
         self.alpha = ALPHA_START;
         self.n_pos = 0;
+        // Positions jumped: re-baseline the motion-convergence reference.
+        for (k, &id) in self.atom_ids.iter().enumerate() {
+            self.ref_pos[k] = self.pos[&id];
+        }
+        self.steps_since_ref = 0;
         compute_forces(
             &self.pos, &self.bonds, &self.adj, &self.atom_ids,
             &self.bonded, &PARAMS, &mut self.forces,
@@ -302,7 +324,7 @@ impl CleanupState {
     }
 
     /// Run up to `n` FIRE steps using Velocity Verlet integration.
-    /// Returns `true` when converged (max force < FORCE_THRESHOLD).
+    /// Returns `true` when converged — i.e. atoms have stopped moving (windowed MSD < MSD_THRESHOLD).
     ///
     /// VV layout per step (one force evaluation):
     ///   1. half-kick:  v += F_stored * dt/2    (F_stored = forces from previous step)
@@ -350,12 +372,28 @@ impl CleanupState {
                 v[1] += f[1] * dt * 0.5;
             }
 
-            // 5. Convergence check (uses new forces).
-            let max_f2 = self.forces.values()
-                .map(|f| f[0] * f[0] + f[1] * f[1])
-                .fold(0.0_f32, f32::max);
-            if max_f2 < FORCE_THRESHOLD * FORCE_THRESHOLD {
-                return true;
+            // 5. Convergence check (motion-based): every MSD_WINDOW steps, measure how far
+            //    atoms have moved from the reference snapshot.  Positions are already final
+            //    for this step (the second half-kick only updates velocity).
+            self.steps_since_ref += 1;
+            if self.steps_since_ref >= MSD_WINDOW {
+                let n = self.atom_ids.len().max(1) as f32;
+                let msd: f32 = self.atom_ids.iter().enumerate()
+                    .map(|(k, id)| {
+                        let np = self.pos[id];
+                        let dx = np[0] - self.ref_pos[k][0];
+                        let dy = np[1] - self.ref_pos[k][1];
+                        dx * dx + dy * dy
+                    })
+                    .sum::<f32>() / n;
+                if msd < MSD_THRESHOLD {
+                    return true;
+                }
+                // Not stationary yet: advance the reference window to the current positions.
+                for (k, &id) in self.atom_ids.iter().enumerate() {
+                    self.ref_pos[k] = self.pos[&id];
+                }
+                self.steps_since_ref = 0;
             }
 
             // 6. Power P = F · v (full velocity, new forces).
@@ -431,6 +469,9 @@ impl CleanupState {
     }
 
     /// Write the current relaxed positions back to the molecule.
+    /// Used by the synchronous `cleanup_2d` (tests / fragment-cleanup script); the interactive
+    /// path streams positions through `CleanupJob` instead.
+    #[allow(dead_code)]
     pub fn apply(&self, mol: &mut Molecule) {
         for (&id, &p) in &self.pos {
             if let Some(atom) = mol.atom_by_id_mut(id) {
@@ -438,10 +479,18 @@ impl CleanupState {
             }
         }
     }
+
+    /// Snapshot of the current positions (atom_ids order) for live preview / publishing.
+    pub fn positions(&self) -> Vec<(u32, [f32; 2])> {
+        self.atom_ids.iter().map(|&id| (id, self.pos[&id])).collect()
+    }
 }
 
-// ─── One-shot entry point (used by interact.rs button etc.) ──────────────────
+// ─── One-shot synchronous entry point ────────────────────────────────────────
+// Blocking version, retained for tests and the fragment-cleanup script. The interactive
+// UI uses `CleanupJob` (background thread + cancel) instead so it never freezes.
 
+#[allow(dead_code)]
 pub fn cleanup_2d(mol: &mut Molecule) {
     if mol.atoms.is_empty() {
         return;
@@ -460,6 +509,127 @@ pub fn cleanup_2d(mol: &mut Molecule) {
     }
     state.step(100_000);
     state.apply(mol);
+}
+
+// ─── Background, cancellable cleanup job ──────────────────────────────────────
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+/// Steps run per chunk between cancel checks and position publishes.
+const JOB_CHUNK: usize = 500;
+const JOB_PHASE_BUDGET: usize = 100_000;
+
+/// A cleanup computation running on a background thread.  The UI thread polls
+/// `latest()` for a live preview and `is_done()` for completion, and may `cancel()`
+/// at any time.  Created with `CleanupJob::start`.
+pub struct CleanupJob {
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    shared: Arc<Mutex<Vec<(u32, [f32; 2])>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CleanupJob {
+    /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread.
+    pub fn start(mol: &Molecule) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(
+            mol.atoms.iter().map(|a| (a.id, a.pos)).collect::<Vec<_>>(),
+        ));
+
+        let snapshot = mol.clone();
+        let (c, d, s) = (cancel.clone(), done.clone(), shared.clone());
+        let handle = std::thread::spawn(move || {
+            run_cleanup_job(&snapshot, &c, &d, &s);
+        });
+
+        CleanupJob { cancel, done, shared, handle: Some(handle) }
+    }
+
+    /// Request the worker to stop at the next chunk boundary.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    /// Latest relaxed positions (for live preview each frame).
+    pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+        self.shared.lock().unwrap().clone()
+    }
+
+    /// Join the worker thread (call once `is_done`).
+    pub fn join(mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for CleanupJob {
+    fn drop(&mut self) {
+        // Make sure a still-running worker stops if the job is dropped without joining.
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Worker body: mirrors `cleanup_2d`'s two-phase logic, but chunked so it can check the
+/// cancel flag and publish intermediate positions for a live preview.
+fn run_cleanup_job(
+    mol: &Molecule,
+    cancel: &AtomicBool,
+    done: &AtomicBool,
+    shared: &Mutex<Vec<(u32, [f32; 2])>>,
+) {
+    if mol.atoms.is_empty() {
+        done.store(true, Ordering::Relaxed);
+        return;
+    }
+    let mut state = CleanupState::new(mol);
+    if state.has_rings {
+        state.apply_ring_fix();
+    }
+
+    // Phase 1.
+    let converged = run_phase(&mut state, cancel, shared);
+
+    // Phase 2: ring fix if still stuck, then continue (only if not cancelled).
+    if !converged && !cancel.load(Ordering::Relaxed) {
+        if state.has_rings && state.max_force() > 0.1 {
+            state.apply_ring_fix();
+        }
+        run_phase(&mut state, cancel, shared);
+    }
+
+    *shared.lock().unwrap() = state.positions();
+    done.store(true, Ordering::Relaxed);
+}
+
+/// Run one JOB_PHASE_BUDGET phase in chunks; returns true if it converged.
+fn run_phase(
+    state: &mut CleanupState,
+    cancel: &AtomicBool,
+    shared: &Mutex<Vec<(u32, [f32; 2])>>,
+) -> bool {
+    let mut done_steps = 0;
+    while done_steps < JOB_PHASE_BUDGET {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let chunk = JOB_CHUNK.min(JOB_PHASE_BUDGET - done_steps);
+        let converged = state.step(chunk);
+        done_steps += chunk;
+        *shared.lock().unwrap() = state.positions();
+        if converged {
+            return true;
+        }
+    }
+    false
 }
 
 // ─── Force field ──────────────────────────────────────────────────────────────
