@@ -1,4 +1,4 @@
-use crate::molecule::{mol2::to_mol2_string, BondOrder, BondStereo};
+use crate::molecule::{mol2::to_mol2_string, BondStereo};
 use crate::widget::{ChemStructEditor, Tool};
 use eframe::{egui, App};
 
@@ -45,42 +45,6 @@ impl App for Mol2App {
                 {
                     self.editor.tool = Tool::Eraser;
                     self.status = "Eraser: click an atom or bond to remove it.".to_string();
-                }
-
-                ui.separator();
-
-                // Element palette
-                ui.label("Element:");
-                for el in &["C", "N", "O", "S", "H", "P", "F", "Cl", "Br", "I"] {
-                    if ui
-                        .selectable_label(self.editor.current_element == *el, *el)
-                        .clicked()
-                    {
-                        self.editor.current_element = el.to_string();
-                    }
-                }
-
-                ui.separator();
-
-                // Bond order
-                ui.label("Bond:");
-                if ui
-                    .selectable_label(self.editor.current_bond_order == BondOrder::Single, "─ 1")
-                    .clicked()
-                {
-                    self.editor.current_bond_order = BondOrder::Single;
-                }
-                if ui
-                    .selectable_label(self.editor.current_bond_order == BondOrder::Double, "═ 2")
-                    .clicked()
-                {
-                    self.editor.current_bond_order = BondOrder::Double;
-                }
-                if ui
-                    .selectable_label(self.editor.current_bond_order == BondOrder::Triple, "≡ 3")
-                    .clicked()
-                {
-                    self.editor.current_bond_order = BondOrder::Triple;
                 }
 
                 ui.separator();
