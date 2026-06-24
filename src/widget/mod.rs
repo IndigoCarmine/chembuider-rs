@@ -4,9 +4,38 @@ pub mod interact;
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
 pub const DEFAULT_BOND_LENGTH: f32 = 1.5;
+
+/// Marker prefix on the clipboard text so paste can recognise our own format and
+/// ignore unrelated text. The remainder is JSON (`ClipMol`).
+const CLIP_PREFIX: &str = "chembuilder-mol:";
+
+#[derive(Serialize, Deserialize)]
+struct ClipAtom {
+    element: String,
+    pos: [f32; 2],
+    charge: i8,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ClipBond {
+    begin: usize,
+    end: usize,
+    order: BondOrder,
+    #[serde(default)]
+    stereo: BondStereo,
+}
+
+/// A self-contained copy of a sub-structure (atoms + the bonds among them), used for
+/// clipboard copy/paste. Atom indices in bonds are positions within `atoms`.
+#[derive(Serialize, Deserialize)]
+struct ClipMol {
+    atoms: Vec<ClipAtom>,
+    bonds: Vec<ClipBond>,
+}
 pub const SCALE_FACTOR: f32 = 50.0;
 pub const NODE_HIT_RADIUS_PX: f32 = 15.0;
 pub const BOND_HIT_THRESHOLD_PX: f32 = 8.0;
@@ -170,6 +199,68 @@ impl ChemStructEditor {
             None        => self.config.fragments.push(def),
         }
         Ok(ids.len())
+    }
+
+    /// Serialize the current selection (or the whole molecule when nothing is selected)
+    /// into clipboard text. Returns None if there is nothing to copy.
+    pub fn copy_to_string(&self) -> Option<String> {
+        let ids: Vec<u32> = self.molecule.atoms.iter()
+            .map(|a| a.id)
+            .filter(|id| self.selected_atoms.is_empty() || self.selected_atoms.contains(id))
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let index: std::collections::HashMap<u32, usize> =
+            ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+        let atoms = ids.iter().map(|&id| {
+            let a = self.molecule.atom_by_id(id).unwrap();
+            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge }
+        }).collect();
+        let bonds = self.molecule.bonds.iter().filter_map(|b| {
+            Some(ClipBond {
+                begin: *index.get(&b.begin)?,
+                end: *index.get(&b.end)?,
+                order: b.order.clone(),
+                stereo: b.stereo.clone(),
+            })
+        }).collect();
+
+        serde_json::to_string(&ClipMol { atoms, bonds })
+            .ok()
+            .map(|json| format!("{CLIP_PREFIX}{json}"))
+    }
+
+    /// Parse clipboard text in our format and paste the atoms/bonds, offset slightly so the
+    /// copy is visible, leaving the pasted atoms selected. Returns true if anything was added.
+    pub fn paste_from_string(&mut self, text: &str) -> bool {
+        let json = match text.strip_prefix(CLIP_PREFIX) {
+            Some(rest) => rest,
+            None => return false, // not our format
+        };
+        let Ok(clip) = serde_json::from_str::<ClipMol>(json) else { return false };
+        if clip.atoms.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        const OFFSET: [f32; 2] = [DEFAULT_BOND_LENGTH, DEFAULT_BOND_LENGTH];
+        let new_ids: Vec<u32> = clip.atoms.iter().map(|a| {
+            self.molecule.add_atom(a.element.clone(),
+                [a.pos[0] + OFFSET[0], a.pos[1] + OFFSET[1]], a.charge)
+        }).collect();
+        for b in &clip.bonds {
+            if let (Some(&begin), Some(&end)) = (new_ids.get(b.begin), new_ids.get(b.end)) {
+                let bid = self.molecule.add_bond(begin, end, b.order.clone());
+                if bid != 0 {
+                    if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
+                        bond.stereo = b.stereo.clone();
+                    }
+                }
+            }
+        }
+        self.selected_atoms = new_ids.into_iter().collect();
+        true
     }
 
     /// True while a background cleanup computation is running.
@@ -447,6 +538,22 @@ impl ChemStructEditor {
         let did_undo = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
         if did_undo { self.undo(); }
 
+        // Ctrl+C: copy selection (or whole molecule) to the system clipboard as text.
+        let do_copy = ui.input(|i| i.key_pressed(egui::Key::C) && i.modifiers.ctrl);
+        if do_copy {
+            if let Some(text) = self.copy_to_string() {
+                ui.ctx().copy_text(text);
+            }
+        }
+        // Paste: egui delivers an Event::Paste(text) on Ctrl+V (from in-app or another app).
+        let pasted: Option<String> = ui.input(|i| i.events.iter().find_map(|e| match e {
+            egui::Event::Paste(t) => Some(t.clone()),
+            _ => None,
+        }));
+        if let Some(text) = pasted {
+            self.paste_from_string(&text);
+        }
+
         // Ctrl+K: toggle background clean-up (start, or stop if already running).
         let cleanup_toggle = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
         if cleanup_toggle {
@@ -546,4 +653,32 @@ pub fn normalize_angle(a: f32) -> f32 {
         a += std::f32::consts::TAU;
     }
     a
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn copy_paste_roundtrip() {
+        let mut e = ChemStructEditor::default();
+        let a = e.molecule.add_atom("O".to_string(), [0.0, 0.0], 0);
+        let b = e.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        e.molecule.add_bond(a, b, BondOrder::Double);
+
+        // Copy (whole molecule, since nothing is selected).
+        let text = e.copy_to_string().expect("should copy");
+        assert!(text.starts_with(CLIP_PREFIX));
+
+        let atoms_before = e.molecule.atoms.len();
+        let bonds_before = e.molecule.bonds.len();
+        assert!(e.paste_from_string(&text));
+        assert_eq!(e.molecule.atoms.len(), atoms_before + 2);
+        assert_eq!(e.molecule.bonds.len(), bonds_before + 1);
+        assert_eq!(e.selected_atoms.len(), 2, "pasted atoms should be selected");
+
+        // Foreign clipboard text is ignored.
+        assert!(!e.paste_from_string("just some text"));
+        assert!(!e.paste_from_string(""));
+    }
 }
