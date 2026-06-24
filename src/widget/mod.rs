@@ -232,6 +232,22 @@ impl ChemStructEditor {
             .map(|json| format!("{CLIP_PREFIX}{json}"))
     }
 
+    /// Publish a copy to the system clipboard. On Windows this also attaches a CDX blob under
+    /// the "ChemDraw Interchange Format" so the structure can be pasted into ChemDraw.
+    #[cfg(windows)]
+    fn copy_to_clipboard(&self, _ctx: &egui::Context, text: String) {
+        let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
+        if crate::clipboard::set_text_and_cdx(&text, cdx.as_deref()).is_err() {
+            // Fall back to egui's text-only clipboard if the native path fails.
+            _ctx.copy_text(text);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn copy_to_clipboard(&self, ctx: &egui::Context, text: String) {
+        ctx.copy_text(text);
+    }
+
     /// Parse clipboard text in our format and paste the atoms/bonds, offset slightly so the
     /// copy is visible, leaving the pasted atoms selected. Returns true if anything was added.
     pub fn paste_from_string(&mut self, text: &str) -> bool {
@@ -538,11 +554,13 @@ impl ChemStructEditor {
         let did_undo = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
         if did_undo { self.undo(); }
 
-        // Ctrl+C: copy selection (or whole molecule) to the system clipboard as text.
+        // Ctrl+C: copy selection (or whole molecule) to the clipboard. On Windows we publish
+        // both our JSON text and a "ChemDraw Interchange Format" CDX blob (ChemDraw-style);
+        // elsewhere, just the text via egui.
         let do_copy = ui.input(|i| i.key_pressed(egui::Key::C) && i.modifiers.ctrl);
         if do_copy {
             if let Some(text) = self.copy_to_string() {
-                ui.ctx().copy_text(text);
+                self.copy_to_clipboard(ui.ctx(), text);
             }
         }
         // Paste: egui delivers an Event::Paste(text) on Ctrl+V (from in-app or another app).

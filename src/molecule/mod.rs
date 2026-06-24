@@ -1,6 +1,8 @@
 pub mod mol2;
 pub mod fragment;
 pub mod cleanup;
+#[cfg(windows)]
+pub mod cdx;
 
 use serde::{Deserialize, Serialize};
 

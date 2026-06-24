@@ -1,4 +1,6 @@
 mod app;
+#[cfg(windows)]
+mod clipboard;
 mod config;
 mod molecule;
 mod widget;
