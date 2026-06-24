@@ -463,6 +463,11 @@ impl CleanupState {
                     v[1] *= FRICTION;
                 }
             }
+
+            // 11. Drain whole-structure translation/rotation so the next drift only relaxes
+            //     internal geometry (otherwise residual spin never lets positions converge).
+            remove_rigid_motion(&self.pos, &mut self.vel, &self.atom_ids);
+
             // self.forces already holds F(x_new), ready for the next step's first half-kick.
         }
         false
@@ -791,6 +796,47 @@ fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
         let p = pos.get_mut(id).unwrap();
         p[0] -= cx;
         p[1] -= cy;
+    }
+}
+
+/// Project out rigid-body motion (net translation + net rotation) from the velocities.
+/// Whole-structure translation and rotation are zero-energy modes with no restoring force;
+/// the angle forces are not perfectly torque-free, so they keep pumping angular momentum into
+/// the rotation mode and the structure spins forever — which, with motion-based convergence,
+/// never settles.  Draining that net motion each step lets only the internal geometry relax,
+/// and keeps the result at the same orientation the user drew.  Assumes `pos` is centered.
+fn remove_rigid_motion(pos: &HashMap<u32, [f32; 2]>, vel: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
+    if ids.len() < 2 {
+        return;
+    }
+    let n = ids.len() as f32;
+
+    // Net (mean) linear velocity.
+    let (mut vx, mut vy) = (0.0_f32, 0.0_f32);
+    for id in ids {
+        let v = vel[id];
+        vx += v[0];
+        vy += v[1];
+    }
+    vx /= n;
+    vy /= n;
+
+    // Angular velocity ω = L / I about the centroid (origin), using the de-translated velocity.
+    let (mut l, mut inertia) = (0.0_f32, 0.0_f32);
+    for id in ids {
+        let r = pos[id];
+        let v = vel[id];
+        l += r[0] * (v[1] - vy) - r[1] * (v[0] - vx);
+        inertia += r[0] * r[0] + r[1] * r[1];
+    }
+    let omega = if inertia > 1e-9 { l / inertia } else { 0.0 };
+
+    // Subtract both the linear and rotational (v_rot = (-ω·y, ω·x)) components.
+    for id in ids {
+        let r = pos[id];
+        let v = vel.get_mut(id).unwrap();
+        v[0] -= vx - omega * r[1];
+        v[1] -= vy + omega * r[0];
     }
 }
 
