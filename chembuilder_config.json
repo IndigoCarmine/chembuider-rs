@@ -16,7 +16,7 @@
       "key": "2",
       "ctrl": false,
       "alt": false,
-      "chain": 2
+      "fragment": "Oxo"
     },
     {
       "key": "3",
@@ -112,7 +112,7 @@
       "key": "O",
       "ctrl": false,
       "alt": false,
-      "fragment": "OMe"
+      "fragment": "O"
     },
     {
       "key": "n",
@@ -130,7 +130,7 @@
       "key": "N",
       "ctrl": false,
       "alt": false,
-      "fragment": "NO2"
+      "fragment": "N"
     },
     {
       "key": "s",

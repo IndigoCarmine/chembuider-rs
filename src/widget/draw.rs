@@ -17,6 +17,10 @@ const WAVY_AMPLITUDE: f32 = 3.0;
 
 pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
     for bond in &editor.molecule.bonds {
+        // Bonds to a folded terminal H are suppressed (the H is shown in the heavy atom's label).
+        if is_folded_h(&editor.molecule, bond.begin) || is_folded_h(&editor.molecule, bond.end) {
+            continue;
+        }
         let Some(a) = editor.molecule.atom_by_id(bond.begin) else { continue };
         let Some(b) = editor.molecule.atom_by_id(bond.end) else { continue };
         let p1 = editor.mol_to_screen(a.pos, center);
@@ -206,7 +210,7 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         }
 
         if should_show_label(editor, atom.id) {
-            let label = atom_label_text(atom);
+            let label = atom_label_text(&editor.molecule, atom);
             painter.text(
                 sp,
                 egui::Align2::CENTER_CENTER,
@@ -237,7 +241,8 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
         let pts: Vec<egui::Pos2> = editor.lasso_path.clone();
         painter.add(egui::Shape::Path(egui::epaint::PathShape {
             points: pts,
-            closed: false,
+            // Must be closed: epaint panics when filling an open path.
+            closed: true,
             fill: egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
             stroke: egui::epaint::PathStroke::new(1.5, egui::Color32::from_rgb(80, 130, 255)),
         }));
@@ -246,15 +251,78 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
-    let Some(atom) = editor.molecule.atom_by_id(atom_id) else { return false };
-    if atom.element != "C" { return true; }
-    if atom.charge != 0   { return true; }
-    editor.molecule.bonds_for_atom(atom_id).len() <= 1
+/// A terminal hydrogen bonded to a single heavy (non-H) atom. Such H atoms are
+/// folded into the heavy atom's label (e.g. N–H renders as "NH2"), so they are
+/// not drawn as separate vertices and their bond is suppressed. Deuterium ("D")
+/// is treated as a normal atom, never folded.
+pub fn is_folded_h(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
+    let Some(atom) = mol.atom_by_id(atom_id) else { return false };
+    if atom.element != "H" { return false; }
+    let bonds = mol.bonds_for_atom(atom_id);
+    if bonds.len() != 1 { return false; }
+    let b = bonds[0];
+    let other = if b.begin == atom_id { b.end } else { b.begin };
+    mol.atom_by_id(other).map_or(false, |n| n.element != "H")
 }
 
-fn atom_label_text(atom: &crate::molecule::Atom) -> String {
+fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
+    let Some(atom) = editor.molecule.atom_by_id(atom_id) else { return false };
+    // Folded hydrogens are merged into their heavy neighbor's label.
+    if is_folded_h(&editor.molecule, atom_id) { return false; }
+    if atom.element == "C" {
+        // Carbon: only show when completely isolated (no bonds) so the atom stays visible
+        return atom.charge != 0 || editor.molecule.bonds_for_atom(atom_id).is_empty();
+    }
+    true
+}
+
+/// Standard organic valence for implicit H calculation.
+fn normal_valence(element: &str) -> Option<u8> {
+    match element {
+        "C"  => Some(4),
+        "N"  => Some(3),
+        "O"  => Some(2),
+        "S"  => Some(2),
+        "P"  => Some(3),
+        "F" | "Cl" | "Br" | "I" => Some(1),
+        "B"  => Some(3),
+        "Si" => Some(4),
+        "H"  => Some(1),
+        _    => None,
+    }
+}
+
+/// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
+/// implicit H needed to satisfy valence. Computed as `valence + charge` minus the
+/// bond-order sum to *non-folded* neighbors, which naturally includes both.
+fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
+    let Some(atom) = mol.atom_by_id(atom_id) else { return 0 };
+    let Some(valence) = normal_valence(&atom.element) else { return 0 };
+    let bond_sum_heavy: i16 = mol.bonds_for_atom(atom_id).iter()
+        .filter(|b| {
+            let other = if b.begin == atom_id { b.end } else { b.begin };
+            !is_folded_h(mol, other)
+        })
+        .map(|b| match b.order {
+            crate::molecule::BondOrder::Single => 1_i16,
+            crate::molecule::BondOrder::Double => 2,
+            crate::molecule::BondOrder::Triple => 3,
+        })
+        .sum();
+    // Positive charge raises effective valence (e.g. N+ = 4), negative lowers it
+    let effective = valence as i16 + atom.charge as i16;
+    (effective - bond_sum_heavy).max(0) as u8
+}
+
+fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom) -> String {
     let mut s = atom.element.clone();
+    let h = displayed_h_count(mol, atom.id);
+    if h == 1 {
+        s.push('H');
+    } else if h > 1 {
+        s.push('H');
+        s.push_str(&h.to_string());
+    }
     match atom.charge {
         0          => {}
         1          => s.push('+'),

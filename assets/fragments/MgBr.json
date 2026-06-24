@@ -1,1 +1,29 @@
-{ "name": "MgBr", "atoms": [{"element":"Mg","pos":[0.0,0.0],"charge":0},{"element":"Br","pos":[1.0,0.0],"charge":0}], "bonds": [{"begin":0,"end":1,"order":"Single"}], "attach_idx": 0 }
+{
+  "name": "MgBr",
+  "atoms": [
+    {
+      "element": "Mg",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "Br",
+      "pos": [
+        1.4999,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 0
+}

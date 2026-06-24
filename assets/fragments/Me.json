@@ -1,1 +1,15 @@
-{ "name": "Me", "atoms": [{"element":"C","pos":[0.0,0.0],"charge":0}], "bonds": [], "attach_idx": 0 }
+{
+  "name": "Me",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [],
+  "attach_idx": 0
+}

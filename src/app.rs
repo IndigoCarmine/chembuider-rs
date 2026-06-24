@@ -1,10 +1,12 @@
-use crate::molecule::{mol2::to_mol2_string, cleanup::cleanup_2d, BondOrder};
+use crate::molecule::{mol2::to_mol2_string, cleanup::cleanup_2d, BondOrder, BondStereo};
 use crate::widget::{ChemStructEditor, Tool};
 use eframe::{egui, App};
 
 pub struct Mol2App {
     editor: ChemStructEditor,
     status: String,
+    /// Name field for the "Save Fragment" feature.
+    fragment_name: String,
 }
 
 impl Default for Mol2App {
@@ -12,6 +14,7 @@ impl Default for Mol2App {
         Self {
             editor: ChemStructEditor::default(),
             status: "Ready — Bond tool active. Click to place atoms, drag between atoms to draw bonds.".to_string(),
+            fragment_name: String::new(),
         }
     }
 }
@@ -82,10 +85,52 @@ impl App for Mol2App {
 
                 ui.separator();
 
+                // Bond stereo
+                ui.label("Stereo:");
+                if ui.selectable_label(
+                    self.editor.current_bond_stereo == BondStereo::None, "─ None"
+                ).clicked() {
+                    self.editor.current_bond_stereo = BondStereo::None;
+                }
+                if ui.selectable_label(
+                    self.editor.current_bond_stereo == BondStereo::WedgeUp, "▲ Wedge"
+                ).clicked() {
+                    self.editor.current_bond_stereo = BondStereo::WedgeUp;
+                }
+                if ui.selectable_label(
+                    self.editor.current_bond_stereo == BondStereo::WedgeDown, "┄ Hash"
+                ).clicked() {
+                    self.editor.current_bond_stereo = BondStereo::WedgeDown;
+                }
+
+                ui.separator();
+
                 // Clean Up button (also Ctrl+K in the canvas)
                 if ui.button("✨ Clean Up").clicked() {
                     cleanup_2d(&mut self.editor.molecule);
                     self.status = "Structure cleaned up.".to_string();
+                }
+
+                ui.separator();
+
+                // Save selection as a reusable fragment
+                ui.label("Fragment:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fragment_name)
+                        .hint_text("name")
+                        .desired_width(70.0),
+                );
+                if ui.button("➕ Save Fragment").clicked() {
+                    match self.editor.save_selection_as_fragment(&self.fragment_name) {
+                        Ok(n) => {
+                            self.status = format!(
+                                "Saved fragment '{}' ({} atoms) to fragments/{}.json",
+                                self.fragment_name.trim(), n, self.fragment_name.trim()
+                            );
+                            self.fragment_name.clear();
+                        }
+                        Err(e) => self.status = format!("Save fragment failed: {e}"),
+                    }
                 }
 
                 ui.separator();

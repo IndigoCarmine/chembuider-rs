@@ -2,7 +2,7 @@ pub mod draw;
 pub mod interact;
 
 use crate::config::Config;
-use crate::molecule::{BondOrder, Molecule};
+use crate::molecule::{BondOrder, BondStereo, Molecule};
 use eframe::egui;
 use std::collections::{HashSet, VecDeque};
 
@@ -64,6 +64,12 @@ pub struct ChemStructEditor {
 
     /// Undo history (molecule snapshots, newest at back).
     pub undo_stack: VecDeque<crate::molecule::Molecule>,
+
+    /// Stereo type applied to newly drawn bonds.
+    pub current_bond_stereo: BondStereo,
+
+    /// Last known mouse position in molecule coordinates (for no-target atom placement).
+    pub last_mouse_mol: [f32; 2],
 }
 
 impl Default for ChemStructEditor {
@@ -88,6 +94,8 @@ impl Default for ChemStructEditor {
             config: Config::load(),
             label_edit: None,
             undo_stack: VecDeque::new(),
+            current_bond_stereo: BondStereo::None,
+            last_mouse_mol: [0.0; 2],
         }
     }
 }
@@ -103,6 +111,61 @@ impl ChemStructEditor {
             }
             self.undo_stack.push_back(self.molecule.clone());
         }
+    }
+
+    /// Build a fragment from the current selection and save it to `fragments/<name>.json`.
+    /// The attach point (the atom that will bond to the rest of a molecule on insertion) is
+    /// the hotspot atom when it is part of the selection, otherwise the lowest-id selected atom.
+    /// Only bonds whose both endpoints are selected are included. Positions are stored relative
+    /// to the attach atom. The new fragment is also registered in the live config for immediate use.
+    pub fn save_selection_as_fragment(&mut self, name: &str) -> Result<usize, String> {
+        use crate::config::{FragAtomDef, FragBondDef, FragmentDef};
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("fragment name is empty".into());
+        }
+        let mut ids: Vec<u32> = self.selected_atoms.iter().copied().collect();
+        if ids.is_empty() {
+            return Err("select the atoms to save first (Select tool)".into());
+        }
+        ids.sort_unstable();
+
+        let attach_id = match self.hotspot_atom {
+            Some(h) if ids.contains(&h) => h,
+            _ => ids[0],
+        };
+        let attach_idx = ids.iter().position(|&i| i == attach_id).unwrap();
+        let base = self.molecule.atom_by_id(attach_id).ok_or("attach atom missing")?.pos;
+
+        let atoms: Vec<FragAtomDef> = ids.iter().map(|&id| {
+            let a = self.molecule.atom_by_id(id).unwrap();
+            FragAtomDef {
+                element: a.element.clone(),
+                pos: [a.pos[0] - base[0], a.pos[1] - base[1]],
+                charge: a.charge,
+            }
+        }).collect();
+
+        let bonds: Vec<FragBondDef> = self.molecule.bonds.iter().filter_map(|b| {
+            let begin = ids.iter().position(|&i| i == b.begin)?;
+            let end   = ids.iter().position(|&i| i == b.end)?;
+            Some(FragBondDef { begin, end, order: b.order.clone() })
+        }).collect();
+
+        let def = FragmentDef { name: name.to_string(), atoms, bonds, attach_idx };
+
+        std::fs::create_dir_all("fragments").map_err(|e| e.to_string())?;
+        let path = format!("fragments/{}.json", name);
+        let json = serde_json::to_string_pretty(&def).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+
+        // Register in the live config (override by name) so it's usable without restart.
+        match self.config.fragments.iter_mut().find(|f| f.name == name) {
+            Some(slot) => *slot = def,
+            None        => self.config.fragments.push(def),
+        }
+        Ok(ids.len())
     }
 
     /// Restore the previous molecule state.
@@ -136,6 +199,8 @@ impl ChemStructEditor {
     pub fn hit_test_atom(&self, screen: egui::Pos2, center: egui::Pos2) -> Option<u32> {
         let mut best: Option<(u32, f32)> = None;
         for atom in &self.molecule.atoms {
+            // Folded terminal H atoms are invisible; don't let them capture hover/clicks.
+            if draw::is_folded_h(&self.molecule, atom.id) { continue; }
             let sp = self.mol_to_screen(atom.pos, center);
             let d = sp.distance(screen);
             if d <= NODE_HIT_RADIUS_PX {
@@ -303,9 +368,10 @@ impl ChemStructEditor {
 
         painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
 
-        // Update hover state
+        // Update hover state and track mouse in mol coords
         let mouse_pos = response.hover_pos().unwrap_or(egui::Pos2::ZERO);
         if rect.contains(mouse_pos) {
+            self.last_mouse_mol = self.screen_to_mol(mouse_pos, center);
             self.hovered_atom = self.hit_test_atom(mouse_pos, center);
             self.hovered_bond = if self.hovered_atom.is_none() {
                 self.hit_test_bond(mouse_pos, center)
@@ -386,7 +452,10 @@ impl ChemStructEditor {
         if label_confirmed { self.label_edit = None; }
         let label_editing = self.label_edit.is_some();
 
-        let tool_modified = if label_editing {
+        // Suppress canvas key/mouse handling whenever a text field (our label editor or a
+        // toolbar field like the fragment-name input) has keyboard focus, so typed characters
+        // don't leak into atom/bond shortcuts.
+        let tool_modified = if label_editing || ui.ctx().wants_keyboard_input() {
             false
         } else {
             match self.tool.clone() {

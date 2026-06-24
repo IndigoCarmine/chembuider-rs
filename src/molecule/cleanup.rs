@@ -778,4 +778,85 @@ mod tests {
             );
         }
     }
+
+    /// Maintenance script (not a real test — `#[ignore]`d so it never runs in CI):
+    /// read every fragment JSON under `assets/fragments/` and `fragments/`, relax its
+    /// geometry with `cleanup_2d`, re-center on the attach atom, and write it back.
+    /// Run with:
+    ///   cargo test cleanup_fragment_geometries -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cleanup_fragment_geometries() {
+        use crate::config::FragmentDef;
+
+        fn round4(v: f32) -> f32 {
+            (v * 10_000.0).round() / 10_000.0
+        }
+
+        fn process_dir(dir: &str) -> usize {
+            let path = std::path::Path::new(dir);
+            if !path.is_dir() {
+                return 0;
+            }
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |x| x == "json"))
+                .collect();
+            files.sort();
+
+            let mut count = 0;
+            for file in files {
+                let Ok(text) = std::fs::read_to_string(&file) else { continue };
+                let mut def: FragmentDef = match serde_json::from_str(&text) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("skip {:?}: {e}", file.file_name().unwrap());
+                        continue;
+                    }
+                };
+                if def.atoms.is_empty() {
+                    continue;
+                }
+
+                // Build a molecule mirroring the fragment topology.
+                let mut mol = Molecule::default();
+                let ids: Vec<u32> = def
+                    .atoms
+                    .iter()
+                    .map(|a| mol.add_atom(a.element.clone(), a.pos, a.charge))
+                    .collect();
+                for b in &def.bonds {
+                    mol.add_bond(ids[b.begin], ids[b.end], b.order.clone());
+                }
+
+                // Relax 2D coordinates.
+                cleanup_2d(&mut mol);
+
+                // Re-center so the attach atom sits at the origin (insert_fragment expects
+                // attach-relative coordinates).
+                let attach = mol.atom_by_id(ids[def.attach_idx]).unwrap().pos;
+                for (i, a) in def.atoms.iter_mut().enumerate() {
+                    let p = mol.atom_by_id(ids[i]).unwrap().pos;
+                    a.pos = [round4(p[0] - attach[0]), round4(p[1] - attach[1])];
+                }
+
+                let out = serde_json::to_string_pretty(&def).unwrap();
+                std::fs::write(&file, out + "\n").unwrap();
+                eprintln!(
+                    "cleaned {:?} ({} atoms)",
+                    file.file_name().unwrap(),
+                    def.atoms.len()
+                );
+                count += 1;
+            }
+            count
+        }
+
+        let a = process_dir("assets/fragments");
+        let b = process_dir("fragments");
+        eprintln!("done: {a} files in assets/fragments, {b} in fragments");
+        assert!(a + b > 0, "no fragment files were processed");
+    }
 }

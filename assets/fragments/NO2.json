@@ -1,1 +1,42 @@
-{ "name": "NO2", "atoms": [{"element":"N","pos":[0.0,0.0],"charge":1},{"element":"O","pos":[1.0,0.0],"charge":0},{"element":"O","pos":[-0.5,0.866],"charge":-1}], "bonds": [{"begin":0,"end":1,"order":"Double"},{"begin":0,"end":2,"order":"Single"}], "attach_idx": 0 }
+{
+  "name": "NO2",
+  "atoms": [
+    {
+      "element": "N",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 1
+    },
+    {
+      "element": "O",
+      "pos": [
+        1.4999,
+        -0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        -0.75,
+        1.2989
+      ],
+      "charge": -1
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Double"
+    },
+    {
+      "begin": 0,
+      "end": 2,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 0
+}

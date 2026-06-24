@@ -1,1 +1,42 @@
-{ "name": "Ac", "atoms": [{"element":"C","pos":[0.0,0.0],"charge":0},{"element":"O","pos":[0.0,-1.0],"charge":0},{"element":"C","pos":[1.0,0.0],"charge":0}], "bonds": [{"begin":0,"end":1,"order":"Double"},{"begin":0,"end":2,"order":"Single"}], "attach_idx": 0 }
+{
+  "name": "Ac",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        -0.3883,
+        -1.4489
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.4489,
+        0.3883
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Double"
+    },
+    {
+      "begin": 0,
+      "end": 2,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 0
+}

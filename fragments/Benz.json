@@ -1,59 +1,67 @@
 {
-  "name": "Boc",
+  "name": "Benz",
   "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        -0.8159,
+        3.8843
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -0.0878,
+        5.1958
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.412,
+        5.2209
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.1836,
+        3.9346
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.4555,
+        2.6231
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -0.0442,
+        2.5979
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -0.7721,
+        1.2862
+      ],
+      "charge": 0
+    },
     {
       "element": "C",
       "pos": [
         0.0,
         0.0
-      ],
-      "charge": 0
-    },
-    {
-      "element": "O",
-      "pos": [
-        0.2974,
-        -1.4703
-      ],
-      "charge": 0
-    },
-    {
-      "element": "O",
-      "pos": [
-        1.1246,
-        0.9928
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        2.5466,
-        0.5152
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        3.9684,
-        0.0372
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        2.0688,
-        -0.9067
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        3.0245,
-        1.9371
       ],
       "charge": 0
     }
@@ -62,12 +70,12 @@
     {
       "begin": 0,
       "end": 1,
-      "order": "Double"
+      "order": "Single"
     },
     {
-      "begin": 0,
+      "begin": 1,
       "end": 2,
-      "order": "Single"
+      "order": "Double"
     },
     {
       "begin": 2,
@@ -77,18 +85,28 @@
     {
       "begin": 3,
       "end": 4,
-      "order": "Single"
+      "order": "Double"
     },
     {
-      "begin": 3,
+      "begin": 4,
       "end": 5,
       "order": "Single"
     },
     {
-      "begin": 3,
+      "begin": 5,
+      "end": 0,
+      "order": "Double"
+    },
+    {
+      "begin": 5,
       "end": 6,
+      "order": "Single"
+    },
+    {
+      "begin": 6,
+      "end": 7,
       "order": "Single"
     }
   ],
-  "attach_idx": 0
+  "attach_idx": 7
 }

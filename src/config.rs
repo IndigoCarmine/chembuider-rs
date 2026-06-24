@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use crate::molecule::fragment::{Fragment, FragAtom, FragBond, ring_positions};
+use crate::molecule::fragment::{FragAtom, FragBond, Fragment, ring_positions};
 use crate::molecule::{BondOrder, BondStereo};
+use serde::{Deserialize, Serialize};
 
 // ─── JSON-serializable shortcut/action types ──────────────────────────────────
 
@@ -9,10 +9,10 @@ use crate::molecule::{BondOrder, BondStereo};
 #[serde(untagged)]
 pub enum AtomAction {
     Fragment { fragment: String },
-    Ring     { ring: usize },
-    Chain    { chain: usize },
-    Zigzag   { zigzag: usize },
-    Charge   { charge: i8 },
+    Ring { ring: usize },
+    Chain { chain: usize },
+    Zigzag { zigzag: usize },
+    Charge { charge: i8 },
 }
 
 /// Action that applies to a hovered bond.
@@ -20,39 +20,52 @@ pub enum AtomAction {
 #[serde(untagged)]
 pub enum BondAction {
     Stereo { stereo: BondStereo },
-    Order  { order: BondOrder },
-    Ring   { ring: usize },
+    Order { order: BondOrder },
+    Ring { ring: usize },
 }
 
 /// Action for the select tool's arrow-key operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SelectionAction {
-    MoveUp, MoveDown, MoveLeft, MoveRight,
-    RotateCW, RotateCCW,
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    RotateCW,
+    RotateCCW,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomShortcut {
     pub key: String,
-    #[serde(default)] pub ctrl: bool,
-    #[serde(default)] pub alt:  bool,
-    #[serde(flatten)] pub action: AtomAction,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(flatten)]
+    pub action: AtomAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BondShortcut {
     pub key: String,
-    #[serde(default)] pub ctrl: bool,
-    #[serde(default)] pub alt:  bool,
-    #[serde(flatten)] pub action: BondAction,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(flatten)]
+    pub action: BondAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionShortcut {
     pub key: String,
-    #[serde(default)] pub ctrl:  bool,
-    #[serde(default)] pub shift: bool,
-    #[serde(default)] pub alt:   bool,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub alt: bool,
     pub action: SelectionAction,
 }
 
@@ -60,36 +73,49 @@ pub struct SelectionShortcut {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentDef {
-    pub name:       String,
-    pub atoms:      Vec<FragAtomDef>,
-    pub bonds:      Vec<FragBondDef>,
+    pub name: String,
+    pub atoms: Vec<FragAtomDef>,
+    pub bonds: Vec<FragBondDef>,
     pub attach_idx: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragAtomDef {
     pub element: String,
-    pub pos:     [f32; 2],
-    #[serde(default)] pub charge: i8,
+    pub pos: [f32; 2],
+    #[serde(default)]
+    pub charge: i8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragBondDef {
     pub begin: usize,
-    pub end:   usize,
+    pub end: usize,
     pub order: BondOrder,
 }
 
 impl FragmentDef {
     pub fn to_fragment(&self) -> Fragment {
         Fragment {
-            name:  self.name.clone(),
-            atoms: self.atoms.iter().map(|a| FragAtom {
-                element: a.element.clone(), pos: a.pos, charge: a.charge,
-            }).collect(),
-            bonds: self.bonds.iter().map(|b| FragBond {
-                begin: b.begin, end: b.end, order: b.order.clone(),
-            }).collect(),
+            name: self.name.clone(),
+            atoms: self
+                .atoms
+                .iter()
+                .map(|a| FragAtom {
+                    element: a.element.clone(),
+                    pos: a.pos,
+                    charge: a.charge,
+                })
+                .collect(),
+            bonds: self
+                .bonds
+                .iter()
+                .map(|b| FragBond {
+                    begin: b.begin,
+                    end: b.end,
+                    order: b.order.clone(),
+                })
+                .collect(),
             attach_idx: self.attach_idx,
         }
     }
@@ -99,11 +125,15 @@ impl FragmentDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    #[serde(default)] pub atom_shortcuts:      Vec<AtomShortcut>,
-    #[serde(default)] pub bond_shortcuts:      Vec<BondShortcut>,
-    #[serde(default)] pub selection_shortcuts: Vec<SelectionShortcut>,
+    #[serde(default)]
+    pub atom_shortcuts: Vec<AtomShortcut>,
+    #[serde(default)]
+    pub bond_shortcuts: Vec<BondShortcut>,
+    #[serde(default)]
+    pub selection_shortcuts: Vec<SelectionShortcut>,
     /// Inline fragments (legacy / override). Normally empty; loaded from fragments/ dir.
-    #[serde(default)] pub fragments:           Vec<FragmentDef>,
+    #[serde(default)]
+    pub fragments: Vec<FragmentDef>,
 }
 
 impl Config {
@@ -131,12 +161,15 @@ impl Config {
     pub fn save(&self) -> std::io::Result<()> {
         // Shortcuts only (fragments live in their own files)
         let shortcuts = Config {
-            atom_shortcuts:      self.atom_shortcuts.clone(),
-            bond_shortcuts:      self.bond_shortcuts.clone(),
+            atom_shortcuts: self.atom_shortcuts.clone(),
+            bond_shortcuts: self.bond_shortcuts.clone(),
             selection_shortcuts: self.selection_shortcuts.clone(),
-            fragments:           Vec::new(),
+            fragments: Vec::new(),
         };
-        std::fs::write("chembuilder_config.json", serde_json::to_string_pretty(&shortcuts)?)?;
+        std::fs::write(
+            "chembuilder_config.json",
+            serde_json::to_string_pretty(&shortcuts)?,
+        )?;
 
         // Individual fragment files
         std::fs::create_dir_all("fragments")?;
@@ -152,25 +185,31 @@ impl Config {
         if let Some(def) = self.fragments.iter().find(|f| f.name == name) {
             return Some(def.to_fragment());
         }
-        if let Some(size) = name.strip_prefix("ring").and_then(|s| s.parse::<usize>().ok()) {
-            if (3..=12).contains(&size) { return Some(Fragment::ring(size)); }
+        if let Some(size) = name
+            .strip_prefix("ring")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if (3..=12).contains(&size) {
+                return Some(Fragment::ring(size));
+            }
         }
-        if name == "benzene" { return Some(Fragment::benzene()); }
+        if name == "benzene" {
+            return Some(Fragment::benzene());
+        }
         None
     }
 
     pub fn atom_action_to_fragment(&self, action: &AtomAction) -> Option<ResolvedAtomAction> {
         match action {
-            AtomAction::Fragment { fragment } =>
-                self.resolve_fragment(fragment).map(ResolvedAtomAction::InsertFragment),
-            AtomAction::Ring    { ring    } =>
-                Some(ResolvedAtomAction::InsertFragment(Fragment::ring(*ring))),
-            AtomAction::Chain   { chain   } =>
-                Some(ResolvedAtomAction::ExtendChain(*chain, false)),
-            AtomAction::Zigzag  { zigzag  } =>
-                Some(ResolvedAtomAction::ExtendChain(*zigzag, true)),
-            AtomAction::Charge  { charge  } =>
-                Some(ResolvedAtomAction::ModifyCharge(*charge)),
+            AtomAction::Fragment { fragment } => self
+                .resolve_fragment(fragment)
+                .map(ResolvedAtomAction::InsertFragment),
+            AtomAction::Ring { ring } => {
+                Some(ResolvedAtomAction::InsertFragment(Fragment::ring(*ring)))
+            }
+            AtomAction::Chain { chain } => Some(ResolvedAtomAction::ExtendChain(*chain, false)),
+            AtomAction::Zigzag { zigzag } => Some(ResolvedAtomAction::ExtendChain(*zigzag, true)),
+            AtomAction::Charge { charge } => Some(ResolvedAtomAction::ModifyCharge(*charge)),
         }
     }
 }
@@ -186,6 +225,9 @@ pub enum ResolvedAtomAction {
 
 /// Embedded fragment JSON strings (compile-time, one per file in assets/fragments/).
 const BUILTIN_FRAGMENT_STRS: &[&str] = &[
+    include_str!("../assets/fragments/Oxo.json"),
+    include_str!("../assets/fragments/N.json"),
+    include_str!("../assets/fragments/O.json"),
     include_str!("../assets/fragments/OH.json"),
     include_str!("../assets/fragments/OMe.json"),
     include_str!("../assets/fragments/NH2.json"),
@@ -219,11 +261,15 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
 /// Load fragments: embedded defaults as base, then merge inline + runtime dir (override by name).
 /// This ensures built-in fragments are always available even when a runtime `fragments/` dir exists.
 fn load_fragments(inline: Vec<FragmentDef>) -> Vec<FragmentDef> {
-    let mut frags: Vec<FragmentDef> = BUILTIN_FRAGMENT_STRS.iter()
+    let mut frags: Vec<FragmentDef> = BUILTIN_FRAGMENT_STRS
+        .iter()
         .filter_map(|s| serde_json::from_str::<FragmentDef>(s).ok())
         .collect();
     merge_fragments(&mut frags, inline);
-    merge_fragments(&mut frags, load_fragments_from_dir(std::path::Path::new("fragments")));
+    merge_fragments(
+        &mut frags,
+        load_fragments_from_dir(std::path::Path::new("fragments")),
+    );
     frags
 }
 
@@ -231,15 +277,19 @@ fn merge_fragments(base: &mut Vec<FragmentDef>, additions: Vec<FragmentDef>) {
     for frag in additions {
         match base.iter_mut().find(|f| f.name == frag.name) {
             Some(slot) => *slot = frag,
-            None       => base.push(frag),
+            None => base.push(frag),
         }
     }
 }
 
 /// Scan a directory for `*.json` fragment files, sorted alphabetically.
 fn load_fragments_from_dir(dir: &std::path::Path) -> Vec<FragmentDef> {
-    if !dir.is_dir() { return Vec::new(); }
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new(); };
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut paths: Vec<_> = entries
         .flatten()
         .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
@@ -253,7 +303,7 @@ fn load_fragments_from_dir(dir: &std::path::Path) -> Vec<FragmentDef> {
             .and_then(|s| serde_json::from_str::<FragmentDef>(&s).map_err(|e| format!("{e}")))
         {
             Ok(frag) => out.push(frag),
-            Err(e)   => eprintln!("Warning: skip {:?}: {e}", path),
+            Err(e) => eprintln!("Warning: skip {:?}: {e}", path),
         }
     }
     out
@@ -268,11 +318,25 @@ const DEFAULT_SHORTCUTS: &str = include_str!("../assets/default_config.json");
 #[allow(dead_code)]
 pub fn ring_fragment_def(n: usize) -> FragmentDef {
     let positions = ring_positions(n);
-    let atoms = positions.iter().map(|&p| FragAtomDef {
-        element: "C".into(), pos: p, charge: 0,
-    }).collect();
-    let bonds = (0..n).map(|k| FragBondDef {
-        begin: k, end: (k + 1) % n, order: BondOrder::Single,
-    }).collect();
-    FragmentDef { name: format!("ring{n}"), atoms, bonds, attach_idx: 0 }
+    let atoms = positions
+        .iter()
+        .map(|&p| FragAtomDef {
+            element: "C".into(),
+            pos: p,
+            charge: 0,
+        })
+        .collect();
+    let bonds = (0..n)
+        .map(|k| FragBondDef {
+            begin: k,
+            end: (k + 1) % n,
+            order: BondOrder::Single,
+        })
+        .collect();
+    FragmentDef {
+        name: format!("ring{n}"),
+        atoms,
+        bonds,
+        attach_idx: 0,
+    }
 }

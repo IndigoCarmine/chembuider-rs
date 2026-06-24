@@ -20,7 +20,8 @@ pub fn process_bond_tool(
     if response.drag_started() {
         editor.push_undo(); // snapshot before drag modifies positions
         editor.drag_origin_screen = Some(mouse);
-        let hit = editor.hit_test_atom(mouse, center);
+        // Prefer hit atom; fall back to currently hovered atom for slight-miss tolerance
+        let hit = editor.hit_test_atom(mouse, center).or(editor.hovered_atom);
         editor.dragging_atom = hit;
         editor.bond_start = None;
     }
@@ -48,15 +49,59 @@ pub fn process_bond_tool(
     }
 
     if response.drag_stopped() {
-        let start_id    = editor.bond_start.take();
-        let end_screen  = editor.preview_end_screen.take();
+        // ── Atom merge: if dragged atom lands on another atom, fuse them ──────
+        if let Some(drag_id) = editor.dragging_atom {
+            let current_pos = editor.molecule.atom_by_id(drag_id).map(|a| a.pos);
+            if let Some(pos) = current_pos {
+                let merge_r = crate::molecule::Molecule::SNAP_RADIUS;
+                let merge_target = editor.molecule.atoms.iter()
+                    .filter(|a| a.id != drag_id)
+                    .filter(|a| {
+                        let dx = a.pos[0] - pos[0];
+                        let dy = a.pos[1] - pos[1];
+                        dx * dx + dy * dy < merge_r * merge_r
+                    })
+                    .min_by(|a, b| {
+                        let da = (a.pos[0]-pos[0]).powi(2) + (a.pos[1]-pos[1]).powi(2);
+                        let db = (b.pos[0]-pos[0]).powi(2) + (b.pos[1]-pos[1]).powi(2);
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .map(|a| a.id);
+
+                if let Some(target_id) = merge_target {
+                    for bond in &mut editor.molecule.bonds {
+                        if bond.begin == drag_id { bond.begin = target_id; }
+                        if bond.end   == drag_id { bond.end   = target_id; }
+                    }
+                    editor.molecule.bonds.retain(|b| b.begin != b.end);
+                    // Remove duplicate bonds (keep first encountered)
+                    let mut seen = std::collections::HashSet::new();
+                    editor.molecule.bonds.retain(|b| {
+                        let key = if b.begin < b.end { (b.begin, b.end) } else { (b.end, b.begin) };
+                        seen.insert(key)
+                    });
+                    editor.molecule.atoms.retain(|a| a.id != drag_id);
+                    if editor.hotspot_atom == Some(drag_id) {
+                        editor.hotspot_atom = Some(target_id);
+                    }
+                    modified = true;
+                }
+            }
+        }
+
+        let start_id   = editor.bond_start.take();
+        let end_screen = editor.preview_end_screen.take();
 
         if let (Some(src_id), Some(end)) = (start_id, end_screen) {
-            let target_id = editor.hit_test_atom(end, center).unwrap_or_else(|| {
-                let mol_pos = editor.screen_to_mol(end, center);
-                editor.molecule.find_atom_near(mol_pos, crate::molecule::Molecule::SNAP_RADIUS)
-                    .unwrap_or_else(|| editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0))
-            });
+            let target_id = editor.hit_test_atom(end, center)
+                .or_else(|| {
+                    let mol_pos = editor.screen_to_mol(end, center);
+                    editor.molecule.find_atom_near(mol_pos, crate::molecule::Molecule::SNAP_RADIUS)
+                })
+                .unwrap_or_else(|| {
+                    let mol_pos = editor.screen_to_mol(end, center);
+                    editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0)
+                });
             if target_id != src_id {
                 if let Some(existing) = editor.molecule.bond_between(src_id, target_id).map(|b| b.id) {
                     if let Some(bond) = editor.molecule.bond_by_id_mut(existing) {
@@ -64,7 +109,12 @@ pub fn process_bond_tool(
                         modified = true;
                     }
                 } else {
-                    editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
+                    let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
+                    if bid != 0 {
+                        if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
+                            bond.stereo = editor.current_bond_stereo.clone();
+                        }
+                    }
                     modified = true;
                 }
             }
@@ -92,7 +142,12 @@ pub fn process_bond_tool(
                         modified = true;
                     }
                 } else {
-                    editor.molecule.add_bond(atom_id, new_id, editor.current_bond_order.clone());
+                    let bid = editor.molecule.add_bond(atom_id, new_id, editor.current_bond_order.clone());
+                    if bid != 0 {
+                        if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
+                            bond.stereo = editor.current_bond_stereo.clone();
+                        }
+                    }
                     modified = true;
                 }
             }
@@ -117,10 +172,37 @@ pub fn process_bond_tool(
         }
     }
 
+    // ── Hover + Delete: remove the atom or bond under the cursor ─────────────
+    let delete_pressed =
+        ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+    if delete_pressed && delete_hovered(editor) {
+        modified = true;
+    }
+
     // ── Keyboard shortcuts ───────────────────────────────────────────────────
     modified |= handle_keys_bond_tool(editor, ui);
 
     modified
+}
+
+/// Delete whichever atom or bond is currently hovered (atom takes priority).
+/// Returns true if something was removed.
+fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
+    if let Some(atom_id) = editor.hovered_atom {
+        editor.push_undo();
+        editor.molecule.remove_atom(atom_id);
+        if editor.hotspot_atom == Some(atom_id) { editor.hotspot_atom = None; }
+        editor.selected_atoms.remove(&atom_id);
+        editor.hovered_atom = None;
+        return true;
+    }
+    if let Some(bond_id) = editor.hovered_bond {
+        editor.push_undo();
+        editor.molecule.remove_bond(bond_id);
+        editor.hovered_bond = None;
+        return true;
+    }
+    false
 }
 
 pub fn process_select_tool(
@@ -190,14 +272,18 @@ pub fn process_select_tool(
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
-    // Delete/Backspace
+    // Delete/Backspace: remove the selection, or fall back to the hovered atom/bond.
     let delete_pressed =
         ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-    if delete_pressed && !editor.selected_atoms.is_empty() {
-        editor.push_undo();
-        let ids: Vec<u32> = editor.selected_atoms.drain().collect();
-        for id in ids { editor.molecule.remove_atom(id); }
-        modified = true;
+    if delete_pressed {
+        if !editor.selected_atoms.is_empty() {
+            editor.push_undo();
+            let ids: Vec<u32> = editor.selected_atoms.drain().collect();
+            for id in ids { editor.molecule.remove_atom(id); }
+            modified = true;
+        } else if delete_hovered(editor) {
+            modified = true;
+        }
     }
 
     modified |= handle_keys_select_tool(editor, ui);
@@ -251,8 +337,8 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
             _ => {}
         }
 
-        // ExpandLabel: x key
-        if key == "x" {
+        // ExpandLabel: x / X key — expands a label-named atom (e.g. "Bor") into its fragment
+        if key == "x" || key == "X" {
             let target = editor.hotspot_atom.or(editor.hovered_atom);
             if let Some(atom_id) = target {
                 editor.push_undo();
@@ -283,6 +369,9 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
         } else if let Some(bond_id) = bond_target {
             editor.push_undo();
             if dispatch_bond_key(editor, bond_id, key) { modified = true; }
+        } else {
+            // No atom or bond target: if key maps to a single-atom fragment, place at cursor
+            if place_element_at_cursor(editor, key) { modified = true; }
         }
     }
 
@@ -718,6 +807,34 @@ fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
     editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
 
     true
+}
+
+/// When no atom is targeted, check if the key maps to a single-atom fragment and place
+/// that element at the current cursor position (last_mouse_mol).
+fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
+    let actions: Vec<crate::config::AtomAction> = editor.config.atom_shortcuts.iter()
+        .filter(|s| s.key == key && !s.ctrl && !s.alt)
+        .map(|s| s.action.clone())
+        .collect();
+
+    for action in &actions {
+        if let Some(crate::config::ResolvedAtomAction::InsertFragment(frag)) =
+            editor.config.atom_action_to_fragment(action)
+        {
+            if frag.atoms.len() == 1 && frag.bonds.is_empty() {
+                editor.push_undo();
+                let pos = editor.last_mouse_mol;
+                let new_id = editor.molecule.add_atom(
+                    frag.atoms[0].element.clone(),
+                    pos,
+                    frag.atoms[0].charge,
+                );
+                editor.hotspot_atom = Some(new_id);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn find_or_create_atom(

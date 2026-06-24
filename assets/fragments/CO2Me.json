@@ -1,1 +1,55 @@
-{ "name": "CO2Me", "atoms": [{"element":"C","pos":[0.0,0.0],"charge":0},{"element":"O","pos":[0.0,-1.0],"charge":0},{"element":"O","pos":[1.0,0.0],"charge":0},{"element":"C","pos":[2.0,0.0],"charge":0}], "bonds": [{"begin":0,"end":1,"order":"Double"},{"begin":0,"end":2,"order":"Single"},{"begin":2,"end":3,"order":"Single"}], "attach_idx": 0 }
+{
+  "name": "CO2Me",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        -0.0793,
+        -1.4979
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        1.337,
+        0.6805
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.5948,
+        -0.1368
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Double"
+    },
+    {
+      "begin": 0,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 0
+}
