@@ -4,7 +4,7 @@ pub mod interact;
 use crate::config::Config;
 use crate::molecule::{BondOrder, Molecule};
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 pub const DEFAULT_BOND_LENGTH: f32 = 1.5;
 pub const SCALE_FACTOR: f32 = 50.0;
@@ -63,7 +63,7 @@ pub struct ChemStructEditor {
     pub label_edit: Option<(u32, String)>,
 
     /// Undo history (molecule snapshots, newest at back).
-    pub undo_stack: Vec<crate::molecule::Molecule>,
+    pub undo_stack: VecDeque<crate::molecule::Molecule>,
 }
 
 impl Default for ChemStructEditor {
@@ -87,7 +87,7 @@ impl Default for ChemStructEditor {
             hotspot_atom: None,
             config: Config::load(),
             label_edit: None,
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
         }
     }
 }
@@ -96,21 +96,22 @@ impl ChemStructEditor {
     /// Push a snapshot of the current molecule state for undo.
     /// Deduplicates: does nothing if the state is identical to the last snapshot.
     pub fn push_undo(&mut self) {
-        let same = self.undo_stack.last().map_or(false, |s| s == &self.molecule);
+        let same = self.undo_stack.back().map_or(false, |s| s == &self.molecule);
         if !same {
-            self.undo_stack.push(self.molecule.clone());
-            if self.undo_stack.len() > 50 {
-                self.undo_stack.remove(0);
+            if self.undo_stack.len() >= 50 {
+                self.undo_stack.pop_front();
             }
+            self.undo_stack.push_back(self.molecule.clone());
         }
     }
 
     /// Restore the previous molecule state.
     pub fn undo(&mut self) -> bool {
-        if let Some(prev) = self.undo_stack.pop() {
+        if let Some(prev) = self.undo_stack.pop_back() {
             self.molecule = prev;
             self.selected_atoms.clear();
             self.hotspot_atom = None;
+            self.label_edit = None;
             true
         } else {
             false

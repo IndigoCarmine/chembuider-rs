@@ -1,5 +1,5 @@
 use super::Molecule;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const L: f32 = 1.5;
 const FORCE_THRESHOLD: f32 = 1e-3;
@@ -28,27 +28,52 @@ pub struct CleanupState {
     pos: HashMap<u32, [f32; 2]>,
     vel: HashMap<u32, [f32; 2]>,
     atom_ids: Vec<u32>,
+    forces: HashMap<u32, [f32; 2]>, // reused buffer — avoids per-step allocation
+    bonds: Vec<(u32, u32)>,         // cached from mol (immutable during relaxation)
+    adj: HashMap<u32, Vec<u32>>,    // cached adjacency list
+    bonded: HashSet<(u32, u32)>,    // both orderings, for O(1) repulsion filter
 }
 
 impl CleanupState {
     pub fn new(mol: &Molecule) -> Self {
         let atom_ids: Vec<u32> = mol.atoms.iter().map(|a| a.id).collect();
         let pos: HashMap<u32, [f32; 2]> = mol.atoms.iter().map(|a| (a.id, a.pos)).collect();
-        let vel: HashMap<u32, [f32; 2]> = atom_ids
-            .iter()
-            .map(|&id| (id, [0.0_f32, 0.0_f32]))
-            .collect();
-        CleanupState { pos, vel, atom_ids }
+        let vel: HashMap<u32, [f32; 2]> = atom_ids.iter().map(|&id| (id, [0.0_f32; 2])).collect();
+        let forces: HashMap<u32, [f32; 2]> = atom_ids.iter().map(|&id| (id, [0.0_f32; 2])).collect();
+
+        let bonds: Vec<(u32, u32)> = mol.bonds.iter().map(|b| (b.begin, b.end)).collect();
+
+        let mut adj: HashMap<u32, Vec<u32>> = atom_ids.iter().map(|&id| (id, Vec::new())).collect();
+        for &(a, b) in &bonds {
+            adj.get_mut(&a).unwrap().push(b);
+            adj.get_mut(&b).unwrap().push(a);
+        }
+
+        let mut bonded: HashSet<(u32, u32)> = HashSet::with_capacity(bonds.len() * 2);
+        for &(a, b) in &bonds {
+            bonded.insert((a, b));
+            bonded.insert((b, a));
+        }
+
+        CleanupState { pos, vel, atom_ids, forces, bonds, adj, bonded }
     }
 
     /// Run `n` force-field steps.  Returns `true` when the simulation has
     /// converged (max force < FORCE_THRESHOLD) and no further steps are needed.
-    pub fn step(&mut self, mol: &Molecule, n: usize) -> bool {
+    pub fn step(&mut self, n: usize) -> bool {
         let p = &PARAMS;
         for _ in 0..n {
-            let forces = compute_forces(&self.pos, mol, &self.atom_ids, p);
+            compute_forces(
+                &self.pos,
+                &self.bonds,
+                &self.adj,
+                &self.atom_ids,
+                &self.bonded,
+                p,
+                &mut self.forces,
+            );
 
-            let max_f2 = forces
+            let max_f2 = self.forces
                 .values()
                 .map(|f| f[0] * f[0] + f[1] * f[1])
                 .fold(0.0_f32, f32::max);
@@ -57,7 +82,7 @@ impl CleanupState {
             }
 
             for &id in &self.atom_ids {
-                let f = forces[&id];
+                let f = self.forces[&id];
                 let v = self.vel.get_mut(&id).unwrap();
                 v[0] = v[0] * p.damping + f[0] * p.dt;
                 v[1] = v[1] * p.damping + f[1] * p.dt;
@@ -87,11 +112,7 @@ pub fn cleanup_2d(mol: &mut Molecule) {
         return;
     }
     let mut state = CleanupState::new(mol);
-    for _ in 0..200 {
-        if state.step(mol, 1000) {
-            break;
-        }
-    }
+    state.step(200_000);
     state.apply(mol);
 }
 
@@ -99,30 +120,34 @@ pub fn cleanup_2d(mol: &mut Molecule) {
 
 fn compute_forces(
     pos: &HashMap<u32, [f32; 2]>,
-    mol: &Molecule,
+    bonds: &[(u32, u32)],
+    adj: &HashMap<u32, Vec<u32>>,
     atom_ids: &[u32],
+    bonded: &HashSet<(u32, u32)>,
     p: &RelaxParams,
-) -> HashMap<u32, [f32; 2]> {
-    let mut forces: HashMap<u32, [f32; 2]> = atom_ids
-        .iter()
-        .map(|&id| (id, [0.0_f32, 0.0_f32]))
-        .collect();
+    forces: &mut HashMap<u32, [f32; 2]>,
+) {
+    for f in forces.values_mut() {
+        *f = [0.0, 0.0];
+    }
 
     // Bond stretching: harmonic spring toward target length L
-    for bond in &mol.bonds {
-        let pi = pos[&bond.begin];
-        let pj = pos[&bond.end];
+    for &(begin, end) in bonds {
+        let pi = pos[&begin];
+        let pj = pos[&end];
         let dx = pj[0] - pi[0];
         let dy = pj[1] - pi[1];
         let d = (dx * dx + dy * dy).sqrt().max(0.001);
         let mag = p.k_bond * (d - L);
         let fx = mag * dx / d;
         let fy = mag * dy / d;
-        if let Some(f) = forces.get_mut(&bond.begin) {
+        {
+            let f = forces.get_mut(&begin).unwrap();
             f[0] += fx;
             f[1] += fy;
         }
-        if let Some(f) = forces.get_mut(&bond.end) {
+        {
+            let f = forces.get_mut(&end).unwrap();
             f[0] -= fx;
             f[1] -= fy;
         }
@@ -133,7 +158,7 @@ fn compute_forces(
     // degree 3: all gaps → 120°
     // degree ≥4: equal spacing 360°/n
     for &c_id in atom_ids {
-        let neighbors = mol.neighbor_atom_ids(c_id);
+        let neighbors = &adj[&c_id];
         let n = neighbors.len();
         if n < 2 {
             continue;
@@ -183,11 +208,13 @@ fn compute_forces(
             let tb = [-(nb[1] - cp[1]) / rb, (nb[0] - cp[0]) / rb];
 
             let f = p.k_angle * err;
-            if let Some(fa) = forces.get_mut(&id_a) {
+            {
+                let fa = forces.get_mut(&id_a).unwrap();
                 fa[0] += f * ta[0];
                 fa[1] += f * ta[1];
             }
-            if let Some(fb) = forces.get_mut(&id_b) {
+            {
+                let fb = forces.get_mut(&id_b).unwrap();
                 fb[0] -= f * tb[0];
                 fb[1] -= f * tb[1];
             }
@@ -199,7 +226,7 @@ fn compute_forces(
         for j in (i + 1)..atom_ids.len() {
             let id_i = atom_ids[i];
             let id_j = atom_ids[j];
-            if mol.bond_between(id_i, id_j).is_some() {
+            if bonded.contains(&(id_i, id_j)) {
                 continue;
             }
             let pi = pos[&id_i];
@@ -214,18 +241,18 @@ fn compute_forces(
             let mag = p.k_rep / d2;
             let fx = mag * dx / d;
             let fy = mag * dy / d;
-            if let Some(f) = forces.get_mut(&id_i) {
+            {
+                let f = forces.get_mut(&id_i).unwrap();
                 f[0] -= fx;
                 f[1] -= fy;
             }
-            if let Some(f) = forces.get_mut(&id_j) {
+            {
+                let f = forces.get_mut(&id_j).unwrap();
                 f[0] += fx;
                 f[1] += fy;
             }
         }
     }
-
-    forces
 }
 
 fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
@@ -239,9 +266,8 @@ fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
     let n = ids.len() as f32;
     let (cx, cy) = (sx / n, sy / n);
     for id in ids {
-        if let Some(p) = pos.get_mut(id) {
-            p[0] -= cx;
-            p[1] -= cy;
-        }
+        let p = pos.get_mut(id).unwrap();
+        p[0] -= cx;
+        p[1] -= cy;
     }
 }
