@@ -52,6 +52,9 @@ mod imp {
 
             println!("─ format {fmt} (0x{fmt:04X})  \"{name}\"  — {} bytes", data.len());
             if data.is_empty() {
+                if fmt == 14 {
+                    capture_enhmetafile(dir); // CF_ENHMETAFILE → vector image (Office's choice)
+                }
                 println!("   (handle-based or empty — skipped)\n");
                 continue;
             }
@@ -128,6 +131,34 @@ mod imp {
             return raw::format_name_big(fmt).unwrap_or_else(|| format!("#{fmt}"));
         }
         format!("#{fmt}")
+    }
+
+    /// Save the clipboard's enhanced metafile (CF_ENHMETAFILE) as image.emf via GDI — this is
+    /// the vector image PowerPoint/Word usually paste from ChemDraw.
+    fn capture_enhmetafile(dir: &Path) {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetClipboardData(format: u32) -> isize;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn GetEnhMetaFileBits(hemf: isize, n: u32, buf: *mut u8) -> u32;
+        }
+        unsafe {
+            let hemf = GetClipboardData(14);
+            if hemf == 0 {
+                return;
+            }
+            let size = GetEnhMetaFileBits(hemf, 0, std::ptr::null_mut());
+            if size == 0 {
+                return;
+            }
+            let mut buf = vec![0u8; size as usize];
+            if GetEnhMetaFileBits(hemf, size, buf.as_mut_ptr()) == size {
+                let _ = std::fs::write(dir.join("image.emf"), &buf);
+                println!("   ** CF_ENHMETAFILE → saved image.emf ({size} bytes) **");
+            }
+        }
     }
 
     fn hex_preview(data: &[u8], n: usize) -> String {

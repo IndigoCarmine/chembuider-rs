@@ -824,6 +824,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

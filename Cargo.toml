@@ -17,3 +17,4 @@ clipboard-win = "5"
 cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs" }
 resvg = "0.43"
 cfb = "0.10"
+uuid = "1"

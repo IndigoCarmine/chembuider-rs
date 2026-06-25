@@ -240,11 +240,24 @@ impl ChemStructEditor {
     /// the "ChemDraw Interchange Format" so the structure can be pasted into ChemDraw.
     #[cfg(windows)]
     fn copy_to_clipboard(&self, _ctx: &egui::Context, text: String) {
-        let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
+        let emf = crate::molecule::image::molecule_to_emf(&self.molecule);
+        let png = crate::molecule::image::molecule_to_png(&self.molecule);
         let dib = crate::molecule::image::molecule_to_dib(&self.molecule);
-        let embed = crate::molecule::ole::molecule_to_ole_embed(&self.molecule);
-        if crate::clipboard::set_clipboard(&text, cdx.as_deref(), dib.as_deref(), embed.as_deref())
-            .is_err()
+        let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
+        // OLE embed (Object Descriptor + Embed Source) is disabled for now: as raw HGLOBAL it
+        // isn't a real TYMED_ISTORAGE, so PowerPoint can't embed it and falls back to text.
+        // Proper embedding needs OleSetClipboard + an IDataObject (COM). Without it, leading with
+        // the image makes a plain paste a picture instead of JSON text.
+        if crate::clipboard::set_clipboard(
+            &text,
+            emf,
+            png.as_deref(),
+            dib.as_deref(),
+            cdx.as_deref(),
+            None,
+            None,
+        )
+        .is_err()
         {
             // Fall back to egui's text-only clipboard if the native path fails.
             _ctx.copy_text(text);
@@ -287,17 +300,22 @@ impl ChemStructEditor {
         true
     }
 
-    /// Merge another molecule's atoms/bonds into this one (offset + selected), as for paste.
+    /// Merge another molecule's atoms/bonds into this one, recentered on the cursor and
+    /// selected. Recentering is essential for CDX from ChemDraw, whose absolute page
+    /// coordinates would otherwise land the structure far off-screen.
     fn paste_molecule(&mut self, other: &Molecule) -> bool {
         if other.atoms.is_empty() {
             return false;
         }
         self.push_undo();
-        const OFFSET: [f32; 2] = [DEFAULT_BOND_LENGTH, DEFAULT_BOND_LENGTH];
+        let n = other.atoms.len() as f32;
+        let cx = other.atoms.iter().map(|a| a.pos[0]).sum::<f32>() / n;
+        let cy = other.atoms.iter().map(|a| a.pos[1]).sum::<f32>() / n;
+        let target = self.last_mouse_mol; // drop the paste at the cursor
         let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for a in &other.atoms {
-            let id = self.molecule.add_atom(a.element.clone(),
-                [a.pos[0] + OFFSET[0], a.pos[1] + OFFSET[1]], a.charge);
+            let pos = [a.pos[0] - cx + target[0], a.pos[1] - cy + target[1]];
+            let id = self.molecule.add_atom(a.element.clone(), pos, a.charge);
             map.insert(a.id, id);
         }
         for b in &other.bonds {
@@ -348,12 +366,20 @@ impl ChemStructEditor {
     pub fn paste_clipboard(&mut self) -> bool {
         #[cfg(windows)]
         {
-            if let Some(text) = crate::clipboard::read_text() {
-                if self.paste_from_string(&text) {
+            // Our own copy uses the private "ChemBuilder Molecule" format (full fidelity);
+            // then fall back to ChemDraw CDX, then any plain text.
+            if let Some(s) = crate::clipboard::read_app_format() {
+                if self.paste_from_string(&s) {
                     return true;
                 }
             }
-            self.try_paste_cdx()
+            if self.try_paste_cdx() {
+                return true;
+            }
+            if let Some(text) = crate::clipboard::read_text() {
+                return self.paste_from_string(&text);
+            }
+            false
         }
         #[cfg(not(windows))]
         {
@@ -801,5 +827,21 @@ mod clipboard_tests {
         // Foreign clipboard text is ignored.
         assert!(!e.paste_from_string("just some text"));
         assert!(!e.paste_from_string(""));
+    }
+
+    #[test]
+    fn paste_molecule_recenters_on_cursor() {
+        let mut e = ChemStructEditor::default();
+        e.last_mouse_mol = [5.0, 7.0];
+        // A structure with large absolute coords, like CDX pasted from ChemDraw.
+        let mut other = Molecule::default();
+        other.add_atom("C".to_string(), [100.0, 200.0], 0);
+        other.add_atom("O".to_string(), [101.5, 200.0], 0);
+        assert!(e.paste_molecule(&other));
+        let n = e.molecule.atoms.len() as f32;
+        let cx = e.molecule.atoms.iter().map(|a| a.pos[0]).sum::<f32>() / n;
+        let cy = e.molecule.atoms.iter().map(|a| a.pos[1]).sum::<f32>() / n;
+        assert!((cx - 5.0).abs() < 0.01 && (cy - 7.0).abs() < 0.01,
+            "pasted centroid should land on the cursor, got ({cx},{cy})");
     }
 }
