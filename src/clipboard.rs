@@ -21,3 +21,13 @@ pub fn set_text_and_cdx(text: &str, cdx: Option<&[u8]>) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Read CDX bytes from the clipboard's "ChemDraw Interchange Format", if present
+/// (e.g. after copying a structure in ChemDraw).
+pub fn read_cdx() -> Option<Vec<u8>> {
+    let _clip = Clipboard::new_attempts(10).ok()?;
+    let format = register_format("ChemDraw Interchange Format")?;
+    let mut out = Vec::new();
+    raw::get_vec(format.get(), &mut out).ok()?;
+    (!out.is_empty()).then_some(out)
+}

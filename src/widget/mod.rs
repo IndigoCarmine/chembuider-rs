@@ -279,6 +279,43 @@ impl ChemStructEditor {
         true
     }
 
+    /// Merge another molecule's atoms/bonds into this one (offset + selected), as for paste.
+    fn paste_molecule(&mut self, other: &Molecule) -> bool {
+        if other.atoms.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        const OFFSET: [f32; 2] = [DEFAULT_BOND_LENGTH, DEFAULT_BOND_LENGTH];
+        let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for a in &other.atoms {
+            let id = self.molecule.add_atom(a.element.clone(),
+                [a.pos[0] + OFFSET[0], a.pos[1] + OFFSET[1]], a.charge);
+            map.insert(a.id, id);
+        }
+        for b in &other.bonds {
+            if let (Some(&begin), Some(&end)) = (map.get(&b.begin), map.get(&b.end)) {
+                let bid = self.molecule.add_bond(begin, end, b.order.clone());
+                if bid != 0 {
+                    if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
+                        bond.stereo = b.stereo.clone();
+                    }
+                }
+            }
+        }
+        self.selected_atoms = map.values().copied().collect();
+        true
+    }
+
+    /// Try to paste a structure from the clipboard's ChemDraw CDX format (Windows only).
+    #[cfg(windows)]
+    fn try_paste_cdx(&mut self) -> bool {
+        let Some(bytes) = crate::clipboard::read_cdx() else { return false };
+        match crate::molecule::cdx::cdx_bytes_to_molecule(&bytes) {
+            Some(mol) => self.paste_molecule(&mol),
+            None => false,
+        }
+    }
+
     /// True while a background cleanup computation is running.
     pub fn is_cleaning(&self) -> bool {
         self.cleanup_job.is_some()
@@ -563,13 +600,21 @@ impl ChemStructEditor {
                 self.copy_to_clipboard(ui.ctx(), text);
             }
         }
-        // Paste: egui delivers an Event::Paste(text) on Ctrl+V (from in-app or another app).
-        let pasted: Option<String> = ui.input(|i| i.events.iter().find_map(|e| match e {
+        // Paste (Ctrl+V): egui delivers an Event::Paste(text). Prefer our own JSON format;
+        // if the clipboard text isn't ours (or there's none), fall back to the ChemDraw CDX
+        // format on Windows so structures copied from ChemDraw can be pasted in.
+        let pasted_text: Option<String> = ui.input(|i| i.events.iter().find_map(|e| match e {
             egui::Event::Paste(t) => Some(t.clone()),
             _ => None,
         }));
-        if let Some(text) = pasted {
-            self.paste_from_string(&text);
+        match pasted_text {
+            Some(text) if self.paste_from_string(&text) => {}
+            _ => {
+                #[cfg(windows)]
+                if ui.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.ctrl) {
+                    self.try_paste_cdx();
+                }
+            }
         }
 
         // Ctrl+K: toggle background clean-up (start, or stop if already running).
