@@ -202,6 +202,25 @@ mod tests {
             "finds the aromatic double bonds");
     }
 
+    /// Dev helper: parse whatever CDX `clipdump` last captured (gitignored, so skipped in CI).
+    /// Run after copying in ChemDraw: cargo test parse_captured_cdx -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads clipboard_dump/structure.cdx from a live clipdump capture"]
+    fn parse_captured_cdx() {
+        let Ok(bytes) = std::fs::read("clipboard_dump/structure.cdx") else {
+            eprintln!("no capture; run clipdump after copying in ChemDraw");
+            return;
+        };
+        let mol = cdx_bytes_to_molecule(&bytes).expect("parse captured CDX");
+        let elems: std::collections::BTreeMap<&str, usize> =
+            mol.atoms.iter().fold(std::collections::BTreeMap::new(), |mut m, a| {
+                *m.entry(a.element.as_str()).or_default() += 1;
+                m
+            });
+        eprintln!("captured CDX → {} atoms {} bonds; elements {:?}",
+            mol.atoms.len(), mol.bonds.len(), elems);
+    }
+
     #[test]
     fn write_then_read_roundtrip() {
         let mut mol = Molecule::default();
