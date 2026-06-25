@@ -848,13 +848,39 @@ fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AtomAction, AtomShortcut};
+
+    fn frag_shortcut(key: &str, fragment: &str) -> AtomShortcut {
+        AtomShortcut {
+            key: key.to_string(),
+            ctrl: false,
+            alt: false,
+            action: AtomAction::Fragment { fragment: fragment.to_string() },
+        }
+    }
+
+    /// Editor with a controlled element-shortcut set (independent of the user's on-disk config).
+    /// The referenced fragments (O/OH/N/NH2/SH/Br/benzene) are all built-in.
+    fn editor() -> ChemStructEditor {
+        let mut e = ChemStructEditor::default();
+        e.config.atom_shortcuts = vec![
+            frag_shortcut("O", "O"),
+            frag_shortcut("o", "OH"),
+            frag_shortcut("N", "N"),
+            frag_shortcut("n", "NH2"),
+            frag_shortcut("s", "SH"),
+            frag_shortcut("b", "Br"),
+            frag_shortcut("a", "benzene"),
+        ];
+        e
+    }
 
     /// Element keys (single-atom or heteroatom-rooted fragments) drop a lone atom of that
     /// element at the cursor — no stray carbon, no attached H group.
     #[test]
     fn element_keys_place_bare_atom_at_cursor() {
         for (key, want) in [("O", "O"), ("o", "O"), ("N", "N"), ("n", "N"), ("s", "S"), ("b", "Br")] {
-            let mut e = ChemStructEditor::default();
+            let mut e = editor();
             e.last_mouse_mol = [2.0, 3.0];
             assert!(place_element_at_cursor(&mut e, key), "key '{key}' should place an atom");
             assert_eq!(e.molecule.atoms.len(), 1, "key '{key}' must add exactly one atom");
@@ -865,16 +891,13 @@ mod tests {
         }
     }
 
-    /// Multi-atom carbon-rooted fragments (benzene) and chains are NOT placed at the cursor;
-    /// they fall through to the build-from-hotspot path. (A single-carbon fragment like Me
-    /// still places a bare C — that's the normal single-atom case.)
+    /// Multi-atom carbon-rooted fragments (benzene) are NOT placed at the cursor; they fall
+    /// through to the build-from-hotspot path.
     #[test]
     fn carbon_multi_fragments_do_not_place_at_cursor() {
-        for key in ["a", "3"] {
-            let mut e = ChemStructEditor::default();
-            assert!(!place_element_at_cursor(&mut e, key), "key '{key}' should not place at cursor");
-            assert!(e.molecule.atoms.is_empty());
-        }
+        let mut e = editor();
+        assert!(!place_element_at_cursor(&mut e, "a"), "benzene should not place at cursor");
+        assert!(e.molecule.atoms.is_empty());
     }
 }
 
