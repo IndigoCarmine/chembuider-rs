@@ -241,11 +241,30 @@ pub fn process_select_tool(
     if response.drag_started() {
         editor.lasso_path.clear();
         editor.drag_origin_screen = Some(mouse);
-        editor.dragging_atom = editor.hovered_atom;
+        // Alt+drag with a selection rotates the molecule around its centroid.
+        if ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty() {
+            editor.push_undo();
+            let c = selection_centroid(editor);
+            let mp = editor.screen_to_mol(mouse, center);
+            editor.rotate_last_angle = Some((mp[1] - c[1]).atan2(mp[0] - c[0]));
+            editor.dragging_atom = None;
+        } else {
+            editor.rotate_last_angle = None;
+            editor.dragging_atom = editor.hovered_atom;
+        }
     }
 
     if response.dragged() {
-        if let Some(atom_id) = editor.dragging_atom {
+        if let Some(last) = editor.rotate_last_angle {
+            // Rotate the selection by the change in cursor angle about its centroid.
+            let c = selection_centroid(editor);
+            let mp = editor.screen_to_mol(mouse, center);
+            let angle = (mp[1] - c[1]).atan2(mp[0] - c[0]);
+            let ids: Vec<u32> = editor.selected_atoms.iter().copied().collect();
+            rotate_atoms(editor, &ids, angle - last);
+            editor.rotate_last_angle = Some(angle);
+            modified = true;
+        } else if let Some(atom_id) = editor.dragging_atom {
             let drag_delta = response.drag_delta();
             let inv = 1.0 / (editor.zoom * super::SCALE_FACTOR);
             let (dx, dy) = (drag_delta.x * inv, drag_delta.y * inv);
@@ -267,7 +286,9 @@ pub fn process_select_tool(
     }
 
     if response.drag_stopped() {
-        if editor.dragging_atom.is_some() {
+        if editor.rotate_last_angle.take().is_some() {
+            // rotation finished
+        } else if editor.dragging_atom.is_some() {
             editor.dragging_atom = None;
         } else if editor.lasso_path.len() > 2 {
             editor.selected_atoms.clear();
@@ -692,6 +713,19 @@ fn move_atoms(editor: &mut ChemStructEditor, ids: &[u32], delta: [f32; 2]) {
             atom.pos[1] += delta[1];
         }
     }
+}
+
+/// Centroid (molecule coords) of the current selection, or origin when empty.
+fn selection_centroid(editor: &ChemStructEditor) -> [f32; 2] {
+    let (mut cx, mut cy, mut n) = (0.0_f32, 0.0_f32, 0u32);
+    for &id in &editor.selected_atoms {
+        if let Some(a) = editor.molecule.atom_by_id(id) {
+            cx += a.pos[0];
+            cy += a.pos[1];
+            n += 1;
+        }
+    }
+    if n == 0 { [0.0, 0.0] } else { [cx / n as f32, cy / n as f32] }
 }
 
 fn rotate_atoms(editor: &mut ChemStructEditor, ids: &[u32], angle: f32) {

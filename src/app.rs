@@ -30,7 +30,7 @@ impl App for Mol2App {
                     .clicked()
                 {
                     self.editor.tool = Tool::Select;
-                    self.status = "Select: click atoms, lasso-drag to multi-select, Delete to remove.".to_string();
+                    self.status = "Select: click/lasso to select, double-click for whole molecule, Alt+drag to rotate, Delete to remove.".to_string();
                 }
                 if ui
                     .selectable_label(self.editor.tool == Tool::Bond, "✏ Bond")

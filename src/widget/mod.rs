@@ -105,6 +105,9 @@ pub struct ChemStructEditor {
 
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
+
+    /// While rotating the selection (Alt+drag): the cursor angle from the last frame.
+    rotate_last_angle: Option<f32>,
 }
 
 impl Default for ChemStructEditor {
@@ -133,6 +136,7 @@ impl Default for ChemStructEditor {
             last_mouse_mol: [0.0; 2],
             cleanup_job: None,
             last_v_down: false,
+            rotate_last_angle: None,
         }
     }
 }
