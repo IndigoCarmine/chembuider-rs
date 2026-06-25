@@ -164,7 +164,8 @@ impl Molecule {
             .collect()
     }
 
-    /// All atom ids in the same connected molecule as `start` (BFS over bonds, includes `start`).
+    /// All atom ids in the same connected molecule as `start` (graph traversal over bonds,
+    /// includes `start`).
     pub fn connected_atoms(&self, start: u32) -> Vec<u32> {
         if self.atom_by_id(start).is_none() {
             return vec![];
