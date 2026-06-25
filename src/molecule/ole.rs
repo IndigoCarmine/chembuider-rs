@@ -8,10 +8,6 @@
 //! (TYMED_ISTORAGE). This builds a structurally valid compound document with the CDX payload;
 //! it has not been validated against ChemDraw/Office.
 
-// Currently unused by the bin (OLE clipboard is disabled until a COM IDataObject path exists),
-// but kept and exercised by tests for when proper OleSetClipboard embedding is added.
-#![allow(dead_code)]
-
 use super::Molecule;
 use std::io::{Cursor, Write};
 
@@ -42,7 +38,13 @@ pub fn molecule_to_ole_embed(mol: &Molecule) -> Option<Vec<u8>> {
     let cdx = super::cdx::molecule_to_cdx_bytes(mol)?;
 
     let mut comp = cfb::CompoundFile::create(Cursor::new(Vec::new())).ok()?;
-    comp.set_storage_clsid("/", uuid::Uuid::from_bytes(CHEMDRAW_CLSID)).ok()?;
+    // cfb writes the CLSID as a GUID (Data1/2/3 little-endian), so build it from the GUID
+    // fields of {41BA6D21-A02E-11CE-8FD9-0020AFD1F20C} — passing raw bytes byte-swaps Data1
+    // and ChemDraw can't bind the server on double-click.
+    let clsid = uuid::Uuid::from_fields(
+        0x41BA_6D21, 0xA02E, 0x11CE, &[0x8F, 0xD9, 0x00, 0x20, 0xAF, 0xD1, 0xF2, 0x0C],
+    );
+    comp.set_storage_clsid("/", clsid).ok()?;
     comp.create_stream("/\u{1}CompObj").ok()?.write_all(&hex_to_bytes(CHEMDRAW_COMPOBJ_HEX)).ok()?;
     comp.create_stream("/CONTENTS").ok()?.write_all(&cdx).ok()?;
     comp.flush().ok()?;
@@ -123,8 +125,11 @@ mod tests {
         let bytes = molecule_to_ole_embed(&mol).expect("embed");
         let mut comp = cfb::CompoundFile::open(Cursor::new(bytes)).expect("valid CFBF");
 
-        // Root storage CLSID = ChemDraw's.
-        assert_eq!(comp.root_entry().clsid(), &uuid::Uuid::from_bytes(CHEMDRAW_CLSID));
+        // Root storage CLSID = ChemDraw's, written in correct GUID byte order.
+        let expected = uuid::Uuid::from_fields(
+            0x41BA_6D21, 0xA02E, 0x11CE, &[0x8F, 0xD9, 0x00, 0x20, 0xAF, 0xD1, 0xF2, 0x0C],
+        );
+        assert_eq!(comp.root_entry().clsid(), &expected);
 
         // CONTENTS holds the CDX; \x01CompObj is present.
         let mut contents = Vec::new();
@@ -133,6 +138,24 @@ mod tests {
         let mut compobj = Vec::new();
         comp.open_stream("/\u{1}CompObj").unwrap().read_to_end(&mut compobj).unwrap();
         assert_eq!(compobj, hex_to_bytes(CHEMDRAW_COMPOBJ_HEX));
+    }
+
+    #[test]
+    fn embed_clsid_bytes_are_chemdraws_raw_order() {
+        let mut mol = Molecule::default();
+        mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let bytes = molecule_to_ole_embed(&mol).unwrap();
+        // ChemDraw's CLSID (raw CFBF byte order) must appear verbatim in the directory entry.
+        let raw = CHEMDRAW_CLSID;
+        let reordered = [ // what we'd get if cfb wrote a field-swapped GUID
+            0x41, 0xba, 0x6d, 0x21, 0xa0, 0x2e, 0x11, 0xce,
+            0x8f, 0xd9, 0x00, 0x20, 0xaf, 0xd1, 0xf2, 0x0c,
+        ];
+        let has_raw = bytes.windows(16).any(|w| w == raw);
+        let has_reordered = bytes.windows(16).any(|w| w == reordered);
+        eprintln!("raw={has_raw} reordered={has_reordered}");
+        assert!(has_raw, "CLSID should be ChemDraw's raw CFBF bytes");
+        assert!(!has_reordered, "no byte-swapped CLSID should remain (root storage must be correct)");
     }
 
     #[test]

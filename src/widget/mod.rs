@@ -244,18 +244,18 @@ impl ChemStructEditor {
         let png = crate::molecule::image::molecule_to_png(&self.molecule);
         let dib = crate::molecule::image::molecule_to_dib(&self.molecule);
         let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
-        // OLE embed (Object Descriptor + Embed Source) is disabled for now: as raw HGLOBAL it
-        // isn't a real TYMED_ISTORAGE, so PowerPoint can't embed it and falls back to text.
-        // Proper embedding needs OleSetClipboard + an IDataObject (COM). Without it, leading with
-        // the image makes a plain paste a picture instead of JSON text.
+        let embed = crate::molecule::ole::molecule_to_ole_embed(&self.molecule);
+        let descriptor = embed
+            .as_ref()
+            .map(|_| crate::molecule::ole::object_descriptor(&self.molecule));
         if crate::clipboard::set_clipboard(
             &text,
             emf,
             png.as_deref(),
             dib.as_deref(),
             cdx.as_deref(),
-            None,
-            None,
+            embed.as_deref(),
+            descriptor.as_deref(),
         )
         .is_err()
         {

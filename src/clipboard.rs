@@ -45,6 +45,7 @@ pub fn set_clipboard(
     if let (Some(od), Some(em)) = (object_descriptor, embed) {
         set_named("Object Descriptor", od)?;
         set_named("Embed Source", em)?;
+        set_named("Native", em)?; // ChemDraw also exposes the same compound doc as "Native"
     }
     // 2) Enhanced metafile (vector picture / OLE presentation). The clipboard takes ownership
     //    of the HENHMETAFILE handle.

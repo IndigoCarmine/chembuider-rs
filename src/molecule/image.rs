@@ -16,8 +16,9 @@ fn font_db() -> Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// Render the molecule to an opaque RGBA pixmap (white background).
-fn render_pixmap(mol: &Molecule) -> Option<resvg::tiny_skia::Pixmap> {
+/// Render the molecule to an RGBA pixmap. `background` paints an opaque fill (e.g. white);
+/// None leaves the background transparent.
+fn render_pixmap(mol: &Molecule, background: Option<resvg::tiny_skia::Color>) -> Option<resvg::tiny_skia::Pixmap> {
     if mol.atoms.is_empty() {
         return None;
     }
@@ -33,21 +34,25 @@ fn render_pixmap(mol: &Molecule) -> Option<resvg::tiny_skia::Pixmap> {
         return None;
     }
     let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
-    pixmap.fill(resvg::tiny_skia::Color::WHITE); // opaque background
+    if let Some(color) = background {
+        pixmap.fill(color);
+    }
     resvg::render(&tree, resvg::tiny_skia::Transform::identity(), &mut pixmap.as_mut());
     Some(pixmap)
 }
 
-/// PNG bytes of the structure (modern Office pastes the registered "PNG" format as an image).
+/// PNG bytes of the structure with a TRANSPARENT background (modern Office pastes the registered
+/// "PNG" format as an image).
 pub fn molecule_to_png(mol: &Molecule) -> Option<Vec<u8>> {
-    render_pixmap(mol)?.encode_png().ok()
+    render_pixmap(mol, None)?.encode_png().ok()
 }
 
 /// CF_DIB byte blob: BITMAPINFOHEADER + bottom-up 24bpp BI_RGB pixels — the most broadly
 /// accepted DIB layout. (32bpp/top-down DIBs are rejected by some apps, incl. PowerPoint, which
 /// then falls back to pasting our text.)
 pub fn molecule_to_dib(mol: &Molecule) -> Option<Vec<u8>> {
-    let pixmap = render_pixmap(mol)?;
+    // 24bpp DIB can't carry alpha, so keep the legacy raster on white.
+    let pixmap = render_pixmap(mol, Some(resvg::tiny_skia::Color::WHITE))?;
     let (w, h) = (pixmap.width() as usize, pixmap.height() as usize);
     let rgba = pixmap.data();
     let stride = (w * 3 + 3) & !3; // each row padded to a 4-byte boundary
@@ -109,7 +114,6 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
     }
     const PX: f32 = 40.0;
     const MARGIN: f32 = 0.7;
-    const HM_PER_PX: f32 = 8.47; // HIMETRIC per drawing pixel (≈ 338.7/40)
     const BLACK: u32 = 0x0000_0000;
     const WHITE: u32 = 0x00FF_FFFF;
 
@@ -122,15 +126,12 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
     let tx = |x: f32| ((x - min_x + MARGIN) * PX) as i32;
     let ty = |y: f32| ((y - min_y + MARGIN) * PX) as i32;
 
-    let frame = Rect_ {
-        left: 0,
-        top: 0,
-        right: (w_px as f32 * HM_PER_PX) as i32,
-        bottom: (h_px as f32 * HM_PER_PX) as i32,
-    };
+    let _ = (w_px, h_px); // drawing extent is implied by the records below
 
     unsafe {
-        let hdc = CreateEnhMetaFileW(0, std::ptr::null(), &frame, std::ptr::null());
+        // NULL frame: GDI computes rclFrame from the drawing + reference-DC resolution, so the
+        // frame and bounds stay consistent (an explicit mismatched frame clips the picture).
+        let hdc = CreateEnhMetaFileW(0, std::ptr::null(), std::ptr::null(), std::ptr::null());
         if hdc == 0 {
             return None;
         }
@@ -306,6 +307,17 @@ mod tests {
             // EMR_HEADER: iType == 1 and the " EMF" signature at offset 40.
             assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 1, "EMR_HEADER");
             assert_eq!(&buf[40..44], b" EMF", "EMF signature");
+            // rclBounds (device px) and rclFrame (.01mm) must be consistent with the device
+            // resolution (szlDevice/szlMillimeters), or PowerPoint clips the picture.
+            let i = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+            let bounds_w = i(16) - i(8);
+            let frame_w = i(32) - i(24);
+            let dev_w = i(72);
+            let mm_w = i(80);
+            let expected_frame_w = bounds_w as f64 * (mm_w as f64 * 100.0) / dev_w as f64;
+            eprintln!("bounds_w={bounds_w} frame_w={frame_w} expected≈{expected_frame_w:.0}");
+            assert!(frame_w > 0 && (frame_w as f64 - expected_frame_w).abs() < expected_frame_w * 0.1,
+                "rclFrame must match bounds × device resolution (no clipping)");
             DeleteEnhMetaFile(hemf);
         }
     }
