@@ -187,6 +187,21 @@ mod tests {
         assert!(molecule_to_cdx_bytes(&Molecule::default()).is_none());
     }
 
+    /// Verify our reader against a REAL ChemDraw CDX (a brominated naphthol captured from
+    /// ChemDraw's clipboard via the `clipdump` tool). This pins our parsing to ChemDraw's
+    /// actual byte layout — coordinate order, element/bond property tags, u32 bond refs.
+    #[test]
+    fn parse_real_chemdraw_cdx() {
+        let bytes = include_bytes!("../../tests/fixtures/chemdraw_real.cdx");
+        let mol = cdx_bytes_to_molecule(bytes).expect("parse real ChemDraw CDX");
+        assert_eq!(mol.atoms.len(), 12);
+        assert_eq!(mol.bonds.len(), 13);
+        assert!(mol.atoms.iter().any(|a| a.element == "O"), "finds the oxygen");
+        assert!(mol.atoms.iter().any(|a| a.element == "Br"), "finds the bromine");
+        assert!(mol.bonds.iter().filter(|b| b.order == BondOrder::Double).count() >= 4,
+            "finds the aromatic double bonds");
+    }
+
     #[test]
     fn write_then_read_roundtrip() {
         let mut mol = Molecule::default();
