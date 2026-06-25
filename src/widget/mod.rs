@@ -595,29 +595,37 @@ impl ChemStructEditor {
         let did_undo = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
         if did_undo { self.undo(); }
 
-        // Ctrl+C: copy selection (or whole molecule) to the clipboard. On Windows we publish
-        // both our JSON text and a "ChemDraw Interchange Format" CDX blob (ChemDraw-style);
-        // elsewhere, just the text via egui.
-        let do_copy = ui.input(|i| i.key_pressed(egui::Key::C) && i.modifiers.ctrl);
+        // Copy/paste only act on the canvas when no text field has focus.
+        let editing_text = ui.ctx().wants_keyboard_input();
+
+        // Copy (Ctrl/Cmd+C): egui converts the shortcut into Event::Copy/Cut — `key_pressed(C)`
+        // does NOT fire — so we listen for those events (with a raw-key fallback). On Windows
+        // we publish text + CDX (+ image + Embed Source); elsewhere just text.
+        let do_copy = !editing_text && ui.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut))
+                || (i.modifiers.command && i.key_pressed(egui::Key::C))
+        });
         if do_copy {
             if let Some(text) = self.copy_to_string() {
                 self.copy_to_clipboard(ui.ctx(), text);
             }
         }
-        // Paste (Ctrl+V): egui delivers an Event::Paste(text). Prefer our own JSON format;
-        // if the clipboard text isn't ours (or there's none), fall back to the ChemDraw CDX
-        // format on Windows so structures copied from ChemDraw can be pasted in.
-        let pasted_text: Option<String> = ui.input(|i| i.events.iter().find_map(|e| match e {
+
+        // Paste (Ctrl/Cmd+V): egui delivers Event::Paste(text) carrying the clipboard text.
+        // Prefer our own JSON; if it isn't ours (e.g. pasted from ChemDraw), fall back to the
+        // ChemDraw CDX clipboard format on Windows.
+        let paste_text = ui.input(|i| i.events.iter().find_map(|e| match e {
             egui::Event::Paste(t) => Some(t.clone()),
             _ => None,
         }));
-        match pasted_text {
-            Some(text) if self.paste_from_string(&text) => {}
-            _ => {
+        let paste_key = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
+        if !editing_text && (paste_text.is_some() || paste_key) {
+            let handled = paste_text.as_deref().map_or(false, |t| self.paste_from_string(t));
+            if !handled {
                 #[cfg(windows)]
-                if ui.input(|i| i.key_pressed(egui::Key::V) && i.modifiers.ctrl) {
-                    self.try_paste_cdx();
-                }
+                self.try_paste_cdx();
+                #[cfg(not(windows))]
+                let _ = handled;
             }
         }
 

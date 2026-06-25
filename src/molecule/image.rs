@@ -3,6 +3,18 @@
 //! 32bpp CF_DIB. Windows-only (depends on resvg).
 
 use super::{BondOrder, Molecule};
+use std::sync::{Arc, OnceLock};
+
+/// System fonts are loaded once and reused (loading them on every copy is slow).
+fn font_db() -> Arc<resvg::usvg::fontdb::Database> {
+    static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        Arc::new(db)
+    })
+    .clone()
+}
 
 /// Render the molecule to a CF_DIB byte blob (BITMAPINFOHEADER + BGRA pixels), or None.
 pub fn molecule_to_dib(mol: &Molecule) -> Option<Vec<u8>> {
@@ -12,7 +24,7 @@ pub fn molecule_to_dib(mol: &Molecule) -> Option<Vec<u8>> {
     let svg = molecule_to_svg(mol);
 
     let mut opt = resvg::usvg::Options::default();
-    opt.fontdb_mut().load_system_fonts();
+    opt.fontdb = font_db();
     let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
 
     let size = tree.size();
