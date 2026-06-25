@@ -69,6 +69,18 @@ impl App for Mol2App {
 
                 ui.separator();
 
+                // Paste button — needed because egui's Ctrl+V is text-only and never fires for
+                // ChemDraw's non-text CDX content. This reads the clipboard directly.
+                if ui.button("📋 Paste").clicked() {
+                    self.status = if self.editor.paste_clipboard() {
+                        "Pasted structure from clipboard.".to_string()
+                    } else {
+                        "No structure on the clipboard to paste.".to_string()
+                    };
+                }
+
+                ui.separator();
+
                 // Clean Up button (also Ctrl+K in the canvas).
                 // Runs on a background thread; turns red ("Stop") while computing so it can
                 // be cancelled and never freezes the UI.

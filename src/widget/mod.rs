@@ -320,6 +320,25 @@ impl ChemStructEditor {
         }
     }
 
+    /// Paste from the system clipboard on demand (e.g. a toolbar button). Needed because egui
+    /// converts Ctrl+V into a text-only `Event::Paste`, which never fires for non-text content
+    /// like ChemDraw's CDX. Tries our richer JSON text first, then the ChemDraw CDX format.
+    pub fn paste_clipboard(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            if let Some(text) = crate::clipboard::read_text() {
+                if self.paste_from_string(&text) {
+                    return true;
+                }
+            }
+            self.try_paste_cdx()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// True while a background cleanup computation is running.
     pub fn is_cleaning(&self) -> bool {
         self.cleanup_job.is_some()

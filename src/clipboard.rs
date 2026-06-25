@@ -49,3 +49,8 @@ pub fn read_cdx() -> Option<Vec<u8>> {
     raw::get_vec(format.get(), &mut out).ok()?;
     (!out.is_empty()).then_some(out)
 }
+
+/// Read Unicode text (CF_UNICODETEXT) from the clipboard, if any.
+pub fn read_text() -> Option<String> {
+    clipboard_win::get_clipboard_string().ok()
+}

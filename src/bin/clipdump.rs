@@ -41,12 +41,18 @@ mod imp {
 
         for fmt in formats {
             let name = format_name(fmt);
+            // Only read HGLOBAL-backed formats: registered (>= 0xC000) or known global predefined.
+            // Handle-based ones (CF_BITMAP, CF_METAFILEPICT, CF_ENHMETAFILE, …) can corrupt
+            // clipboard-win's get_vec, so we skip them.
+            let readable = fmt >= 0xC000 || matches!(fmt, 1 | 7 | 8 | 13 | 16 | 17);
             let mut data = Vec::new();
-            let _ = raw::get_vec(fmt, &mut data); // handle-based formats (bitmaps) may yield nothing
+            if readable {
+                let _ = raw::get_vec(fmt, &mut data);
+            }
 
             println!("─ format {fmt} (0x{fmt:04X})  \"{name}\"  — {} bytes", data.len());
             if data.is_empty() {
-                println!("   (no HGLOBAL data — likely a handle-based format)\n");
+                println!("   (handle-based or empty — skipped)\n");
                 continue;
             }
             println!("   first bytes: {}", hex_preview(&data, 32));
@@ -117,7 +123,11 @@ mod imp {
         if let Some(n) = predefined {
             return n.to_string();
         }
-        raw::format_name_big(fmt).unwrap_or_else(|| format!("#{fmt}"))
+        // Only query names for registered formats; some predefined ids upset the API.
+        if fmt >= 0xC000 {
+            return raw::format_name_big(fmt).unwrap_or_else(|| format!("#{fmt}"));
+        }
+        format!("#{fmt}")
     }
 
     fn hex_preview(data: &[u8], n: usize) -> String {
