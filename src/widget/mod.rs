@@ -102,6 +102,9 @@ pub struct ChemStructEditor {
 
     /// Active background cleanup computation, if any (None when idle).
     pub cleanup_job: Option<crate::molecule::cleanup::CleanupJob>,
+
+    /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
+    last_v_down: bool,
 }
 
 impl Default for ChemStructEditor {
@@ -129,6 +132,7 @@ impl Default for ChemStructEditor {
             current_bond_stereo: BondStereo::None,
             last_mouse_mol: [0.0; 2],
             cleanup_job: None,
+            last_v_down: false,
         }
     }
 }
@@ -320,7 +324,25 @@ impl ChemStructEditor {
         }
     }
 
-    /// Paste from the system clipboard on demand (e.g. a toolbar button). Needed because egui
+    /// Detect a fresh Ctrl+V keystroke straight from the OS keyboard state. egui consumes
+    /// Ctrl+V into a text-only `Event::Paste` (which never fires for ChemDraw's non-text CDX),
+    /// so we bypass it. Returns true once per V press while Ctrl is held.
+    #[cfg(windows)]
+    fn ctrl_v_pressed(&mut self) -> bool {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetAsyncKeyState(v_key: i32) -> i16;
+        }
+        const VK_CONTROL: i32 = 0x11;
+        const VK_V: i32 = 0x56;
+        let down = |key: i32| (unsafe { GetAsyncKeyState(key) } as u16) & 0x8000 != 0;
+        let v = down(VK_V);
+        let edge = v && !self.last_v_down; // only on the press transition
+        self.last_v_down = v;
+        edge && down(VK_CONTROL)
+    }
+
+    /// Paste from the system clipboard on demand (toolbar button / Ctrl+V). Needed because egui
     /// converts Ctrl+V into a text-only `Event::Paste`, which never fires for non-text content
     /// like ChemDraw's CDX. Tries our richer JSON text first, then the ChemDraw CDX format.
     pub fn paste_clipboard(&mut self) -> bool {
@@ -630,21 +652,26 @@ impl ChemStructEditor {
             }
         }
 
-        // Paste (Ctrl/Cmd+V): egui delivers Event::Paste(text) carrying the clipboard text.
-        // Prefer our own JSON; if it isn't ours (e.g. pasted from ChemDraw), fall back to the
-        // ChemDraw CDX clipboard format on Windows.
-        let paste_text = ui.input(|i| i.events.iter().find_map(|e| match e {
-            egui::Event::Paste(t) => Some(t.clone()),
-            _ => None,
-        }));
-        let paste_key = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
-        if !editing_text && (paste_text.is_some() || paste_key) {
-            let handled = paste_text.as_deref().map_or(false, |t| self.paste_from_string(t));
-            if !handled {
-                #[cfg(windows)]
-                self.try_paste_cdx();
-                #[cfg(not(windows))]
-                let _ = handled;
+        // Paste (Ctrl+V). On Windows, detect the keystroke from the OS (egui's Ctrl+V is
+        // text-only and won't fire for ChemDraw's non-text CDX) and read the clipboard
+        // directly. Elsewhere, use egui's Event::Paste(text).
+        #[cfg(windows)]
+        {
+            let app_focused = ui.input(|i| i.focused);
+            // Always sample the key so edge-detection state stays current, even if suppressed.
+            let ctrl_v = self.ctrl_v_pressed();
+            if ctrl_v && app_focused && !editing_text {
+                self.paste_clipboard();
+            }
+        }
+        #[cfg(not(windows))]
+        if !editing_text {
+            let pasted = ui.input(|i| i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(t) => Some(t.clone()),
+                _ => None,
+            }));
+            if let Some(text) = pasted {
+                self.paste_from_string(&text);
             }
         }
 
