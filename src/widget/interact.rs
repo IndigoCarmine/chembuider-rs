@@ -214,7 +214,18 @@ pub fn process_select_tool(
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
 
-    if response.clicked() {
+    // Double-click an atom or bond → select that whole connected molecule.
+    if response.double_clicked() {
+        editor.lasso_path.clear();
+        let seed = editor.hovered_atom.or_else(|| {
+            editor.hovered_bond
+                .and_then(|bid| editor.molecule.bonds.iter().find(|b| b.id == bid))
+                .map(|b| b.begin)
+        });
+        if let Some(atom_id) = seed {
+            editor.selected_atoms = editor.molecule.connected_atoms(atom_id).into_iter().collect();
+        }
+    } else if response.clicked() {
         editor.lasso_path.clear();
         if let Some(atom_id) = editor.hovered_atom {
             if editor.selected_atoms.contains(&atom_id) {

@@ -164,6 +164,23 @@ impl Molecule {
             .collect()
     }
 
+    /// All atom ids in the same connected molecule as `start` (BFS over bonds, includes `start`).
+    pub fn connected_atoms(&self, start: u32) -> Vec<u32> {
+        if self.atom_by_id(start).is_none() {
+            return vec![];
+        }
+        let mut seen = std::collections::HashSet::from([start]);
+        let mut queue = vec![start];
+        while let Some(id) = queue.pop() {
+            for n in self.neighbor_atom_ids(id) {
+                if seen.insert(n) {
+                    queue.push(n);
+                }
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     /// Snap radius for merging overlapping atoms (molecular units).
     pub const SNAP_RADIUS: f32 = 0.4;
 
@@ -229,5 +246,30 @@ impl Molecule {
         }
 
         new_ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connected_atoms_finds_one_molecule() {
+        let mut m = Molecule::default();
+        // Molecule A: a–b–c
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let c = m.add_atom("O".to_string(), [2.0, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        m.add_bond(b, c, BondOrder::Single);
+        // Molecule B: a separate, unbonded atom
+        let d = m.add_atom("N".to_string(), [5.0, 0.0], 0);
+
+        let mut got = m.connected_atoms(b);
+        got.sort();
+        let mut want = vec![a, b, c];
+        want.sort();
+        assert_eq!(got, want, "reaches the whole A component from any of its atoms");
+        assert_eq!(m.connected_atoms(d), vec![d], "isolated atom is its own molecule");
     }
 }
