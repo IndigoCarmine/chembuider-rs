@@ -238,7 +238,10 @@ impl ChemStructEditor {
     fn copy_to_clipboard(&self, _ctx: &egui::Context, text: String) {
         let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
         let dib = crate::molecule::image::molecule_to_dib(&self.molecule);
-        if crate::clipboard::set_clipboard(&text, cdx.as_deref(), dib.as_deref()).is_err() {
+        let embed = crate::molecule::ole::molecule_to_ole_embed(&self.molecule);
+        if crate::clipboard::set_clipboard(&text, cdx.as_deref(), dib.as_deref(), embed.as_deref())
+            .is_err()
+        {
             // Fall back to egui's text-only clipboard if the native path fails.
             _ctx.copy_text(text);
         }

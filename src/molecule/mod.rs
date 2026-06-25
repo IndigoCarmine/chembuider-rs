@@ -5,6 +5,8 @@ pub mod cleanup;
 pub mod cdx;
 #[cfg(windows)]
 pub mod image;
+#[cfg(windows)]
+pub mod ole;
 
 use serde::{Deserialize, Serialize};
 
