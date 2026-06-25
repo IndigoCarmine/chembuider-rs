@@ -11,7 +11,8 @@ rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# CDX export + ChemDraw-compatible clipboard are Windows-only.
+# CDX export + ChemDraw-compatible clipboard (text/CDX/image) are Windows-only.
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
 cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs" }
+resvg = "0.43"

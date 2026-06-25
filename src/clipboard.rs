@@ -7,9 +7,12 @@
 
 use clipboard_win::{raw, register_format, Clipboard};
 
-/// Publish `text` (Unicode) and, when present, `cdx` bytes under the ChemDraw clipboard format.
-/// Both formats share a single clipboard session so neither clobbers the other.
-pub fn set_text_and_cdx(text: &str, cdx: Option<&[u8]>) -> Result<(), String> {
+/// Standard Windows DIB clipboard format (CF_DIB).
+const CF_DIB: u32 = 8;
+
+/// Publish a copy with up to three flavors in one clipboard session (so none clobbers another):
+/// Unicode `text` (our JSON), `cdx` bytes under "ChemDraw Interchange Format", and a `dib` image.
+pub fn set_clipboard(text: &str, cdx: Option<&[u8]>, dib: Option<&[u8]>) -> Result<(), String> {
     let _clip = Clipboard::new_attempts(10).map_err(|e| format!("open clipboard: {e}"))?;
     raw::empty().map_err(|e| format!("empty clipboard: {e}"))?;
     raw::set_string(text).map_err(|e| format!("set text: {e}"))?;
@@ -18,6 +21,9 @@ pub fn set_text_and_cdx(text: &str, cdx: Option<&[u8]>) -> Result<(), String> {
             raw::set_without_clear(format.get(), bytes)
                 .map_err(|e| format!("set CDX: {e}"))?;
         }
+    }
+    if let Some(bytes) = dib {
+        raw::set_without_clear(CF_DIB, bytes).map_err(|e| format!("set image: {e}"))?;
     }
     Ok(())
 }

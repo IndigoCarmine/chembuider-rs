@@ -808,6 +808,7 @@ dependencies = [
  "clipboard-win",
  "eframe",
  "egui",
+ "resvg",
  "rfd",
  "serde",
  "serde_json",

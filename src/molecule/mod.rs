@@ -3,6 +3,8 @@ pub mod fragment;
 pub mod cleanup;
 #[cfg(windows)]
 pub mod cdx;
+#[cfg(windows)]
+pub mod image;
 
 use serde::{Deserialize, Serialize};
 
