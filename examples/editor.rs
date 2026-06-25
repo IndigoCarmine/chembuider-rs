@@ -1,76 +1,83 @@
-use crate::molecule::{mol2::to_mol2_string, BondStereo};
-use crate::widget::{ChemStructEditor, Tool};
+//! Example host application for the `chembuider_rs` chemical-structure editor widget.
+//!
+//! Run with: `cargo run --example editor`
+//!
+//! This wraps the library's [`ChemStructEditor`] widget in an eframe window with a toolbar
+//! (tools, stereo, paste, clean-up, fragments, config, MOL2 export) and a status bar. The
+//! widget itself is library code; everything here is host-app glue you'd write per application.
+
+use chembuider_rs::molecule::mol2::to_mol2_string;
+use chembuider_rs::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use eframe::{egui, App};
 
-pub struct Mol2App {
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 750.0])
+            .with_title("ChemBuilder — MOL2 Editor"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "ChemBuilder",
+        options,
+        Box::new(|_cc| Ok(Box::new(EditorApp::default()))),
+    )
+}
+
+struct EditorApp {
     editor: ChemStructEditor,
     status: String,
     /// Name field for the "Save Fragment" feature.
     fragment_name: String,
 }
 
-impl Default for Mol2App {
+impl Default for EditorApp {
     fn default() -> Self {
+        // A host app may load user shortcuts/fragments from disk; the widget itself never does.
+        let mut editor = ChemStructEditor::default();
+        editor.config = Config::load();
         Self {
-            editor: ChemStructEditor::default(),
+            editor,
             status: "Ready — Bond tool active. Click to place atoms, drag between atoms to draw bonds.".to_string(),
             fragment_name: String::new(),
         }
     }
 }
 
-impl App for Mol2App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+impl App for EditorApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.34 hands us the root viewport Ui; panels are shown inside it.
+        egui::Panel::top("toolbar").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                // Tool selection
                 ui.label("Tool:");
-                if ui
-                    .selectable_label(self.editor.tool == Tool::Select, "⬚ Select")
-                    .clicked()
-                {
+                if ui.selectable_label(self.editor.tool == Tool::Select, "⬚ Select").clicked() {
                     self.editor.tool = Tool::Select;
                     self.status = "Select: click/lasso to select, double-click for whole molecule, Alt+drag to rotate, Delete to remove.".to_string();
                 }
-                if ui
-                    .selectable_label(self.editor.tool == Tool::Bond, "✏ Bond")
-                    .clicked()
-                {
+                if ui.selectable_label(self.editor.tool == Tool::Bond, "✏ Bond").clicked() {
                     self.editor.tool = Tool::Bond;
                     self.status = "Bond: click atom to extend chain, drag atom→atom to draw bond, click bond to cycle order.".to_string();
                 }
-                if ui
-                    .selectable_label(self.editor.tool == Tool::Eraser, "✖ Eraser")
-                    .clicked()
-                {
+                if ui.selectable_label(self.editor.tool == Tool::Eraser, "✖ Eraser").clicked() {
                     self.editor.tool = Tool::Eraser;
                     self.status = "Eraser: click an atom or bond to remove it.".to_string();
                 }
 
                 ui.separator();
 
-                // Bond stereo
                 ui.label("Stereo:");
-                if ui.selectable_label(
-                    self.editor.current_bond_stereo == BondStereo::None, "─ None"
-                ).clicked() {
+                if ui.selectable_label(self.editor.current_bond_stereo == BondStereo::None, "─ None").clicked() {
                     self.editor.current_bond_stereo = BondStereo::None;
                 }
-                if ui.selectable_label(
-                    self.editor.current_bond_stereo == BondStereo::WedgeUp, "▲ Wedge"
-                ).clicked() {
+                if ui.selectable_label(self.editor.current_bond_stereo == BondStereo::WedgeUp, "▲ Wedge").clicked() {
                     self.editor.current_bond_stereo = BondStereo::WedgeUp;
                 }
-                if ui.selectable_label(
-                    self.editor.current_bond_stereo == BondStereo::WedgeDown, "┄ Hash"
-                ).clicked() {
+                if ui.selectable_label(self.editor.current_bond_stereo == BondStereo::WedgeDown, "┄ Hash").clicked() {
                     self.editor.current_bond_stereo = BondStereo::WedgeDown;
                 }
 
                 ui.separator();
 
-                // Paste button — needed because egui's Ctrl+V is text-only and never fires for
-                // ChemDraw's non-text CDX content. This reads the clipboard directly.
                 if ui.button("📋 Paste").clicked() {
                     self.status = if self.editor.paste_clipboard() {
                         "Pasted structure from clipboard.".to_string()
@@ -81,9 +88,6 @@ impl App for Mol2App {
 
                 ui.separator();
 
-                // Clean Up button (also Ctrl+K in the canvas).
-                // Runs on a background thread; turns red ("Stop") while computing so it can
-                // be cancelled and never freezes the UI.
                 let cleaning = self.editor.is_cleaning();
                 let button = if cleaning {
                     egui::Button::new(egui::RichText::new("⛔ Stop").color(egui::Color32::WHITE))
@@ -102,7 +106,6 @@ impl App for Mol2App {
 
                 ui.separator();
 
-                // Save selection as a reusable fragment
                 ui.label("Fragment:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.fragment_name)
@@ -124,33 +127,30 @@ impl App for Mol2App {
 
                 ui.separator();
 
-                // Save Config
                 if ui.button("⚙ Save Config").clicked() {
                     match self.editor.config.save() {
-                        Ok(_)  => self.status = "Config saved to chembuilder_config.json".to_string(),
+                        Ok(_) => self.status = "Config saved to chembuilder_config.json".to_string(),
                         Err(e) => self.status = format!("Config save failed: {e}"),
                     }
                 }
 
                 ui.separator();
 
-                // Clear button
                 if ui.button("🗑 Clear").clicked() {
-                    self.editor.molecule = crate::molecule::Molecule::default();
+                    self.editor.molecule = Molecule::default();
                     self.editor.selected_atoms.clear();
                     self.status = "Canvas cleared.".to_string();
                 }
 
                 ui.separator();
 
-                // Save MOL2
                 if ui.button("💾 Save MOL2").clicked() {
-                    self.save_mol2(ctx);
+                    self.save_mol2();
                 }
             });
         });
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "Atoms: {}  Bonds: {}  Tool: {}  Element: {}  {}",
@@ -163,14 +163,14 @@ impl App for Mol2App {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             self.editor.ui(ui);
         });
     }
 }
 
-impl Mol2App {
-    fn save_mol2(&mut self, _ctx: &egui::Context) {
+impl EditorApp {
+    fn save_mol2(&mut self) {
         if self.editor.molecule.atoms.is_empty() {
             self.status = "Nothing to save — draw a molecule first.".to_string();
             return;

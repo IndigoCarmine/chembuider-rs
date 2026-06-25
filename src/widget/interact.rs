@@ -1,7 +1,6 @@
 use super::{ChemStructEditor, DEFAULT_BOND_LENGTH};
 use crate::config::{AtomAction, BondAction, ResolvedAtomAction, SelectionAction};
 use crate::molecule::{BondOrder, BondStereo};
-use eframe::egui;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public tool handlers

@@ -3,7 +3,6 @@ pub mod interact;
 
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};
-use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
@@ -129,7 +128,7 @@ impl Default for ChemStructEditor {
             lasso_path: Vec::new(),
             drag_origin_screen: None,
             hotspot_atom: None,
-            config: Config::load(),
+            config: Config::default(),
             label_edit: None,
             undo_stack: VecDeque::new(),
             current_bond_stereo: BondStereo::None,
@@ -645,7 +644,7 @@ impl ChemStructEditor {
 
         // Zoom via scroll wheel
         if rect.contains(mouse_pos) {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let factor: f32 = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
                 let before = self.screen_to_mol(mouse_pos, center);
@@ -667,7 +666,7 @@ impl ChemStructEditor {
         if did_undo { self.undo(); }
 
         // Copy/paste only act on the canvas when no text field has focus.
-        let editing_text = ui.ctx().wants_keyboard_input();
+        let editing_text = ui.ctx().egui_wants_keyboard_input();
 
         // Copy (Ctrl/Cmd+C): egui converts the shortcut into Event::Copy/Cut — `key_pressed(C)`
         // does NOT fire — so we listen for those events (with a raw-key fallback). On Windows
@@ -764,7 +763,7 @@ impl ChemStructEditor {
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let tool_modified = if label_editing || cleaning || ui.ctx().wants_keyboard_input() {
+        let tool_modified = if label_editing || cleaning || ui.ctx().egui_wants_keyboard_input() {
             false
         } else {
             match self.tool.clone() {

@@ -1,20 +1,29 @@
 [package]
 name = "chembuider-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-description = "An egui-based 2D chemical structure editor with MOL2 export"
+description = "An egui widget library for drawing and editing 2D chemical structure diagrams"
+
+[lib]
+name = "chembuider_rs"
+path = "src/lib.rs"
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
-rfd = "0.17.2"
+egui = "0.34.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# CDX export + ChemDraw-compatible clipboard (text/CDX/image) are Windows-only.
+# Only the example host app needs a windowing backend / file dialogs.
+# Use the glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12
+# layer fails to build against current `windows` crate versions on this toolchain.
+[dev-dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["glow", "default_fonts"] }
+rfd = "0.17.2"
+
+# CDX export + ChemDraw-compatible clipboard (text/CDX/image/OLE) are Windows-only.
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
 cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs" }
-resvg = "0.43"
-cfb = "0.10"
+resvg = "0.47.0"
+cfb = "0.14.0"
 uuid = "1"

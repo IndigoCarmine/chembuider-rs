@@ -184,7 +184,7 @@ impl Default for StyleConfig {
 
 // ─── Top-level Config ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub atom_shortcuts: Vec<AtomShortcut>,
@@ -200,7 +200,24 @@ pub struct Config {
     pub fragments: Vec<FragmentDef>,
 }
 
+impl Default for Config {
+    /// The built-in defaults compiled into the crate — shortcuts and fragments, but **no file
+    /// I/O**. This is what [`ChemStructEditor`](crate::ChemStructEditor) uses unless you assign
+    /// it a config of your own. Use [`Config::load`] to additionally read user files from disk.
+    fn default() -> Self {
+        Self::embedded()
+    }
+}
+
 impl Config {
+    /// Built-in shortcuts and fragments compiled into the crate. Does not touch the filesystem.
+    pub fn embedded() -> Self {
+        let mut cfg: Config =
+            serde_json::from_str(DEFAULT_SHORTCUTS).expect("embedded shortcuts valid");
+        cfg.fragments = builtin_fragments();
+        cfg
+    }
+
     /// Load shortcuts from `chembuilder_config.json` (or embedded default),
     /// then load fragments from the `fragments/` directory (or embedded defaults).
     pub fn load() -> Self {
@@ -323,13 +340,18 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/TBS.json"),
 ];
 
+/// Parse the compile-time built-in fragments. No file I/O.
+fn builtin_fragments() -> Vec<FragmentDef> {
+    BUILTIN_FRAGMENT_STRS
+        .iter()
+        .filter_map(|s| serde_json::from_str::<FragmentDef>(s).ok())
+        .collect()
+}
+
 /// Load fragments: embedded defaults as base, then merge inline + runtime dir (override by name).
 /// This ensures built-in fragments are always available even when a runtime `fragments/` dir exists.
 fn load_fragments(inline: Vec<FragmentDef>) -> Vec<FragmentDef> {
-    let mut frags: Vec<FragmentDef> = BUILTIN_FRAGMENT_STRS
-        .iter()
-        .filter_map(|s| serde_json::from_str::<FragmentDef>(s).ok())
-        .collect();
+    let mut frags = builtin_fragments();
     merge_fragments(&mut frags, inline);
     merge_fragments(
         &mut frags,

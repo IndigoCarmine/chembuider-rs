@@ -1,6 +1,5 @@
 use super::ChemStructEditor;
 use crate::molecule::{BondOrder, BondStereo};
-use eframe::egui;
 
 // Visual sizes (bond width, label size, etc.) are user-configurable via `config.style`
 // (see StyleConfig). These two only affect internal rendering detail and stay fixed.
