@@ -10,6 +10,8 @@ const WAVY_STEPS: usize = 16;
 
 pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
     let s = &editor.config.style;
+    // Visual sizes scale with zoom so they track the panzoom transform (z == 1.0 = baseline).
+    let z = editor.zoom;
     for bond in &editor.molecule.bonds {
         // Bonds to a folded terminal H are suppressed (the H is shown in the heavy atom's label).
         if is_folded_h(&editor.molecule, bond.begin) || is_folded_h(&editor.molecule, bond.end) {
@@ -25,15 +27,15 @@ pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: eg
         } else {
             egui::Color32::BLACK
         };
-        let stroke = egui::Stroke::new(s.bond_width, color);
+        let stroke = egui::Stroke::new(s.bond_width * z, color);
 
         match &bond.stereo {
-            BondStereo::None => draw_bond_order(painter, p1, p2, &bond.order, stroke, s.double_bond_offset),
-            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color, s.wedge_width),
-            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color, s.wedge_width, s.bond_width),
-            BondStereo::Bold => draw_bold(painter, p1, p2, color, s.bold_width),
-            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke, s.dash_len, s.dash_gap),
-            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke, s.wavy_amplitude),
+            BondStereo::None => draw_bond_order(painter, p1, p2, &bond.order, stroke, s.double_bond_offset * z),
+            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color, s.wedge_width * z),
+            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color, s.wedge_width * z, s.bond_width * z),
+            BondStereo::Bold => draw_bold(painter, p1, p2, color, s.bold_width * z),
+            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke, s.dash_len * z, s.dash_gap * z),
+            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke, s.wavy_amplitude * z),
         }
     }
 }
@@ -166,7 +168,8 @@ pub fn draw_atom_backgrounds(
     for atom in &editor.molecule.atoms {
         if should_show_label(editor, atom.id) {
             let sp = editor.mol_to_screen(atom.pos, center);
-            painter.circle_filled(sp, bg_radius, egui::Color32::WHITE);
+            // Radius scales with zoom so it tracks the panzoom transform.
+            painter.circle_filled(sp, bg_radius * editor.zoom, egui::Color32::WHITE);
         }
     }
 }
@@ -174,7 +177,9 @@ pub fn draw_atom_backgrounds(
 // ─── Layer 2: atom labels + selection/hover/hotspot rings ────────────────────
 
 pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
-    let bg_radius = editor.config.style.atom_bg_radius;
+    // Visual sizes scale with zoom so they track the panzoom transform (z == 1.0 = baseline).
+    let z = editor.zoom;
+    let bg = editor.config.style.atom_bg_radius * z;
     let label_size = editor.config.style.label_size;
     for atom in &editor.molecule.atoms {
         let sp = editor.mol_to_screen(atom.pos, center);
@@ -186,33 +191,33 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         if is_hotspot {
             painter.circle_stroke(
                 sp,
-                bg_radius + 9.0,
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 140, 0)),
+                bg + 9.0 * z,
+                egui::Stroke::new(2.0 * z, egui::Color32::from_rgb(255, 140, 0)),
             );
         }
         // Selection ring (blue)
         if is_selected {
             painter.circle_stroke(
                 sp,
-                bg_radius + 5.0,
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 130, 255)),
+                bg + 5.0 * z,
+                egui::Stroke::new(2.0 * z, egui::Color32::from_rgb(80, 130, 255)),
             );
         }
         // Hover ring (green)
         if is_hovered {
             painter.circle_stroke(
                 sp,
-                bg_radius + 2.0,
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(50, 180, 50)),
+                bg + 2.0 * z,
+                egui::Stroke::new(1.5 * z, egui::Color32::from_rgb(50, 180, 50)),
             );
         }
         // Over-valence warning (red dashed) — applies to all atoms, even unlabeled carbons.
         if is_valence_invalid(&editor.molecule, atom.id) {
-            draw_dashed_circle(painter, sp, bg_radius + 7.0, egui::Color32::from_rgb(220, 30, 30));
+            draw_dashed_circle(painter, sp, bg + 7.0 * z, egui::Color32::from_rgb(220, 30, 30), 1.5 * z);
         }
 
         if should_show_label(editor, atom.id) {
-            let job = atom_label_job(&editor.molecule, atom, label_size, egui::Color32::BLACK);
+            let job = atom_label_job(&editor.molecule, atom, label_size * z, egui::Color32::BLACK);
             let galley = painter.layout_job(job);
             let pos = sp - galley.size() * 0.5; // center the laid-out label on the atom
             painter.galley(pos, galley, egui::Color32::BLACK);
@@ -270,7 +275,7 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
             let sp = editor.mol_to_screen(src.pos, center);
             painter.line_segment(
                 [sp, end],
-                egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180)),
+                egui::Stroke::new(1.5 * editor.zoom, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180)),
             );
         }
     }
@@ -283,7 +288,7 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
             // Must be closed: epaint panics when filling an open path.
             closed: true,
             fill: egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
-            stroke: egui::epaint::PathStroke::new(1.5, egui::Color32::from_rgb(80, 130, 255)),
+            stroke: egui::epaint::PathStroke::new(1.5 * editor.zoom, egui::Color32::from_rgb(80, 130, 255)),
         }));
     }
 }
@@ -333,9 +338,9 @@ pub fn is_valence_invalid(mol: &crate::molecule::Molecule, atom_id: u32) -> bool
 }
 
 /// Draw a dashed circle (used as the over-valence warning ring).
-fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32) {
+fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32, stroke_width: f32) {
     const SEGMENTS: usize = 20;
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(stroke_width, color);
     for i in (0..SEGMENTS).step_by(2) {
         let a0 = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
         let a1 = (i + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
