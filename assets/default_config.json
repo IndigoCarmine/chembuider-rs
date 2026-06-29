@@ -62,7 +62,7 @@
     { "key": "1", "order": "Single" },
     { "key": "2", "order": "Double" },
     { "key": "3", "order": "Triple" },
-    { "key": "a", "ring": 6 },
+    { "key": "a", "fragment": "benzene" },
     { "key": "v", "ring": 3 },
     { "key": "4", "ring": 4 },
     { "key": "5", "ring": 5 },

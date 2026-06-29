@@ -394,19 +394,20 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
         //  1. hovering an atom → act on it (change element / attach fragment)
         //  2. else, a key that names an element → drop that atom at the cursor, ahead of any
         //     stale hotspot (so O/N/S place a new atom rather than editing the hotspot)
-        //  3. else, a hotspot → build from it (chains, rings, fused fragments)
-        //  4. else, a hovered bond → bond key
+        //  3. else, a hovered bond → bond key (a hovered bond beats a stale hotspot so e.g.
+        //     fusing a ring/fragment onto the bond targets the bond, not the hotspot atom)
+        //  4. else, a hotspot → build from it (chains, rings, fused fragments)
         if let Some(atom_id) = editor.hovered_atom {
             editor.push_undo();
             if dispatch_atom_key(editor, atom_id, key) { modified = true; }
         } else if place_element_at_cursor(editor, key) {
             modified = true;
-        } else if let Some(atom_id) = editor.hotspot_atom {
-            editor.push_undo();
-            if dispatch_atom_key(editor, atom_id, key) { modified = true; }
         } else if let Some(bond_id) = editor.hovered_bond {
             editor.push_undo();
             if dispatch_bond_key(editor, bond_id, key) { modified = true; }
+        } else if let Some(atom_id) = editor.hotspot_atom {
+            editor.push_undo();
+            if dispatch_atom_key(editor, atom_id, key) { modified = true; }
         }
     }
 
@@ -592,6 +593,14 @@ fn apply_bond_action(editor: &mut ChemStructEditor, bond_id: u32, action: &BondA
             fuse_ring_onto_bond(editor, bond_id, *ring);
             true
         }
+        BondAction::Fragment { fragment } => {
+            // Fuse a named fragment (e.g. benzene) onto the bond, sharing it as one edge.
+            // Ignore unknown fragment names.
+            if let Some(frag) = editor.config.resolve_fragment(fragment) {
+                fuse_fragment_onto_bond(editor, bond_id, &frag);
+            }
+            true
+        }
     }
 }
 
@@ -678,6 +687,137 @@ fn fuse_ring_onto_bond(editor: &mut ChemStructEditor, bond_id: u32, n: usize) {
         let b = ring_atoms[(k + 1) % n];
         if editor.molecule.bond_between(a, b).is_none() {
             editor.molecule.add_bond(a, b, BondOrder::Single);
+        }
+    }
+}
+
+/// Fuse a named fragment onto a bond, sharing that bond as one edge.
+///
+/// The fragment's attach edge (`attach_idx` → `next`) is mapped rigidly onto the existing bond's
+/// endpoints with a similarity transform (translation + rotation + uniform scale). A reflection is
+/// chosen so the fragment's remaining atoms land on the side AWAY from existing neighbor atoms of
+/// the bond's endpoints. New atoms snap to existing atoms within SNAP_RADIUS. The shared edge's
+/// order is updated to the fragment's attach-edge order (so e.g. benzene ends up fully alternating
+/// relative to the shared bond).
+fn fuse_fragment_onto_bond(
+    editor: &mut ChemStructEditor,
+    bond_id: u32,
+    frag: &crate::molecule::fragment::Fragment,
+) {
+    let n = frag.atoms.len();
+    if n < 2 { return; }
+    let attach = frag.attach_idx;
+    let next = (attach + 1) % n;
+
+    let (a_id, b_id) = {
+        let Some(bond) = editor.molecule.bonds.iter().find(|b| b.id == bond_id) else { return };
+        (bond.begin, bond.end)
+    };
+    let (pa, pb) = {
+        let Some(a) = editor.molecule.atom_by_id(a_id) else { return };
+        let Some(b) = editor.molecule.atom_by_id(b_id) else { return };
+        (a.pos, b.pos)
+    };
+
+    // Raw fragment attach-edge endpoints.
+    let p0 = frag.atoms[attach].pos;
+    let p1 = frag.atoms[next].pos;
+    let fdx = p1[0] - p0[0];
+    let fdy = p1[1] - p0[1];
+    let flen = (fdx * fdx + fdy * fdy).sqrt();
+    if flen < 1e-6 { return; }
+
+    let bdx = pb[0] - pa[0];
+    let bdy = pb[1] - pa[1];
+    let blen = (bdx * bdx + bdy * bdy).sqrt();
+    if blen < 1e-6 { return; }
+
+    let scale = blen / flen;
+    // Rotation that takes the (normalized) fragment edge onto the (normalized) bond edge.
+    let fang = fdy.atan2(fdx);
+    let bang = bdy.atan2(bdx);
+
+    // Transform a raw fragment point with the given handedness (flip = mirror across the edge).
+    let transform = |p: [f32; 2], flip: bool| -> [f32; 2] {
+        // Translate so p0 is at origin.
+        let mut x = p[0] - p0[0];
+        let mut y = p[1] - p0[1];
+        // Optional reflection across the fragment edge axis: rotate edge to x-axis, flip y, rotate back.
+        if flip {
+            let (s, c) = (-fang).sin_cos();
+            let rx = x * c - y * s;
+            let ry = x * s + y * c;
+            let ry = -ry;
+            let (s2, c2) = fang.sin_cos();
+            x = rx * c2 - ry * s2;
+            y = rx * s2 + ry * c2;
+        }
+        // Scale + rotate from fragment edge angle to bond edge angle, then translate to pa.
+        let dang = bang - fang;
+        let (s, c) = dang.sin_cos();
+        let sx = x * scale;
+        let sy = y * scale;
+        [pa[0] + sx * c - sy * s, pa[1] + sx * s + sy * c]
+    };
+
+    // Existing neighbor atom positions (excluding a_id/b_id themselves) to clear from.
+    let mut neighbors: Vec<[f32; 2]> = Vec::new();
+    for &nid in editor.molecule.neighbor_atom_ids(a_id).iter()
+        .chain(editor.molecule.neighbor_atom_ids(b_id).iter())
+    {
+        if nid == a_id || nid == b_id { continue; }
+        if let Some(at) = editor.molecule.atom_by_id(nid) {
+            neighbors.push(at.pos);
+        }
+    }
+
+    // Score a handedness by the minimum clearance of the fragment's non-edge atoms from neighbors.
+    let clearance = |flip: bool| -> f32 {
+        let mut min_clear = f32::MAX;
+        for (i, fa) in frag.atoms.iter().enumerate() {
+            if i == attach || i == next { continue; }
+            let q = transform(fa.pos, flip);
+            for nb in &neighbors {
+                let dx = q[0] - nb[0];
+                let dy = q[1] - nb[1];
+                let d = (dx * dx + dy * dy).sqrt();
+                if d < min_clear { min_clear = d; }
+            }
+        }
+        min_clear
+    };
+
+    let flip = if neighbors.is_empty() {
+        false
+    } else {
+        clearance(true) > clearance(false)
+    };
+
+    // Build id_map: attach→a_id, next→b_id, rest transformed + snapped or created.
+    let snap = crate::molecule::Molecule::SNAP_RADIUS;
+    let mut id_map: Vec<u32> = vec![0; n];
+    id_map[attach] = a_id;
+    id_map[next] = b_id;
+    for (i, fa) in frag.atoms.iter().enumerate() {
+        if i == attach || i == next { continue; }
+        let pos = transform(fa.pos, flip);
+        let id = editor.molecule.find_atom_near(pos, snap)
+            .unwrap_or_else(|| editor.molecule.add_atom(fa.element.clone(), pos, fa.charge));
+        id_map[i] = id;
+    }
+
+    // Add fragment bonds. The shared edge already exists: update its order instead of adding.
+    for fb in &frag.bonds {
+        let u = id_map[fb.begin];
+        let v = id_map[fb.end];
+        if u == v { continue; }
+        if let Some(existing) = editor.molecule.bond_between(u, v) {
+            let existing_id = existing.id;
+            if let Some(bond) = editor.molecule.bond_by_id_mut(existing_id) {
+                bond.order = fb.order.clone();
+            }
+        } else {
+            editor.molecule.add_bond(u, v, fb.order.clone());
         }
     }
 }
@@ -942,6 +1082,26 @@ mod tests {
         let mut e = editor();
         assert!(!place_element_at_cursor(&mut e, "a"), "benzene should not place at cursor");
         assert!(e.molecule.atoms.is_empty());
+    }
+
+    /// Fusing benzene onto a single bond yields a 6-membered ring sharing that bond:
+    /// 6 atoms, 6 ring bonds, 3 double bonds.
+    #[test]
+    fn fuse_benzene_onto_bond_builds_aromatic_ring() {
+        let mut e = editor();
+        let a = e.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = e.molecule.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let bond_id = e.molecule.add_bond(a, b, BondOrder::Single);
+
+        let frag = e.config.resolve_fragment("benzene").expect("benzene fragment");
+        fuse_fragment_onto_bond(&mut e, bond_id, &frag);
+
+        assert_eq!(e.molecule.atoms.len(), 6, "benzene fuse should yield 6 atoms");
+        assert_eq!(e.molecule.bonds.len(), 6, "benzene fuse should yield 6 ring bonds");
+        let doubles = e.molecule.bonds.iter()
+            .filter(|bd| bd.order == BondOrder::Double)
+            .count();
+        assert_eq!(doubles, 3, "aromatic benzene should have 3 double bonds");
     }
 }
 
