@@ -22,6 +22,7 @@ pub enum BondAction {
     Stereo { stereo: BondStereo },
     Order { order: BondOrder },
     Ring { ring: usize },
+    Fragment { fragment: String },
 }
 
 /// Action for the select tool's arrow-key operations.

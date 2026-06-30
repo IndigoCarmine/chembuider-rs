@@ -30,14 +30,51 @@ pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: eg
         let stroke = egui::Stroke::new(s.bond_width * z, color);
 
         match &bond.stereo {
-            BondStereo::None => draw_bond_order(painter, p1, p2, &bond.order, stroke, s.double_bond_offset * z),
-            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color, s.wedge_width * z),
-            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color, s.wedge_width * z, s.bond_width * z),
-            BondStereo::Bold => draw_bold(painter, p1, p2, color, s.bold_width * z),
-            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke, s.dash_len * z, s.dash_gap * z),
-            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke, s.wavy_amplitude * z),
+            BondStereo::None => {
+                // For a plain (non-stereo) double bond, decide where the two lines go based on
+                // which side of the bond axis the neighboring bonds sit (ChemDraw convention):
+                // neighbors on only one side ⇒ main line on the axis + a short inset line toward
+                // that side; neighbors on both sides or none ⇒ symmetric pair (legacy behavior).
+                let placement = if matches!(bond.order, BondOrder::Double) {
+                    let (nx, ny) = perp_normal(p1, p2);
+                    // Collect screen positions of the OTHER neighbors of each endpoint.
+                    let mut neighbors: Vec<egui::Pos2> = Vec::new();
+                    for nid in editor.molecule.neighbor_atom_ids(bond.begin) {
+                        if nid == bond.end { continue; }
+                        if let Some(na) = editor.molecule.atom_by_id(nid) {
+                            neighbors.push(editor.mol_to_screen(na.pos, center));
+                        }
+                    }
+                    for nid in editor.molecule.neighbor_atom_ids(bond.end) {
+                        if nid == bond.begin { continue; }
+                        if let Some(na) = editor.molecule.atom_by_id(nid) {
+                            neighbors.push(editor.mol_to_screen(na.pos, center));
+                        }
+                    }
+                    double_bond_placement(p1, p2, (nx, ny), &neighbors)
+                } else {
+                    DoubleBondPlacement::Symmetric
+                };
+                draw_bond_order(painter, p1, p2, &bond.order, stroke, s.double_bond_offset, placement)
+            }
+            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color, s.wedge_width),
+            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color, s.wedge_width, s.bond_width),
+            BondStereo::Bold => draw_bold(painter, p1, p2, color, s.bold_width),
+            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke, s.dash_len, s.dash_gap),
+            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke, s.wavy_amplitude),
         }
     }
+}
+
+/// Where to place the two lines of a `BondOrder::Double` (with `BondStereo::None`).
+/// Decided from the side on which the bond's substituents lie (see `double_bond_placement`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DoubleBondPlacement {
+    /// Two lines symmetric about the bond axis (terminal/isolated bonds or trans-disubstituted).
+    Symmetric,
+    /// Main line on the axis + a shorter inset line offset toward one side. The `f32` is the
+    /// side sign (+1.0 = +normal side, -1.0 = -normal side).
+    Centered(f32),
 }
 
 fn draw_bond_order(
@@ -47,21 +84,40 @@ fn draw_bond_order(
     order: &BondOrder,
     stroke: egui::Stroke,
     double_bond_offset: f32,
+    placement: DoubleBondPlacement,
 ) {
     match order {
         BondOrder::Single => {
             painter.line_segment([p1, p2], stroke);
         }
-        BondOrder::Double => {
-            let (nx, ny) = perp_normal(p1, p2);
-            let half = double_bond_offset * 0.5;
-            let a1 = egui::Pos2::new(p1.x + nx * half, p1.y + ny * half);
-            let a2 = egui::Pos2::new(p2.x + nx * half, p2.y + ny * half);
-            let b1 = egui::Pos2::new(p1.x - nx * half, p1.y - ny * half);
-            let b2 = egui::Pos2::new(p2.x - nx * half, p2.y - ny * half);
-            painter.line_segment([a1, a2], stroke);
-            painter.line_segment([b1, b2], stroke);
-        }
+        BondOrder::Double => match placement {
+            DoubleBondPlacement::Symmetric => {
+                let (nx, ny) = perp_normal(p1, p2);
+                let half = double_bond_offset * 0.5;
+                let a1 = egui::Pos2::new(p1.x + nx * half, p1.y + ny * half);
+                let a2 = egui::Pos2::new(p2.x + nx * half, p2.y + ny * half);
+                let b1 = egui::Pos2::new(p1.x - nx * half, p1.y - ny * half);
+                let b2 = egui::Pos2::new(p2.x - nx * half, p2.y - ny * half);
+                painter.line_segment([a1, a2], stroke);
+                painter.line_segment([b1, b2], stroke);
+            }
+            DoubleBondPlacement::Centered(side) => {
+                // Main line runs full-length on the bond axis.
+                painter.line_segment([p1, p2], stroke);
+                // Second line: full offset toward the substituent side, inset 15% at each end so
+                // it sits inside the ring/cis region.
+                let (nx, ny) = perp_normal(p1, p2);
+                let dx = p2.x - p1.x;
+                let dy = p2.y - p1.y;
+                let len = (dx * dx + dy * dy).sqrt();
+                let (ox, oy) = (nx * double_bond_offset * side, ny * double_bond_offset * side);
+                let inset = 0.15 * len;
+                let (ux, uy) = if len > 0.001 { (dx / len, dy / len) } else { (0.0, 0.0) };
+                let inner_start = egui::Pos2::new(p1.x + ux * inset + ox, p1.y + uy * inset + oy);
+                let inner_end   = egui::Pos2::new(p2.x - ux * inset + ox, p2.y - uy * inset + oy);
+                painter.line_segment([inner_start, inner_end], stroke);
+            }
+        },
         BondOrder::Triple => {
             painter.line_segment([p1, p2], stroke);
             let (nx, ny) = perp_normal(p1, p2);
@@ -155,6 +211,46 @@ fn perp_normal(p1: egui::Pos2, p2: egui::Pos2) -> (f32, f32) {
     let len = (dx * dx + dy * dy).sqrt();
     if len < 0.001 { return (0.0, 1.0); }
     (-dy / len, dx / len)
+}
+
+/// Decide the line placement for a plain double bond from where its neighboring atoms sit
+/// relative to the bond axis. `normal` is the perpendicular unit normal of the bond (see
+/// `perp_normal`); `neighbors` are the screen positions of the other atoms bonded to either
+/// endpoint. The signed component `(neighbor - midpoint) · normal` classifies each neighbor as
+/// being on the +normal side (`dot > eps`) or -normal side (`dot < -eps`).
+///
+/// - neighbors only on the +normal side  → `Centered(+1.0)` (inset line toward +normal)
+/// - neighbors only on the -normal side  → `Centered(-1.0)` (inset line toward -normal)
+/// - neighbors on both sides, or none    → `Symmetric`
+///
+/// Coordinate space: this function is space-agnostic — it works in whatever space the caller
+/// supplies, as long as `p1/p2`, `normal`, and `neighbors` are all in the same space. The
+/// rendering path uses screen coordinates (where y is flipped vs molecule coords); the
+/// symmetric-vs-Centered decision is sign-consistent either way, only the meaning of the
+/// returned side sign is tied to the chosen `normal`.
+fn double_bond_placement(
+    p1: egui::Pos2,
+    p2: egui::Pos2,
+    normal: (f32, f32),
+    neighbors: &[egui::Pos2],
+) -> DoubleBondPlacement {
+    let mid = egui::Pos2::new((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
+    let eps = 1e-3_f32;
+    let mut positive = 0;
+    let mut negative = 0;
+    for n in neighbors {
+        let dot = (n.x - mid.x) * normal.0 + (n.y - mid.y) * normal.1;
+        if dot > eps {
+            positive += 1;
+        } else if dot < -eps {
+            negative += 1;
+        }
+    }
+    match (positive, negative) {
+        (p, 0) if p > 0 => DoubleBondPlacement::Centered(1.0),
+        (0, n) if n > 0 => DoubleBondPlacement::Centered(-1.0),
+        _ => DoubleBondPlacement::Symmetric,
+    }
 }
 
 // ─── Layer 1: atom background circles ────────────────────────────────────────
@@ -480,5 +576,41 @@ mod tests {
         let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
         m.add_bond(a, o, BondOrder::Triple);
         assert!(is_valence_invalid(&m, o), "O with a triple bond is over-valence");
+    }
+
+    /// Side-decision for double-bond line placement. The helper is space-agnostic, so the test
+    /// works in plain (molecule-like) coordinates: bond along the x axis with normal (0, 1).
+    #[test]
+    fn double_bond_placement_picks_substituent_side() {
+        let p1 = egui::Pos2::new(0.0, 0.0);
+        let p2 = egui::Pos2::new(2.0, 0.0);
+        let normal = perp_normal(p1, p2); // (0, 1) for a horizontal bond
+
+        // Ring-like / cis: both neighbors above the axis (same, +normal side) → Centered(+1).
+        let cis = [egui::Pos2::new(0.0, 1.0), egui::Pos2::new(2.0, 1.0)];
+        assert_eq!(
+            double_bond_placement(p1, p2, normal, &cis),
+            DoubleBondPlacement::Centered(1.0),
+        );
+
+        // Cis on the other side → Centered(-1).
+        let cis_neg = [egui::Pos2::new(0.0, -1.0), egui::Pos2::new(2.0, -1.0)];
+        assert_eq!(
+            double_bond_placement(p1, p2, normal, &cis_neg),
+            DoubleBondPlacement::Centered(-1.0),
+        );
+
+        // Trans: one neighbor on each side → Symmetric.
+        let trans = [egui::Pos2::new(0.0, 1.0), egui::Pos2::new(2.0, -1.0)];
+        assert_eq!(
+            double_bond_placement(p1, p2, normal, &trans),
+            DoubleBondPlacement::Symmetric,
+        );
+
+        // Terminal / isolated: no neighbors → Symmetric.
+        assert_eq!(
+            double_bond_placement(p1, p2, normal, &[]),
+            DoubleBondPlacement::Symmetric,
+        );
     }
 }
