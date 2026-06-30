@@ -722,7 +722,8 @@ impl ChemStructEditor {
         // ── Label text-edit overlay ──────────────────────────────────────────
         let mut label_confirmed = false;
         // Extract what we need before the mutable borrow of label_edit
-        let label_size = self.config.style.label_size;
+        // Font size scales with zoom so it tracks the panzoom transform (zoom == 1.0 = baseline).
+        let label_size = self.config.style.label_size * self.zoom;
         let label_state: Option<(u32, egui::Pos2)> = self.label_edit.as_ref().and_then(|(atom_id, _)| {
             let pos = self.molecule.atom_by_id(*atom_id)?.pos;
             Some((*atom_id, self.mol_to_screen(pos, center)))
