@@ -1,4 +1,5 @@
 pub mod draw;
+pub mod fragments;
 pub mod interact;
 
 use crate::config::Config;
@@ -238,6 +239,42 @@ impl ChemStructEditor {
             };
         }
 
+        // Try to place a new bond at 120° from an existing bond.
+        // Generate all ±120° candidates, keep those ≥ 60° from every existing bond,
+        // then pick the most open one. Fall back to bisecting the largest gap when
+        // no valid 120° position exists (crowded or distorted).
+        const MIN_SEP: f32 = std::f32::consts::PI / 3.0; // 60°
+        let mut candidates: Vec<f32> = angles
+            .iter()
+            .flat_map(|&a| {
+                [
+                    normalize_angle(a + std::f32::consts::TAU / 3.0),
+                    normalize_angle(a - std::f32::consts::TAU / 3.0),
+                ]
+            })
+            .collect();
+        candidates.retain(|&c| {
+            angles.iter().all(|&a| angular_distance(c, a) >= MIN_SEP)
+        });
+
+        if !candidates.is_empty() {
+            return *candidates
+                .iter()
+                .max_by(|&&c1, &&c2| {
+                    let min1 = angles
+                        .iter()
+                        .map(|&a| angular_distance(c1, a))
+                        .fold(f32::MAX, f32::min);
+                    let min2 = angles
+                        .iter()
+                        .map(|&a| angular_distance(c2, a))
+                        .fold(f32::MAX, f32::min);
+                    min1.partial_cmp(&min2).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+        }
+
+        // Fallback: bisect the largest angular gap
         angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mut max_gap = 0.0_f32;
         let mut best = 0.0_f32;
@@ -308,18 +345,19 @@ impl ChemStructEditor {
             crate::molecule::cleanup::cleanup_2d(&mut self.molecule);
         }
 
-        let modified = cleanup | match self.tool.clone() {
+        let tool_modified = match self.tool.clone() {
             Tool::Bond => interact::process_bond_tool(self, &response, center, ui),
             Tool::Select => interact::process_select_tool(self, &response, center, ui),
             Tool::Eraser => interact::process_eraser_tool(self, &response, center),
         };
+        let frag_modified = interact::process_fragment_shortcuts(self, ui, &response, center);
 
         draw::draw_bonds(self, &painter, center);
         draw::draw_atom_backgrounds(self, &painter, center);
         draw::draw_atom_labels(self, &painter, center);
         draw::draw_overlays(self, &painter, center);
 
-        modified
+        cleanup || tool_modified || frag_modified
     }
 }
 
@@ -332,6 +370,11 @@ pub fn point_to_segment_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32
     }
     let t = ((ap.x * ab.x + ap.y * ab.y) / ab_sq).clamp(0.0, 1.0);
     (p - (a + ab * t)).length()
+}
+
+pub fn angular_distance(a: f32, b: f32) -> f32 {
+    let diff = (a - b).rem_euclid(std::f32::consts::TAU);
+    diff.min(std::f32::consts::TAU - diff)
 }
 
 pub fn normalize_angle(a: f32) -> f32 {

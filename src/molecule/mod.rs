@@ -116,6 +116,10 @@ impl Molecule {
         self.atoms.iter_mut().find(|a| a.id == id)
     }
 
+    pub fn bond_by_id(&self, id: u32) -> Option<&Bond> {
+        self.bonds.iter().find(|b| b.id == id)
+    }
+
     pub fn bond_by_id_mut(&mut self, id: u32) -> Option<&mut Bond> {
         self.bonds.iter_mut().find(|b| b.id == id)
     }

@@ -113,6 +113,9 @@ impl App for Mol2App {
                 if ui.button("💾 Save MOL2").clicked() {
                     self.save_mol2(ctx);
                 }
+
+                ui.separator();
+                ui.label("Fragments (hover+key): C=C=O  A=Amide  E=Ester  B=Benzene");
             });
         });
 

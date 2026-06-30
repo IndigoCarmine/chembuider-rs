@@ -663,6 +663,68 @@ fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
 // Geometry / polygon helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
+pub fn process_fragment_shortcuts(
+    editor: &mut ChemStructEditor,
+    ui: &egui::Ui,
+    response: &egui::Response,
+    center: egui::Pos2,
+) -> bool {
+    if !response.hovered() {
+        return false;
+    }
+    let Some(mouse_screen) = response.hover_pos() else {
+        return false;
+    };
+
+    use egui::Key;
+    use super::fragments::{AtomFragment, BondFragment, Fragment};
+
+    let fragment = if ui.input(|i| i.key_pressed(Key::C)) {
+        Fragment::Atom(AtomFragment::carbonyl())
+    } else if ui.input(|i| i.key_pressed(Key::A)) {
+        Fragment::Atom(AtomFragment::amide())
+    } else if ui.input(|i| i.key_pressed(Key::E)) {
+        Fragment::Atom(AtomFragment::ester())
+    } else if ui.input(|i| i.key_pressed(Key::B)) {
+        if editor.hovered_bond.is_some() {
+            Fragment::Bond(BondFragment::benzene())
+        } else {
+            Fragment::Atom(AtomFragment::benzene())
+        }
+    } else {
+        return false;
+    };
+
+    match fragment {
+        Fragment::Atom(af) => {
+            let (anchor_id, dir_angle, origin) = if let Some(id) = editor.hovered_atom {
+                let pos = editor.molecule.atom_by_id(id).map(|a| a.pos).unwrap_or([0.0; 2]);
+                let neighbors = editor.molecule.neighbor_atom_ids(id);
+                let dir = match neighbors.len() {
+                    0 => 0.0,
+                    1 => {
+                        let nbr_pos = editor.molecule.atom_by_id(neighbors[0])
+                            .map(|a| a.pos).unwrap_or(pos);
+                        (pos[1] - nbr_pos[1]).atan2(pos[0] - nbr_pos[0])
+                    }
+                    _ => editor.best_new_bond_angle(id),
+                };
+                (Some(id), dir, pos)
+            } else {
+                (None, 0.0_f32, editor.screen_to_mol(mouse_screen, center))
+            };
+            af.insert(&mut editor.molecule, origin, anchor_id, dir_angle);
+        }
+        Fragment::Bond(bf) => {
+            if let Some(bond_id) = editor.hovered_bond {
+                bf.insert(&mut editor.molecule, bond_id);
+            }
+        }
+    }
+
+    true
+}
+
 fn find_or_create_atom(
     editor: &mut ChemStructEditor,
     mol_pos: [f32; 2],
