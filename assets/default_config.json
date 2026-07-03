@@ -85,7 +85,7 @@
     { "key": "ArrowDown",  "ctrl": false, "shift": true,  "alt": false, "action": "MoveDown"  }
   ],
   "style": {
-    "label_size": 25.0,
+    "label_size": 30.0,
     "bond_width": 1.5,
     "double_bond_offset": 7.0,
     "atom_bg_radius": 9.0,

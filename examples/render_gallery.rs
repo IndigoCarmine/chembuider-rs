@@ -39,7 +39,8 @@ fn main() {
         .expect("run from the repo root; fixtures come from scripts/gen_test_structures.py")
         .filter_map(|e| {
             let p = e.ok()?.path();
-            (p.extension()? == "json").then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
+            (p.extension()? == "json")
+                .then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
         })
         .collect();
     names.sort();
@@ -70,7 +71,10 @@ fn main() {
             let cell = renderer.render(&mut editor, &label);
             if !single {
                 write_bmp(
-                    &format!("{out_dir}/{name}{}.bmp", if cleaned { "_cleanup" } else { "" }),
+                    &format!(
+                        "{out_dir}/{name}{}.bmp",
+                        if cleaned { "_cleanup" } else { "" }
+                    ),
                     &cell,
                     CELL_W,
                     CELL_H,
@@ -109,8 +113,14 @@ fn fit_view(editor: &mut ChemStructEditor) {
     if xs.is_empty() {
         return;
     }
-    let (min_x, max_x) = (xs.iter().cloned().fold(f32::MAX, f32::min), xs.iter().cloned().fold(f32::MIN, f32::max));
-    let (min_y, max_y) = (ys.iter().cloned().fold(f32::MAX, f32::min), ys.iter().cloned().fold(f32::MIN, f32::max));
+    let (min_x, max_x) = (
+        xs.iter().cloned().fold(f32::MAX, f32::min),
+        xs.iter().cloned().fold(f32::MIN, f32::max),
+    );
+    let (min_y, max_y) = (
+        ys.iter().cloned().fold(f32::MAX, f32::min),
+        ys.iter().cloned().fold(f32::MIN, f32::max),
+    );
     let w = (max_x - min_x).max(1.0) * SCALE_FACTOR;
     let h = (max_y - min_y).max(1.0) * SCALE_FACTOR;
     let zoom = ((CELL_W as f32 - 120.0) / w).min((CELL_H as f32 - 100.0) / h);
@@ -173,15 +183,19 @@ struct CellRenderer {
 
 impl CellRenderer {
     fn new() -> Self {
-        Self { ctx: egui::Context::default(), textures: HashMap::new() }
+        Self {
+            ctx: egui::Context::default(),
+            textures: HashMap::new(),
+        }
     }
 
     fn render(&mut self, editor: &mut ChemStructEditor, caption: &str) -> Vec<u8> {
-        let cell = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(CELL_W as f32, CELL_H as f32),
-        );
-        let raw = egui::RawInput { screen_rect: Some(cell), ..Default::default() };
+        let cell =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(CELL_W as f32, CELL_H as f32));
+        let raw = egui::RawInput {
+            screen_rect: Some(cell),
+            ..Default::default()
+        };
         let frame = |editor: &mut ChemStructEditor, ui: &mut egui::Ui| {
             editor.ui(ui);
             // Caption + cell border on top of the editor's white canvas.
@@ -216,7 +230,9 @@ impl CellRenderer {
     /// persistent atlas copies.
     fn fold_textures(&mut self, deltas: &egui::TexturesDelta) {
         for (id, delta) in &deltas.set {
-            let egui::TextureId::Managed(mid) = id else { continue };
+            let egui::TextureId::Managed(mid) = id else {
+                continue;
+            };
             let egui::epaint::image::ImageData::Color(img) = &delta.image;
             match delta.pos {
                 None => {
@@ -248,7 +264,9 @@ fn rasterize(
     let mut canvas = vec![[255.0_f32; 4]; w * h];
 
     for prim in primitives {
-        let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else { continue };
+        let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
+            continue;
+        };
         let tex = match mesh.texture_id {
             egui::TextureId::Managed(mid) => textures.get(&mid),
             _ => None,
@@ -262,9 +280,11 @@ fn rasterize(
             let xs = [v[0].pos.x, v[1].pos.x, v[2].pos.x];
             let ys = [v[0].pos.y, v[1].pos.y, v[2].pos.y];
             let min_x = xs.iter().cloned().fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-            let max_x = (xs.iter().cloned().fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(w - 1);
+            let max_x =
+                (xs.iter().cloned().fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(w - 1);
             let min_y = ys.iter().cloned().fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-            let max_y = (ys.iter().cloned().fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(h - 1);
+            let max_y =
+                (ys.iter().cloned().fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(h - 1);
             let denom = (ys[1] - ys[2]) * (xs[0] - xs[2]) + (xs[2] - xs[1]) * (ys[0] - ys[2]);
             if denom.abs() < 1e-9 {
                 continue;
@@ -277,8 +297,10 @@ fn rasterize(
                     for (ox, oy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
                         let x = px as f32 + ox;
                         let y = py as f32 + oy;
-                        let l0 = ((ys[1] - ys[2]) * (x - xs[2]) + (xs[2] - xs[1]) * (y - ys[2])) / denom;
-                        let l1 = ((ys[2] - ys[0]) * (x - xs[2]) + (xs[0] - xs[2]) * (y - ys[2])) / denom;
+                        let l0 =
+                            ((ys[1] - ys[2]) * (x - xs[2]) + (xs[2] - xs[1]) * (y - ys[2])) / denom;
+                        let l1 =
+                            ((ys[2] - ys[0]) * (x - xs[2]) + (xs[0] - xs[2]) * (y - ys[2])) / denom;
                         let l2 = 1.0 - l0 - l1;
                         if l0 < -0.001 || l1 < -0.001 || l2 < -0.001 {
                             continue;

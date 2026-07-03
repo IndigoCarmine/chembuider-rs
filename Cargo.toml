@@ -1,6 +1,6 @@
 [package]
 name = "chembuider-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "An egui widget library for drawing and editing 2D chemical structure diagrams"
 
@@ -9,7 +9,7 @@ name = "chembuider_rs"
 path = "src/lib.rs"
 
 [dependencies]
-egui = "0.34.3"
+egui = "0.35.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
