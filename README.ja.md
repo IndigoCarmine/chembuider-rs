@@ -111,6 +111,12 @@ impl eframe::App for MyApp {
 配置するため、上付き・下付き・太字・斜体がどのズーム倍率でもきれいに描画されます。水素数は
 下付き、電荷は上付きに自動でなります（NH₃⁺, SO₄²⁻）。
 
+ラベルは ChemDraw の描画慣習に従います: ラベル全体の外接矩形ではなく**元素記号そのもの**が
+原子座標にセンタリングされ、結合が右から来る場合は水素が空いている側に反転し（HO–, H₂N–）、
+結合線はラベルを貫通せず境界でトリミングされます。多数の構造での描画確認には
+`cargo run --example render_gallery` が使えます（`tests/fixtures/rendering/` の RDKit 生成
+フィクスチャを、生座標とクリーンアップ後の 2 通りでヘッドレス描画し BMP を出力）。
+
 カスタムラベル（原子上で `` ` `` キーを押して編集）と単体の `RichLabel` ウィジェットは、次の
 軽量マークアップを解釈します。
 
@@ -159,6 +165,8 @@ src/molecule/         データモデル、MOL2、2D クリーンアップ、CDX
 src/config.rs         ショートカット、スタイル、フラグメントライブラリ
 src/bin/clipdump.rs   診断ツール: クリップボードの各フォーマットをダンプ（Windows）
 examples/editor.rs    完全なホストアプリ
+examples/render_gallery.rs  描画フィクスチャのヘッドレス BMP ギャラリー
+scripts/gen_test_structures.py  tests/fixtures/rendering/ の RDKit 生成スクリプト
 assets/               デフォルト設定と組み込みフラグメント JSON
 ```
 

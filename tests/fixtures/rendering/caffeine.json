@@ -1,0 +1,208 @@
+{
+ "atoms": [
+  {
+   "element": "C",
+   "pos": [
+    3.3789,
+    1.3434
+   ],
+   "charge": 0
+  },
+  {
+   "element": "N",
+   "pos": [
+    2.4408,
+    0.1729
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    2.8364,
+    -1.274
+   ],
+   "charge": 0
+  },
+  {
+   "element": "N",
+   "pos": [
+    1.5825,
+    -2.0973
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.412,
+    -1.1592
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.9425,
+    0.2439
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.0074,
+    1.4048
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    0.5231,
+    2.8079
+   ],
+   "charge": 0
+  },
+  {
+   "element": "N",
+   "pos": [
+    -1.4877,
+    1.1627
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.4375,
+    2.3236
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.0182,
+    -0.2404
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -3.4985,
+    -0.4825
+   ],
+   "charge": 0
+  },
+  {
+   "element": "N",
+   "pos": [
+    -1.0683,
+    -1.4013
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -1.5988,
+    -2.8044
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 3,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 3,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 5,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 5,
+   "end": 6,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 7,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 8,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 8,
+   "end": 9,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 8,
+   "end": 10,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 10,
+   "end": 11,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 10,
+   "end": 12,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 12,
+   "end": 13,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 5,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 12,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  }
+ ]
+}

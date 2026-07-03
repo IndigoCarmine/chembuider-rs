@@ -362,6 +362,38 @@ impl RichGalley {
         self.paint(painter, rect.min);
         rect
     }
+
+    /// Bounding rect (relative to this galley's top-left) of a range of characters of the
+    /// *flattened* text — the concatenation of every span's text, in order. Used to anchor
+    /// a chemical label on its element symbol rather than the whole bounding box.
+    ///
+    /// Char-based (not span-based) because [`RichText::span`] merges adjacent same-style
+    /// runs, so "the element symbol" is in general a prefix/slice of a larger part.
+    ///
+    /// The vertical extent is each covered part's own line box (not the whole galley), so
+    /// the anchor stays on the base text even when a superscript grows the galley upward.
+    /// Returns `None` when the range covers no glyphs.
+    pub fn char_range_rect(&self, chars: std::ops::Range<usize>) -> Option<Rect> {
+        let mut rect: Option<Rect> = None;
+        let mut idx = 0usize; // running char index over the flattened text
+        for part in &self.parts {
+            for row in &part.galley.rows {
+                for glyph in &row.row.glyphs {
+                    if chars.contains(&idx) {
+                        let x0 = part.offset.x + row.pos.x + glyph.pos.x;
+                        let x1 = x0 + glyph.advance_width + part.bold_offset.unwrap_or(0.0);
+                        let g = Rect::from_min_max(
+                            Pos2::new(x0, part.offset.y),
+                            Pos2::new(x1, part.offset.y + part.galley.rect.height()),
+                        );
+                        rect = Some(rect.map_or(g, |r| r.union(g)));
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        rect
+    }
 }
 
 /// Baseline of a single-row galley, measured from the galley's top. epaint stores glyph
@@ -629,6 +661,39 @@ mod tests {
         assert_eq!(g.size, Vec2::ZERO);
     }
 
+    #[test]
+    fn char_range_rect_measures_the_flattened_text() {
+        let style = RichTextStyle::new(20.0, Color32::BLACK);
+
+        // "NH" merges into one part; the first char's rect must stop short of the whole.
+        let g = layout(&RichText::plain("NH"), &style);
+        assert_eq!(g.parts.len(), 1);
+        let n = g.char_range_rect(0..1).expect("N rect");
+        let all = g.char_range_rect(0..2).expect("NH rect");
+        assert!(n.width() > 0.0);
+        assert!(n.max.x < all.max.x, "N alone must end before NH ({n:?} vs {all:?})");
+        assert!((all.width() - g.size.x).abs() < 0.5, "full range spans the galley width");
+
+        // "H2N": chars are H(0) 2(1) N(2); the N rect sits right of the subscript.
+        let g = layout(&RichText::new().text("H").subscript("2").text("N"), &style);
+        let two = g.char_range_rect(1..2).expect("2 rect");
+        let n = g.char_range_rect(2..3).expect("N rect");
+        assert!(n.min.x >= two.max.x - 0.5, "N starts after the subscript 2");
+
+        // "O^-": the O anchor's vertical center is the base part's middle, not the
+        // (superscript-extended) whole-galley middle.
+        let g = layout(&RichText::new().text("O").superscript("-"), &style);
+        let o = g.char_range_rect(0..1).expect("O rect");
+        let base = &g.parts[0];
+        let base_mid = base.offset.y + base.galley.rect.height() * 0.5;
+        assert!((o.center().y - base_mid).abs() < 0.01);
+        assert!(g.size.y > base.galley.rect.height() - 0.01);
+
+        // Out-of-range / empty requests.
+        assert!(g.char_range_rect(5..9).is_none());
+        assert!(g.char_range_rect(1..1).is_none());
+    }
+
     /// The widget path: `ui.add(RichLabel)` in a headless egui frame allocates a
     /// non-empty rect and paints one galley per styled span.
     #[test]
@@ -638,11 +703,9 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 240.0))),
             ..Default::default()
         };
-        let output = ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let response = ui.add(RichLabel::new("SO_4^{2-}"));
-                assert!(response.rect.width() > 0.0 && response.rect.height() > 0.0);
-            });
+        let output = ctx.run_ui(raw, |ui| {
+            let response = ui.add(RichLabel::new("SO_4^{2-}"));
+            assert!(response.rect.width() > 0.0 && response.rect.height() > 0.0);
         });
         fn count_text(shape: &egui::Shape) -> usize {
             match shape {

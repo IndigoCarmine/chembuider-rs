@@ -113,6 +113,13 @@ styled run out as its own galley and places it with real baseline arithmetic, so
 superscripts, bold, and italics stay crisp at any zoom. Hydrogen counts become subscripts and
 charges become superscripts automatically (NH₃⁺, SO₄²⁻).
 
+Labels follow ChemDraw drawing conventions: the element symbol itself (not the label's
+bounding box) is centered on the atom position, hydrogens flip to the atom's free side when
+its bonds come from the right (HO–, H₂N–), and bonds are trimmed at the label boundary
+instead of striking through the text. Rendering across many structures can be checked with
+`cargo run --example render_gallery`, which draws the RDKit-generated fixtures in
+`tests/fixtures/rendering/` headlessly (raw and after 2D clean-up) into BMP contact sheets.
+
 Custom labels (press `` ` `` on an atom to edit) and the standalone `RichLabel` widget accept
 a lightweight markup:
 
@@ -159,6 +166,8 @@ src/molecule/         data model, MOL2, 2D clean-up, CDX/image/OLE (Windows)
 src/config.rs         shortcuts, style, fragment library
 src/bin/clipdump.rs   diagnostic tool: dump clipboard formats (Windows)
 examples/editor.rs    full host application
+examples/render_gallery.rs  headless BMP gallery of the rendering fixtures
+scripts/gen_test_structures.py  RDKit generator for tests/fixtures/rendering/
 assets/               default config + built-in fragment JSON
 ```
 

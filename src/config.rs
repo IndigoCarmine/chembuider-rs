@@ -137,7 +137,8 @@ pub struct StyleConfig {
     /// Perpendicular spacing between the lines of a double/triple bond.
     #[serde(default = "def_double_bond_offset")]
     pub double_bond_offset: f32,
-    /// Radius of the white background circle drawn behind atom labels.
+    /// Base radius of the hover/selection/hotspot rings drawn around atoms.
+    /// (Label backgrounds are now tight rectangles; see `label_bg_pad`.)
     #[serde(default = "def_atom_bg_radius")]
     pub atom_bg_radius: f32,
     /// Half-width of the wide end of a stereo wedge (solid/hash).
@@ -155,6 +156,13 @@ pub struct StyleConfig {
     /// Amplitude of a wavy bond.
     #[serde(default = "def_wavy_amplitude")]
     pub wavy_amplitude: f32,
+    /// Gap left between a trimmed bond tip and the label's bounding box.
+    #[serde(default = "def_label_trim_pad")]
+    pub label_trim_pad: f32,
+    /// Padding of the white rectangle painted behind an atom label. Kept below
+    /// `label_trim_pad` so the background never overpaints a trimmed bond tip.
+    #[serde(default = "def_label_bg_pad")]
+    pub label_bg_pad: f32,
 }
 
 fn def_label_size() -> f32 { 13.0 }
@@ -166,6 +174,8 @@ fn def_bold_width() -> f32 { 4.0 }
 fn def_dash_len() -> f32 { 5.0 }
 fn def_dash_gap() -> f32 { 4.0 }
 fn def_wavy_amplitude() -> f32 { 3.0 }
+fn def_label_trim_pad() -> f32 { 2.0 }
+fn def_label_bg_pad() -> f32 { 1.0 }
 
 impl Default for StyleConfig {
     fn default() -> Self {
@@ -179,6 +189,8 @@ impl Default for StyleConfig {
             dash_len: def_dash_len(),
             dash_gap: def_dash_gap(),
             wavy_amplitude: def_wavy_amplitude(),
+            label_trim_pad: def_label_trim_pad(),
+            label_bg_pad: def_label_bg_pad(),
         }
     }
 }

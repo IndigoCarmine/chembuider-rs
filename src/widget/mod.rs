@@ -108,6 +108,11 @@ pub struct ChemStructEditor {
 
     /// While rotating the selection (Alt+drag): the cursor angle from the last frame.
     rotate_last_angle: Option<f32>,
+
+    /// Screen rects of the atom labels painted last frame, for hit testing (wide labels
+    /// like "CO2Et" should be clickable over their whole text, not just a small circle).
+    /// One frame of lag is fine — hover runs before the draw pass.
+    last_label_rects: std::collections::HashMap<u32, egui::Rect>,
 }
 
 impl Default for ChemStructEditor {
@@ -137,6 +142,7 @@ impl Default for ChemStructEditor {
             cleanup_job: None,
             last_v_down: false,
             rotate_last_angle: None,
+            last_label_rects: std::collections::HashMap::new(),
         }
     }
 }
@@ -456,6 +462,12 @@ impl ChemStructEditor {
         ]
     }
 
+    /// Screen rects of the atom labels painted last frame (atom id → rect). Empty until
+    /// the first `ui()` frame. Useful for fitting a view around the drawn structure.
+    pub fn label_rects(&self) -> &std::collections::HashMap<u32, egui::Rect> {
+        &self.last_label_rects
+    }
+
     pub fn hit_test_atom(&self, screen: egui::Pos2, center: egui::Pos2) -> Option<u32> {
         let mut best: Option<(u32, f32)> = None;
         for atom in &self.molecule.atoms {
@@ -463,7 +475,13 @@ impl ChemStructEditor {
             if draw::is_folded_h(&self.molecule, atom.id) { continue; }
             let sp = self.mol_to_screen(atom.pos, center);
             let d = sp.distance(screen);
-            if d <= NODE_HIT_RADIUS_PX {
+            // Hit within the base radius, or anywhere on the label text painted last
+            // frame (wide labels like "CO2Et" stay clickable over their whole extent).
+            let in_label = self
+                .last_label_rects
+                .get(&atom.id)
+                .is_some_and(|r| r.contains(screen));
+            if d <= NODE_HIT_RADIUS_PX || in_label {
                 if best.map_or(true, |(_, bd)| d < bd) {
                     best = Some((atom.id, d));
                 }
@@ -776,9 +794,14 @@ impl ChemStructEditor {
         };
         let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning;
 
-        draw::draw_bonds(self, &painter, center);
-        draw::draw_atom_backgrounds(self, &painter, center);
-        draw::draw_atom_labels(self, &painter, center);
+        // Lay all labels out first: bonds trim at the label rects, backgrounds mask
+        // crossing bonds, and labels paint the cached galleys. Keep the rects for next
+        // frame's hit testing.
+        let label_layouts = draw::compute_label_layouts(self, &painter, center);
+        self.last_label_rects = label_layouts.iter().map(|(id, l)| (*id, l.rect)).collect();
+        draw::draw_bonds(self, &painter, center, &label_layouts);
+        draw::draw_atom_backgrounds(self, &painter, center, &label_layouts);
+        draw::draw_atom_labels(self, &painter, center, &label_layouts);
         draw::draw_overlays(self, &painter, center);
 
         modified

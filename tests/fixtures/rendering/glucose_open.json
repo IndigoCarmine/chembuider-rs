@@ -1,0 +1,168 @@
+{
+ "atoms": [
+  {
+   "element": "O",
+   "pos": [
+    4.5609,
+    -0.1026
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    3.1906,
+    -0.7126
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.9771,
+    0.1691
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    2.134,
+    1.6609
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.6067,
+    -0.4409
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    0.4498,
+    -1.9327
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.6067,
+    0.4409
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -0.4498,
+    1.9327
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -1.9771,
+    -0.1691
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -2.134,
+    -1.6609
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -3.1906,
+    0.7126
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -4.5609,
+    0.1026
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 3,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 5,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 6,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 7,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 8,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 8,
+   "end": 9,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 8,
+   "end": 10,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 10,
+   "end": 11,
+   "order": "Double",
+   "stereo": "None"
+  }
+ ]
+}

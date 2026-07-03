@@ -1,15 +1,62 @@
 use super::ChemStructEditor;
-use super::rich_text::{RichText, RichTextStyle};
+use super::rich_text::{RichGalley, RichText, RichTextStyle};
 use crate::molecule::{BondOrder, BondStereo};
+use std::collections::HashMap;
 
 // Visual sizes (bond width, label size, etc.) are user-configurable via `config.style`
 // (see StyleConfig). These two only affect internal rendering detail and stay fixed.
 const HASH_COUNT: usize = 6;
 const WAVY_STEPS: usize = 16;
 
+// ─── Per-frame label layout pass ─────────────────────────────────────────────
+
+/// A laid-out atom label: the galley plus the screen rect it occupies. The rect is
+/// positioned so the label's *element symbol* (not the bounding box) is centered on the
+/// atom position — wide labels and scripts grow outward from the anchor.
+pub struct AtomLabelLayout {
+    pub galley: RichGalley,
+    pub rect: egui::Rect,
+}
+
+/// Lay out every visible atom label once per frame. The map is shared by the bond pass
+/// (endpoint trimming), the background pass (white mask rects) and the label pass
+/// (painting), so the baseline math runs once. Galley construction itself is cheap:
+/// egui caches galleys by layout-job hash across frames.
+pub fn compute_label_layouts(
+    editor: &ChemStructEditor,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+) -> HashMap<u32, AtomLabelLayout> {
+    let style = RichTextStyle::new(
+        editor.config.style.label_size * editor.zoom,
+        egui::Color32::BLACK,
+    );
+    let mut map = HashMap::new();
+    for atom in &editor.molecule.atoms {
+        if !should_show_label(editor, atom.id) {
+            continue;
+        }
+        let label = atom_label(&editor.molecule, atom);
+        let galley = label.rich.layout_with(&style, |job| painter.layout_job(job));
+        let anchor = galley
+            .char_range_rect(label.anchor_chars)
+            .map(|r| r.center().to_vec2())
+            .unwrap_or_else(|| galley.size() * 0.5); // no glyphs: fall back to bbox center
+        let sp = editor.mol_to_screen(atom.pos, center);
+        let rect = egui::Rect::from_min_size(sp - anchor, galley.size());
+        map.insert(atom.id, AtomLabelLayout { galley, rect });
+    }
+    map
+}
+
 // ─── Layer 0: bonds ──────────────────────────────────────────────────────────
 
-pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
+pub fn draw_bonds(
+    editor: &ChemStructEditor,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
+) {
     let s = &editor.config.style;
     // Visual sizes scale with zoom so they track the panzoom transform (z == 1.0 = baseline).
     let z = editor.zoom;
@@ -22,6 +69,16 @@ pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: eg
         let Some(b) = editor.molecule.atom_by_id(bond.end) else { continue };
         let p1 = editor.mol_to_screen(a.pos, center);
         let p2 = editor.mol_to_screen(b.pos, center);
+
+        // Trim each endpoint at its label's (padded) rect so bonds stop short of the
+        // text instead of striking through it. A bond fully swallowed by its labels
+        // (very short bond) is skipped — the labels still show the connectivity.
+        let trim_rect = |id: u32| labels.get(&id).map(|l| l.rect.expand(s.label_trim_pad * z));
+        let Some((tp1, tp2)) =
+            trimmed_bond_endpoints(p1, p2, trim_rect(bond.begin), trim_rect(bond.end))
+        else {
+            continue;
+        };
 
         let color = if editor.hovered_bond == Some(bond.id) {
             egui::Color32::from_rgb(50, 180, 50)
@@ -36,6 +93,8 @@ pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: eg
                 // which side of the bond axis the neighboring bonds sit (ChemDraw convention):
                 // neighbors on only one side ⇒ main line on the axis + a short inset line toward
                 // that side; neighbors on both sides or none ⇒ symmetric pair (legacy behavior).
+                // The side decision is pure geometry classification and uses the UNTRIMMED
+                // atom positions; only the drawn lines use the trimmed endpoints.
                 let placement = if matches!(bond.order, BondOrder::Double) {
                     let (nx, ny) = perp_normal(p1, p2);
                     // Collect screen positions of the OTHER neighbors of each endpoint.
@@ -56,15 +115,70 @@ pub fn draw_bonds(editor: &ChemStructEditor, painter: &egui::Painter, center: eg
                 } else {
                     DoubleBondPlacement::Symmetric
                 };
-                draw_bond_order(painter, p1, p2, &bond.order, stroke, s.double_bond_offset, placement)
+                draw_bond_order(painter, tp1, tp2, &bond.order, stroke, s.double_bond_offset, placement)
             }
-            BondStereo::WedgeUp => draw_wedge_solid(painter, p1, p2, color, s.wedge_width),
-            BondStereo::WedgeDown => draw_wedge_hash(painter, p1, p2, color, s.wedge_width, s.bond_width),
-            BondStereo::Bold => draw_bold(painter, p1, p2, color, s.bold_width),
-            BondStereo::Dashed => draw_dashed(painter, p1, p2, stroke, s.dash_len, s.dash_gap),
-            BondStereo::Wavy => draw_wavy(painter, p1, p2, stroke, s.wavy_amplitude),
+            BondStereo::WedgeUp => draw_wedge_solid(painter, tp1, tp2, color, s.wedge_width),
+            BondStereo::WedgeDown => {
+                // Hash half-widths keep the taper rate of the untrimmed wedge: each hash's
+                // width is its fraction along the ORIGINAL p1→p2 segment.
+                draw_wedge_hash(painter, (tp1, tp2), (p1, p2), color, s.wedge_width, s.bond_width)
+            }
+            BondStereo::Bold => draw_bold(painter, tp1, tp2, color, s.bold_width),
+            BondStereo::Dashed => draw_dashed(painter, tp1, tp2, stroke, s.dash_len, s.dash_gap),
+            BondStereo::Wavy => draw_wavy(painter, tp1, tp2, stroke, s.wavy_amplitude),
         }
     }
+}
+
+/// Parametric `t` in `(0, 1]` where the segment `p → q` exits `rect` (slab method), for a
+/// `p` lying inside the rect. `None` when `q` is also inside (the segment never leaves).
+fn segment_rect_exit(p: egui::Pos2, q: egui::Pos2, rect: egui::Rect) -> Option<f32> {
+    let d = q - p;
+    let tx = if d.x > 0.0 {
+        (rect.max.x - p.x) / d.x
+    } else if d.x < 0.0 {
+        (rect.min.x - p.x) / d.x
+    } else {
+        f32::INFINITY
+    };
+    let ty = if d.y > 0.0 {
+        (rect.max.y - p.y) / d.y
+    } else if d.y < 0.0 {
+        (rect.min.y - p.y) / d.y
+    } else {
+        f32::INFINITY
+    };
+    let t = tx.min(ty);
+    (t.is_finite() && t <= 1.0).then_some(t.max(0.0))
+}
+
+/// Trim a bond's endpoints at the (already padded) label rects of its endpoint atoms.
+/// `None` rect = unlabeled endpoint (bare carbon), no trim at that end. Returns `None`
+/// when the labels swallow the whole bond (degenerate short bond → skip drawing).
+fn trimmed_bond_endpoints(
+    p1: egui::Pos2,
+    p2: egui::Pos2,
+    r1: Option<egui::Rect>,
+    r2: Option<egui::Rect>,
+) -> Option<(egui::Pos2, egui::Pos2)> {
+    // A labeled endpoint whose rect the segment never exits swallows the whole bond.
+    let t1 = match r1.map(|r| segment_rect_exit(p1, p2, r)) {
+        None => 0.0,
+        Some(Some(t)) => t,
+        Some(None) => return None,
+    };
+    let t2 = match r2.map(|r| segment_rect_exit(p2, p1, r)) {
+        None => 1.0,
+        Some(Some(t)) => 1.0 - t,
+        Some(None) => return None,
+    };
+    let len = (p2 - p1).length();
+    // Require ~1px of remaining bond, else consider it swallowed.
+    if len < 1e-3 || (t2 - t1) * len < 1.0 {
+        return None;
+    }
+    let at = |t: f32| p1 + (p2 - p1) * t;
+    Some((at(t1), at(t2)))
 }
 
 /// Where to place the two lines of a `BondOrder::Double` (with `BondStereo::None`).
@@ -147,14 +261,27 @@ fn draw_wedge_solid(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, col
     ));
 }
 
-/// Hash wedge: series of short lines widening from p1 to p2.
-fn draw_wedge_hash(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32, wedge_width: f32, line_width: f32) {
+/// Hash wedge: series of short lines widening from p1 to p2. The hashes are drawn over
+/// the (possibly trimmed) `trimmed` segment, but each hash's half-width comes from its
+/// fraction along the ORIGINAL `full` segment so the taper rate matches the untrimmed wedge.
+fn draw_wedge_hash(
+    painter: &egui::Painter,
+    trimmed: (egui::Pos2, egui::Pos2),
+    full: (egui::Pos2, egui::Pos2),
+    color: egui::Color32,
+    wedge_width: f32,
+    line_width: f32,
+) {
+    let (p1, p2) = trimmed;
+    let (full1, full2) = full;
     let (nx, ny) = perp_normal(p1, p2);
+    let full_len = (full2 - full1).length().max(1e-3);
     for i in 1..=HASH_COUNT {
         let t = i as f32 / HASH_COUNT as f32;
         let px = p1.x + (p2.x - p1.x) * t;
         let py = p1.y + (p2.y - p1.y) * t;
-        let half = wedge_width * t;
+        let full_t = ((egui::Pos2::new(px, py) - full1).length() / full_len).min(1.0);
+        let half = wedge_width * full_t;
         painter.line_segment([
             egui::Pos2::new(px + nx * half, py + ny * half),
             egui::Pos2::new(px - nx * half, py - ny * half),
@@ -254,30 +381,33 @@ fn double_bond_placement(
     }
 }
 
-// ─── Layer 1: atom background circles ────────────────────────────────────────
+// ─── Layer 1: atom label backgrounds ─────────────────────────────────────────
 
+/// White rectangles behind labels: incident bonds are already trimmed at the label rect,
+/// so this only masks NON-incident bonds that happen to cross behind the text.
 pub fn draw_atom_backgrounds(
     editor: &ChemStructEditor,
     painter: &egui::Painter,
-    center: egui::Pos2,
+    _center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
 ) {
-    let bg_radius = editor.config.style.atom_bg_radius;
-    for atom in &editor.molecule.atoms {
-        if should_show_label(editor, atom.id) {
-            let sp = editor.mol_to_screen(atom.pos, center);
-            // Radius scales with zoom so it tracks the panzoom transform.
-            painter.circle_filled(sp, bg_radius * editor.zoom, egui::Color32::WHITE);
-        }
+    let pad = editor.config.style.label_bg_pad * editor.zoom;
+    for layout in labels.values() {
+        painter.rect_filled(layout.rect.expand(pad), 0.0, egui::Color32::WHITE);
     }
 }
 
 // ─── Layer 2: atom labels + selection/hover/hotspot rings ────────────────────
 
-pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
+pub fn draw_atom_labels(
+    editor: &ChemStructEditor,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
+) {
     // Visual sizes scale with zoom so they track the panzoom transform (z == 1.0 = baseline).
     let z = editor.zoom;
     let bg = editor.config.style.atom_bg_radius * z;
-    let label_size = editor.config.style.label_size;
     for atom in &editor.molecule.atoms {
         let sp = editor.mol_to_screen(atom.pos, center);
         let is_hovered  = editor.hovered_atom  == Some(atom.id);
@@ -313,31 +443,102 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
             draw_dashed_circle(painter, sp, bg + 7.0 * z, egui::Color32::from_rgb(220, 30, 30), 1.5 * z);
         }
 
-        if should_show_label(editor, atom.id) {
-            let rich = atom_label_rich(&editor.molecule, atom);
-            let style = RichTextStyle::new(label_size * z, egui::Color32::BLACK);
-            // Center the laid-out label on the atom.
-            rich.paint(painter, sp, egui::Align2::CENTER_CENTER, &style);
+        if let Some(layout) = labels.get(&atom.id) {
+            // Pre-laid-out with the element symbol anchored on the atom position.
+            layout.galley.paint(painter, layout.rect.min);
         }
     }
 }
 
-/// Build the styled atom label: hydrogen count as a true subscript (CH₃, NH₂) and the
-/// charge as a true superscript (N⁺, SO₄²⁻). The element text itself goes through the
-/// rich-text markup parser, so custom labels typed into the editor can use `_`/`^`
-/// scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
-fn atom_label_rich(
+/// Which side of the element symbol the displayed hydrogens go on.
+/// `Right` is the normal reading order ("OH", "NH2"); `Left` mirrors it ("HO", "H2N")
+/// so the hydrogens point into free space when the bonds come from the right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HSide {
+    Right,
+    Left,
+}
+
+/// Averages the unit directions from the atom toward its (non-folded) neighbors: when
+/// they point right (x-sum above a small deadzone) the free side is the left, so the
+/// hydrogens flip there. Near-vertical sums inside the deadzone and unbonded atoms keep
+/// the default `Right`. (Vertical H placement — H above/below for straight-up bonds, as
+/// ChemDraw does in crowded rings — is a possible future refinement.)
+fn h_side(mol: &crate::molecule::Molecule, atom_id: u32) -> HSide {
+    const H_FLIP_DEADZONE: f32 = 0.1;
+    let Some(atom) = mol.atom_by_id(atom_id) else { return HSide::Right };
+    let mut sum_x = 0.0_f32;
+    for nid in mol.neighbor_atom_ids(atom_id) {
+        if is_folded_h(mol, nid) {
+            continue;
+        }
+        let Some(n) = mol.atom_by_id(nid) else { continue };
+        let dx = n.pos[0] - atom.pos[0];
+        let dy = n.pos[1] - atom.pos[1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 1e-6 {
+            sum_x += dx / len;
+        }
+    }
+    if sum_x > H_FLIP_DEADZONE { HSide::Left } else { HSide::Right }
+}
+
+/// A styled atom label plus the char range (over the flattened text) of the element
+/// symbol — the part that gets centered on the atom position.
+pub struct AtomLabel {
+    pub rich: RichText,
+    pub anchor_chars: std::ops::Range<usize>,
+}
+
+/// Length in chars of the leading element token of a parsed label's flat text: the first
+/// `[A-Z][a-z]*` run ("CO2Et" → "C", "Cl" → "Cl", "OTf" → "O"), falling back to a single
+/// char for labels that start otherwise (e.g. italic "tBu").
+fn element_token_len(flat: &str) -> usize {
+    let mut chars = flat.chars();
+    let Some(first) = chars.next() else { return 0 };
+    if !first.is_ascii_uppercase() {
+        return 1;
+    }
+    1 + chars.take_while(|c| c.is_ascii_lowercase()).count()
+}
+
+/// Build the styled atom label: hydrogen count as a true subscript (CH₃, NH₂), the charge
+/// as a trailing superscript (N⁺, SO₄²⁻), and the hydrogens flipped to the atom's free
+/// side ("HO", "H₂N" when the bonds come from the right). The element text itself goes
+/// through the rich-text markup parser, so custom labels typed into the editor can use
+/// `_`/`^` scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
+fn atom_label(
     mol: &crate::molecule::Molecule,
     atom: &crate::molecule::Atom,
-) -> RichText {
-    let mut rich = RichText::parse(&atom.element);
+) -> AtomLabel {
+    let element = RichText::parse(&atom.element);
+    let element_flat: String = element.spans.iter().map(|s| s.text.as_str()).collect();
     let h = displayed_h_count(mol, atom.id);
-    if h >= 1 {
+    let side = if h >= 1 { h_side(mol, atom.id) } else { HSide::Right };
+
+    let mut rich = RichText::new();
+    let mut anchor_start = 0usize;
+    if side == HSide::Left {
+        // Hydrogens first: "H", then the count subscript ("H₂N").
+        rich = rich.text("H");
+        anchor_start = 1;
+        if h > 1 {
+            let count = h.to_string();
+            anchor_start += count.chars().count();
+            rich = rich.subscript(count);
+        }
+    }
+    for span in element.spans {
+        rich = rich.span(span.text, span.style);
+    }
+    if side == HSide::Right && h >= 1 {
         rich = rich.text("H");
         if h > 1 {
             rich = rich.subscript(h.to_string());
         }
     }
+    // The charge stays a trailing superscript in both orders (top-right, ChemDraw-style;
+    // the strict-ChemDraw leading variant "⁺H₃N" is a possible future refinement).
     match atom.charge {
         0 => {}
         1 => rich = rich.superscript("+"),
@@ -345,7 +546,11 @@ fn atom_label_rich(
         c if c > 0 => rich = rich.superscript(format!("{c}+")),
         c => rich = rich.superscript(format!("{}-", -c)),
     }
-    rich
+
+    // Anchor on the element token; degenerate labels fall back to the first char.
+    let token_len = element_token_len(&element_flat);
+    let (start, len) = if token_len == 0 { (0, 1) } else { (anchor_start, token_len) };
+    AtomLabel { rich, anchor_chars: start..start + len }
 }
 
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────
@@ -406,9 +611,13 @@ fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
 /// allows (e.g. a carbon with more than 4 bond-orders, an oxygen with more than 2). Such
 /// atoms are marked with a red dashed warning ring. Under-bonded atoms are valid — the
 /// missing valence is shown as implicit H — and elements with no standard valence aren't checked.
+///
+/// The warning threshold is the element's *highest* common valence (`max_valence`), so
+/// hypervalent-but-ordinary S and P (sulfones, sulfates, phosphates) are not flagged,
+/// while implicit-H counting keeps using the lowest (`normal_valence`).
 pub fn is_valence_invalid(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
     let Some(atom) = mol.atom_by_id(atom_id) else { return false };
-    let Some(valence) = normal_valence(&atom.element) else { return false };
+    let Some(valence) = max_valence(&atom.element) else { return false };
     let bond_sum: i16 = mol.bonds_for_atom(atom_id).iter()
         .map(|b| match b.order {
             crate::molecule::BondOrder::Single => 1,
@@ -436,7 +645,8 @@ fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, 
     }
 }
 
-/// Standard organic valence for implicit H calculation.
+/// Standard organic valence for implicit H calculation (the element's lowest
+/// common valence: S counts hydrogens like H₂S, not like a sulfone).
 fn normal_valence(element: &str) -> Option<u8> {
     match element {
         "C"  => Some(4),
@@ -449,6 +659,16 @@ fn normal_valence(element: &str) -> Option<u8> {
         "Si" => Some(4),
         "H"  => Some(1),
         _    => None,
+    }
+}
+
+/// Highest common valence, used by the over-valence warning so hypervalent-but-normal
+/// S(VI) and P(V) centers (sulfones, sulfonamides, sulfates, phosphates) are not flagged.
+fn max_valence(element: &str) -> Option<u8> {
+    match element {
+        "S" => Some(6),
+        "P" => Some(5),
+        other => normal_valence(other),
     }
 }
 
@@ -479,18 +699,21 @@ fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
     (effective - bond_sum_heavy).max(0) as u8
 }
 
-/// Plain-text label (scripts flattened) — the rendering path uses `atom_label_rich`; this
-/// is the readable oracle used by tests. Kept in sync by `label_oracle_matches_rich_label`.
+/// Plain-text label (scripts flattened) — the rendering path uses `atom_label`; this is
+/// the readable oracle used by tests. Kept in sync by `label_oracle_matches_rich_label`.
 #[cfg(test)]
 fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom) -> String {
-    let mut s = atom.element.clone();
     let h = displayed_h_count(mol, atom.id);
-    if h == 1 {
-        s.push('H');
-    } else if h > 1 {
-        s.push('H');
-        s.push_str(&h.to_string());
-    }
+    let side = if h >= 1 { h_side(mol, atom.id) } else { HSide::Right };
+    let h_part = match h {
+        0 => String::new(),
+        1 => "H".to_string(),
+        n => format!("H{n}"),
+    };
+    let mut s = match side {
+        HSide::Right => format!("{}{}", atom.element, h_part),
+        HSide::Left => format!("{}{}", h_part, atom.element),
+    };
     match atom.charge {
         0          => {}
         1          => s.push('+'),
@@ -562,6 +785,29 @@ mod tests {
         let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
         m.add_bond(a, o, BondOrder::Triple);
         assert!(is_valence_invalid(&m, o), "O with a triple bond is over-valence");
+
+        // Hypervalent-but-ordinary sulfur: a sulfonamide S (two S=O, S-N, S-C = 6) is
+        // valid; seven bond-orders tips it over.
+        let mut m = Molecule::default();
+        let s = m.add_atom("S".to_string(), [0.0, 0.0], 0);
+        let o1 = m.add_atom("O".to_string(), [0.0, 1.0], 0);
+        let o2 = m.add_atom("O".to_string(), [0.0, -1.0], 0);
+        let n = m.add_atom("N".to_string(), [1.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [-1.0, 0.0], 0);
+        m.add_bond(s, o1, BondOrder::Double);
+        m.add_bond(s, o2, BondOrder::Double);
+        m.add_bond(s, n, BondOrder::Single);
+        m.add_bond(s, c, BondOrder::Single);
+        assert!(!is_valence_invalid(&m, s), "sulfonamide S(VI) must not be flagged");
+        let x = m.add_atom("C".to_string(), [1.0, 1.0], 0);
+        m.add_bond(s, x, BondOrder::Single);
+        assert!(is_valence_invalid(&m, s), "seven bond-orders on S is over-valence");
+        // But H-filling still uses the low valence: S with one bond shows SH, not SH5.
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let s = m.add_atom("S".to_string(), [1.0, 0.0], 0);
+        m.add_bond(c, s, BondOrder::Single);
+        assert_eq!(label(&m, s), "SH");
     }
 
     /// The rich label carries the same characters as the plain-text oracle, with the H
@@ -571,19 +817,19 @@ mod tests {
         use crate::widget::rich_text::Script;
         let mut m = Molecule::default();
         let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
-        let n = m.add_atom("N".to_string(), [1.5, 0.0], 1); // NH3+ once bonded
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 1); // NH3+ once bonded (bond from the left)
         let o = m.add_atom("O".to_string(), [3.0, 0.0], -2); // O 2- (over-reduced, but exercises multi-charge)
         m.add_bond(c, n, BondOrder::Single);
 
         for id in [n, o] {
             let atom = m.atom_by_id(id).unwrap();
-            let rich = atom_label_rich(&m, atom);
+            let rich = atom_label(&m, atom).rich;
             let flat: String = rich.spans.iter().map(|s| s.text.as_str()).collect();
             assert_eq!(flat, atom_label_text(&m, atom));
         }
 
-        // NH3+: the 3 is a subscript, the + a superscript.
-        let rich = atom_label_rich(&m, m.atom_by_id(n).unwrap());
+        // NH3+ (bond from the left keeps reading order): 3 subscript, + superscript.
+        let rich = atom_label(&m, m.atom_by_id(n).unwrap()).rich;
         let scripts: Vec<(String, Script)> = rich.spans.iter()
             .map(|s| (s.text.clone(), s.style.script)).collect();
         assert_eq!(scripts, vec![
@@ -593,9 +839,131 @@ mod tests {
         ]);
 
         // O with charge -2 renders the chemistry-style "2-" superscript.
-        let rich = atom_label_rich(&m, m.atom_by_id(o).unwrap());
+        let rich = atom_label(&m, m.atom_by_id(o).unwrap()).rich;
         assert_eq!(rich.spans.last().map(|s| (s.text.as_str(), s.style.script)),
                    Some(("2-", Script::Super)));
+    }
+
+    /// Hydrogens flip to the free side: a terminal O whose bond comes from the RIGHT
+    /// renders "HO"; from the LEFT renders "OH". Anchor chars always cover the element.
+    #[test]
+    fn h_side_flips_terminal_labels() {
+        use crate::widget::rich_text::Script;
+
+        // C at the right of O → bond direction +x from O's perspective → flip: "HO".
+        let mut m = Molecule::default();
+        let o = m.add_atom("O".to_string(), [0.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+        m.add_bond(o, c, BondOrder::Single);
+        assert_eq!(h_side(&m, o), HSide::Left);
+        let label = atom_label(&m, m.atom_by_id(o).unwrap());
+        let flat: String = label.rich.spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(flat, "HO");
+        assert_eq!(flat, atom_label_text(&m, m.atom_by_id(o).unwrap()));
+        assert_eq!(label.anchor_chars, 1..2, "anchor must be the O, after the H");
+
+        // C at the left of O → default order "OH", anchored on the leading O.
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let o = m.add_atom("O".to_string(), [1.5, 0.0], 0);
+        m.add_bond(c, o, BondOrder::Single);
+        assert_eq!(h_side(&m, o), HSide::Right);
+        let label = atom_label(&m, m.atom_by_id(o).unwrap());
+        let flat: String = label.rich.spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(flat, "OH");
+        assert_eq!(label.anchor_chars, 0..1);
+
+        // Flipped charged amine: H first, count subscript right after the H, charge last.
+        let mut m = Molecule::default();
+        let n = m.add_atom("N".to_string(), [0.0, 0.0], 1);
+        let c = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+        m.add_bond(n, c, BondOrder::Single);
+        let label = atom_label(&m, m.atom_by_id(n).unwrap());
+        let scripts: Vec<(String, Script)> = label.rich.spans.iter()
+            .map(|s| (s.text.clone(), s.style.script)).collect();
+        assert_eq!(scripts, vec![
+            ("H".to_string(), Script::Normal),
+            ("3".to_string(), Script::Sub),
+            ("N".to_string(), Script::Normal),
+            ("+".to_string(), Script::Super),
+        ]);
+        assert_eq!(label.anchor_chars, 2..3, "anchor is the N after H and the count");
+
+        // Near-vertical bond stays in the deadzone → no flip.
+        let mut m = Molecule::default();
+        let o = m.add_atom("O".to_string(), [0.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [0.0, 1.5], 0);
+        m.add_bond(o, c, BondOrder::Single);
+        assert_eq!(h_side(&m, o), HSide::Right);
+
+        // Two neighbors straddling the atom cancel out → no flip.
+        let mut m = Molecule::default();
+        let o = m.add_atom("O".to_string(), [0.0, 0.0], 0);
+        let a = m.add_atom("C".to_string(), [-1.5, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+        m.add_bond(a, o, BondOrder::Single);
+        m.add_bond(o, b, BondOrder::Single);
+        assert_eq!(h_side(&m, o), HSide::Right);
+
+        // Custom label with an element token: anchor covers the whole leading token.
+        let mut m = Molecule::default();
+        let x = m.add_atom("Cl".to_string(), [0.0, 0.0], 0);
+        let label = atom_label(&m, m.atom_by_id(x).unwrap());
+        assert_eq!(label.anchor_chars, 0..2);
+        let x2 = m.add_atom("CO2Et".to_string(), [1.0, 0.0], 0);
+        let label = atom_label(&m, m.atom_by_id(x2).unwrap());
+        assert_eq!(label.anchor_chars, 0..1, "CO2Et anchors on the C only");
+    }
+
+    #[test]
+    fn segment_rect_exit_finds_the_leaving_point() {
+        let rect = egui::Rect::from_min_max(egui::pos2(-10.0, -5.0), egui::pos2(10.0, 5.0));
+        let c = egui::pos2(0.0, 0.0);
+
+        // Exit right: t where x reaches 10 on the way to (40, 0).
+        let t = segment_rect_exit(c, egui::pos2(40.0, 0.0), rect).unwrap();
+        assert!((t - 0.25).abs() < 1e-5);
+        // Exit top (y-min side).
+        let t = segment_rect_exit(c, egui::pos2(0.0, -20.0), rect).unwrap();
+        assert!((t - 0.25).abs() < 1e-5);
+        // Diagonal: the y slab (5/20) is hit before the x slab (10/20).
+        let t = segment_rect_exit(c, egui::pos2(20.0, 20.0), rect).unwrap();
+        assert!((t - 0.25).abs() < 1e-5);
+        // Axis-parallel with zero x movement.
+        let t = segment_rect_exit(c, egui::pos2(0.0, 50.0), rect).unwrap();
+        assert!((t - 0.1).abs() < 1e-5);
+        // Never exits: destination inside the rect.
+        assert!(segment_rect_exit(c, egui::pos2(5.0, 0.0), rect).is_none());
+    }
+
+    #[test]
+    fn trimmed_bond_endpoints_clip_at_labels() {
+        let p1 = egui::pos2(0.0, 0.0);
+        let p2 = egui::pos2(100.0, 0.0);
+        let r1 = egui::Rect::from_center_size(p1, egui::vec2(20.0, 10.0));
+        let r2 = egui::Rect::from_center_size(p2, egui::vec2(40.0, 10.0));
+
+        // Both ends labeled: clipped at each rect's edge.
+        let (a, b) = trimmed_bond_endpoints(p1, p2, Some(r1), Some(r2)).unwrap();
+        assert!((a.x - 10.0).abs() < 1e-4 && a.y == 0.0);
+        assert!((b.x - 80.0).abs() < 1e-4 && b.y == 0.0);
+
+        // Only one end labeled: the other end stays put.
+        let (a, b) = trimmed_bond_endpoints(p1, p2, Some(r1), None).unwrap();
+        assert!((a.x - 10.0).abs() < 1e-4);
+        assert_eq!(b, p2);
+
+        // Unlabeled: identity.
+        assert_eq!(trimmed_bond_endpoints(p1, p2, None, None), Some((p1, p2)));
+
+        // Overlapping label rects swallow the bond entirely.
+        let big1 = egui::Rect::from_center_size(p1, egui::vec2(130.0, 10.0));
+        let big2 = egui::Rect::from_center_size(p2, egui::vec2(130.0, 10.0));
+        assert_eq!(trimmed_bond_endpoints(p1, p2, Some(big1), Some(big2)), None);
+
+        // Whole bond inside one label rect → swallowed too.
+        let huge = egui::Rect::from_center_size(p1, egui::vec2(300.0, 30.0));
+        assert_eq!(trimmed_bond_endpoints(p1, p2, Some(huge), None), None);
     }
 
     /// End-to-end: run one headless editor frame (real egui context, real fonts) and check
@@ -613,10 +981,8 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
             ..Default::default()
         };
-        let output = ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                editor.ui(ui);
-            });
+        let output = ctx.run_ui(raw, |ui| {
+            editor.ui(ui);
         });
 
         // Collect the text of every painted galley (recursing into shape groups).
@@ -641,6 +1007,106 @@ mod tests {
                 "expected a '{expect}' galley among painted text {texts:?}"
             );
         }
+    }
+
+    /// Anchoring: the element glyph (not the bounding box) is centered on the atom, so a
+    /// flipped "HO" extends left of the atom and the O sits exactly on it. Runs the real
+    /// layout path (fonts + galleys) inside a headless frame.
+    #[test]
+    fn labels_anchor_the_element_glyph_on_the_atom() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let o = editor.molecule.add_atom("O".to_string(), [0.0, 0.0], 0);
+        let c = editor.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        editor.molecule.add_bond(o, c, BondOrder::Single); // bond from the right → "HO"
+
+        let center = egui::pos2(200.0, 150.0);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let layouts = compute_label_layouts(&editor, ui.painter(), center);
+            let layout = &layouts[&o];
+            let sp = editor.mol_to_screen([0.0, 0.0], center);
+            assert!(layout.rect.contains(sp), "atom must sit inside its label rect");
+
+            // The anchor char (the O of "HO") is centered on the atom position.
+            let label = atom_label(&editor.molecule, editor.molecule.atom_by_id(o).unwrap());
+            let flat: String = label.rich.spans.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(flat, "HO");
+            let a = layout.galley.char_range_rect(label.anchor_chars).unwrap();
+            let anchor_screen = layout.rect.min + a.center().to_vec2();
+            assert!((anchor_screen.x - sp.x).abs() < 0.75, "{anchor_screen:?} vs {sp:?}");
+            assert!((anchor_screen.y - sp.y).abs() < 0.75, "{anchor_screen:?} vs {sp:?}");
+
+            // "HO" extends to the left of the anchored O.
+            assert!(layout.rect.center().x < sp.x);
+        });
+    }
+
+    /// Bond lines stop at the label boundary instead of striking through the text.
+    #[test]
+    fn editor_frame_trims_bonds_at_labels() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let c = editor.molecule.add_atom("C".to_string(), [-1.5, 0.0], 0);
+        let o = editor.molecule.add_atom("O".to_string(), [0.0, 0.0], 0);
+        editor.molecule.add_bond(c, o, BondOrder::Single);
+
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(raw, |ui| {
+            editor.ui(ui);
+        });
+
+        let label_rect = *editor.last_label_rects.get(&o).expect("O label rect recorded");
+        fn collect_lines(shape: &egui::Shape, out: &mut Vec<[egui::Pos2; 2]>) {
+            match shape {
+                egui::Shape::LineSegment { points, .. } => out.push(*points),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        collect_lines(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut lines = Vec::new();
+        for clipped in &output.shapes {
+            collect_lines(&clipped.shape, &mut lines);
+        }
+        // Exactly one bond line, and neither endpoint reaches into the label rect.
+        assert!(!lines.is_empty(), "the C-O bond must be painted");
+        for [a, b] in &lines {
+            assert!(
+                !label_rect.contains(*a) && !label_rect.contains(*b),
+                "bond endpoint inside label rect: {a:?}/{b:?} in {label_rect:?}"
+            );
+        }
+    }
+
+    /// Wide labels are clickable over their whole text via last-frame label rects.
+    #[test]
+    fn hit_test_covers_the_label_rect() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let a = editor.molecule.add_atom("CO2Et".to_string(), [0.0, 0.0], 0);
+
+        let center = egui::pos2(200.0, 150.0);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let layouts = compute_label_layouts(&editor, ui.painter(), center);
+            editor.last_label_rects =
+                layouts.iter().map(|(id, l)| (*id, l.rect)).collect();
+        });
+
+        let rect = editor.last_label_rects[&a];
+        assert!(rect.width() > 30.0, "CO2Et should lay out wide, got {rect:?}");
+        let sp = editor.mol_to_screen([0.0, 0.0], center);
+        let far_point = egui::pos2(rect.max.x - 2.0, rect.center().y);
+        assert!(sp.distance(far_point) > super::super::NODE_HIT_RADIUS_PX,
+            "test point must be outside the base hit circle");
+        assert_eq!(editor.hit_test_atom(far_point, center), Some(a));
+        // Outside both circle and rect: no hit.
+        assert_eq!(editor.hit_test_atom(egui::pos2(rect.max.x + 30.0, rect.max.y + 30.0), center), None);
     }
 
     /// Side-decision for double-bond line placement. The helper is space-agnostic, so the test
