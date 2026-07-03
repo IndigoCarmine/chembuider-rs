@@ -231,6 +231,25 @@ def main() -> None:
     (out_dir / "short_bond.json").write_text(json.dumps(short, indent=1) + "\n")
     print("short_bond: hand-made degenerate fixture")
 
+    # Hand-made bent alkyne: 2-butyne drawn with a ~90 deg kink at each sp carbon.
+    # Cleanup should straighten both triple-bond carbons back to ~180 deg (before the
+    # sp-linear fix, the degree-2 angle term pulled them toward 120 deg instead).
+    bent = {
+        "atoms": [
+            {"element": "C", "pos": [0.0, 0.0], "charge": 0},
+            {"element": "C", "pos": [1.5, 0.0], "charge": 0},
+            {"element": "C", "pos": [1.5, 1.5], "charge": 0},
+            {"element": "C", "pos": [3.0, 1.5], "charge": 0},
+        ],
+        "bonds": [
+            {"begin": 0, "end": 1, "order": "Single", "stereo": "None"},
+            {"begin": 1, "end": 2, "order": "Triple", "stereo": "None"},
+            {"begin": 2, "end": 3, "order": "Single", "stereo": "None"},
+        ],
+    }
+    (out_dir / "bent_alkyne.json").write_text(json.dumps(bent, indent=1) + "\n")
+    print("bent_alkyne: hand-made bent triple-bond fixture")
+
 
 if __name__ == "__main__":
     main()

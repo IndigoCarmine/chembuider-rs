@@ -235,6 +235,9 @@ pub struct CleanupState {
     bonds: Vec<(u32, u32)>,         // cached from mol (immutable during relaxation)
     adj: HashMap<u32, Vec<u32>>,    // cached adjacency list
     bonded: HashSet<(u32, u32)>,    // both orderings, for O(1) repulsion filter
+    // sp-hybridized centers that want linear (180°) geometry: a degree-2 atom with a
+    // triple bond, or the central atom of two cumulated double bonds (allene).
+    linear_atoms: HashSet<u32>,
     // Fundamental cycles (for deferred ring-crossing fix in phase 2).
     cycles: Vec<Vec<u32>>,
     // FIRE adaptive state
@@ -273,16 +276,19 @@ impl CleanupState {
             bonded.insert((b, a));
         }
 
+        let linear_atoms = linear_centers(mol);
+
         let cycles = find_simple_cycles(&adj, &atom_ids);
         let has_rings = !cycles.is_empty();
 
         // Pre-compute initial forces so the first VV half-kick uses real forces, not zeros.
-        compute_forces(&pos, &bonds, &adj, &atom_ids, &bonded, &PARAMS, &mut forces);
+        compute_forces(&pos, &bonds, &adj, &atom_ids, &bonded, &linear_atoms, &PARAMS, &mut forces);
 
         let ref_pos: Vec<[f32; 2]> = atom_ids.iter().map(|id| pos[id]).collect();
 
         CleanupState {
             pos, vel, atom_ids, forces, bonds, adj, bonded,
+            linear_atoms,
             cycles,
             dt: PARAMS.dt_init,
             alpha: ALPHA_START,
@@ -312,7 +318,7 @@ impl CleanupState {
         self.steps_since_ref = 0;
         compute_forces(
             &self.pos, &self.bonds, &self.adj, &self.atom_ids,
-            &self.bonded, &PARAMS, &mut self.forces,
+            &self.bonded, &self.linear_atoms, &PARAMS, &mut self.forces,
         );
     }
 
@@ -361,7 +367,7 @@ impl CleanupState {
             // 3. Compute forces at the new positions (overwrites self.forces).
             compute_forces(
                 &self.pos, &self.bonds, &self.adj, &self.atom_ids,
-                &self.bonded, p, &mut self.forces,
+                &self.bonded, &self.linear_atoms, p, &mut self.forces,
             );
 
             // 4. Second half-kick — velocity is now the full VV velocity at the new position.
@@ -639,12 +645,43 @@ fn run_phase(
 
 // ─── Force field ──────────────────────────────────────────────────────────────
 
+/// Atoms whose 2D geometry should be linear (180°): sp-hybridized centers. A degree-2
+/// atom is linear when it carries a triple bond (alkyne / nitrile carbon) or two
+/// cumulated double bonds (allene central carbon). Higher-degree atoms and terminal
+/// atoms are excluded — the bend term only acts on degree ≥ 2 anyway.
+fn linear_centers(mol: &Molecule) -> HashSet<u32> {
+    use crate::molecule::BondOrder;
+    let mut triples: HashMap<u32, u32> = HashMap::new();
+    let mut doubles: HashMap<u32, u32> = HashMap::new();
+    let mut degree: HashMap<u32, u32> = HashMap::new();
+    for b in &mol.bonds {
+        for id in [b.begin, b.end] {
+            *degree.entry(id).or_insert(0) += 1;
+            match b.order {
+                BondOrder::Triple => *triples.entry(id).or_insert(0) += 1,
+                BondOrder::Double => *doubles.entry(id).or_insert(0) += 1,
+                BondOrder::Single => {}
+            }
+        }
+    }
+    mol.atoms
+        .iter()
+        .map(|a| a.id)
+        .filter(|id| {
+            degree.get(id).copied().unwrap_or(0) == 2
+                && (triples.get(id).copied().unwrap_or(0) >= 1
+                    || doubles.get(id).copied().unwrap_or(0) >= 2)
+        })
+        .collect()
+}
+
 fn compute_forces(
     pos: &HashMap<u32, [f32; 2]>,
     bonds: &[(u32, u32)],
     adj: &HashMap<u32, Vec<u32>>,
     atom_ids: &[u32],
     bonded: &HashSet<(u32, u32)>,
+    linear_atoms: &HashSet<u32>,
     p: &RelaxParams,
     forces: &mut HashMap<u32, [f32; 2]>,
 ) {
@@ -704,7 +741,10 @@ fn compute_forces(
                 gap += std::f32::consts::TAU;
             }
 
-            let theta0 = if n == 2 {
+            let theta0 = if n == 2 && linear_atoms.contains(&c_id) {
+                // sp center (triple bond / allene): both gaps want 180°.
+                std::f32::consts::PI
+            } else if n == 2 {
                 if gap < std::f32::consts::PI {
                     std::f32::consts::TAU / 3.0
                 } else {
@@ -952,6 +992,75 @@ mod tests {
 
         println!("\n{n_failed}/50 trials did NOT converge within {cap} steps");
         // Not asserting — diagnostic only
+    }
+
+    /// Interior angle at atom `b` (in degrees) for the chain a–b–c.
+    fn angle_deg(mol: &Molecule, a: u32, b: u32, c: u32) -> f32 {
+        let pa = mol.atom_by_id(a).unwrap().pos;
+        let pb = mol.atom_by_id(b).unwrap().pos;
+        let pc = mol.atom_by_id(c).unwrap().pos;
+        let v1 = [pa[0] - pb[0], pa[1] - pb[1]];
+        let v2 = [pc[0] - pb[0], pc[1] - pb[1]];
+        let dot = v1[0] * v2[0] + v1[1] * v2[1];
+        let n1 = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt();
+        let n2 = (v2[0] * v2[0] + v2[1] * v2[1]).sqrt();
+        (dot / (n1 * n2)).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// `linear_centers` flags exactly the sp atoms: alkyne/nitrile carbons and allene
+    /// centers, but not sp²/sp³ atoms or triple-bond terminals.
+    #[test]
+    fn linear_centers_flags_sp_atoms() {
+        // Propyne  CH3–C≡CH : the two internal alkyne carbons are sp (degree 2 here).
+        let mut m = Molecule::default();
+        let c0 = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c1 = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let c2 = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        m.add_bond(c0, c1, BondOrder::Single);
+        m.add_bond(c1, c2, BondOrder::Triple);
+        let lin = linear_centers(&m);
+        assert!(lin.contains(&c1), "alkyne carbon with the triple bond is linear");
+        assert!(!lin.contains(&c0), "sp3 methyl carbon is not linear");
+        assert!(!lin.contains(&c2), "triple-bond terminal (degree 1) is not linear");
+
+        // Allene  C=C=C : the central carbon has two double bonds → linear.
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Double);
+        m.add_bond(b, c, BondOrder::Double);
+        let lin = linear_centers(&m);
+        assert!(lin.contains(&b), "allene central carbon is linear");
+        assert!(!lin.contains(&a) && !lin.contains(&c));
+
+        // A single =C< with one double + one single bond (degree 2, sp²) is NOT linear.
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let c = m.add_atom("O".to_string(), [2.0, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        m.add_bond(b, c, BondOrder::Double);
+        assert!(!linear_centers(&m).contains(&b), "vinyl/sp2 carbon is not linear");
+    }
+
+    /// Cleanup relaxes a triple-bonded chain toward a 180° angle at the sp carbon, even
+    /// when it starts badly bent.
+    #[test]
+    fn triple_bond_relaxes_to_180() {
+        // C0–C1≡C2 with C1 kinked to ~90°.
+        let mut m = Molecule::default();
+        let c0 = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c1 = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c2 = m.add_atom("C".to_string(), [1.5, 1.5], 0); // bent up ~90°
+        m.add_bond(c0, c1, BondOrder::Single);
+        m.add_bond(c1, c2, BondOrder::Triple);
+
+        let before = angle_deg(&m, c0, c1, c2);
+        assert!(before < 120.0, "start should be bent, got {before:.1}");
+        cleanup_2d(&mut m);
+        let after = angle_deg(&m, c0, c1, c2);
+        assert!(after > 172.0, "sp carbon should straighten to ~180°, got {after:.1}");
     }
 
     #[test]
