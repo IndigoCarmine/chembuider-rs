@@ -17,6 +17,9 @@ for a complete one.
 - **Drawing tools** — Select, Bond, and Eraser, with hover highlighting and snapping.
 - **Atoms & elements** — single-key placement of heteroatoms and charges; carbons are drawn
   implicitly with implicit hydrogens (CH₃, OH, NH₂ …) and subscripts.
+- **Rich labels** — atom labels render with true baseline-aligned subscripts and
+  superscripts (NH₃⁺, SO₄²⁻); custom labels support a lightweight markup for scripts,
+  bold, and italics (see [Rich text labels](#rich-text-labels)).
 - **Bonds** — single / double / triple (cycle by clicking), plus wedge, hash, bold, dashed,
   and wavy stereo bonds.
 - **Templates** — rings (3–10 membered), zig-zag chains, benzene, and a library of built-in
@@ -102,6 +105,34 @@ While hovering the canvas, single keys place elements, fragments, and templates.
 Selected atoms can be nudged with `Shift`+arrows (or `Ctrl`+arrows) and rotated with
 `Alt`+arrows. The full, user-editable key map lives in
 [`assets/default_config.json`](assets/default_config.json).
+
+## Rich text labels
+
+Atom labels are drawn by a dedicated rich-text renderer (`widget::rich_text`) that lays each
+styled run out as its own galley and places it with real baseline arithmetic, so subscripts,
+superscripts, bold, and italics stay crisp at any zoom. Hydrogen counts become subscripts and
+charges become superscripts automatically (NH₃⁺, SO₄²⁻).
+
+Custom labels (press `` ` `` on an atom to edit) and the standalone `RichLabel` widget accept
+a lightweight markup:
+
+| syntax          | result                                |
+|-----------------|---------------------------------------|
+| `_2` / `_{aq}`  | subscript (one char / braced group)   |
+| `^+` / `^{2-}`  | superscript (one char / braced group) |
+| `**text**`      | bold                                  |
+| `//text//`      | italic                                |
+| `\x`            | literal `x` (escape)                  |
+
+So `CO_2Et` renders as CO₂Et and `//t//Bu` as *t*Bu. The renderer is exported for host apps:
+
+```rust
+use chembuider_rs::{RichLabel, RichText};
+
+ui.add(RichLabel::new("[Cu(NH_3)_4]^{2+}").size(20.0)); // as an egui widget
+RichText::parse("SO_4^{2-}")                            // or paint directly
+    .paint(&painter, pos, egui::Align2::CENTER_CENTER, &style);
+```
 
 ## Configuration
 

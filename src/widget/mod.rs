@@ -1,5 +1,6 @@
 pub mod draw;
 pub mod interact;
+pub mod rich_text;
 
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};

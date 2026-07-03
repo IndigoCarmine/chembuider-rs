@@ -1,4 +1,5 @@
 use super::ChemStructEditor;
+use super::rich_text::{RichText, RichTextStyle};
 use crate::molecule::{BondOrder, BondStereo};
 
 // Visual sizes (bond width, label size, etc.) are user-configurable via `config.style`
@@ -313,53 +314,38 @@ pub fn draw_atom_labels(editor: &ChemStructEditor, painter: &egui::Painter, cent
         }
 
         if should_show_label(editor, atom.id) {
-            let job = atom_label_job(&editor.molecule, atom, label_size * z, egui::Color32::BLACK);
-            let galley = painter.layout_job(job);
-            let pos = sp - galley.size() * 0.5; // center the laid-out label on the atom
-            painter.galley(pos, galley, egui::Color32::BLACK);
+            let rich = atom_label_rich(&editor.molecule, atom);
+            let style = RichTextStyle::new(label_size * z, egui::Color32::BLACK);
+            // Center the laid-out label on the atom.
+            rich.paint(painter, sp, egui::Align2::CENTER_CENTER, &style);
         }
     }
 }
 
-/// Build a laid-out atom label with the hydrogen count rendered as a subscript
-/// (e.g. CH₃, NH₂). The element symbol, the "H", and the charge are at the base
-/// size; only the multi-H count digit is smaller and bottom-aligned.
-fn atom_label_job(
+/// Build the styled atom label: hydrogen count as a true subscript (CH₃, NH₂) and the
+/// charge as a true superscript (N⁺, SO₄²⁻). The element text itself goes through the
+/// rich-text markup parser, so custom labels typed into the editor can use `_`/`^`
+/// scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
+fn atom_label_rich(
     mol: &crate::molecule::Molecule,
     atom: &crate::molecule::Atom,
-    base_size: f32,
-    color: egui::Color32,
-) -> egui::text::LayoutJob {
-    use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::default();
-    let normal = TextFormat {
-        font_id: egui::FontId::proportional(base_size),
-        color,
-        ..Default::default()
-    };
-    let subscript = TextFormat {
-        font_id: egui::FontId::proportional(base_size * 0.7),
-        color,
-        valign: egui::Align::BOTTOM,
-        ..Default::default()
-    };
-
-    job.append(&atom.element, 0.0, normal.clone());
+) -> RichText {
+    let mut rich = RichText::parse(&atom.element);
     let h = displayed_h_count(mol, atom.id);
     if h >= 1 {
-        job.append("H", 0.0, normal.clone());
+        rich = rich.text("H");
         if h > 1 {
-            job.append(&h.to_string(), 0.0, subscript);
+            rich = rich.subscript(h.to_string());
         }
     }
     match atom.charge {
         0 => {}
-        1 => job.append("+", 0.0, normal),
-        -1 => job.append("-", 0.0, normal),
-        c if c > 0 => job.append(&format!("{c}+"), 0.0, normal),
-        c => job.append(&format!("{c}"), 0.0, normal),
+        1 => rich = rich.superscript("+"),
+        -1 => rich = rich.superscript("-"),
+        c if c > 0 => rich = rich.superscript(format!("{c}+")),
+        c => rich = rich.superscript(format!("{}-", -c)),
     }
-    job
+    rich
 }
 
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────
@@ -493,8 +479,8 @@ fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
     (effective - bond_sum_heavy).max(0) as u8
 }
 
-/// Plain-text label (no subscript) — the rendering path uses `atom_label_job`; this is the
-/// readable oracle used by tests.
+/// Plain-text label (scripts flattened) — the rendering path uses `atom_label_rich`; this
+/// is the readable oracle used by tests. Kept in sync by `label_oracle_matches_rich_label`.
 #[cfg(test)]
 fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom) -> String {
     let mut s = atom.element.clone();
@@ -510,7 +496,7 @@ fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom
         1          => s.push('+'),
         -1         => s.push('-'),
         c if c > 0 => s.push_str(&format!("{}+", c)),
-        c          => s.push_str(&format!("{}", c)),
+        c          => s.push_str(&format!("{}-", -c)),
     }
     s
 }
@@ -576,6 +562,85 @@ mod tests {
         let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
         m.add_bond(a, o, BondOrder::Triple);
         assert!(is_valence_invalid(&m, o), "O with a triple bond is over-valence");
+    }
+
+    /// The rich label carries the same characters as the plain-text oracle, with the H
+    /// count as a subscript span and the charge as a superscript span.
+    #[test]
+    fn label_oracle_matches_rich_label() {
+        use crate::widget::rich_text::Script;
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 1); // NH3+ once bonded
+        let o = m.add_atom("O".to_string(), [3.0, 0.0], -2); // O 2- (over-reduced, but exercises multi-charge)
+        m.add_bond(c, n, BondOrder::Single);
+
+        for id in [n, o] {
+            let atom = m.atom_by_id(id).unwrap();
+            let rich = atom_label_rich(&m, atom);
+            let flat: String = rich.spans.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(flat, atom_label_text(&m, atom));
+        }
+
+        // NH3+: the 3 is a subscript, the + a superscript.
+        let rich = atom_label_rich(&m, m.atom_by_id(n).unwrap());
+        let scripts: Vec<(String, Script)> = rich.spans.iter()
+            .map(|s| (s.text.clone(), s.style.script)).collect();
+        assert_eq!(scripts, vec![
+            ("NH".to_string(), Script::Normal),
+            ("3".to_string(), Script::Sub),
+            ("+".to_string(), Script::Super),
+        ]);
+
+        // O with charge -2 renders the chemistry-style "2-" superscript.
+        let rich = atom_label_rich(&m, m.atom_by_id(o).unwrap());
+        assert_eq!(rich.spans.last().map(|s| (s.text.as_str(), s.style.script)),
+                   Some(("2-", Script::Super)));
+    }
+
+    /// End-to-end: run one headless editor frame (real egui context, real fonts) and check
+    /// that a charged amine paints its label as separate galleys — the base "NH", the
+    /// subscript count, and the superscript charge — through the full `ui()` paint path.
+    #[test]
+    fn editor_frame_paints_rich_labels() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let c = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let n = editor.molecule.add_atom("N".to_string(), [1.5, 0.0], 1);
+        editor.molecule.add_bond(c, n, BondOrder::Single);
+
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor.ui(ui);
+            });
+        });
+
+        // Collect the text of every painted galley (recursing into shape groups).
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        collect_text(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        for expect in ["NH", "3", "+"] {
+            assert!(
+                texts.iter().any(|t| t == expect),
+                "expected a '{expect}' galley among painted text {texts:?}"
+            );
+        }
     }
 
     /// Side-decision for double-bond line placement. The helper is space-agnostic, so the test
