@@ -1,0 +1,98 @@
+{
+ "atoms": [
+  {
+   "element": "O",
+   "pos": [
+    2.7865,
+    -0.2956
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.3548,
+    -0.7431
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.2514,
+    0.273
+   ],
+   "charge": 0
+  },
+  {
+   "element": "N",
+   "pos": [
+    0.5797,
+    1.7367
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -1.1803,
+    -0.1745
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -1.5086,
+    -1.6381
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -2.2837,
+    0.8417
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 3,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 5,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 6,
+   "order": "Single",
+   "stereo": "None"
+  }
+ ]
+}

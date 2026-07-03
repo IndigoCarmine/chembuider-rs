@@ -1,0 +1,76 @@
+{
+ "atoms": [
+  {
+   "element": "C",
+   "pos": [
+    1.276,
+    0.0
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.3943,
+    -1.2135
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -1.0323,
+    -0.75
+   ],
+   "charge": 0
+  },
+  {
+   "element": "N",
+   "pos": [
+    -1.0323,
+    0.75
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.3943,
+    1.2135
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 3,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 3,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 0,
+   "order": "Double",
+   "stereo": "None"
+  }
+ ]
+}

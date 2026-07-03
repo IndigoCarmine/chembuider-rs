@@ -1,0 +1,188 @@
+{
+ "atoms": [
+  {
+   "element": "C",
+   "pos": [
+    -3.8123,
+    1.2868
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.6987,
+    0.2818
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -3.0122,
+    -1.185
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -1.2716,
+    0.7438
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.158,
+    -0.2612
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.4715,
+    -1.7281
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.642,
+    -2.733
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    2.0691,
+    -2.2711
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    2.3827,
+    -0.8043
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.2691,
+    0.2007
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.5826,
+    1.6676
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    3.0097,
+    2.1295
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    0.469,
+    2.6725
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 3,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 3,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 5,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 5,
+   "end": 6,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 7,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 7,
+   "end": 8,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 8,
+   "end": 9,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 9,
+   "end": 10,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 10,
+   "end": 11,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 10,
+   "end": 12,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 9,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  }
+ ]
+}
