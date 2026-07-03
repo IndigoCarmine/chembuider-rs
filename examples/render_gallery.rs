@@ -5,8 +5,9 @@
 //! side by side, plus everything combined into one contact sheet:
 //!
 //! ```text
-//! cargo run --example render_gallery            # -> target/render_gallery/*.bmp
-//! cargo run --example render_gallery -- out_dir # custom output directory
+//! cargo run --example render_gallery                 # pairs (raw | cleanup), per-cell BMPs
+//! cargo run --example render_gallery -- --single     # one cleaned cell per fixture (compact)
+//! cargo run --example render_gallery -- out_dir      # custom output directory
 //! ```
 //!
 //! Rendering goes through the full production path (`ChemStructEditor::ui` in an
@@ -20,12 +21,16 @@ use std::collections::HashMap;
 
 const CELL_W: usize = 380;
 const CELL_H: usize = 280;
-/// Fixture pairs (raw | cleaned) per contact-sheet row.
-const PAIRS_PER_ROW: usize = 2;
 
 fn main() {
-    let out_dir = std::env::args()
-        .nth(1)
+    // Args: `--single` picks the compact one-cell-per-fixture mode; the first
+    // non-flag argument is the output directory.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let single = args.iter().any(|a| a == "--single");
+    let out_dir = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| "target/render_gallery".to_string());
     std::fs::create_dir_all(&out_dir).unwrap();
 
@@ -39,11 +44,14 @@ fn main() {
         .collect();
     names.sort();
 
+    // Per fixture, which variants to render: single = cleanup only; default = both.
+    let variants: &[bool] = if single { &[true] } else { &[false, true] };
+
     let mut renderer = CellRenderer::new();
     let mut cells: Vec<(String, Vec<u8>)> = Vec::new(); // (label, RGB cell buffer)
     for name in &names {
         let json = std::fs::read_to_string(fixture_dir.join(format!("{name}.json"))).unwrap();
-        for cleaned in [false, true] {
+        for &cleaned in variants {
             let mut editor = ChemStructEditor::default();
             assert!(
                 editor.paste_from_string(&format!("chembuilder-mol:{json}")),
@@ -54,20 +62,27 @@ fn main() {
                 chembuider_rs::molecule::cleanup::cleanup_2d(&mut editor.molecule);
             }
             fit_view(&mut editor);
-            let label = format!("{name}{}", if cleaned { " (cleanup)" } else { "" });
+            let label = if single {
+                name.clone()
+            } else {
+                format!("{name}{}", if cleaned { " (cleanup)" } else { "" })
+            };
             let cell = renderer.render(&mut editor, &label);
-            write_bmp(
-                &format!("{out_dir}/{name}{}.bmp", if cleaned { "_cleanup" } else { "" }),
-                &cell,
-                CELL_W,
-                CELL_H,
-            );
+            if !single {
+                write_bmp(
+                    &format!("{out_dir}/{name}{}.bmp", if cleaned { "_cleanup" } else { "" }),
+                    &cell,
+                    CELL_W,
+                    CELL_H,
+                );
+            }
             cells.push((label, cell));
         }
     }
 
-    // Contact sheet: PAIRS_PER_ROW fixture pairs per row.
-    let cols = PAIRS_PER_ROW * 2;
+    // Contact sheet: keep raw|cleanup pairs adjacent in default mode (even columns),
+    // widen to 5 columns in the compact single mode.
+    let cols = if single { 5 } else { 4 };
     let rows = cells.len().div_ceil(cols);
     let (sheet_w, sheet_h) = (cols * CELL_W, rows * CELL_H);
     let mut sheet = vec![220u8; sheet_w * sheet_h * 3];

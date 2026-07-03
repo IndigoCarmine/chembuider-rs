@@ -1,0 +1,118 @@
+{
+ "atoms": [
+  {
+   "element": "C",
+   "pos": [
+    -3.0851,
+    -0.4695
+   ],
+   "charge": 0
+  },
+  {
+   "element": "O",
+   "pos": [
+    -2.0677,
+    0.6327
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.6045,
+    0.3028
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.1586,
+    -1.1294
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.3047,
+    -1.4594
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    2.3221,
+    -0.3572
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.8762,
+    1.075
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.4129,
+    1.405
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 3,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 3,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 5,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 5,
+   "end": 6,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 7,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 7,
+   "end": 2,
+   "order": "Single",
+   "stereo": "None"
+  }
+ ]
+}

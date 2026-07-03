@@ -26,25 +26,140 @@ from rdkit.Chem import rdDepictor
 
 TARGET_BOND_LEN = 1.5
 
-# Chosen to exercise: terminal OH/NH2 pointing left AND right (glucose has
-# several of each), charges (+/-/2-), wide-ish hetero labels, fused rings,
-# hetero-rich rings, and halogens.
+# A broad set (~100) exercising: terminal OH/NH2 pointing both ways, charges
+# (+/-/2-), wide hetero labels, fused/hetero rings, halogens, triple bonds,
+# sulfur/phosphorus, and real drug scaffolds. Any SMILES that fails to parse is
+# skipped with a warning rather than aborting the whole run.
 STRUCTURES = [
+    # ── small molecules & functional groups ──
     ("ethanol", "CCO"),
     ("tert_butanol", "OC(C)(C)C"),
     ("methylamine", "CN"),
+    ("ethylene_glycol", "OCCO"),
+    ("acetone", "CC(=O)C"),
+    ("acetaldehyde", "CC=O"),
+    ("acetic_acid", "CC(=O)O"),
+    ("acetamide", "CC(=O)N"),
+    ("acetonitrile", "CC#N"),
+    ("propyne", "CC#C"),
+    ("dimethyl_ether", "COC"),
+    ("dimethyl_sulfoxide", "CS(=O)C"),
+    ("dimethyl_sulfone", "CS(=O)(=O)C"),
+    ("nitromethane", "C[N+](=O)[O-]"),
+    ("urea", "NC(=O)N"),
+    ("guanidine", "NC(=N)N"),
+    ("formamide", "O=CN"),
+    ("carbamate", "NC(=O)OC"),
+    ("trimethylamine", "CN(C)C"),
+    ("diethyl_ether", "CCOCC"),
+    ("ethanethiol", "CCS"),
+    ("dimethyl_disulfide", "CSSC"),
+    ("chloroform", "C(Cl)(Cl)Cl"),
+    ("carbon_tetrachloride", "ClC(Cl)(Cl)Cl"),
+    ("tfa", "OC(=O)C(F)(F)F"),
     ("glycine", "NCC(=O)O"),
+    ("alanine", "CC(N)C(=O)O"),
+    ("serine", "OCC(N)C(=O)O"),
+    ("lactic_acid", "CC(O)C(=O)O"),
+    ("oxalic_acid", "OC(=O)C(=O)O"),
+    ("malonic_acid", "OC(=O)CC(=O)O"),
+    ("succinic_acid", "OC(=O)CCC(=O)O"),
+    ("dimethyl_carbonate", "COC(=O)OC"),
+    # ── charged species ──
     ("acetate", "CC(=O)[O-]"),
     ("tetramethylammonium", "C[N+](C)(C)C"),
     ("sulfate", "[O-]S([O-])(=O)=O"),
+    ("phosphate", "OP(=O)([O-])[O-]"),
+    ("nitrate", "[O-][N+](=O)[O-]"),
+    ("carbonate", "[O-]C(=O)[O-]"),
+    ("guanidinium", "NC(=[NH2+])N"),
+    ("ammonium_acetate", "CC(=O)[O-].[NH4+]"),
+    ("bicarbonate", "OC(=O)[O-]"),
+    ("methoxide", "C[O-]"),
+    # ── aromatic & heteroaromatic ──
+    ("benzene", "c1ccccc1"),
+    ("toluene", "Cc1ccccc1"),
+    ("phenol", "Oc1ccccc1"),
+    ("aniline", "Nc1ccccc1"),
+    ("benzoic_acid", "OC(=O)c1ccccc1"),
+    ("nitrobenzene", "O=[N+]([O-])c1ccccc1"),
+    ("styrene", "C=Cc1ccccc1"),
+    ("benzaldehyde", "O=Cc1ccccc1"),
+    ("anisole", "COc1ccccc1"),
     ("ethyl_benzoate", "CCOC(=O)c1ccccc1"),
-    ("caffeine", "Cn1cnc2c1c(=O)n(C)c(=O)n2C"),
-    ("aspirin", "CC(=O)Oc1ccccc1C(=O)O"),
-    ("glucose_open", "OCC(O)C(O)C(O)C(O)C=O"),
     ("benzenesulfonamide", "NS(=O)(=O)c1ccccc1"),
-    ("naphthalene", "c1ccc2ccccc2c1"),
+    ("benzonitrile", "N#Cc1ccccc1"),
     ("cf3_chlorobenzene", "FC(F)(F)c1ccc(Cl)cc1"),
+    ("catechol", "Oc1ccccc1O"),
+    ("resorcinol", "Oc1cccc(O)c1"),
+    ("mesitylene", "Cc1cc(C)cc(C)c1"),
+    ("pyridine", "c1ccncc1"),
+    ("pyrimidine", "c1cncnc1"),
+    ("pyrazine", "c1cnccn1"),
+    ("pyrrole", "c1cc[nH]c1"),
+    ("furan", "c1ccoc1"),
+    ("thiophene", "c1ccsc1"),
+    ("imidazole", "c1c[nH]cn1"),
+    ("oxazole", "c1ocnc1"),
+    ("thiazole", "c1cscn1"),
+    ("pyrazole", "c1cc[nH]n1"),
+    ("triazole", "c1nc[nH]n1"),
+    ("tetrazole", "c1nnn[nH]1"),
+    ("indole", "c1ccc2[nH]ccc2c1"),
+    ("quinoline", "c1ccc2ncccc2c1"),
+    ("isoquinoline", "c1ccc2cnccc2c1"),
+    ("benzofuran", "c1ccc2occc2c1"),
+    ("benzothiophene", "c1ccc2sccc2c1"),
+    ("benzimidazole", "c1ccc2[nH]cnc2c1"),
+    ("purine", "c1nc2[nH]cnc2cn1"),
+    ("naphthalene", "c1ccc2ccccc2c1"),
+    ("anthracene", "c1ccc2cc3ccccc3cc2c1"),
+    ("biphenyl", "c1ccc(-c2ccccc2)cc1"),
+    ("carbazole", "c1ccc2c(c1)[nH]c1ccccc12"),
+    ("dibenzofuran", "c1ccc2c(c1)oc1ccccc12"),
+    # ── rings, aliphatic ──
+    ("cyclohexane", "C1CCCCC1"),
+    ("cyclopropane", "C1CC1"),
+    ("cyclopentanone", "O=C1CCCC1"),
+    ("piperidine", "C1CCNCC1"),
+    ("piperazine", "C1CNCCN1"),
+    ("morpholine", "C1COCCN1"),
+    ("tetrahydrofuran", "C1CCOC1"),
+    ("gamma_butyrolactone", "O=C1CCCO1"),
+    ("epoxide", "C1CO1"),
+    ("dioxane", "C1COCCO1"),
+    ("cyclohexene", "C1CCCC=C1"),
+    # ── drugs & natural products ──
+    ("aspirin", "CC(=O)Oc1ccccc1C(=O)O"),
+    ("paracetamol", "CC(=O)Nc1ccc(O)cc1"),
+    ("ibuprofen", "CC(C)Cc1ccc(C(C)C(=O)O)cc1"),
+    ("caffeine", "Cn1cnc2c1c(=O)n(C)c(=O)n2C"),
+    ("nicotine", "CN1CCCC1c1cccnc1"),
+    ("dopamine", "NCCc1ccc(O)c(O)c1"),
+    ("serotonin", "NCCc1c[nH]c2ccc(O)cc12"),
+    ("histamine", "NCCc1c[nH]cn1"),
+    ("salicylic_acid", "OC(=O)c1ccccc1O"),
+    ("phenylalanine", "NC(Cc1ccccc1)C(=O)O"),
+    ("tryptophan", "NC(Cc1c[nH]c2ccccc12)C(=O)O"),
+    ("proline", "OC(=O)C1CCCN1"),
+    ("cysteine", "NC(CS)C(=O)O"),
+    ("methionine", "CSCCC(N)C(=O)O"),
+    ("glucose_open", "OCC(O)C(O)C(O)C(O)C=O"),
+    ("glucose_ring", "OCC1OC(O)C(O)C(O)C1O"),
+    ("fructose", "OCC(=O)C(O)C(O)C(O)CO"),
+    ("citric_acid", "OC(=O)CC(O)(C(=O)O)CC(=O)O"),
+    ("sulfanilamide", "Nc1ccc(S(N)(=O)=O)cc1"),
+    ("acetanilide", "CC(=O)Nc1ccccc1"),
+    ("vanillin", "COc1cc(C=O)ccc1O"),
+    ("coumarin", "O=c1ccc2ccccc2o1"),
+    ("indomethacin_core", "Cc1c(CC(=O)O)c2ccccc2n1C(=O)c1ccc(Cl)cc1"),
+    # ── organosilicon / phosphorus / triple bonds ──
     ("tms_ether", "C[Si](C)(C)OCC"),
+    ("triethyl_phosphate", "CCOP(=O)(OCC)OCC"),
+    ("triphenylphosphine", "c1ccc(P(c2ccccc2)c2ccccc2)cc1"),
+    ("acetylene_diol", "OC#CO"),
+    ("propargyl_alcohol", "OCC#C"),
+    ("diphenylacetylene", "c1ccc(C#Cc2ccccc2)cc1"),
 ]
 
 ORDER_NAMES = {
@@ -93,10 +208,16 @@ def to_clipmol(smiles: str) -> dict:
 def main() -> None:
     out_dir = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "rendering"
     out_dir.mkdir(parents=True, exist_ok=True)
+    ok = 0
     for name, smiles in STRUCTURES:
-        data = to_clipmol(smiles)
+        try:
+            data = to_clipmol(smiles)
+        except Exception as e:  # noqa: BLE001 - skip a bad SMILES, keep going
+            print(f"SKIP {name}: {e}")
+            continue
         (out_dir / f"{name}.json").write_text(json.dumps(data, indent=1) + "\n")
-        print(f"{name}: {len(data['atoms'])} atoms, {len(data['bonds'])} bonds")
+        ok += 1
+    print(f"wrote {ok}/{len(STRUCTURES)} structures")
 
     # Hand-made degenerate case: two charged, labeled atoms far closer than a
     # normal bond, so the trimmed bond is fully swallowed by the label rects.

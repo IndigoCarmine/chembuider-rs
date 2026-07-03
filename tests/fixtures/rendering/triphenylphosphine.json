@@ -1,0 +1,284 @@
+{
+ "atoms": [
+  {
+   "element": "C",
+   "pos": [
+    4.5,
+    0.0
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    3.75,
+    1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    2.25,
+    1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    1.5,
+    -0.0
+   ],
+   "charge": 0
+  },
+  {
+   "element": "P",
+   "pos": [
+    -0.0,
+    -0.0
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.75,
+    -1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    0.0,
+    -2.5981
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.75,
+    -3.8971
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.25,
+    -3.8971
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -3.0,
+    -2.5981
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.25,
+    -1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.75,
+    1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.25,
+    1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -3.0,
+    2.5981
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -2.25,
+    3.8971
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.75,
+    3.8971
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    -0.0,
+    2.5981
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    2.25,
+    -1.299
+   ],
+   "charge": 0
+  },
+  {
+   "element": "C",
+   "pos": [
+    3.75,
+    -1.299
+   ],
+   "charge": 0
+  }
+ ],
+ "bonds": [
+  {
+   "begin": 0,
+   "end": 1,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 1,
+   "end": 2,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 2,
+   "end": 3,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 3,
+   "end": 4,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 5,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 5,
+   "end": 6,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 6,
+   "end": 7,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 7,
+   "end": 8,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 8,
+   "end": 9,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 9,
+   "end": 10,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 4,
+   "end": 11,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 11,
+   "end": 12,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 12,
+   "end": 13,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 13,
+   "end": 14,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 14,
+   "end": 15,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 15,
+   "end": 16,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 3,
+   "end": 17,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 17,
+   "end": 18,
+   "order": "Double",
+   "stereo": "None"
+  },
+  {
+   "begin": 18,
+   "end": 0,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 10,
+   "end": 5,
+   "order": "Single",
+   "stereo": "None"
+  },
+  {
+   "begin": 16,
+   "end": 11,
+   "order": "Single",
+   "stereo": "None"
+  }
+ ]
+}
