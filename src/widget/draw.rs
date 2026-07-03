@@ -91,8 +91,8 @@ pub fn draw_bonds(
             BondStereo::None => {
                 // For a plain (non-stereo) double bond, decide where the two lines go based on
                 // which side of the bond axis the neighboring bonds sit (ChemDraw convention):
-                // neighbors on only one side ⇒ main line on the axis + a short inset line toward
-                // that side; neighbors on both sides or none ⇒ symmetric pair (legacy behavior).
+                // more neighbors on one side ⇒ main line on the axis + a short inset line toward
+                // the majority side; equal counts (or none) ⇒ symmetric pair (legacy behavior).
                 // The side decision is pure geometry classification and uses the UNTRIMMED
                 // atom positions; only the drawn lines use the trimmed endpoints.
                 let placement = if matches!(bond.order, BondOrder::Double) {
@@ -347,9 +347,12 @@ fn perp_normal(p1: egui::Pos2, p2: egui::Pos2) -> (f32, f32) {
 /// endpoint. The signed component `(neighbor - midpoint) · normal` classifies each neighbor as
 /// being on the +normal side (`dot > eps`) or -normal side (`dot < -eps`).
 ///
-/// - neighbors only on the +normal side  → `Centered(+1.0)` (inset line toward +normal)
-/// - neighbors only on the -normal side  → `Centered(-1.0)` (inset line toward -normal)
-/// - neighbors on both sides, or none    → `Symmetric`
+/// The inset line goes toward the side with MORE neighbors (into the ring / the
+/// substituted side, ChemDraw convention):
+///
+/// - more neighbors on the +normal side → `Centered(+1.0)` (inset line toward +normal)
+/// - more neighbors on the -normal side → `Centered(-1.0)` (inset line toward -normal)
+/// - equal counts (both sides alike, or none) → `Symmetric`
 ///
 /// Coordinate space: this function is space-agnostic — it works in whatever space the caller
 /// supplies, as long as `p1/p2`, `normal`, and `neighbors` are all in the same space. The
@@ -375,8 +378,8 @@ fn double_bond_placement(
         }
     }
     match (positive, negative) {
-        (p, 0) if p > 0 => DoubleBondPlacement::Centered(1.0),
-        (0, n) if n > 0 => DoubleBondPlacement::Centered(-1.0),
+        (p, n) if p > n => DoubleBondPlacement::Centered(1.0),
+        (p, n) if n > p => DoubleBondPlacement::Centered(-1.0),
         _ => DoubleBondPlacement::Symmetric,
     }
 }
@@ -1136,6 +1139,26 @@ mod tests {
         assert_eq!(
             double_bond_placement(p1, p2, normal, &trans),
             DoubleBondPlacement::Symmetric,
+        );
+
+        // Asymmetric: two neighbors above, one below → inset line toward the majority.
+        let asym = [
+            egui::Pos2::new(0.0, 1.0),
+            egui::Pos2::new(2.0, 1.0),
+            egui::Pos2::new(2.0, -1.0),
+        ];
+        assert_eq!(
+            double_bond_placement(p1, p2, normal, &asym),
+            DoubleBondPlacement::Centered(1.0),
+        );
+        let asym_neg = [
+            egui::Pos2::new(0.0, -1.0),
+            egui::Pos2::new(2.0, -1.0),
+            egui::Pos2::new(0.0, 1.0),
+        ];
+        assert_eq!(
+            double_bond_placement(p1, p2, normal, &asym_neg),
+            DoubleBondPlacement::Centered(-1.0),
         );
 
         // Terminal / isolated: no neighbors → Symmetric.
