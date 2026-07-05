@@ -1,0 +1,172 @@
+{
+  "name": "C12H25",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        2.25,
+        -1.2990384
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.75,
+        -1.2990384
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.4999995,
+        -2.5980768
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        6.0,
+        -2.5980775
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        6.749999,
+        -3.897116
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.5,
+        -2.3841858e-7
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        8.249999,
+        -3.8971167
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        8.999999,
+        -5.196155
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        10.499999,
+        -5.1961565
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        11.249997,
+        -6.4951954
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        12.749997,
+        -6.4951973
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        13.499995,
+        -7.794237
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    },
+    {
+      "begin": 1,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Single"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 0,
+      "end": 5,
+      "order": "Single"
+    },
+    {
+      "begin": 4,
+      "end": 6,
+      "order": "Single"
+    },
+    {
+      "begin": 6,
+      "end": 7,
+      "order": "Single"
+    },
+    {
+      "begin": 7,
+      "end": 8,
+      "order": "Single"
+    },
+    {
+      "begin": 8,
+      "end": 9,
+      "order": "Single"
+    },
+    {
+      "begin": 9,
+      "end": 10,
+      "order": "Single"
+    },
+    {
+      "begin": 10,
+      "end": 11,
+      "order": "Single"
+    },
+    {
+      "begin": 5,
+      "end": 12,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 12
+}

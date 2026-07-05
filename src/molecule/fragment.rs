@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use super::BondOrder;
+use super::{BondOrder, Molecule};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragAtom {
@@ -355,6 +356,76 @@ impl Fragment {
             });
         }
         Fragment { name: "Cbz".into(), atoms, bonds, attach_idx: 0 }
+    }
+}
+
+// ─── JSON I/O and Molecule interop ────────────────────────────────────────────
+
+impl Fragment {
+    /// Parse a fragment from its JSON representation (the on-disk `fragments/<name>.json` format).
+    pub fn from_json(s: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(s)
+    }
+
+    /// Pretty-print the fragment as JSON, matching the on-disk fragment format.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Load a fragment from a JSON file.
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        Self::from_json(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Save the fragment to a JSON file.
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let json = self
+            .to_json()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Materialize this fragment as a standalone [`Molecule`]. Atoms are added in fragment order,
+    /// so `molecule.atoms[i]` corresponds to `self.atoms[i]` (and the attach atom is at
+    /// `self.attach_idx`).
+    pub fn to_molecule(&self) -> Molecule {
+        let mut mol = Molecule::default();
+        mol.name = self.name.clone();
+        let ids: Vec<u32> = self
+            .atoms
+            .iter()
+            .map(|a| mol.add_atom(a.element.clone(), a.pos, a.charge))
+            .collect();
+        for b in &self.bonds {
+            mol.add_bond(ids[b.begin], ids[b.end], b.order.clone());
+        }
+        mol
+    }
+
+    /// Rebuild a fragment from a molecule (e.g. after `cleanup_2d`), taking each atom's element,
+    /// position and charge and re-indexing bond endpoints by atom order. `attach_idx` is carried
+    /// over unchanged, so pass the same value used to build the molecule.
+    pub fn from_molecule(mol: &Molecule, attach_idx: usize) -> Self {
+        let index_of: std::collections::HashMap<u32, usize> =
+            mol.atoms.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+        let atoms = mol
+            .atoms
+            .iter()
+            .map(|a| FragAtom { element: a.element.clone(), pos: a.pos, charge: a.charge })
+            .collect();
+        let bonds = mol
+            .bonds
+            .iter()
+            .filter_map(|b| {
+                Some(FragBond {
+                    begin: *index_of.get(&b.begin)?,
+                    end: *index_of.get(&b.end)?,
+                    order: b.order.clone(),
+                })
+            })
+            .collect();
+        Fragment { name: mol.name.clone(), atoms, bonds, attach_idx }
     }
 }
 

@@ -1,0 +1,159 @@
+{
+  "name": "TEG",
+  "atoms": [
+    {
+      "element": "O",
+      "pos": [
+        0.7540693,
+        1.2966802
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.008145809,
+        2.5980642
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.76221776,
+        3.8947427
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        2.262209,
+        3.8900332
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.0162878,
+        5.1867075
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.516279,
+        5.181986
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        5.2621794,
+        3.8805904
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        6.762171,
+        3.875856
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        7.5080633,
+        2.5744557
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        6.753962,
+        1.2777933
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        7.499853,
+        -0.023608685
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    },
+    {
+      "begin": 1,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Single"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 4,
+      "end": 5,
+      "order": "Single"
+    },
+    {
+      "begin": 5,
+      "end": 6,
+      "order": "Single"
+    },
+    {
+      "begin": 6,
+      "end": 7,
+      "order": "Single"
+    },
+    {
+      "begin": 7,
+      "end": 8,
+      "order": "Single"
+    },
+    {
+      "begin": 8,
+      "end": 9,
+      "order": "Single"
+    },
+    {
+      "begin": 9,
+      "end": 10,
+      "order": "Single"
+    },
+    {
+      "begin": 0,
+      "end": 11,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 11
+}

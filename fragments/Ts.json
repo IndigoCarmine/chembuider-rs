@@ -1,0 +1,151 @@
+{
+  "name": "Ts",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        -5.519167,
+        -5.0782695
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -4.415331,
+        -4.062619
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -2.9838333,
+        -4.510744
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -1.8799971,
+        -3.4950936
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -2.2076602,
+        -2.031318
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -3.6391573,
+        -1.5831952
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -4.7429924,
+        -2.5988452
+      ],
+      "charge": 0
+    },
+    {
+      "element": "S",
+      "pos": [
+        -1.103828,
+        -1.0156608
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        -0.088168144,
+        -2.1194882
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        -2.1194873,
+        0.08816743
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    },
+    {
+      "begin": 1,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Double"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 4,
+      "end": 5,
+      "order": "Double"
+    },
+    {
+      "begin": 5,
+      "end": 6,
+      "order": "Single"
+    },
+    {
+      "begin": 6,
+      "end": 1,
+      "order": "Double"
+    },
+    {
+      "begin": 4,
+      "end": 7,
+      "order": "Single"
+    },
+    {
+      "begin": 7,
+      "end": 8,
+      "order": "Double"
+    },
+    {
+      "begin": 7,
+      "end": 9,
+      "order": "Double"
+    },
+    {
+      "begin": 7,
+      "end": 10,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 10
+}

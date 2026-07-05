@@ -1,6 +1,6 @@
 [package]
 name = "chembuider-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "An egui widget library for drawing and editing 2D chemical structure diagrams"
 
@@ -19,7 +19,7 @@ serde_json = "1"
 [dev-dependencies]
 # x11/wayland: winit needs at least one Linux backend enabled or it fails to compile
 # there (both features are no-ops on Windows/macOS).
-eframe = { version = "0.34.3", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 rfd = "0.17.2"
 
 # CDX export + ChemDraw-compatible clipboard (text/CDX/image/OLE) are Windows-only.

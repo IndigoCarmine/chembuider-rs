@@ -47,7 +47,7 @@ impl Default for EditorApp {
 impl App for EditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // eframe 0.34 hands us the root viewport Ui; panels are shown inside it.
-        egui::Panel::top("toolbar").show_inside(ui, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Tool:");
                 if ui.selectable_label(self.editor.tool == Tool::Select, "⬚ Select").clicked() {
@@ -150,7 +150,7 @@ impl App for EditorApp {
             });
         });
 
-        egui::Panel::bottom("status").show_inside(ui, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "Atoms: {}  Bonds: {}  Tool: {}  Element: {}  {}",
@@ -163,7 +163,7 @@ impl App for EditorApp {
             });
         });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             self.editor.ui(ui);
         });
     }

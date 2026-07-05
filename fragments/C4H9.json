@@ -1,0 +1,68 @@
+{
+  "name": "C4H9",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.5,
+        -2.3841858e-7
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.2499998,
+        -1.2990382
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.7499998,
+        -1.2990388
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.499999,
+        -2.5980773
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    },
+    {
+      "begin": 1,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Single"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 0
+}
