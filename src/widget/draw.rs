@@ -115,17 +115,17 @@ pub fn draw_bonds(
                 } else {
                     DoubleBondPlacement::Symmetric
                 };
-                draw_bond_order(painter, tp1, tp2, &bond.order, stroke, s.double_bond_offset, placement)
+                draw_bond_order(painter, tp1, tp2, &bond.order, stroke, s.double_bond_offset * z, placement)
             }
-            BondStereo::WedgeUp => draw_wedge_solid(painter, tp1, tp2, color, s.wedge_width),
+            BondStereo::WedgeUp => draw_wedge_solid(painter, tp1, tp2, color, s.wedge_width * z),
             BondStereo::WedgeDown => {
                 // Hash half-widths keep the taper rate of the untrimmed wedge: each hash's
                 // width is its fraction along the ORIGINAL p1→p2 segment.
-                draw_wedge_hash(painter, (tp1, tp2), (p1, p2), color, s.wedge_width, s.bond_width)
+                draw_wedge_hash(painter, (tp1, tp2), (p1, p2), color, s.wedge_width * z, s.bond_width * z)
             }
-            BondStereo::Bold => draw_bold(painter, tp1, tp2, color, s.bold_width),
-            BondStereo::Dashed => draw_dashed(painter, tp1, tp2, stroke, s.dash_len, s.dash_gap),
-            BondStereo::Wavy => draw_wavy(painter, tp1, tp2, stroke, s.wavy_amplitude),
+            BondStereo::Bold => draw_bold(painter, tp1, tp2, color, s.bold_width * z),
+            BondStereo::Dashed => draw_dashed(painter, tp1, tp2, stroke, s.dash_len * z, s.dash_gap * z),
+            BondStereo::Wavy => draw_wavy(painter, tp1, tp2, stroke, s.wavy_amplitude * z),
         }
     }
 }
