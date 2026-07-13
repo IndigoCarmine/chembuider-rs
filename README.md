@@ -100,6 +100,8 @@ While hovering the canvas, single keys place elements, fragments, and templates.
 | `z` / `Z` | zig-zag chain |
 | `+` / `-` | increase / decrease charge |
 | `Ctrl`+`K` | clean up layout |
+| `Ctrl`+`Z` | undo |
+| `Ctrl`+`Y` / `Ctrl`+`Shift`+`Z` | redo |
 | `Ctrl`+`C` / `Ctrl`+`V` | copy / paste (Windows) |
 
 Selected atoms can be nudged with `Shift`+arrows (or `Ctrl`+arrows) and rotated with

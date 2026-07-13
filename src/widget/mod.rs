@@ -94,6 +94,10 @@ pub struct ChemStructEditor {
     /// Undo history (molecule snapshots, newest at back).
     pub undo_stack: VecDeque<crate::molecule::Molecule>,
 
+    /// Redo history (molecule snapshots undone via `undo`, newest at back). Cleared
+    /// whenever a new edit is pushed onto `undo_stack` — the usual undo/redo contract.
+    pub redo_stack: VecDeque<crate::molecule::Molecule>,
+
     /// Stereo type applied to newly drawn bonds.
     pub current_bond_stereo: BondStereo,
 
@@ -137,6 +141,7 @@ impl Default for ChemStructEditor {
             config: Config::default(),
             label_edit: None,
             undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
             current_bond_stereo: BondStereo::None,
             last_mouse_mol: [0.0; 2],
             cleanup_job: None,
@@ -157,6 +162,7 @@ impl ChemStructEditor {
                 self.undo_stack.pop_front();
             }
             self.undo_stack.push_back(self.molecule.clone());
+            self.redo_stack.clear();
         }
     }
 
@@ -434,10 +440,29 @@ impl ChemStructEditor {
         }
     }
 
-    /// Restore the previous molecule state.
+    /// Restore the previous molecule state, pushing the current one onto the redo stack.
     pub fn undo(&mut self) -> bool {
         if let Some(prev) = self.undo_stack.pop_back() {
-            self.molecule = prev;
+            if self.redo_stack.len() >= 50 {
+                self.redo_stack.pop_front();
+            }
+            self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
+            self.selected_atoms.clear();
+            self.hotspot_atom = None;
+            self.label_edit = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-apply a state previously undone, pushing the current one back onto the undo stack.
+    pub fn redo(&mut self) -> bool {
+        if let Some(next) = self.redo_stack.pop_back() {
+            if self.undo_stack.len() >= 50 {
+                self.undo_stack.pop_front();
+            }
+            self.undo_stack.push_back(std::mem::replace(&mut self.molecule, next));
             self.selected_atoms.clear();
             self.hotspot_atom = None;
             self.label_edit = None;
@@ -661,11 +686,15 @@ impl ChemStructEditor {
             self.hovered_bond = None;
         }
 
-        // Zoom via scroll wheel
+        // Zoom via scroll wheel. `smooth_scroll_delta` is egui's *smoothed* delta — one wheel
+        // notch is spread across several frames, not delivered as a single non-zero value —
+        // so the factor must scale with the delta's magnitude. A fixed factor applied on every
+        // frame the (smoothed, still-decaying) delta happens to be nonzero compounds
+        // exponentially over those frames, turning one notch into a multi-fold zoom jump.
         if rect.contains(mouse_pos) {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                let factor: f32 = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                let factor = (scroll * 0.002).exp();
                 let before = self.screen_to_mol(mouse_pos, center);
                 self.zoom = (self.zoom * factor).clamp(0.1, 20.0);
                 let after = self.mol_to_screen(before, center);
@@ -680,9 +709,14 @@ impl ChemStructEditor {
             }
         }
 
-        // Ctrl+Z: undo
-        let did_undo = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
-        if did_undo { self.undo(); }
+        // Ctrl+Z: undo. Ctrl+Y or Ctrl+Shift+Z: redo.
+        let undo_pressed = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
+        let did_undo = undo_pressed && self.undo();
+        let redo_pressed = ui.input(|i| {
+            (i.key_pressed(egui::Key::Y) && i.modifiers.ctrl)
+                || (i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && i.modifiers.shift)
+        });
+        let did_redo = redo_pressed && self.redo();
 
         // Copy/paste only act on the canvas when no text field has focus.
         let editing_text = ui.ctx().egui_wants_keyboard_input();
@@ -754,10 +788,23 @@ impl ChemStructEditor {
             let area_resp = egui::Area::new(egui::Id::new("label_edit_area"))
                 .fixed_pos(screen_pos + egui::vec2(12.0, -12.0))
                 .show(ui.ctx(), |ui| {
-                    let edit = egui::TextEdit::singleline(text)
+                    let mut output = egui::TextEdit::singleline(text)
                         .desired_width(80.0)
-                        .font(egui::FontId::proportional(label_size));
-                    ui.add(edit)
+                        .font(egui::FontId::proportional(label_size))
+                        .show(ui);
+                    // Select the pre-filled element text (e.g. "C") on the first frame the box
+                    // is open, so typing replaces it outright instead of appending onto it —
+                    // `has_focus()` is false only on that first frame, before `request_focus()`
+                    // below takes effect.
+                    if !output.response.has_focus() {
+                        let range = egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(text.chars().count()),
+                        );
+                        output.state.cursor.set_char_range(Some(range));
+                        output.state.store(ui.ctx(), output.response.id);
+                    }
+                    output.response
                 });
             area_resp.inner.request_focus();
 
@@ -792,7 +839,7 @@ impl ChemStructEditor {
                 Tool::Eraser => interact::process_eraser_tool(self, &response, center),
             }
         };
-        let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning;
+        let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
         // crossing bonds, and labels paint the cached galleys. Keep the rects for next
@@ -871,5 +918,78 @@ mod clipboard_tests {
         let cy = e.molecule.atoms.iter().map(|a| a.pos[1]).sum::<f32>() / n;
         assert!((cx - 5.0).abs() < 0.01 && (cy - 7.0).abs() < 0.01,
             "pasted centroid should land on the cursor, got ({cx},{cy})");
+    }
+}
+
+#[cfg(test)]
+mod undo_redo_tests {
+    use super::*;
+
+    #[test]
+    fn undo_then_redo_restores_the_undone_state() {
+        let mut e = ChemStructEditor::default();
+        e.push_undo(); // snapshot of the empty molecule
+        e.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+
+        assert!(e.undo(), "should undo back to the empty molecule");
+        assert!(e.molecule.atoms.is_empty());
+
+        assert!(e.redo(), "should redo back to the one-atom state");
+        assert_eq!(e.molecule.atoms.len(), 1);
+
+        assert!(!e.redo(), "nothing left to redo");
+    }
+
+    #[test]
+    fn a_new_edit_clears_the_redo_stack() {
+        let mut e = ChemStructEditor::default();
+        e.push_undo();
+        e.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        assert!(e.undo());
+        assert_eq!(e.redo_stack.len(), 1);
+
+        // A fresh edit (push_undo + mutation) should invalidate the old redo branch.
+        e.push_undo();
+        e.molecule.add_atom("O".to_string(), [1.5, 0.0], 0);
+        assert!(e.redo_stack.is_empty(), "starting a new edit after undo must clear redo");
+        assert!(!e.redo());
+    }
+
+    fn run_frame(ctx: &egui::Context, screen_rect: egui::Rect, editor: &mut ChemStructEditor, events: Vec<egui::Event>) {
+        let raw = egui::RawInput { screen_rect: Some(screen_rect), events, focused: true, ..Default::default() };
+        let _ = ctx.run_ui(raw, |ui| { editor.ui(ui); });
+    }
+
+    #[test]
+    fn ctrl_z_undoes_a_click_placed_atom_through_the_full_ui() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p1 = egui::pos2(300.0, 200.0);
+        let p2 = egui::pos2(450.0, 280.0);
+
+        for p in [p1, p2] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+            run_frame(&ctx, screen_rect, &mut editor, vec![
+                egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            ]);
+            run_frame(&ctx, screen_rect, &mut editor, vec![
+                egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ]);
+        }
+        assert_eq!(editor.molecule.atoms.len(), 2, "two clicks on empty canvas should place two atoms");
+
+        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        let raw = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            modifiers: ctrl,
+            focused: true,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z, physical_key: Some(egui::Key::Z), pressed: true, repeat: false, modifiers: ctrl,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| { editor.ui(ui); });
+        assert_eq!(editor.molecule.atoms.len(), 1, "Ctrl+Z should undo the second atom placement");
     }
 }

@@ -10,6 +10,39 @@
 
 use chembuider_rs::molecule::cleanup::cleanup_2d;
 use chembuider_rs::molecule::fragment::Fragment;
+use chembuider_rs::Config;
+
+/// Every `fragments/<name>.json` must also be embedded (`assets/fragments/` +
+/// `BUILTIN_FRAGMENT_STRS` in `src/config.rs`), or it silently disappears on the web build —
+/// `fragments/` is read from disk at runtime, which doesn't exist in a browser (see
+/// `Config::load`/`load_fragments_from_dir`). Catches a fragment saved via the app's "Save
+/// Fragment" button but never promoted to the embedded set.
+#[test]
+fn every_fragment_on_disk_is_embedded() {
+    let embedded_names: std::collections::HashSet<String> = Config::embedded()
+        .fragments
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir("fragments").expect("run from the repo root; `fragments/` must exist") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if !embedded_names.contains(&name) {
+            missing.push(name);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "fragments/ has JSON files not embedded for the web build (copy into assets/fragments/ \
+         and add an include_str! line in src/config.rs's BUILTIN_FRAGMENT_STRS): {missing:?}"
+    );
+}
 
 #[test]
 fn load_cleanup_save_roundtrip() {

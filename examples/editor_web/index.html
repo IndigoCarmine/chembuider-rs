@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>ChemBuilder — MOL2 Editor</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            background: #1e1e1e;
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #loading_text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ccc;
+            font-family: sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="the_canvas_id"></canvas>
+    <p id="loading_text">Loading…</p>
+    <script type="module">
+        import init from "./editor.js";
+        await init();
+    </script>
+</body>
+</html>

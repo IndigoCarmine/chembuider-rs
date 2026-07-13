@@ -524,73 +524,180 @@ pub fn cleanup_2d(mol: &mut Molecule) {
 
 // ─── Background, cancellable cleanup job ──────────────────────────────────────
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-
 /// Steps run per chunk between cancel checks and position publishes.
 const JOB_CHUNK: usize = 500;
 const JOB_PHASE_BUDGET: usize = 100_000;
 
-/// A cleanup computation running on a background thread.  The UI thread polls
-/// `latest()` for a live preview and `is_done()` for completion, and may `cancel()`
-/// at any time.  Created with `CleanupJob::start`.
-pub struct CleanupJob {
-    cancel: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
-    shared: Arc<Mutex<Vec<(u32, [f32; 2])>>>,
-    handle: Option<JoinHandle<()>>,
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod job_native {
+    use super::{run_cleanup_job, Molecule};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
 
-impl CleanupJob {
-    /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread.
-    pub fn start(mol: &Molecule) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
-        let shared = Arc::new(Mutex::new(
-            mol.atoms.iter().map(|a| (a.id, a.pos)).collect::<Vec<_>>(),
-        ));
-
-        let snapshot = mol.clone();
-        let (c, d, s) = (cancel.clone(), done.clone(), shared.clone());
-        let handle = std::thread::spawn(move || {
-            run_cleanup_job(&snapshot, &c, &d, &s);
-        });
-
-        CleanupJob { cancel, done, shared, handle: Some(handle) }
+    /// A cleanup computation running on a background thread. The UI thread polls
+    /// `latest()` for a live preview and `is_done()` for completion, and may `cancel()`
+    /// at any time. Created with `CleanupJob::start`.
+    pub struct CleanupJob {
+        cancel: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+        shared: Arc<Mutex<Vec<(u32, [f32; 2])>>>,
+        handle: Option<JoinHandle<()>>,
     }
 
-    /// Request the worker to stop at the next chunk boundary.
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+    impl CleanupJob {
+        /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread.
+        pub fn start(mol: &Molecule) -> Self {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let done = Arc::new(AtomicBool::new(false));
+            let shared = Arc::new(Mutex::new(
+                mol.atoms.iter().map(|a| (a.id, a.pos)).collect::<Vec<_>>(),
+            ));
+
+            let snapshot = mol.clone();
+            let (c, d, s) = (cancel.clone(), done.clone(), shared.clone());
+            let handle = std::thread::spawn(move || {
+                run_cleanup_job(&snapshot, &c, &d, &s);
+            });
+
+            CleanupJob { cancel, done, shared, handle: Some(handle) }
+        }
+
+        /// Request the worker to stop at the next chunk boundary.
+        pub fn cancel(&self) {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+
+        pub fn is_done(&self) -> bool {
+            self.done.load(Ordering::Relaxed)
+        }
+
+        /// Latest relaxed positions (for live preview each frame).
+        pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            self.shared.lock().unwrap().clone()
+        }
+
+        /// Join the worker thread (call once `is_done`).
+        pub fn join(mut self) {
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
     }
 
-    pub fn is_done(&self) -> bool {
-        self.done.load(Ordering::Relaxed)
-    }
-
-    /// Latest relaxed positions (for live preview each frame).
-    pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
-        self.shared.lock().unwrap().clone()
-    }
-
-    /// Join the worker thread (call once `is_done`).
-    pub fn join(mut self) {
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+    impl Drop for CleanupJob {
+        fn drop(&mut self) {
+            // Make sure a still-running worker stops if the job is dropped without joining.
+            self.cancel.store(true, Ordering::Relaxed);
         }
     }
 }
 
-impl Drop for CleanupJob {
-    fn drop(&mut self) {
-        // Make sure a still-running worker stops if the job is dropped without joining.
-        self.cancel.store(true, Ordering::Relaxed);
+#[cfg(not(target_arch = "wasm32"))]
+pub use job_native::CleanupJob;
+
+// wasm32-unknown-unknown has no `std::thread::spawn` (it always returns an "unsupported"
+// error, and `thread::spawn` panics on that) — there's no Web Worker / SharedArrayBuffer
+// setup here for real background threads. Instead, `latest()` — already polled once per UI
+// frame by `ChemStructEditor::poll_cleanup` — advances the same chunked relaxation by one
+// `JOB_CHUNK` on each call, so the tab still repaints between chunks instead of blocking on
+// one huge synchronous relaxation. `Cell`/`RefCell` stand in for the native version's atomics
+// and mutex since wasm32-unknown-unknown is single-threaded.
+#[cfg(target_arch = "wasm32")]
+mod job_wasm {
+    use super::{CleanupState, Molecule, JOB_CHUNK, JOB_PHASE_BUDGET};
+    use std::cell::{Cell, RefCell};
+
+    pub struct CleanupJob {
+        state: RefCell<Option<CleanupState>>,
+        phase: Cell<u8>,
+        steps_done_in_phase: Cell<usize>,
+        cancelled: Cell<bool>,
+        done: Cell<bool>,
+        positions: RefCell<Vec<(u32, [f32; 2])>>,
+    }
+
+    impl CleanupJob {
+        pub fn start(mol: &Molecule) -> Self {
+            if mol.atoms.is_empty() {
+                return Self {
+                    state: RefCell::new(None),
+                    phase: Cell::new(1),
+                    steps_done_in_phase: Cell::new(0),
+                    cancelled: Cell::new(false),
+                    done: Cell::new(true),
+                    positions: RefCell::new(Vec::new()),
+                };
+            }
+            let mut state = CleanupState::new(mol);
+            if state.has_rings {
+                state.apply_ring_fix();
+            }
+            let positions = state.positions();
+            Self {
+                state: RefCell::new(Some(state)),
+                phase: Cell::new(1),
+                steps_done_in_phase: Cell::new(0),
+                cancelled: Cell::new(false),
+                done: Cell::new(false),
+                positions: RefCell::new(positions),
+            }
+        }
+
+        pub fn cancel(&self) {
+            self.cancelled.set(true);
+        }
+
+        pub fn is_done(&self) -> bool {
+            self.done.get()
+        }
+
+        /// Advance one chunk of the relaxation (mirrors `run_phase`'s two-phase logic, just
+        /// spread across polls instead of a background-thread loop), then return positions.
+        pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            if !self.done.get() {
+                if self.cancelled.get() {
+                    self.done.set(true);
+                } else if let Some(state) = self.state.borrow_mut().as_mut() {
+                    let budget_left = JOB_PHASE_BUDGET - self.steps_done_in_phase.get();
+                    let chunk = JOB_CHUNK.min(budget_left);
+                    let converged = state.step(chunk);
+                    self.steps_done_in_phase.set(self.steps_done_in_phase.get() + chunk);
+                    *self.positions.borrow_mut() = state.positions();
+
+                    let phase_exhausted = self.steps_done_in_phase.get() >= JOB_PHASE_BUDGET;
+                    if converged || phase_exhausted {
+                        if self.phase.get() == 1 && !converged {
+                            if state.has_rings && state.max_force() > 0.1 {
+                                state.apply_ring_fix();
+                            }
+                            self.phase.set(2);
+                            self.steps_done_in_phase.set(0);
+                        } else {
+                            self.done.set(true);
+                        }
+                    }
+                }
+            }
+            self.positions.borrow().clone()
+        }
+
+        /// Nothing to join — there is no worker thread on wasm32.
+        pub fn join(self) {}
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub use job_wasm::CleanupJob;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
+
 /// Worker body: mirrors `cleanup_2d`'s two-phase logic, but chunked so it can check the
 /// cancel flag and publish intermediate positions for a live preview.
+#[cfg(not(target_arch = "wasm32"))]
 fn run_cleanup_job(
     mol: &Molecule,
     cancel: &AtomicBool,
@@ -622,6 +729,7 @@ fn run_cleanup_job(
 }
 
 /// Run one JOB_PHASE_BUDGET phase in chunks; returns true if it converged.
+#[cfg(not(target_arch = "wasm32"))]
 fn run_phase(
     state: &mut CleanupState,
     cancel: &AtomicBool,

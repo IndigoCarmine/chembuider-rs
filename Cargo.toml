@@ -14,13 +14,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Only the example host app needs a windowing backend / file dialogs.
-# Use the glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12
+# Native: glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12
 # layer fails to build against current `windows` crate versions on this toolchain.
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # x11/wayland: winit needs at least one Linux backend enabled or it fails to compile
 # there (both features are no-ops on Windows/macOS).
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 rfd = "0.17.2"
+
+# Web (wasm32): eframe's wgpu backend (WebGPU, auto-falling back to WebGL2) — the glow
+# backend needs native-only windowing (glutin) and isn't available on wasm32.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts"] }
+log = "0.4"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "Document", "Window"] }
 
 # CDX export + ChemDraw-compatible clipboard (text/CDX/image/OLE) are Windows-only.
 [target.'cfg(windows)'.dependencies]

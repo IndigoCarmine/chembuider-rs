@@ -351,6 +351,18 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/BPin.json"),
     include_str!("../assets/fragments/TMS.json"),
     include_str!("../assets/fragments/TBS.json"),
+    include_str!("../assets/fragments/Ts.json"),
+    include_str!("../assets/fragments/Benz.json"),
+    include_str!("../assets/fragments/TEG.json"),
+    include_str!("../assets/fragments/C4H9.json"),
+    include_str!("../assets/fragments/C5H11.json"),
+    include_str!("../assets/fragments/C6H13.json"),
+    include_str!("../assets/fragments/C7H15.json"),
+    include_str!("../assets/fragments/C8H17.json"),
+    include_str!("../assets/fragments/C9H19.json"),
+    include_str!("../assets/fragments/C10H21.json"),
+    include_str!("../assets/fragments/C11H23.json"),
+    include_str!("../assets/fragments/C12H25.json"),
 ];
 
 /// Parse the compile-time built-in fragments. No file I/O.

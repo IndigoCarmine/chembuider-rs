@@ -1,0 +1,81 @@
+{
+  "name": "C5H11",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        0.7500005,
+        -1.2990379
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.2500005,
+        -1.2990382
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.0000002,
+        -2.598076
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.5,
+        -2.5980768
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        5.2499995,
+        -3.8971152
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    },
+    {
+      "begin": 1,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Single"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 0,
+      "end": 5,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 5
+}

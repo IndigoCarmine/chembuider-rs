@@ -15,79 +15,26 @@ pub fn process_bond_tool(
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
 
-    // ── Drag tracking ────────────────────────────────────────────────────────
+    // ── Drag tracking: dragging from an atom always draws a bond, never moves it — the
+    // Bond tool's own gesture list is "drag atom→atom to draw a bond"; repositioning atoms
+    // via drag is Select tool's job (`process_select_tool`), not this one. ─────────────────
     if response.drag_started() {
-        editor.push_undo(); // snapshot before drag modifies positions
-        editor.drag_origin_screen = Some(mouse);
+        editor.push_undo(); // snapshot before drag adds a bond/atom
+        // `drag_started()` only fires once the pointer has moved past egui's drag threshold,
+        // so by now `mouse` (the *current* position) may already be well past the atom the
+        // drag actually started on. Hit-test at the press origin instead, or a fast drag off
+        // an atom silently does nothing (see `bond_tool_drag_from_atom_to_empty_space_creates_bonded_atom`).
+        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
         // Prefer hit atom; fall back to currently hovered atom for slight-miss tolerance
-        let hit = editor.hit_test_atom(mouse, center).or(editor.hovered_atom);
-        editor.dragging_atom = hit;
-        editor.bond_start = None;
+        editor.bond_start = editor.hit_test_atom(origin, center).or(editor.hovered_atom);
+        editor.preview_end_screen = Some(mouse);
     }
 
     if response.dragged() {
-        let drag_delta = response.drag_delta();
-        let total_delta = mouse - editor.drag_origin_screen.unwrap_or(mouse - drag_delta);
-
-        if let Some(atom_id) = editor.dragging_atom {
-            let inv = 1.0 / (editor.zoom * super::SCALE_FACTOR);
-            if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
-                atom.pos[0] += drag_delta.x * inv;
-                atom.pos[1] += drag_delta.y * inv;
-                modified = true;
-            }
-            editor.bond_start = None;
-            editor.preview_end_screen = None;
-        } else if total_delta.length() > 4.0 {
-            if editor.bond_start.is_none() {
-                let origin = editor.drag_origin_screen.unwrap_or(mouse);
-                editor.bond_start = editor.hit_test_atom(origin, center);
-            }
-            editor.preview_end_screen = Some(mouse);
-        }
+        editor.preview_end_screen = Some(mouse);
     }
 
     if response.drag_stopped() {
-        // ── Atom merge: if dragged atom lands on another atom, fuse them ──────
-        if let Some(drag_id) = editor.dragging_atom {
-            let current_pos = editor.molecule.atom_by_id(drag_id).map(|a| a.pos);
-            if let Some(pos) = current_pos {
-                let merge_r = crate::molecule::Molecule::SNAP_RADIUS;
-                let merge_target = editor.molecule.atoms.iter()
-                    .filter(|a| a.id != drag_id)
-                    .filter(|a| {
-                        let dx = a.pos[0] - pos[0];
-                        let dy = a.pos[1] - pos[1];
-                        dx * dx + dy * dy < merge_r * merge_r
-                    })
-                    .min_by(|a, b| {
-                        let da = (a.pos[0]-pos[0]).powi(2) + (a.pos[1]-pos[1]).powi(2);
-                        let db = (b.pos[0]-pos[0]).powi(2) + (b.pos[1]-pos[1]).powi(2);
-                        da.partial_cmp(&db).unwrap()
-                    })
-                    .map(|a| a.id);
-
-                if let Some(target_id) = merge_target {
-                    for bond in &mut editor.molecule.bonds {
-                        if bond.begin == drag_id { bond.begin = target_id; }
-                        if bond.end   == drag_id { bond.end   = target_id; }
-                    }
-                    editor.molecule.bonds.retain(|b| b.begin != b.end);
-                    // Remove duplicate bonds (keep first encountered)
-                    let mut seen = std::collections::HashSet::new();
-                    editor.molecule.bonds.retain(|b| {
-                        let key = if b.begin < b.end { (b.begin, b.end) } else { (b.end, b.begin) };
-                        seen.insert(key)
-                    });
-                    editor.molecule.atoms.retain(|a| a.id != drag_id);
-                    if editor.hotspot_atom == Some(drag_id) {
-                        editor.hotspot_atom = Some(target_id);
-                    }
-                    modified = true;
-                }
-            }
-        }
-
         let start_id   = editor.bond_start.take();
         let end_screen = editor.preview_end_screen.take();
 
@@ -118,9 +65,6 @@ pub fn process_bond_tool(
                 }
             }
         }
-        editor.dragging_atom = None;
-        editor.drag_start_mol = None;
-        editor.drag_origin_screen = None;
     }
 
     // ── Click ────────────────────────────────────────────────────────────────
@@ -330,9 +274,11 @@ pub fn process_eraser_tool(
     let mut modified = false;
     if response.clicked() {
         if let Some(atom_id) = editor.hovered_atom {
+            editor.push_undo();
             editor.molecule.remove_atom(atom_id);
             modified = true;
         } else if let Some(bond_id) = editor.hovered_bond {
+            editor.push_undo();
             editor.molecule.remove_bond(bond_id);
             modified = true;
         }
@@ -549,6 +495,17 @@ fn apply_atom_action(editor: &mut ChemStructEditor, atom_id: u32, action: Resolv
                 }
                 editor.hotspot_atom = Some(atom_id);
             } else {
+                // `insert_fragment` merges the fragment's attach atom into the existing one by
+                // ID only — it doesn't touch its element/charge. Set those first (mirrors
+                // `expand_label`), or e.g. pressing 'o' on a C would bond a new O onto an atom
+                // still labeled "C" instead of turning it into the O of an O-H.
+                let root_elem = frag.atoms[frag.attach_idx].element.clone();
+                let root_charge = frag.atoms[frag.attach_idx].charge;
+                if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
+                    atom.element = root_elem;
+                    atom.charge = root_charge;
+                }
+
                 // Detect best orientation: angle + flip to keep ring bulk away from existing bonds
                 let (angle, flip) = editor.best_fragment_placement(atom_id, &frag);
                 let new_ids = editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
@@ -1033,6 +990,125 @@ fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{AtomAction, AtomShortcut};
+
+    fn run_frame(ctx: &egui::Context, screen_rect: egui::Rect, editor: &mut ChemStructEditor, events: Vec<egui::Event>) {
+        let raw = egui::RawInput { screen_rect: Some(screen_rect), events, focused: true, ..Default::default() };
+        let _ = ctx.run_ui(raw, |ui| { editor.ui(ui); });
+    }
+
+    /// Regression test: dragging from an existing atom out into empty space (Bond tool)
+    /// should draw a bond to a newly created atom at the drop point, not silently do
+    /// nothing (see the `process_bond_tool` drag_stopped handler).
+    #[test]
+    fn bond_tool_drag_from_atom_to_empty_space_creates_bonded_atom() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, crate::Tool::Bond);
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p1 = egui::pos2(300.0, 200.0);
+        let p2 = egui::pos2(450.0, 280.0); // far from p1, empty space
+
+        // Frame 1: press, then (frame 1b) release on empty canvas -> places the first atom
+        // exactly at p1. Split across two frames: egui's click detection needs the release
+        // to arrive in a later input batch than the press, like a real mouse click would.
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p1)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p1, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p1, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]);
+        assert_eq!(editor.molecule.atoms.len(), 1, "click on empty canvas should place one atom");
+        let atom_id = editor.molecule.atoms[0].id;
+        let pos_before = editor.molecule.atom_by_id(atom_id).unwrap().pos;
+
+        // Frame 2: press down exactly on that atom.
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p1, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        // Frame 3: drag out to p2 (well past any drag threshold).
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerMoved(p2),
+        ]);
+        // Frame 4: release at p2, in empty space.
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p2, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]);
+
+        assert_eq!(editor.molecule.atoms.len(), 2, "dragging from an atom to empty space should create a new atom");
+        assert_eq!(editor.molecule.bonds.len(), 1, "dragging from an atom to empty space should bond it to the new atom");
+        let pos_after = editor.molecule.atom_by_id(atom_id).unwrap().pos;
+        assert_eq!(pos_before, pos_after, "the source atom must stay put, not be moved by the drag");
+    }
+
+    /// Dragging from one existing atom onto another draws a bond between them (both atoms
+    /// keep their own identity/position — this is a bond, not a merge).
+    #[test]
+    fn bond_tool_drag_from_atom_to_atom_creates_bond() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p1 = egui::pos2(300.0, 200.0);
+        let p2 = egui::pos2(450.0, 280.0);
+
+        // Place two atoms, one at p1 and one at p2.
+        for p in [p1, p2] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+            run_frame(&ctx, screen_rect, &mut editor, vec![
+                egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            ]);
+            run_frame(&ctx, screen_rect, &mut editor, vec![
+                egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ]);
+        }
+        assert_eq!(editor.molecule.atoms.len(), 2);
+        assert!(editor.molecule.bonds.is_empty());
+
+        // Drag from the atom at p1 onto the atom at p2.
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p1, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p2)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p2, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]);
+
+        assert_eq!(editor.molecule.atoms.len(), 2, "both atoms must still exist — this bonds, it doesn't merge");
+        assert_eq!(editor.molecule.bonds.len(), 1, "dragging atom-to-atom should draw exactly one bond");
+    }
+
+    /// Regression test: deleting with the Eraser tool must be undoable, like every other
+    /// mutation. Without a `push_undo()` before the delete, Ctrl+Z after an eraser click
+    /// doesn't restore the deleted atom — it skips past it to whatever state preceded the
+    /// *previous* edit, silently losing the deleted atom for good.
+    #[test]
+    fn eraser_tool_delete_is_undoable() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        editor.molecule.add_bond(a, b, BondOrder::Single);
+        editor.tool = crate::Tool::Eraser;
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let center = screen_rect.center();
+        let p_a = editor.mol_to_screen([0.0, 0.0], center);
+
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p_a)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p_a, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: p_a, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]);
+
+        assert_eq!(editor.molecule.atoms.len(), 1, "eraser click should delete the hovered atom");
+        assert!(editor.undo(), "the delete must have pushed an undo snapshot");
+        assert_eq!(editor.molecule.atoms.len(), 2, "undo should restore the deleted atom");
+        assert_eq!(editor.molecule.bonds.len(), 1, "undo should restore its bond too");
+    }
 
     fn frag_shortcut(key: &str, fragment: &str) -> AtomShortcut {
         AtomShortcut {

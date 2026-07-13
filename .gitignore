@@ -1,2 +1,6 @@
 /target/
 clipboard_dump/
+
+# wasm-bindgen build output for the web example (regenerate via examples/editor_web/README.md)
+/examples/editor_web/editor.js
+/examples/editor_web/editor_bg.wasm

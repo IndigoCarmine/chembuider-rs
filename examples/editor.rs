@@ -1,6 +1,9 @@
 //! Example host application for the `chembuider_rs` chemical-structure editor widget.
 //!
-//! Run with: `cargo run --example editor`
+//! Run natively with: `cargo run --example editor`
+//!
+//! Also builds for the web (wasm32, via eframe's wgpu/WebGPU backend) — see
+//! `examples/editor_web/README.md` for the build steps.
 //!
 //! This wraps the library's [`ChemStructEditor`] widget in an eframe window with a toolbar
 //! (tools, stereo, paste, clean-up, fragments, config, MOL2 export) and a status bar. The
@@ -10,6 +13,7 @@ use chembuider_rs::molecule::mol2::to_mol2_string;
 use chembuider_rs::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use eframe::{egui, App};
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -22,6 +26,48 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(EditorApp::default()))),
     )
+}
+
+/// Web entry point: attaches eframe to `<canvas id="the_canvas_id">` on the host page.
+/// wasm-bindgen auto-invokes `main` on module load for a binary crate like this example.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use eframe::wasm_bindgen::JsCast as _;
+
+    eframe::WebLogger::init(log::LevelFilter::Debug).ok();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document");
+
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("failed to find #the_canvas_id")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("#the_canvas_id was not a canvas");
+
+        let start_result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(|_cc| Ok(Box::new(EditorApp::default()))),
+            )
+            .await;
+
+        if let Some(loading_text) = document.get_element_by_id("loading_text") {
+            match start_result {
+                Ok(_) => loading_text.remove(),
+                Err(e) => {
+                    loading_text.set_inner_html(
+                        "<p>The app has crashed. See the developer console for details.</p>",
+                    );
+                    panic!("failed to start eframe: {e:?}");
+                }
+            }
+        }
+    });
 }
 
 struct EditorApp {
@@ -52,15 +98,15 @@ impl App for EditorApp {
                 ui.label("Tool:");
                 if ui.selectable_label(self.editor.tool == Tool::Select, "⬚ Select").clicked() {
                     self.editor.tool = Tool::Select;
-                    self.status = "Select: click/lasso to select, double-click for whole molecule, Alt+drag to rotate, Delete to remove.".to_string();
+                    self.status = tool_status(Tool::Select);
                 }
                 if ui.selectable_label(self.editor.tool == Tool::Bond, "✏ Bond").clicked() {
                     self.editor.tool = Tool::Bond;
-                    self.status = "Bond: click atom to extend chain, drag atom→atom to draw bond, click bond to cycle order.".to_string();
+                    self.status = tool_status(Tool::Bond);
                 }
                 if ui.selectable_label(self.editor.tool == Tool::Eraser, "✖ Eraser").clicked() {
                     self.editor.tool = Tool::Eraser;
-                    self.status = "Eraser: click an atom or bond to remove it.".to_string();
+                    self.status = tool_status(Tool::Eraser);
                 }
 
                 ui.separator();
@@ -164,8 +210,23 @@ impl App for EditorApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.editor.ui(ui);
+            // Refresh the status line once a canvas edit makes the last toolbar message (e.g.
+            // "Canvas cleared.") stale. Takes effect next repaint, since this panel draws after
+            // the status bar above — imperceptible, as canvas edits already trigger a repaint.
+            if self.editor.ui(ui) {
+                self.status = tool_status(self.editor.tool.clone());
+            }
         });
+    }
+}
+
+/// The toolbar message shown when a tool is selected, and reused to refresh the status line
+/// after a canvas edit (see the `CentralPanel` above).
+fn tool_status(tool: Tool) -> String {
+    match tool {
+        Tool::Select => "Select: click/lasso to select, double-click for whole molecule, Alt+drag to rotate, Delete to remove.".to_string(),
+        Tool::Bond => "Bond: click atom to extend chain, drag atom→atom to draw bond, click bond to cycle order.".to_string(),
+        Tool::Eraser => "Eraser: click an atom or bond to remove it.".to_string(),
     }
 }
 
@@ -176,15 +237,54 @@ impl EditorApp {
             return;
         }
         let mol2_text = to_mol2_string(&self.editor.molecule);
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Tripos MOL2", &["mol2"])
-            .set_file_name("molecule.mol2")
-            .save_file()
+
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            match std::fs::write(&path, mol2_text) {
-                Ok(_) => self.status = format!("Saved: {}", path.display()),
-                Err(e) => self.status = format!("Save failed: {e}"),
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Tripos MOL2", &["mol2"])
+                .set_file_name("molecule.mol2")
+                .save_file()
+            {
+                match std::fs::write(&path, mol2_text) {
+                    Ok(_) => self.status = format!("Saved: {}", path.display()),
+                    Err(e) => self.status = format!("Save failed: {e}"),
+                }
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            match download_text_file("molecule.mol2", "chemical/x-mol2", &mol2_text) {
+                Ok(()) => self.status = "Downloaded molecule.mol2".to_string(),
+                Err(e) => self.status = format!("Download failed: {e:?}"),
             }
         }
     }
+}
+
+/// Triggers a browser download of `contents` by creating an object URL and clicking a
+/// throwaway `<a download>` link — there is no native save dialog to call into on the web.
+#[cfg(target_arch = "wasm32")]
+fn download_text_file(
+    filename: &str,
+    mime_type: &str,
+    contents: &str,
+) -> Result<(), wasm_bindgen::JsValue> {
+    use wasm_bindgen::JsCast as _;
+    use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
+
+    let parts = js_sys::Array::new();
+    parts.push(&wasm_bindgen::JsValue::from_str(contents));
+    let bag = BlobPropertyBag::new();
+    bag.set_type(mime_type);
+    let blob = Blob::new_with_str_sequence_and_options(&parts, &bag)?;
+    let url = Url::create_object_url_with_blob(&blob)?;
+
+    let document = web_sys::window().unwrap().document().unwrap();
+    let anchor: HtmlAnchorElement = document.create_element("a")?.dyn_into()?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    anchor.click();
+    Url::revoke_object_url(&url)?;
+    Ok(())
 }

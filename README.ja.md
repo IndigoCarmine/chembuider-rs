@@ -99,6 +99,8 @@ impl eframe::App for MyApp {
 | `z` / `Z` | ジグザグ鎖 |
 | `+` / `-` | 電荷を増やす / 減らす |
 | `Ctrl`+`K` | レイアウトをクリーンアップ |
+| `Ctrl`+`Z` | undo（元に戻す） |
+| `Ctrl`+`Y` / `Ctrl`+`Shift`+`Z` | redo（やり直し） |
 | `Ctrl`+`C` / `Ctrl`+`V` | コピー / ペースト（Windows） |
 
 選択した原子は `Shift`+矢印（または `Ctrl`+矢印）で移動、`Alt`+矢印で回転できます。
