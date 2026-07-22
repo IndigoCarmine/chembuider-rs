@@ -1,5 +1,9 @@
 pub mod draw;
 pub mod interact;
+#[cfg(test)]
+mod keyboard_solver;
+#[cfg(test)]
+mod keyboard_tests;
 pub mod rich_text;
 
 use crate::config::Config;
@@ -84,6 +88,14 @@ pub struct ChemStructEditor {
     /// The "active" atom for keyboard navigation (hotspot).
     pub hotspot_atom: Option<u32>,
 
+    /// The "active" bond for keyboard bond actions (order, stereo, ring/fragment fusion).
+    ///
+    /// Bond shortcuts are otherwise reachable only by hovering a bond with the mouse, which
+    /// makes bond order and ring fusion impossible to express with the keyboard alone. Set
+    /// with Shift+arrow from [`hotspot_atom`](Self::hotspot_atom); cleared by Space/Tab or by
+    /// moving the atom hotspot.
+    pub hotspot_bond: Option<u32>,
+
     /// Loaded keyboard/fragment configuration (from JSON).
     pub config: Config,
 
@@ -103,6 +115,14 @@ pub struct ChemStructEditor {
 
     /// Last known mouse position in molecule coordinates (for no-target atom placement).
     pub last_mouse_mol: [f32; 2],
+
+    /// Whether a pointer was actually over the canvas this frame.
+    ///
+    /// Distinguishes "the cursor is somewhere the user can see" from keyboard-only use, where
+    /// [`last_mouse_mol`](Self::last_mouse_mol) is a stale leftover rather than a place the
+    /// user is pointing at. Element keys use this to decide between dropping a new atom at
+    /// the cursor and retargeting the hotspot.
+    pub pointer_active: bool,
 
     /// Active background cleanup computation, if any (None when idle).
     pub cleanup_job: Option<crate::molecule::cleanup::CleanupJob>,
@@ -138,12 +158,14 @@ impl Default for ChemStructEditor {
             lasso_path: Vec::new(),
             drag_origin_screen: None,
             hotspot_atom: None,
+            hotspot_bond: None,
             config: Config::default(),
             label_edit: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             current_bond_stereo: BondStereo::None,
             last_mouse_mol: [0.0; 2],
+            pointer_active: false,
             cleanup_job: None,
             last_v_down: false,
             rotate_last_angle: None,
@@ -671,9 +693,16 @@ impl ChemStructEditor {
 
         painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
 
-        // Update hover state and track mouse in mol coords
-        let mouse_pos = response.hover_pos().unwrap_or(egui::Pos2::ZERO);
-        if rect.contains(mouse_pos) {
+        // Update hover state and track mouse in mol coords.
+        //
+        // `hover_pos()` is None whenever no pointer is over the widget — which is every frame
+        // of keyboard-only use. Substituting a position for that absence (this used to be
+        // `unwrap_or(Pos2::ZERO)`) makes the editor behave as though the cursor were parked at
+        // the screen origin: if the canvas contains that point, it hovers whatever is drawn
+        // there and keys get routed to that atom instead of placing new ones.
+        let mouse_pos = response.hover_pos().filter(|p| rect.contains(*p));
+        self.pointer_active = mouse_pos.is_some();
+        if let Some(mouse_pos) = mouse_pos {
             self.last_mouse_mol = self.screen_to_mol(mouse_pos, center);
             self.hovered_atom = self.hit_test_atom(mouse_pos, center);
             self.hovered_bond = if self.hovered_atom.is_none() {
@@ -686,12 +715,22 @@ impl ChemStructEditor {
             self.hovered_bond = None;
         }
 
+        // A keyboard bond target is only meaningful while that bond exists, and undo, redo,
+        // deletion and label expansion can all remove it. Validating centrally here beats
+        // relying on every mutation site to remember — the same call-site discipline that
+        // `push_undo` already depends on, and occasionally loses.
+        if let Some(bid) = self.hotspot_bond {
+            if !self.molecule.bonds.iter().any(|b| b.id == bid) {
+                self.hotspot_bond = None;
+            }
+        }
+
         // Zoom via scroll wheel. `smooth_scroll_delta` is egui's *smoothed* delta — one wheel
         // notch is spread across several frames, not delivered as a single non-zero value —
         // so the factor must scale with the delta's magnitude. A fixed factor applied on every
         // frame the (smoothed, still-decaying) delta happens to be nonzero compounds
         // exponentially over those frames, turning one notch into a multi-fold zoom jump.
-        if rect.contains(mouse_pos) {
+        if let Some(mouse_pos) = mouse_pos {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let factor = (scroll * 0.002).exp();
@@ -706,6 +745,23 @@ impl ChemStructEditor {
                 self.zoom = (self.zoom * zoom_delta).clamp(0.1, 20.0);
                 let after = self.mol_to_screen(before, center);
                 self.pan += mouse_pos - after;
+            }
+        }
+
+        // Ctrl+1/2/3: switch tool. Handled here, above the tool dispatch, because the Bond
+        // tool discards every Ctrl-modified key and there was otherwise no way to leave a
+        // tool without clicking the toolbar.
+        for (key, tool) in [
+            (egui::Key::Num1, Tool::Select),
+            (egui::Key::Num2, Tool::Bond),
+            (egui::Key::Num3, Tool::Eraser),
+        ] {
+            if ui.input(|i| i.key_pressed(key) && i.modifiers.ctrl) {
+                self.tool = tool;
+                // Targets and in-flight gestures belong to the tool that was active.
+                self.hotspot_bond = None;
+                self.bond_start = None;
+                self.lasso_path.clear();
             }
         }
 
@@ -820,6 +876,17 @@ impl ChemStructEditor {
                 label_confirmed = true;
             }
             if escape { label_confirmed = true; }
+
+            // Hand keyboard focus back to the canvas the moment the editor closes.
+            //
+            // `egui_wants_keyboard_input` reports the focus still held at the *end* of a frame,
+            // and a `TextEdit` that simply stops being shown keeps its focus until egui reaps
+            // it. So without this the suppression below stayed on for one frame after the box
+            // was gone, and the first key pressed after committing a label was silently eaten
+            // — invisible at 60 Hz, perfectly reproducible in a scripted key sequence.
+            if label_confirmed {
+                area_resp.inner.surrender_focus();
+            }
         } else if self.label_edit.is_some() {
             label_confirmed = true; // atom no longer exists
         }
@@ -955,13 +1022,10 @@ mod undo_redo_tests {
         assert!(!e.redo());
     }
 
-    fn run_frame(ctx: &egui::Context, screen_rect: egui::Rect, editor: &mut ChemStructEditor, events: Vec<egui::Event>) {
-        let raw = egui::RawInput { screen_rect: Some(screen_rect), events, focused: true, ..Default::default() };
-        let _ = ctx.run_ui(raw, |ui| { editor.ui(ui); });
-    }
-
     #[test]
     fn ctrl_z_undoes_a_click_placed_atom_through_the_full_ui() {
+        use crate::testkit::{run_frame, run_frame_with_modifiers};
+
         let ctx = egui::Context::default();
         let mut editor = ChemStructEditor::default();
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
@@ -979,17 +1043,8 @@ mod undo_redo_tests {
         }
         assert_eq!(editor.molecule.atoms.len(), 2, "two clicks on empty canvas should place two atoms");
 
-        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
-        let raw = egui::RawInput {
-            screen_rect: Some(screen_rect),
-            modifiers: ctrl,
-            focused: true,
-            events: vec![egui::Event::Key {
-                key: egui::Key::Z, physical_key: Some(egui::Key::Z), pressed: true, repeat: false, modifiers: ctrl,
-            }],
-            ..Default::default()
-        };
-        let _ = ctx.run_ui(raw, |ui| { editor.ui(ui); });
+        let (events, modifiers) = crate::testkit::chord("Ctrl+Z");
+        run_frame_with_modifiers(&ctx, screen_rect, &mut editor, events, modifiers);
         assert_eq!(editor.molecule.atoms.len(), 1, "Ctrl+Z should undo the second atom placement");
     }
 }

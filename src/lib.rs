@@ -26,6 +26,10 @@ pub mod widget;
 #[cfg(windows)]
 mod clipboard;
 
+/// Shared harness for driving the widget through synthetic egui frames in tests.
+#[cfg(test)]
+pub(crate) mod testkit;
+
 /// Re-export of the exact [`egui`] version this widget is built against, so host apps can
 /// depend on a matching API without pinning the version themselves.
 pub use egui;

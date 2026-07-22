@@ -1,5 +1,6 @@
 pub mod mol2;
 pub mod fragment;
+pub mod canonical;
 pub mod cleanup;
 #[cfg(windows)]
 pub mod cdx;

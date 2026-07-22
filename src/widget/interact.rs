@@ -128,24 +128,48 @@ pub fn process_bond_tool(
     modified
 }
 
-/// Delete whichever atom or bond is currently hovered (atom takes priority).
+/// Delete the current atom or bond target.
+///
+/// Priority: pointer targets first (an atom under the cursor beats a bond under it), then
+/// keyboard targets. The keyboard *bond* target outranks the keyboard *atom* target because
+/// it is only ever set by an explicit Shift+arrow, whereas the atom hotspot lingers after
+/// every build action — deleting the atom when the user just selected a bond would be wrong.
+///
+/// The keyboard fallbacks are what make Delete work with no pointer at all.
+///
 /// Returns true if something was removed.
 fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
-    if let Some(atom_id) = editor.hovered_atom {
-        editor.push_undo();
-        editor.molecule.remove_atom(atom_id);
-        if editor.hotspot_atom == Some(atom_id) { editor.hotspot_atom = None; }
-        editor.selected_atoms.remove(&atom_id);
-        editor.hovered_atom = None;
-        return true;
+    enum Target { Atom(u32), Bond(u32) }
+
+    let target = editor.hovered_atom.map(Target::Atom)
+        .or_else(|| editor.hovered_bond.map(Target::Bond))
+        .or_else(|| editor.hotspot_bond.map(Target::Bond))
+        .or_else(|| editor.hotspot_atom.map(Target::Atom));
+
+    match target {
+        Some(Target::Atom(atom_id)) => {
+            editor.push_undo();
+            // Note a neighbour before the bonds disappear with the atom. Deleting the hotspot
+            // used to clear it outright, which is unrecoverable without a pointer: `Enter` and
+            // `g` both re-acquire a hotspot only from a *hovered* atom. A keyboard user could
+            // therefore delete exactly once per structure and then had no way to keep editing.
+            // Stepping to a former neighbour keeps the structure reachable.
+            let fallback = editor.molecule.neighbor_atom_ids(atom_id).into_iter().next();
+            editor.molecule.remove_atom(atom_id);
+            if editor.hotspot_atom == Some(atom_id) { editor.hotspot_atom = fallback; }
+            editor.selected_atoms.remove(&atom_id);
+            editor.hovered_atom = None;
+            true
+        }
+        Some(Target::Bond(bond_id)) => {
+            editor.push_undo();
+            editor.molecule.remove_bond(bond_id);
+            editor.hovered_bond = None;
+            editor.hotspot_bond = None;
+            true
+        }
+        None => false,
     }
-    if let Some(bond_id) = editor.hovered_bond {
-        editor.push_undo();
-        editor.molecule.remove_bond(bond_id);
-        editor.hovered_bond = None;
-        return true;
-    }
-    false
 }
 
 pub fn process_select_tool(
@@ -305,6 +329,7 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
             }
             "Space" | "Tab" => {
                 editor.hotspot_atom = None;
+                editor.hotspot_bond = None;
                 continue;
             }
             "g" | "G" => {
@@ -340,15 +365,15 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
         //  1. hovering an atom → act on it (change element / attach fragment)
         //  2. else, a key that names an element → drop that atom at the cursor, ahead of any
         //     stale hotspot (so O/N/S place a new atom rather than editing the hotspot)
-        //  3. else, a hovered bond → bond key (a hovered bond beats a stale hotspot so e.g.
-        //     fusing a ring/fragment onto the bond targets the bond, not the hotspot atom)
+        //  3. else, a hovered bond, or a keyboard-selected bond → bond key (either beats a
+        //     stale atom hotspot so e.g. fusing a ring/fragment targets the bond, not the atom)
         //  4. else, a hotspot → build from it (chains, rings, fused fragments)
         if let Some(atom_id) = editor.hovered_atom {
             editor.push_undo();
             if dispatch_atom_key(editor, atom_id, key) { modified = true; }
         } else if place_element_at_cursor(editor, key) {
             modified = true;
-        } else if let Some(bond_id) = editor.hovered_bond {
+        } else if let Some(bond_id) = editor.hovered_bond.or(editor.hotspot_bond) {
             editor.push_undo();
             if dispatch_bond_key(editor, bond_id, key) { modified = true; }
         } else if let Some(atom_id) = editor.hotspot_atom {
@@ -357,18 +382,43 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
         }
     }
 
-    // Arrow key navigation (with or without repeat)
-    if let Some(src_id) = editor.hotspot_atom {
-        let dir = ui.input(|i| {
-            if i.key_pressed(egui::Key::ArrowRight) { Some((1.0_f32,  0.0_f32)) }
+    // Arrow key navigation (with or without repeat).
+    //
+    // Plain arrow walks the hotspot atom to the neighbour in that direction. Shift+arrow
+    // instead targets the *bond* to that neighbour: bond actions (order, stereo, ring and
+    // fragment fusion) are otherwise reachable only by hovering a bond, so without this the
+    // keyboard cannot express a double bond or a fused ring at all.
+    let (dir, shift) = ui.input(|i| {
+        let d = if i.key_pressed(egui::Key::ArrowRight) { Some((1.0_f32,  0.0_f32)) }
             else if i.key_pressed(egui::Key::ArrowLeft)  { Some((-1.0, 0.0)) }
             else if i.key_pressed(egui::Key::ArrowUp)    { Some((0.0, -1.0)) }
             else if i.key_pressed(egui::Key::ArrowDown)  { Some((0.0,  1.0)) }
-            else { None }
-        });
-        if let Some((dx, dy)) = dir {
-            if let Some(next) = navigate_direction(&editor.molecule, src_id, dx, dy) {
-                editor.hotspot_atom = Some(next);
+            else { None };
+        (d, i.modifiers.shift)
+    });
+
+    if let Some((dx, dy)) = dir {
+        match editor.hotspot_atom {
+            Some(src_id) => {
+                if let Some(next) = navigate_direction(&editor.molecule, src_id, dx, dy) {
+                    if shift {
+                        editor.hotspot_bond =
+                            editor.molecule.bond_between(src_id, next).map(|b| b.id);
+                    } else {
+                        editor.hotspot_atom = Some(next);
+                        // A bond target from the old position would be stale and would
+                        // silently steer the next bond key at the wrong bond.
+                        editor.hotspot_bond = None;
+                    }
+                }
+            }
+            // With no hotspot the arrows move the *insertion cursor* instead. Without this,
+            // `last_mouse_mol` never changes in keyboard-only use, so every seeded atom lands
+            // on the same coordinate and a second, separate component cannot be placed at all
+            // (it snaps into the first). Space/Tab drops the hotspot to get here.
+            None => {
+                editor.last_mouse_mol[0] += dx * DEFAULT_BOND_LENGTH;
+                editor.last_mouse_mol[1] += dy * DEFAULT_BOND_LENGTH;
             }
         }
     }
@@ -391,9 +441,16 @@ fn handle_keys_select_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool
                 if let Some(id) = editor.hovered_atom { editor.hotspot_atom = Some(id); }
                 continue;
             }
-            "Space" | "Tab" => { editor.hotspot_atom = None; continue; }
+            "Space" | "Tab" => {
+                editor.hotspot_atom = None;
+                editor.hotspot_bond = None;
+                continue;
+            }
             "g" | "G" => {
-                if let Some(id) = editor.hovered_atom {
+                // Fall back to the hotspot: this is the only key that grows the selection,
+                // so requiring a hovered atom left selection (and therefore Delete, move and
+                // rotate) completely unreachable without a pointer.
+                if let Some(id) = editor.hovered_atom.or(editor.hotspot_atom) {
                     editor.hotspot_atom = Some(id);
                     editor.selected_atoms.insert(id);
                 }
@@ -763,7 +820,11 @@ fn fuse_fragment_onto_bond(
         id_map[i] = id;
     }
 
+    // The shared edge's original order, kept so the repair pass below can restore it.
+    let shared_order = editor.molecule.bond_between(a_id, b_id).map(|b| b.order.clone());
+
     // Add fragment bonds. The shared edge already exists: update its order instead of adding.
+    let mut touched: Vec<(u32, u32)> = Vec::new();
     for fb in &frag.bonds {
         let u = id_map[fb.begin];
         let v = id_map[fb.end];
@@ -776,11 +837,77 @@ fn fuse_fragment_onto_bond(
         } else {
             editor.molecule.add_bond(u, v, fb.order.clone());
         }
+        touched.push((u, v));
+    }
+
+    // A fragment's bond orders describe a *free-standing* ring, so they know nothing about
+    // the double bonds the two fusion atoms already carry. Adopting them verbatim can leave
+    // a carbon with two double bonds — fusing benzene onto benzene did exactly that, giving
+    // pentavalent ring-fusion carbons instead of naphthalene.
+    //
+    // Only re-derive when the fragment's own pattern is actually invalid, so saturated
+    // fragments (cyclohexane, piperidine, …) keep their orders untouched.
+    if touched.iter().any(|&(u, v)| double_count(&editor.molecule, u) > 1
+                                 || double_count(&editor.molecule, v) > 1)
+    {
+        // The pre-existing bond was already consistent with the rest of the molecule; the
+        // fragment has no standing to change it.
+        if let (Some(order), Some(id)) =
+            (shared_order, editor.molecule.bond_between(a_id, b_id).map(|b| b.id))
+        {
+            if let Some(bond) = editor.molecule.bond_by_id_mut(id) {
+                bond.order = order;
+            }
+        }
+        let is_shared = |u: u32, v: u32| (u == a_id && v == b_id) || (u == b_id && v == a_id);
+
+        // Clear the fragment's doubles before re-deriving. Without this, deciding bond k
+        // would count doubles on bonds k+1.. that are still carrying the fragment's own
+        // pattern, so every bond looks blocked and the ring comes out fully saturated.
+        for &(u, v) in &touched {
+            if is_shared(u, v) { continue; }
+            if let Some(id) = editor.molecule.bond_between(u, v).map(|b| b.id) {
+                if let Some(bond) = editor.molecule.bond_by_id_mut(id) {
+                    // Never demote a triple bond: it is an explicit choice, not alternation.
+                    if bond.order == BondOrder::Double {
+                        bond.order = BondOrder::Single;
+                    }
+                }
+            }
+        }
+
+        // Walk the newly contributed bonds in fragment order — for a ring fused on one edge
+        // this is the path from one fusion atom to the other — making each one double only
+        // where both ends still need one. This reproduces the Kekulé structure the fused
+        // system actually admits, rather than the isolated ring's.
+        for &(u, v) in &touched {
+            if is_shared(u, v) { continue; }
+            if double_count(&editor.molecule, u) != 0 || double_count(&editor.molecule, v) != 0 {
+                continue;
+            }
+            if let Some(id) = editor.molecule.bond_between(u, v).map(|b| b.id) {
+                if let Some(bond) = editor.molecule.bond_by_id_mut(id) {
+                    if bond.order != BondOrder::Triple {
+                        bond.order = BondOrder::Double;
+                    }
+                }
+            }
+        }
     }
 }
 
+/// How many double bonds `atom_id` currently carries.
+fn double_count(mol: &crate::molecule::Molecule, atom_id: u32) -> usize {
+    mol.bonds.iter()
+        .filter(|b| (b.begin == atom_id || b.end == atom_id) && b.order == BondOrder::Double)
+        .count()
+}
+
 /// Find the neighbor atom most in direction (dx, dy) from source.
-fn navigate_direction(
+///
+/// `pub(crate)` so the keyboard solver can enumerate arrow-key navigation without replaying
+/// frames: a duplicate of this rule in the search would silently drift from the real one.
+pub(crate) fn navigate_direction(
     mol: &crate::molecule::Molecule,
     src_id: u32,
     dx: f32,
@@ -866,7 +993,7 @@ fn pressed_key_strings(ui: &egui::Ui) -> Vec<(String, bool, bool, bool)> {
     })
 }
 
-fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
+pub(crate) fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
     use egui::Key::*;
     let s: &str = match key {
         A => if shift { "A" } else { "a" },
@@ -955,11 +1082,28 @@ fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
 }
 
 /// If `key` names an element, drop a bare atom of it at the cursor (`last_mouse_mol`).
-/// Applies to single-atom fragments and to any fragment whose root (attach) atom is a
-/// heteroatom — so "O"/"o" (O, OH), "N"/"n" (N, NH2), "s" (SH), halogens, etc. all place
-/// that atom. Carbon-rooted fragments (chains, benzene, Me) are left to the
-/// build-from-hotspot path and return false here.
+///
+/// Applies to any fragment whose root (attach) atom is a heteroatom — so "O"/"o" (O, OH),
+/// "N"/"n" (N, NH2), "s" (SH), halogens, etc. all place that atom — and to a lone carbon
+/// ("c"/"m", Me) **only while there is no hotspot**.
+///
+/// That carbon exception is what lets a structure be started at all: on an empty canvas
+/// nothing is hovered and no hotspot exists, so without it no carbon skeleton could begin.
+/// Multi-atom carbon-rooted fragments (chains, benzene) always fall through to the
+/// build-from-hotspot path.
+///
+/// **Requires a live pointer once a hotspot exists.** With the mouse, dropping a new atom
+/// wherever the cursor sits — ahead of a stale hotspot — is the useful behaviour. With the
+/// keyboard there is no cursor to aim: `last_mouse_mol` is a leftover, so placing there
+/// stranded every heteroatom as its own component (`c 1 o` gave a loose oxygen instead of an
+/// alcohol) and made most structures unbuildable. Deferring to the hotspot instead lets
+/// `dispatch_atom_key` retarget that atom, which is how a heteroatom joins the structure.
+/// Space/Tab drops the hotspot when a separate component really is wanted.
 fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
+    if !editor.pointer_active && editor.hotspot_atom.is_some() {
+        return false;
+    }
+
     let actions: Vec<crate::config::AtomAction> = editor.config.atom_shortcuts.iter()
         .filter(|s| s.key == key && !s.ctrl && !s.alt)
         .map(|s| s.action.clone())
@@ -990,11 +1134,7 @@ fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{AtomAction, AtomShortcut};
-
-    fn run_frame(ctx: &egui::Context, screen_rect: egui::Rect, editor: &mut ChemStructEditor, events: Vec<egui::Event>) {
-        let raw = egui::RawInput { screen_rect: Some(screen_rect), events, focused: true, ..Default::default() };
-        let _ = ctx.run_ui(raw, |ui| { editor.ui(ui); });
-    }
+    use crate::testkit::run_frame;
 
     /// Regression test: dragging from an existing atom out into empty space (Bond tool)
     /// should draw a bond to a newly created atom at the drop point, not silently do
