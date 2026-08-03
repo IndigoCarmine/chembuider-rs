@@ -103,6 +103,9 @@ struct ReactionApp {
     editor: ReactionEditor,
     /// The one place structures are drawn. Everything in the figure was taken from here.
     canvas: ChemStructEditor,
+    /// The scheme structure the canvas is currently editing, if any. While set, canvas edits
+    /// are written straight back into this slot every frame so the table below follows live.
+    linked_structure: Option<usize>,
     status: String,
 }
 
@@ -115,8 +118,10 @@ impl Default for ReactionApp {
             reaction: reference_reaction(),
             editor: ReactionEditor::new(),
             canvas,
+            linked_structure: None,
             status: "Draw on the canvas, then add it to the figure. Double-click a structure to \
-                     edit it, drag scheme items to reorder, right-click for more."
+                     edit it — canvas edits then flow into the table live. Drag scheme items to \
+                     reorder, right-click for more."
                 .to_string(),
         }
     }
@@ -176,6 +181,9 @@ impl eframe::App for ReactionApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
+                // Carry this frame's canvas edits into the linked scheme structure before the
+                // figure is drawn, so the table below re-derives live as the structure changes.
+                self.sync_linked_structure();
                 let response = self.editor.show(ui, &mut self.reaction);
                 // Right-click a scheme item for the same actions the inspector offers, so the
                 // figure is fully operable on its own — no side panel required (課題D).
@@ -198,6 +206,36 @@ impl ReactionApp {
             return None;
         }
         Some(self.canvas.molecule.clone())
+    }
+
+    /// Write the canvas straight into the scheme structure it is linked to (set by
+    /// double-clicking a structure), so the table below follows the edit with no extra click.
+    /// Only pushes when the molecule actually changed, and drops the link if the canvas is
+    /// emptied or the linked slot is gone.
+    fn sync_linked_structure(&mut self) {
+        let Some(index) = self.linked_structure else {
+            return;
+        };
+        // An emptied canvas breaks the link rather than wiping the linked structure.
+        if self.canvas.molecule.atoms.is_empty() {
+            self.linked_structure = None;
+            self.status = "Canvas cleared — the structure is no longer linked.".to_string();
+            return;
+        }
+        let changed = match self.reaction.scheme.items.get(index) {
+            Some(SchemeItem::Structure(m)) => *m != self.canvas.molecule,
+            // The linked item was deleted or is no longer a structure: forget the link.
+            _ => {
+                self.linked_structure = None;
+                return;
+            }
+        };
+        if changed {
+            // set_scheme_structure carries the edit into its analysis column, so the table's
+            // formula, MW and stoichiometry redraw with the structure.
+            self.reaction
+                .set_scheme_structure(index, self.canvas.molecule.clone());
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -467,6 +505,9 @@ impl ReactionApp {
         // Any selection or open box may be pointing at an index that is about to move.
         self.editor.select(None);
         self.editor.cancel_edit();
+        // Drop the live edit link too — a delete/reorder can invalidate its index. The
+        // EditSchemeStructureInCanvas arm re-establishes it for the structure it opens.
+        self.linked_structure = None;
         match action {
             Action::RemoveSchemeItem(i) => {
                 self.reaction.scheme.remove(i);
@@ -497,12 +538,12 @@ impl ReactionApp {
                     self.canvas.molecule = mol.clone();
                     self.canvas.selected_atoms.clear();
                     self.canvas.tool = Tool::Select;
-                    // Leave the source selected so "Replace selected structure" writes the
-                    // edited canvas straight back into this slot.
+                    // Link this slot to the canvas: every edit now flows back into it (and the
+                    // table) automatically, no Replace click needed.
+                    self.linked_structure = Some(i);
                     self.editor.select(Some(Hit::Scheme { index: i, part: SchemePart::Structure }));
                     self.status =
-                        "Loaded the structure into the canvas — edit it, then ⟳ Replace selected \
-                         structure to write it back."
+                        "Editing this structure on the canvas — your changes update the table live."
                             .to_string();
                 }
             }
