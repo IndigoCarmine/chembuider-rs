@@ -840,6 +840,10 @@ impl ReactionEditor {
                 };
                 let delta = target as isize - drag.from as isize;
                 if let Some(landed) = reaction.scheme.move_item(drag.from, delta) {
+                    // Reordering shifts the structure→column mapping, which is positional
+                    // (reactants before the arrow, products after). Re-derive every table
+                    // column from whatever structure now sits at its position.
+                    reaction.sync_structures_from_scheme();
                     self.selection = Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
                 }
             }

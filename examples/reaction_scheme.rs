@@ -474,6 +474,8 @@ impl ReactionApp {
             }
             Action::MoveSchemeItem(i, delta) => {
                 self.reaction.scheme.move_item(i, delta);
+                // Keep the table's columns aligned with the reordered structures.
+                self.reaction.sync_structures_from_scheme();
             }
             Action::ReplaceSchemeStructure(i) => {
                 if let Some(mol) = self.canvas_structure() {
