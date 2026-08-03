@@ -916,3 +916,133 @@ fn golden_key_sequences_build_their_structures() {
     assert!(failures.is_empty(), "golden sequences failed:\n{}", failures.join("\n"));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Label expansion, including chained fragment names (`MeOPh` = Me–O–Ph)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Type `label` onto a fresh atom and press `x` to expand it.
+///
+/// `prefix` builds whatever the atom should already be attached to; `""` leaves it bare.
+/// `` ` `` opens the label editor on the hotspot, Enter commits, `x` runs `expand_label`.
+fn expand(prefix: &str, label: &str) -> Molecule {
+    let seed = if prefix.is_empty() { "c".to_string() } else { format!("c {prefix}") };
+    type_keys(&format!("{seed} ` text:{label} Enter x")).molecule
+}
+
+/// Heavy (non-hydrogen) neighbours of an atom.
+fn heavy_degree(mol: &Molecule, id: u32) -> usize {
+    mol.neighbor_atom_ids(id)
+        .iter()
+        .filter(|n| mol.atom_by_id(**n).is_some_and(|a| a.element != "H"))
+        .count()
+}
+
+/// The headline case: three fragment names run together expand to the three fragments bonded
+/// in that order. On a bare atom `MeOPh` is exactly anisole, CH3–O–C6H5.
+#[test]
+fn a_chained_label_expands_into_a_chain() {
+    let mol = expand("", "MeOPh");
+    assert_eq!(mol.atoms.len(), 8, "CH3 + O + C6H5");
+    assert_eq!(mol.bonds.len(), 8, "6 ring bonds + ring–O + O–CH3");
+    assert!(
+        is_isomorphic(&mol, &load_fixture("anisole")),
+        "MeOPh should build anisole, got {} atoms / {} bonds",
+        mol.atoms.len(),
+        mol.bonds.len(),
+    );
+}
+
+/// The same label on an atom that already has a bond gives the same chain with one more
+/// neighbour on its leading carbon — `–CH2–O–Ph` rather than `CH3–O–Ph`.
+///
+/// Hydrogens are never stored (they are counted from valence when the label is drawn), so the
+/// observable difference is exactly this: the leading carbon's heavy degree goes 1 → 2.
+#[test]
+fn a_chained_label_expands_the_same_way_on_a_bonded_atom() {
+    let bare = expand("", "MeOPh");
+    let bonded = expand("1", "MeOPh"); // `1` grows a one-carbon chain first
+
+    assert_eq!(bonded.atoms.len(), bare.atoms.len() + 1, "one extra carbon from the prefix");
+    assert_eq!(bonded.bonds.len(), bare.bonds.len() + 1, "and one extra bond");
+    assert_eq!(bonded.atoms.len(), 9, "CH3CH2–O–C6H5");
+
+    // The oxygen still bridges exactly two carbons in both cases.
+    let o_degree = |m: &Molecule| {
+        let o = m.atoms.iter().find(|a| a.element == "O").expect("the ether oxygen");
+        heavy_degree(m, o.id)
+    };
+    assert_eq!(o_degree(&bare), 2);
+    assert_eq!(o_degree(&bonded), 2);
+
+    // The methyl carbon of the bare case has one heavy neighbour; with a prefix bond it has two.
+    let leading = |m: &Molecule| {
+        let o = m.atoms.iter().find(|a| a.element == "O").unwrap();
+        m.neighbor_atom_ids(o.id)
+            .into_iter()
+            .map(|n| heavy_degree(m, n))
+            .min()
+            .unwrap()
+    };
+    assert_eq!(leading(&bare), 1, "CH3– has only the oxygen");
+    assert_eq!(leading(&bonded), 2, "–CH2– has the oxygen and the prefix carbon");
+}
+
+/// Single fragment names must expand exactly as they always did — the chain reading is only
+/// consulted for labels that are not names.
+#[test]
+fn a_single_fragment_label_still_expands_on_its_own() {
+    for (label, atoms, bonds) in [
+        ("OMe", 2, 1),
+        ("NO2", 3, 2),
+        ("CO2Me", 4, 3),
+        ("TMS", 4, 3),
+        ("Boc", 7, 6),
+        ("benzene", 6, 6),
+    ] {
+        let mol = expand("", label);
+        assert_eq!(mol.atoms.len(), atoms, "{label}: atom count");
+        assert_eq!(mol.bonds.len(), bonds, "{label}: bond count");
+    }
+}
+
+/// A label with no reading is left untouched — expansion never half-applies or invents atoms.
+#[test]
+fn an_unreadable_label_is_left_alone() {
+    for label in ["Qq", "MeQq", "Si", "P", "ME"] {
+        let mol = expand("", label);
+        assert_eq!(mol.atoms.len(), 1, "{label}: nothing should have been added");
+        assert!(mol.bonds.is_empty(), "{label}: nothing should have been bonded");
+        assert_eq!(
+            mol.atoms[0].element, label,
+            "{label}: the label text must survive verbatim",
+        );
+    }
+}
+
+/// Case is significant, and `Ph` (phenyl) versus `PH2` (phosphino) is where it bites.
+#[test]
+fn chained_labels_are_case_sensitive() {
+    let phenyl = expand("", "MeOPh");
+    let phosphino = expand("", "MeOPH2");
+    assert_eq!(phenyl.atoms.len(), 8, "Me–O–C6H5");
+    assert_eq!(phosphino.atoms.len(), 5, "Me–O–PH2 (P plus two explicit H)");
+    assert!(phosphino.atoms.iter().any(|a| a.element == "P"));
+    assert!(!phenyl.atoms.iter().any(|a| a.element == "P"));
+}
+
+/// A name that only *looks* splittable must not be nibbled apart: `NO2` is the nitro group,
+/// `CO2Me` the methyl ester, and neither may be read as a chain starting with `N` or `C`.
+#[test]
+fn multi_character_fragment_names_are_not_split() {
+    for (label, want_elements) in [
+        ("NO2", vec!["N", "O", "O"]),
+        ("CO2Me", vec!["C", "C", "O", "O"]),
+        ("SiH3", vec!["H", "H", "H", "Si"]),
+        ("CF3", vec!["C", "F", "F", "F"]),
+    ] {
+        let mol = expand("", label);
+        let mut got: Vec<&str> = mol.atoms.iter().map(|a| a.element.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, want_elements, "{label}");
+    }
+}

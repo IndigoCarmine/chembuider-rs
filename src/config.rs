@@ -363,6 +363,7 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/C10H21.json"),
     include_str!("../assets/fragments/C11H23.json"),
     include_str!("../assets/fragments/C12H25.json"),
+    include_str!("../assets/fragments/Ph.json"),
 ];
 
 /// Parse the compile-time built-in fragments. No file I/O.

@@ -19,6 +19,7 @@
 //! See `examples/editor.rs` for a complete host application (toolbar, status bar, MOL2 export).
 
 pub mod config;
+pub mod label_chain;
 pub mod molecule;
 pub mod widget;
 
