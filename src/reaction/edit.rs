@@ -384,6 +384,24 @@ pub fn set_scheme_text(
     true
 }
 
+/// Run the automatic 2-D layout cleanup ([`crate::molecule::cleanup`]) on the structure at
+/// `index`, rewriting its atom coordinates in place. Returns `false` when the item at that
+/// index is not a structure (or the index is out of range), leaving the scheme untouched.
+///
+/// This is the synchronous, one-shot relaxation — fine for the small structures a scheme
+/// carries. The interactive canvas editor streams the same computation off a background
+/// thread instead (see [`ChemStructEditor::toggle_cleanup`](crate::widget::ChemStructEditor));
+/// a scheme structure is redrawn from scratch every frame, so it just takes the final result.
+pub fn cleanup_scheme_structure(scheme: &mut ReactionScheme, index: usize) -> bool {
+    match scheme.items.get_mut(index) {
+        Some(SchemeItem::Structure(mol)) => {
+            crate::molecule::cleanup::cleanup_2d(mol);
+            true
+        }
+        _ => false,
+    }
+}
+
 // ─── Geometry ────────────────────────────────────────────────────────────────
 
 /// Screen rect of a table cell, for a figure whose top-left corner is at `top_left`.
@@ -431,6 +449,40 @@ pub fn scheme_item_rect(
         ),
         _ => rect,
     })
+}
+
+/// Where a scheme item dragged to `pointer` would drop: the number of items whose horizontal
+/// centre sits left of the pointer, i.e. an insertion slot in `0..=items.len()`. Independent
+/// of which item is being dragged, so the caller converts it to a final index itself.
+pub fn scheme_drop_index(layout: &FigureLayout, top_left: Pos2, pointer: Pos2) -> usize {
+    let origin = top_left + layout.scheme_offset;
+    layout
+        .scheme
+        .items
+        .iter()
+        .filter(|placed| placed.rect.translate(origin.to_vec2()).center().x < pointer.x)
+        .count()
+}
+
+/// A vertical caret marking where a dragged item will drop, spanning the scheme band.
+fn draw_drop_caret(
+    painter: &egui::Painter,
+    layout: &FigureLayout,
+    top_left: Pos2,
+    insert_at: usize,
+    color: Color32,
+) {
+    let origin = top_left + layout.scheme_offset;
+    let scheme = &layout.scheme;
+    let Some(last) = scheme.items.last() else { return };
+    let x = match scheme.items.get(insert_at) {
+        Some(placed) => placed.rect.translate(origin.to_vec2()).min.x,
+        None => last.rect.translate(origin.to_vec2()).max.x,
+    };
+    painter.line_segment(
+        [Pos2::new(x, origin.y), Pos2::new(x, origin.y + scheme.size.y)],
+        Stroke::new(2.5, color),
+    );
 }
 
 /// What is under `pos` in a figure drawn with its top-left corner at `top_left`.
@@ -499,6 +551,15 @@ struct Editing {
     text: String,
 }
 
+/// A scheme item being dragged to a new position on the reaction line.
+#[derive(Clone, Copy)]
+struct DragReorder {
+    /// Index of the item picked up.
+    from: usize,
+    /// Where it will drop: the number of items that will sit to its left (`0..=items.len()`).
+    insert_at: usize,
+}
+
 /// Interactive front end for [`ReactionView`]: the same figure, plus click-to-edit.
 ///
 /// Hold one between frames — it owns the view, which owns the structure drawing context.
@@ -513,6 +574,15 @@ pub struct ReactionEditor {
     edit: Option<Editing>,
     selection: Option<Hit>,
     error: Option<String>,
+    /// Set when a scheme structure is double-clicked: the host reads it with
+    /// [`take_edit_request`](Self::take_edit_request) and opens that structure in a molecule
+    /// editor of its own.
+    edit_request: Option<usize>,
+    /// What the pointer was over when the context menu (secondary click) opened; the host
+    /// reads it with [`context_target`](Self::context_target) to build the menu.
+    context_target: Option<Hit>,
+    /// A scheme item being dragged to reorder, live for the duration of the drag.
+    drag: Option<DragReorder>,
 }
 
 impl Default for ReactionEditor {
@@ -529,6 +599,9 @@ impl ReactionEditor {
             edit: None,
             selection: None,
             error: None,
+            edit_request: None,
+            context_target: None,
+            drag: None,
         }
     }
 
@@ -540,6 +613,45 @@ impl ReactionEditor {
 
     pub fn select(&mut self, hit: Option<Hit>) {
         self.selection = hit;
+    }
+
+    /// Take the pending "edit this structure" request, set when a scheme structure is
+    /// double-clicked. The host loads that structure (`reaction.scheme.items[index]`) into a
+    /// [`ChemStructEditor`](crate::widget::ChemStructEditor) and, once edited, writes it back —
+    /// e.g. through the selection this same double-click leaves on that structure.
+    pub fn take_edit_request(&mut self) -> Option<usize> {
+        self.edit_request.take()
+    }
+
+    /// What the pointer was over when the context menu was opened (secondary click). Read this
+    /// inside a [`Response::context_menu`](egui::Response::context_menu) closure to decide what
+    /// the menu offers.
+    pub fn context_target(&self) -> Option<Hit> {
+        self.context_target
+    }
+
+    /// Forget the context-menu target (e.g. after the menu closes).
+    pub fn clear_context_target(&mut self) {
+        self.context_target = None;
+    }
+
+    /// True while a scheme item is being dragged to reorder it.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Run the automatic 2-D layout cleanup on the *selected* scheme structure, if the current
+    /// selection is one. Returns the index that was cleaned up. A convenience wrapper over
+    /// [`cleanup_scheme_structure`].
+    pub fn cleanup_selected_structure(&mut self, reaction: &mut Reaction) -> Option<usize> {
+        match self.selection {
+            Some(Hit::Scheme { index, part: SchemePart::Structure })
+                if cleanup_scheme_structure(&mut reaction.scheme, index) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        }
     }
 
     /// The open edit box: what it edits, and the text in it.
@@ -652,7 +764,9 @@ impl ReactionEditor {
     pub fn show(&mut self, ui: &mut egui::Ui, reaction: &mut Reaction) -> egui::Response {
         let painter = ui.painter().clone();
         let layout = self.view.measure(&painter, reaction);
-        let (rect, response) = ui.allocate_exact_size(layout.size, Sense::click());
+        // `click_and_drag` so scheme items can be picked up and reordered; a press-release
+        // without movement is still a click, so cell/label editing is unchanged.
+        let (rect, response) = ui.allocate_exact_size(layout.size, Sense::click_and_drag());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter().clone();
             self.view.paint_layout(&layout, &painter, rect.min, reaction);
@@ -661,6 +775,23 @@ impl ReactionEditor {
         let hover = response
             .hover_pos()
             .and_then(|p| hit_test(&reaction.scheme, &layout, rect.min, p));
+
+        // ── Drag to reorder a scheme item ──────────────────────────────────────
+        // Only scheme items reorder; a drag that starts on the table does nothing.
+        if response.drag_started() {
+            let start = response
+                .interact_pointer_pos()
+                .and_then(|p| hit_test(&reaction.scheme, &layout, rect.min, p));
+            if let Some(Hit::Scheme { index, .. }) = start {
+                self.drag = Some(DragReorder { from: index, insert_at: index });
+                self.edit = None;
+            }
+        }
+        if response.dragged() {
+            if let (Some(drag), Some(p)) = (self.drag.as_mut(), response.interact_pointer_pos()) {
+                drag.insert_at = scheme_drop_index(&layout, rect.min, p);
+            }
+        }
 
         // Outlines over the finished figure. Nothing is drawn when the pointer is elsewhere
         // and nothing is selected, so an idle figure is byte-for-byte the plain rendering.
@@ -677,21 +808,67 @@ impl ReactionEditor {
         if let Some(hit) = self.selection {
             outline(hit, Stroke::new(1.5, self.highlight));
         }
-        if let Some(hit) = hover.filter(|h| Some(*h) != self.selection) {
-            outline(hit, Stroke::new(1.0, self.highlight.gamma_multiply(0.5)));
+        // While dragging, the hover outline would just chase the pointer — the drop caret says
+        // where the item lands instead.
+        if self.drag.is_none() {
+            if let Some(hit) = hover.filter(|h| Some(*h) != self.selection) {
+                outline(hit, Stroke::new(1.0, self.highlight.gamma_multiply(0.5)));
+            }
+        } else if let Some(drag) = self.drag {
+            outline(
+                Hit::Scheme { index: drag.from, part: SchemePart::Structure },
+                Stroke::new(1.5, self.highlight.gamma_multiply(0.7)),
+            );
+            draw_drop_caret(&painter, &layout, rect.min, drag.insert_at, self.highlight);
         }
-        if hover.is_some() {
+
+        if self.drag.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if hover.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        // Commit the reorder when the drag ends: `insert_at` counts items left of the pointer,
+        // so once the moved item is pulled out its final index shifts down by one whenever it
+        // was dropped to the right of where it started.
+        if response.drag_stopped() {
+            if let Some(drag) = self.drag.take() {
+                let target = if drag.insert_at > drag.from {
+                    drag.insert_at - 1
+                } else {
+                    drag.insert_at
+                };
+                let delta = target as isize - drag.from as isize;
+                if let Some(landed) = reaction.scheme.move_item(drag.from, delta) {
+                    self.selection = Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                }
+            }
         }
 
         // The overlay runs before the click below, so clicking straight from one cell to the
         // next commits the first (the box loses focus) and then opens the second.
         self.edit_overlay(ui, reaction, &layout, rect.min);
 
-        if response.clicked() {
+        // Double-click a structure to ask the host to open it in a molecule editor.
+        if response.double_clicked() {
+            if let Some(Hit::Scheme { index, part: SchemePart::Structure }) = hover {
+                self.selection = Some(Hit::Scheme { index, part: SchemePart::Structure });
+                self.edit_request = Some(index);
+                self.edit = None;
+            }
+        } else if response.clicked() {
             match hover {
                 Some(hit) => self.click(hit, reaction),
                 None => self.selection = None,
+            }
+        }
+
+        // Secondary click records what the pointer is over so the host's context menu (attached
+        // to the returned response) knows what it was opened on.
+        if response.secondary_clicked() {
+            self.context_target = hover;
+            if let Some(hit) = hover {
+                self.selection = Some(hit);
             }
         }
 
@@ -1346,6 +1523,79 @@ mod tests {
                 );
             }
         });
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────────
+
+    /// Cleanup relaxes a scheme structure's coordinates in place, and leaves every other
+    /// kind of scheme item (and out-of-range indices) untouched.
+    #[test]
+    fn cleanup_scheme_structure_relaxes_only_structures() {
+        use crate::molecule::{BondOrder, Molecule};
+
+        let mut mol = Molecule::default();
+        let a = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = mol.add_atom("C".to_string(), [5.0, 0.0], 0); // bond far too long
+        mol.add_bond(a, b, BondOrder::Single);
+        let mut scheme = ReactionScheme::new().structure(mol).plus();
+
+        assert!(cleanup_scheme_structure(&mut scheme, 0), "index 0 is a structure");
+        let SchemeItem::Structure(relaxed) = &scheme.items[0] else {
+            panic!("item 0 is a structure");
+        };
+        let (p, q) = (relaxed.atoms[0].pos, relaxed.atoms[1].pos);
+        let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+        assert!((d - 1.5).abs() < 0.2, "the bond relaxes toward L = 1.5, got {d}");
+
+        // A `+` (and an out-of-range index) is not a structure — reported, not cleaned.
+        assert!(!cleanup_scheme_structure(&mut scheme, 1), "index 1 is a plus");
+        assert!(!cleanup_scheme_structure(&mut scheme, 99), "out of range");
+    }
+
+    // ── Drag to reorder ─────────────────────────────────────────────────────
+
+    /// The drop slot is the number of items whose centre sits left of the pointer, so it runs
+    /// `0..=items.len()` across the reaction line.
+    #[test]
+    fn scheme_drop_index_counts_items_left_of_the_pointer() {
+        let reaction = demo::williamson_ether_synthesis();
+        with_figure(&reaction, |layout, top_left| {
+            let origin = top_left + layout.scheme_offset;
+            let centre: Vec<f32> = layout
+                .scheme
+                .items
+                .iter()
+                .map(|p| p.rect.translate(origin.to_vec2()).center().x)
+                .collect();
+            let y = origin.y + layout.scheme.center_line;
+
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(origin.x - 50.0, y)), 0);
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(centre[2] + 500.0, y)), 3);
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(centre[0] + 1.0, y)), 1);
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(centre[1] + 1.0, y)), 2);
+        });
+    }
+
+    /// The drop-slot → final-index conversion in `show`'s `drag_stopped` handler moves an item
+    /// to exactly the gap the caret pointed at, whichever direction it travelled.
+    #[test]
+    fn dragging_reorders_scheme_items() {
+        // Mirror the index math in `ReactionEditor::show`.
+        fn drop(scheme: &mut ReactionScheme, from: usize, insert_at: usize) -> Option<usize> {
+            let target = if insert_at > from { insert_at - 1 } else { insert_at };
+            scheme.move_item(from, target as isize - from as isize)
+        }
+
+        // [Structure, Arrow, Structure]
+        let mut scheme = demo::williamson_ether_synthesis().scheme;
+        // Drag the first structure past the end (slot 3): it lands last.
+        assert_eq!(drop(&mut scheme, 0, 3), Some(2));
+        assert!(matches!(scheme.items[0], SchemeItem::Arrow(_)));
+        assert!(matches!(scheme.items[2], SchemeItem::Structure(_)));
+        // Drag it back to the front (slot 0).
+        assert_eq!(drop(&mut scheme, 2, 0), Some(0));
+        assert!(matches!(scheme.items[0], SchemeItem::Structure(_)));
+        assert!(matches!(scheme.items[1], SchemeItem::Arrow(_)));
     }
 
     // ── The widget ──────────────────────────────────────────────────────────
