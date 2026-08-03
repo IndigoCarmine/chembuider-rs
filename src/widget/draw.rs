@@ -1,52 +1,63 @@
 use super::ChemStructEditor;
-use super::rich_text::{RichGalley, RichText, RichTextStyle};
-use crate::molecule::{max_valence, normal_valence, BondOrder, BondStereo};
+use super::rich_text::RichText;
+use super::scene::{self, RenderTransform};
+use crate::molecule::{max_valence, normal_valence, Molecule};
 use std::collections::HashMap;
 
-// Visual sizes (bond width, label size, etc.) are user-configurable via `config.style`
-// (see StyleConfig). These two only affect internal rendering detail and stay fixed.
-const HASH_COUNT: usize = 6;
-const WAVY_STEPS: usize = 16;
+// Geometry helpers moved to `scene.rs` (the backend-neutral primitive builder). Re-exported so
+// draw.rs's own unit tests keep reaching them by their old names.
+#[cfg(test)]
+pub(crate) use scene::{
+    double_bond_placement, perp_normal, segment_rect_exit, trimmed_bond_endpoints,
+    DoubleBondPlacement,
+};
+
+/// A laid-out atom label (galley + element-anchored screen rect). Alias of the backend-neutral
+/// [`SceneLabel`] so callers (the reaction figure, tests) keep the old type name.
+pub use scene::SceneLabel as AtomLabelLayout;
+
+/// The mapping from editor pan/zoom to the backend-neutral [`RenderTransform`]. Positions scale
+/// by `zoom * SCALE_FACTOR`; visual sizes (widths, font) scale by `zoom` alone — so at zoom = 1
+/// the editor and the image exporter (which uses `SCALE_FACTOR`, `visual_scale = 1`) agree exactly.
+fn editor_transform(editor: &ChemStructEditor, center: egui::Pos2) -> RenderTransform {
+    RenderTransform {
+        coord_scale: editor.zoom * super::SCALE_FACTOR,
+        offset: center.to_vec2() + editor.pan,
+        visual_scale: editor.zoom,
+    }
+}
 
 // ─── Per-frame label layout pass ─────────────────────────────────────────────
 
-/// A laid-out atom label: the galley plus the screen rect it occupies. The rect is
-/// positioned so the label's *element symbol* (not the bounding box) is centered on the
-/// atom position — wide labels and scripts grow outward from the anchor.
-pub struct AtomLabelLayout {
-    pub galley: RichGalley,
-    pub rect: egui::Rect,
-}
-
-/// Lay out every visible atom label once per frame. The map is shared by the bond pass
-/// (endpoint trimming), the background pass (white mask rects) and the label pass
-/// (painting), so the baseline math runs once. Galley construction itself is cheap:
-/// egui caches galleys by layout-job hash across frames.
+/// Lay out every visible atom label once per frame, via the shared [`scene::build_labels`]. The
+/// map is shared by the bond pass (endpoint trimming), the background pass (white mask rects) and
+/// the label pass (painting), so the baseline math runs once.
 pub fn compute_label_layouts(
     editor: &ChemStructEditor,
     painter: &egui::Painter,
     center: egui::Pos2,
 ) -> HashMap<u32, AtomLabelLayout> {
-    let style = RichTextStyle::new(
-        editor.config.style.label_size * editor.zoom,
-        egui::Color32::BLACK,
-    );
-    let mut map = HashMap::new();
-    for atom in &editor.molecule.atoms {
-        if !should_show_label(editor, atom.id) {
-            continue;
-        }
-        let label = atom_label(&editor.molecule, atom);
-        let galley = label.rich.layout_with(&style, |job| painter.layout_job(job));
-        let anchor = galley
-            .char_range_rect(label.anchor_chars)
-            .map(|r| r.center().to_vec2())
-            .unwrap_or_else(|| galley.size() * 0.5); // no glyphs: fall back to bbox center
-        let sp = editor.mol_to_screen(atom.pos, center);
-        let rect = egui::Rect::from_min_size(sp - anchor, galley.size());
-        map.insert(atom.id, AtomLabelLayout { galley, rect });
+    scene::build_labels(
+        &editor.molecule,
+        &editor.config.style,
+        editor_transform(editor, center),
+        |job| painter.layout_job(job),
+    )
+}
+
+// ─── Layer -1: ring fills ─────────────────────────────────────────────────────
+
+/// Colored ring interiors, drawn behind the bonds (ChemDraw-style ring shading). Same shared
+/// fill polygons the image exporter draws, so the canvas and the copied picture match.
+pub fn draw_ring_fills(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
+    for poly in scene::build_ring_fills(&editor.molecule, editor_transform(editor, center)) {
+        painter.add(egui::Shape::Path(egui::epaint::PathShape {
+            points: poly.points,
+            closed: true,
+            fill: poly.color,
+            stroke: egui::epaint::PathStroke::NONE,
+        }));
     }
-    map
 }
 
 // ─── Layer 0: bonds ──────────────────────────────────────────────────────────
@@ -57,330 +68,25 @@ pub fn draw_bonds(
     center: egui::Pos2,
     labels: &HashMap<u32, AtomLabelLayout>,
 ) {
-    let s = &editor.config.style;
-    // Visual sizes scale with zoom so they track the panzoom transform (z == 1.0 = baseline).
-    let z = editor.zoom;
-    for bond in &editor.molecule.bonds {
-        // Bonds to a folded terminal H are suppressed (the H is shown in the heavy atom's label).
-        if is_folded_h(&editor.molecule, bond.begin) || is_folded_h(&editor.molecule, bond.end) {
-            continue;
-        }
-        let Some(a) = editor.molecule.atom_by_id(bond.begin) else { continue };
-        let Some(b) = editor.molecule.atom_by_id(bond.end) else { continue };
-        let p1 = editor.mol_to_screen(a.pos, center);
-        let p2 = editor.mol_to_screen(b.pos, center);
-
-        // Trim each endpoint at its label's (padded) rect so bonds stop short of the
-        // text instead of striking through it. A bond fully swallowed by its labels
-        // (very short bond) is skipped — the labels still show the connectivity.
-        let trim_rect = |id: u32| labels.get(&id).map(|l| l.rect.expand(s.label_trim_pad * z));
-        let Some((tp1, tp2)) =
-            trimmed_bond_endpoints(p1, p2, trim_rect(bond.begin), trim_rect(bond.end))
-        else {
-            continue;
-        };
-
-        let color = if editor.hovered_bond == Some(bond.id) {
+    let bonds = scene::build_bonds(
+        &editor.molecule,
+        &editor.config.style,
+        editor_transform(editor, center),
+        labels,
+    );
+    for bond in bonds {
+        // A hovered bond is tinted green; the geometry is identical to the exported picture.
+        let color = if editor.hovered_bond == Some(bond.bond_id) {
             egui::Color32::from_rgb(50, 180, 50)
         } else {
             egui::Color32::BLACK
         };
-        let stroke = egui::Stroke::new(s.bond_width * z, color);
-
-        match &bond.stereo {
-            BondStereo::None => {
-                // For a plain (non-stereo) double bond, decide where the two lines go based on
-                // which side of the bond axis the neighboring bonds sit (ChemDraw convention):
-                // more neighbors on one side ⇒ main line on the axis + a short inset line toward
-                // the majority side; equal counts (or none) ⇒ symmetric pair (legacy behavior).
-                // The side decision is pure geometry classification and uses the UNTRIMMED
-                // atom positions; only the drawn lines use the trimmed endpoints.
-                let placement = if matches!(bond.order, BondOrder::Double) {
-                    let (nx, ny) = perp_normal(p1, p2);
-                    // Collect screen positions of the OTHER neighbors of each endpoint.
-                    let mut neighbors: Vec<egui::Pos2> = Vec::new();
-                    for nid in editor.molecule.neighbor_atom_ids(bond.begin) {
-                        if nid == bond.end { continue; }
-                        if let Some(na) = editor.molecule.atom_by_id(nid) {
-                            neighbors.push(editor.mol_to_screen(na.pos, center));
-                        }
-                    }
-                    for nid in editor.molecule.neighbor_atom_ids(bond.end) {
-                        if nid == bond.begin { continue; }
-                        if let Some(na) = editor.molecule.atom_by_id(nid) {
-                            neighbors.push(editor.mol_to_screen(na.pos, center));
-                        }
-                    }
-                    double_bond_placement(p1, p2, (nx, ny), &neighbors)
-                } else {
-                    DoubleBondPlacement::Symmetric
-                };
-                draw_bond_order(painter, tp1, tp2, &bond.order, stroke, s.double_bond_offset * z, placement)
-            }
-            BondStereo::WedgeUp => draw_wedge_solid(painter, tp1, tp2, color, s.wedge_width * z),
-            BondStereo::WedgeDown => {
-                // Hash half-widths keep the taper rate of the untrimmed wedge: each hash's
-                // width is its fraction along the ORIGINAL p1→p2 segment.
-                draw_wedge_hash(painter, (tp1, tp2), (p1, p2), color, s.wedge_width * z, s.bond_width * z)
-            }
-            BondStereo::Bold => draw_bold(painter, tp1, tp2, color, s.bold_width * z),
-            BondStereo::Dashed => draw_dashed(painter, tp1, tp2, stroke, s.dash_len * z, s.dash_gap * z),
-            BondStereo::Wavy => draw_wavy(painter, tp1, tp2, stroke, s.wavy_amplitude * z),
+        for s in &bond.strokes {
+            painter.line_segment([s.a, s.b], egui::Stroke::new(s.width, color));
         }
-    }
-}
-
-/// Parametric `t` in `(0, 1]` where the segment `p → q` exits `rect` (slab method), for a
-/// `p` lying inside the rect. `None` when `q` is also inside (the segment never leaves).
-fn segment_rect_exit(p: egui::Pos2, q: egui::Pos2, rect: egui::Rect) -> Option<f32> {
-    let d = q - p;
-    let tx = if d.x > 0.0 {
-        (rect.max.x - p.x) / d.x
-    } else if d.x < 0.0 {
-        (rect.min.x - p.x) / d.x
-    } else {
-        f32::INFINITY
-    };
-    let ty = if d.y > 0.0 {
-        (rect.max.y - p.y) / d.y
-    } else if d.y < 0.0 {
-        (rect.min.y - p.y) / d.y
-    } else {
-        f32::INFINITY
-    };
-    let t = tx.min(ty);
-    (t.is_finite() && t <= 1.0).then_some(t.max(0.0))
-}
-
-/// Trim a bond's endpoints at the (already padded) label rects of its endpoint atoms.
-/// `None` rect = unlabeled endpoint (bare carbon), no trim at that end. Returns `None`
-/// when the labels swallow the whole bond (degenerate short bond → skip drawing).
-fn trimmed_bond_endpoints(
-    p1: egui::Pos2,
-    p2: egui::Pos2,
-    r1: Option<egui::Rect>,
-    r2: Option<egui::Rect>,
-) -> Option<(egui::Pos2, egui::Pos2)> {
-    // A labeled endpoint whose rect the segment never exits swallows the whole bond.
-    let t1 = match r1.map(|r| segment_rect_exit(p1, p2, r)) {
-        None => 0.0,
-        Some(Some(t)) => t,
-        Some(None) => return None,
-    };
-    let t2 = match r2.map(|r| segment_rect_exit(p2, p1, r)) {
-        None => 1.0,
-        Some(Some(t)) => 1.0 - t,
-        Some(None) => return None,
-    };
-    let len = (p2 - p1).length();
-    // Require ~1px of remaining bond, else consider it swallowed.
-    if len < 1e-3 || (t2 - t1) * len < 1.0 {
-        return None;
-    }
-    let at = |t: f32| p1 + (p2 - p1) * t;
-    Some((at(t1), at(t2)))
-}
-
-/// Where to place the two lines of a `BondOrder::Double` (with `BondStereo::None`).
-/// Decided from the side on which the bond's substituents lie (see `double_bond_placement`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum DoubleBondPlacement {
-    /// Two lines symmetric about the bond axis (terminal/isolated bonds or trans-disubstituted).
-    Symmetric,
-    /// Main line on the axis + a shorter inset line offset toward one side. The `f32` is the
-    /// side sign (+1.0 = +normal side, -1.0 = -normal side).
-    Centered(f32),
-}
-
-fn draw_bond_order(
-    painter: &egui::Painter,
-    p1: egui::Pos2,
-    p2: egui::Pos2,
-    order: &BondOrder,
-    stroke: egui::Stroke,
-    double_bond_offset: f32,
-    placement: DoubleBondPlacement,
-) {
-    match order {
-        BondOrder::Single => {
-            painter.line_segment([p1, p2], stroke);
+        for fill in bond.fills {
+            painter.add(egui::Shape::convex_polygon(fill, color, egui::Stroke::NONE));
         }
-        BondOrder::Double => match placement {
-            DoubleBondPlacement::Symmetric => {
-                let (nx, ny) = perp_normal(p1, p2);
-                let half = double_bond_offset * 0.5;
-                let a1 = egui::Pos2::new(p1.x + nx * half, p1.y + ny * half);
-                let a2 = egui::Pos2::new(p2.x + nx * half, p2.y + ny * half);
-                let b1 = egui::Pos2::new(p1.x - nx * half, p1.y - ny * half);
-                let b2 = egui::Pos2::new(p2.x - nx * half, p2.y - ny * half);
-                painter.line_segment([a1, a2], stroke);
-                painter.line_segment([b1, b2], stroke);
-            }
-            DoubleBondPlacement::Centered(side) => {
-                // Main line runs full-length on the bond axis.
-                painter.line_segment([p1, p2], stroke);
-                // Second line: full offset toward the substituent side, inset 15% at each end so
-                // it sits inside the ring/cis region.
-                let (nx, ny) = perp_normal(p1, p2);
-                let dx = p2.x - p1.x;
-                let dy = p2.y - p1.y;
-                let len = (dx * dx + dy * dy).sqrt();
-                let (ox, oy) = (nx * double_bond_offset * side, ny * double_bond_offset * side);
-                let inset = 0.15 * len;
-                let (ux, uy) = if len > 0.001 { (dx / len, dy / len) } else { (0.0, 0.0) };
-                let inner_start = egui::Pos2::new(p1.x + ux * inset + ox, p1.y + uy * inset + oy);
-                let inner_end   = egui::Pos2::new(p2.x - ux * inset + ox, p2.y - uy * inset + oy);
-                painter.line_segment([inner_start, inner_end], stroke);
-            }
-        },
-        BondOrder::Triple => {
-            painter.line_segment([p1, p2], stroke);
-            let (nx, ny) = perp_normal(p1, p2);
-            let off = double_bond_offset;
-            painter.line_segment([
-                egui::Pos2::new(p1.x + nx * off, p1.y + ny * off),
-                egui::Pos2::new(p2.x + nx * off, p2.y + ny * off),
-            ], stroke);
-            painter.line_segment([
-                egui::Pos2::new(p1.x - nx * off, p1.y - ny * off),
-                egui::Pos2::new(p2.x - nx * off, p2.y - ny * off),
-            ], stroke);
-        }
-    }
-}
-
-/// Solid filled wedge: narrow at p1 (begin), wide at p2 (end).
-fn draw_wedge_solid(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32, wedge_width: f32) {
-    let (nx, ny) = perp_normal(p1, p2);
-    let w_a = egui::Pos2::new(p2.x + nx * wedge_width, p2.y + ny * wedge_width);
-    let w_b = egui::Pos2::new(p2.x - nx * wedge_width, p2.y - ny * wedge_width);
-    painter.add(egui::Shape::convex_polygon(
-        vec![p1, w_a, w_b],
-        color,
-        egui::Stroke::NONE,
-    ));
-}
-
-/// Hash wedge: series of short lines widening from p1 to p2. The hashes are drawn over
-/// the (possibly trimmed) `trimmed` segment, but each hash's half-width comes from its
-/// fraction along the ORIGINAL `full` segment so the taper rate matches the untrimmed wedge.
-fn draw_wedge_hash(
-    painter: &egui::Painter,
-    trimmed: (egui::Pos2, egui::Pos2),
-    full: (egui::Pos2, egui::Pos2),
-    color: egui::Color32,
-    wedge_width: f32,
-    line_width: f32,
-) {
-    let (p1, p2) = trimmed;
-    let (full1, full2) = full;
-    let (nx, ny) = perp_normal(p1, p2);
-    let full_len = (full2 - full1).length().max(1e-3);
-    for i in 1..=HASH_COUNT {
-        let t = i as f32 / HASH_COUNT as f32;
-        let px = p1.x + (p2.x - p1.x) * t;
-        let py = p1.y + (p2.y - p1.y) * t;
-        let full_t = ((egui::Pos2::new(px, py) - full1).length() / full_len).min(1.0);
-        let half = wedge_width * full_t;
-        painter.line_segment([
-            egui::Pos2::new(px + nx * half, py + ny * half),
-            egui::Pos2::new(px - nx * half, py - ny * half),
-        ], egui::Stroke::new(line_width, color));
-    }
-}
-
-/// Heavy/bold bond.
-fn draw_bold(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, color: egui::Color32, bold_width: f32) {
-    painter.line_segment([p1, p2], egui::Stroke::new(bold_width, color));
-}
-
-/// Dashed line.
-fn draw_dashed(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke, dash_len: f32, dash_gap: f32) {
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    let total = (dx * dx + dy * dy).sqrt();
-    if total < 0.001 { return; }
-    let (ux, uy) = (dx / total, dy / total);
-    let mut t = 0.0_f32;
-    let mut drawing = true;
-    while t < total {
-        let seg = if drawing { dash_len } else { dash_gap };
-        let end_t = (t + seg).min(total);
-        if drawing {
-            painter.line_segment([
-                egui::Pos2::new(p1.x + ux * t,     p1.y + uy * t),
-                egui::Pos2::new(p1.x + ux * end_t, p1.y + uy * end_t),
-            ], stroke);
-        }
-        t = end_t;
-        drawing = !drawing;
-    }
-}
-
-/// Wavy bond (sine-wave approximation).
-fn draw_wavy(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke, wavy_amplitude: f32) {
-    let (nx, ny) = perp_normal(p1, p2);
-    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(WAVY_STEPS + 1);
-    for i in 0..=WAVY_STEPS {
-        let t = i as f32 / WAVY_STEPS as f32;
-        let px = p1.x + (p2.x - p1.x) * t;
-        let py = p1.y + (p2.y - p1.y) * t;
-        let wave = (t * std::f32::consts::TAU * 2.0).sin() * wavy_amplitude;
-        pts.push(egui::Pos2::new(px + nx * wave, py + ny * wave));
-    }
-    for win in pts.windows(2) {
-        painter.line_segment([win[0], win[1]], stroke);
-    }
-}
-
-fn perp_normal(p1: egui::Pos2, p2: egui::Pos2) -> (f32, f32) {
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 0.001 { return (0.0, 1.0); }
-    (-dy / len, dx / len)
-}
-
-/// Decide the line placement for a plain double bond from where its neighboring atoms sit
-/// relative to the bond axis. `normal` is the perpendicular unit normal of the bond (see
-/// `perp_normal`); `neighbors` are the screen positions of the other atoms bonded to either
-/// endpoint. The signed component `(neighbor - midpoint) · normal` classifies each neighbor as
-/// being on the +normal side (`dot > eps`) or -normal side (`dot < -eps`).
-///
-/// The inset line goes toward the side with MORE neighbors (into the ring / the
-/// substituted side, ChemDraw convention):
-///
-/// - more neighbors on the +normal side → `Centered(+1.0)` (inset line toward +normal)
-/// - more neighbors on the -normal side → `Centered(-1.0)` (inset line toward -normal)
-/// - equal counts (both sides alike, or none) → `Symmetric`
-///
-/// Coordinate space: this function is space-agnostic — it works in whatever space the caller
-/// supplies, as long as `p1/p2`, `normal`, and `neighbors` are all in the same space. The
-/// rendering path uses screen coordinates (where y is flipped vs molecule coords); the
-/// symmetric-vs-Centered decision is sign-consistent either way, only the meaning of the
-/// returned side sign is tied to the chosen `normal`.
-fn double_bond_placement(
-    p1: egui::Pos2,
-    p2: egui::Pos2,
-    normal: (f32, f32),
-    neighbors: &[egui::Pos2],
-) -> DoubleBondPlacement {
-    let mid = egui::Pos2::new((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
-    let eps = 1e-3_f32;
-    let mut positive = 0;
-    let mut negative = 0;
-    for n in neighbors {
-        let dot = (n.x - mid.x) * normal.0 + (n.y - mid.y) * normal.1;
-        if dot > eps {
-            positive += 1;
-        } else if dot < -eps {
-            negative += 1;
-        }
-    }
-    match (positive, negative) {
-        (p, n) if p > n => DoubleBondPlacement::Centered(1.0),
-        (p, n) if n > p => DoubleBondPlacement::Centered(-1.0),
-        _ => DoubleBondPlacement::Symmetric,
     }
 }
 
@@ -515,7 +221,7 @@ fn element_token_len(flat: &str) -> usize {
 /// side ("HO", "H₂N" when the bonds come from the right). The element text itself goes
 /// through the rich-text markup parser, so custom labels typed into the editor can use
 /// `_`/`^` scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
-fn atom_label(
+pub(crate) fn atom_label(
     mol: &crate::molecule::Molecule,
     atom: &crate::molecule::Atom,
 ) -> AtomLabel {
@@ -629,13 +335,13 @@ pub fn is_folded_h(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
     used < valence as i16 + heavy.charge as i16
 }
 
-fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
-    let Some(atom) = editor.molecule.atom_by_id(atom_id) else { return false };
+pub(crate) fn should_show_label(mol: &Molecule, atom_id: u32) -> bool {
+    let Some(atom) = mol.atom_by_id(atom_id) else { return false };
     // Folded hydrogens are merged into their heavy neighbor's label.
-    if is_folded_h(&editor.molecule, atom_id) { return false; }
+    if is_folded_h(mol, atom_id) { return false; }
     if atom.element == "C" {
         // Carbon: only show when completely isolated (no bonds) so the atom stays visible
-        return atom.charge != 0 || editor.molecule.bonds_for_atom(atom_id).is_empty();
+        return atom.charge != 0 || mol.bonds_for_atom(atom_id).is_empty();
     }
     true
 }

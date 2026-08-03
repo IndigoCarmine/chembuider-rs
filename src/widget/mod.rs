@@ -5,6 +5,7 @@ mod keyboard_solver;
 #[cfg(test)]
 mod keyboard_tests;
 pub mod rich_text;
+pub mod scene;
 
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};
@@ -38,12 +39,24 @@ struct ClipBond {
     stereo: BondStereo,
 }
 
+/// A ring fill on the clipboard: atom *indices* (positions within `ClipMol::atoms`, not ids,
+/// which change on paste) plus the straight RGBA color.
+#[derive(Serialize, Deserialize)]
+struct ClipRingFill {
+    atoms: Vec<usize>,
+    color: [u8; 4],
+}
+
 /// A self-contained copy of a sub-structure (atoms + the bonds among them), used for
 /// clipboard copy/paste. Atom indices in bonds are positions within `atoms`.
 #[derive(Serialize, Deserialize)]
 struct ClipMol {
     atoms: Vec<ClipAtom>,
     bonds: Vec<ClipBond>,
+    /// Colored ring interiors. Defaulted, so clipboard text written before this field existed
+    /// still parses (and a copy with no fills omits it entirely).
+    #[serde(default)]
+    ring_fills: Vec<ClipRingFill>,
 }
 pub const SCALE_FACTOR: f32 = 50.0;
 pub const NODE_HIT_RADIUS_PX: f32 = 15.0;
@@ -193,6 +206,52 @@ impl ChemStructEditor {
         }
     }
 
+    /// Fill the smallest ring passing through `atom_id` with `color` (straight RGBA), drawn
+    /// behind the bonds. Returns false (and does nothing) when the atom is on no ring. Records
+    /// an undo step so the fill can be reverted with Ctrl+Z.
+    pub fn fill_ring_at(&mut self, atom_id: u32, color: [u8; 4]) -> bool {
+        match self.molecule.smallest_ring_containing(atom_id) {
+            Some(ring) => {
+                self.push_undo();
+                self.molecule.set_ring_fill(ring, color);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fill the ring the current selection points at: the smallest ring through the hotspot
+    /// atom, or through any selected atom. Convenience for a toolbar "fill ring" action before
+    /// a dedicated canvas ring-picking gesture is wired up. Returns false when nothing is
+    /// selected or the seed atom is on no ring.
+    pub fn fill_selected_ring(&mut self, color: [u8; 4]) -> bool {
+        let seed = self
+            .hotspot_atom
+            .or_else(|| self.selected_atoms.iter().copied().min());
+        match seed {
+            Some(a) => self.fill_ring_at(a, color),
+            None => false,
+        }
+    }
+
+    /// Remove the ring fill through the hotspot / any selected atom. Returns true if one went.
+    pub fn clear_selected_ring_fill(&mut self) -> bool {
+        let seed = self
+            .hotspot_atom
+            .or_else(|| self.selected_atoms.iter().copied().min());
+        match seed {
+            Some(a) => {
+                self.push_undo();
+                let removed = self.molecule.clear_ring_fill_containing(a);
+                if !removed {
+                    self.undo_stack.pop_back();
+                }
+                removed
+            }
+            None => false,
+        }
+    }
+
     /// Build a fragment from the current selection and save it to `fragments/<name>.json`.
     /// The attach point (the atom that will bond to the rest of a molecule on insertion) is
     /// the hotspot atom when it is part of the selection, otherwise the lowest-id selected atom.
@@ -274,7 +333,13 @@ impl ChemStructEditor {
             })
         }).collect();
 
-        serde_json::to_string(&ClipMol { atoms, bonds })
+        // Ring fills survive the copy only when every ring atom is in the copied set.
+        let ring_fills = self.molecule.ring_fills.iter().filter_map(|rf| {
+            let atoms: Option<Vec<usize>> = rf.atoms.iter().map(|id| index.get(id).copied()).collect();
+            Some(ClipRingFill { atoms: atoms?, color: rf.color })
+        }).collect();
+
+        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills })
             .ok()
             .map(|json| format!("{CLIP_PREFIX}{json}"))
     }
@@ -341,6 +406,13 @@ impl ChemStructEditor {
                         bond.stereo = b.stereo.clone();
                     }
                 }
+            }
+        }
+        // Restore ring fills, remapping the copied atom indices to the freshly created ids.
+        for rf in &clip.ring_fills {
+            let ids: Option<Vec<u32>> = rf.atoms.iter().map(|i| new_ids.get(*i).copied()).collect();
+            if let Some(ids) = ids {
+                self.molecule.set_ring_fill(ids, rf.color);
             }
         }
         self.selected_atoms = new_ids.into_iter().collect();
@@ -971,6 +1043,9 @@ impl ChemStructEditor {
         // frame's hit testing.
         let label_layouts = draw::compute_label_layouts(self, &painter, center);
         self.last_label_rects = label_layouts.iter().map(|(id, l)| (*id, l.rect)).collect();
+        // Ring fills sit behind the bonds (ChemDraw-style shading). Same shared fill polygons the
+        // image exporter draws, so the canvas and the copied picture look identical.
+        draw::draw_ring_fills(self, &painter, center);
         draw::draw_bonds(self, &painter, center, &label_layouts);
         draw::draw_atom_backgrounds(self, &painter, center, &label_layouts);
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
@@ -1027,6 +1102,51 @@ mod clipboard_tests {
         // Foreign clipboard text is ignored.
         assert!(!e.paste_from_string("just some text"));
         assert!(!e.paste_from_string(""));
+    }
+
+    #[test]
+    fn copy_paste_preserves_ring_fills() {
+        let mut e = ChemStructEditor::default();
+        // A triangle ring, filled green.
+        let a = e.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = e.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c = e.molecule.add_atom("C".to_string(), [0.75, 1.3], 0);
+        e.molecule.add_bond(a, b, BondOrder::Single);
+        e.molecule.add_bond(b, c, BondOrder::Single);
+        e.molecule.add_bond(c, a, BondOrder::Single);
+        e.molecule.set_ring_fill(vec![a, b, c], [0, 200, 0, 128]);
+
+        let text = e.copy_to_string().expect("copy");
+        // A fresh editor receives the paste; the fill's color survives the round-trip.
+        let mut e2 = ChemStructEditor::default();
+        assert!(e2.paste_from_string(&text));
+        assert_eq!(e2.molecule.ring_fills.len(), 1, "the ring fill was pasted");
+        assert_eq!(e2.molecule.ring_fills[0].color, [0, 200, 0, 128], "with its color");
+        // And it references three real, freshly-created atoms.
+        assert_eq!(e2.molecule.ring_fills[0].atoms.len(), 3);
+        for id in &e2.molecule.ring_fills[0].atoms {
+            assert!(e2.molecule.atom_by_id(*id).is_some());
+        }
+    }
+
+    #[test]
+    fn fill_ring_at_colors_the_smallest_ring() {
+        let mut e = ChemStructEditor::default();
+        let ids: Vec<u32> = (0..6)
+            .map(|k| {
+                let a = (k as f32) * std::f32::consts::TAU / 6.0;
+                e.molecule.add_atom("C".to_string(), [a.cos(), a.sin()], 0)
+            })
+            .collect();
+        for k in 0..6 {
+            e.molecule.add_bond(ids[k], ids[(k + 1) % 6], BondOrder::Single);
+        }
+        assert!(e.fill_ring_at(ids[0], [255, 0, 0, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 1);
+        assert_eq!(e.molecule.ring_fills[0].atoms.len(), 6);
+        // Undo (the fill recorded a snapshot) removes it again.
+        assert!(e.undo());
+        assert!(e.molecule.ring_fills.is_empty());
     }
 
     #[test]
