@@ -28,7 +28,10 @@
 //! See [`chembuider_rs::reaction::edit`] for the editing API this app is a host for.
 
 use chembuider_rs::egui;
-use chembuider_rs::reaction::edit::{EditTarget, Hit, SchemePart, cleanup_scheme_structure};
+use chembuider_rs::reaction::edit::{
+    EditTarget, Hit, SchemePart, StructureRef, cleanup_scheme_structure, scheme_arrow_structure,
+    set_scheme_arrow_structure,
+};
 use chembuider_rs::reaction::{
     Analysis, Arrow, Mass, MolecularFormula, Product, Reactant, Reaction, ReactionEditor,
     ReactionScheme, SchemeItem, demo,
@@ -37,9 +40,12 @@ use chembuider_rs::{ChemStructEditor, Molecule, Tool};
 
 /// The reference figure: PhOH + MeI / K₂CO₃ → PhOMe, 700 mg isolated (60.92 %).
 fn reference_reaction() -> Reaction {
+    // The arrow carries a *structure* above the shaft — biphenyl, drawn as the same kind of
+    // object as the main-line structures — with the base written out below it, to show the two
+    // kinds of arrow label side by side. Double-click the biphenyl to edit it on the canvas.
     let scheme = ReactionScheme::new()
         .structure(demo::phenol())
-        .arrow(Arrow::new().above("MeI").below("K_2CO_3"))
+        .arrow(Arrow::new().above_structure(demo::biphenyl()).below("K_2CO_3"))
         .structure(demo::anisole());
 
     let analysis = Analysis::new()
@@ -103,9 +109,10 @@ struct ReactionApp {
     editor: ReactionEditor,
     /// The one place structures are drawn. Everything in the figure was taken from here.
     canvas: ChemStructEditor,
-    /// The scheme structure the canvas is currently editing, if any. While set, canvas edits
-    /// are written straight back into this slot every frame so the table below follows live.
-    linked_structure: Option<usize>,
+    /// The scheme structure the canvas is currently editing, if any (a main-line structure or
+    /// one on an arrow label). While set, canvas edits are written straight back into this slot
+    /// every frame so the table below follows live.
+    linked_structure: Option<StructureRef>,
     status: String,
 }
 
@@ -136,7 +143,10 @@ enum Action {
     /// Relax the layout of a scheme structure with the automatic 2-D cleanup (課題A).
     CleanupSchemeStructure(usize),
     /// Load a scheme structure into the canvas so it can be edited, then written back (課題B).
-    EditSchemeStructureInCanvas(usize),
+    /// The target is a main-line structure or one riding on an arrow label.
+    EditSchemeStructureInCanvas(StructureRef),
+    /// Put the canvas structure on an arrow's above/below label.
+    PlaceArrowStructure(usize, SchemePart),
     EditSchemeText(usize, SchemePart),
     RemoveReactant(usize),
     RemoveProduct(usize),
@@ -188,9 +198,10 @@ impl eframe::App for ReactionApp {
                 // Right-click a scheme item for the same actions the inspector offers, so the
                 // figure is fully operable on its own — no side panel required (課題D).
                 self.scheme_context_menu(response);
-                // A double-click on a structure loads it into the canvas for editing (課題B).
-                if let Some(index) = self.editor.take_edit_request() {
-                    self.apply(Action::EditSchemeStructureInCanvas(index));
+                // A double-click on a structure (main-line or on an arrow label) loads it into
+                // the canvas for editing (課題B).
+                if let Some(target) = self.editor.take_edit_request() {
+                    self.apply(Action::EditSchemeStructureInCanvas(target));
                 }
             });
         });
@@ -213,7 +224,7 @@ impl ReactionApp {
     /// Only pushes when the molecule actually changed, and drops the link if the canvas is
     /// emptied or the linked slot is gone.
     fn sync_linked_structure(&mut self) {
-        let Some(index) = self.linked_structure else {
+        let Some(target) = self.linked_structure else {
             return;
         };
         // An emptied canvas breaks the link rather than wiping the linked structure.
@@ -222,19 +233,39 @@ impl ReactionApp {
             self.status = "Canvas cleared — the structure is no longer linked.".to_string();
             return;
         }
-        let changed = match self.reaction.scheme.items.get(index) {
-            Some(SchemeItem::Structure(m)) => *m != self.canvas.molecule,
-            // The linked item was deleted or is no longer a structure: forget the link.
-            _ => {
-                self.linked_structure = None;
-                return;
+        // The molecule currently in the linked slot, whichever kind of slot it is.
+        let current = match target {
+            StructureRef::Item(i) => match self.reaction.scheme.items.get(i) {
+                Some(SchemeItem::Structure(m)) => Some(m),
+                _ => None,
+            },
+            StructureRef::ArrowLabel { index, part } => {
+                scheme_arrow_structure(&self.reaction.scheme, index, part)
             }
         };
-        if changed {
-            // set_scheme_structure carries the edit into its analysis column, so the table's
-            // formula, MW and stoichiometry redraw with the structure.
-            self.reaction
-                .set_scheme_structure(index, self.canvas.molecule.clone());
+        let Some(current) = current else {
+            // The linked slot was deleted or is no longer a structure: forget the link.
+            self.linked_structure = None;
+            return;
+        };
+        if *current != self.canvas.molecule {
+            match target {
+                // set_scheme_structure carries the edit into its analysis column, so the table's
+                // formula, MW and stoichiometry redraw with the structure.
+                StructureRef::Item(i) => {
+                    self.reaction.set_scheme_structure(i, self.canvas.molecule.clone());
+                }
+                // An arrow-label structure is purely visual (no table column), so it is written
+                // straight back.
+                StructureRef::ArrowLabel { index, part } => {
+                    set_scheme_arrow_structure(
+                        &mut self.reaction.scheme,
+                        index,
+                        part,
+                        self.canvas.molecule.clone(),
+                    );
+                }
+            }
         }
     }
 
@@ -328,6 +359,32 @@ impl ReactionApp {
                 && let Some(i) = self.editor.cleanup_selected_structure(&mut self.reaction)
             {
                 self.status = format!("Cleaned up the layout of scheme structure {i}.");
+            }
+
+            ui.separator();
+
+            // Put the canvas structure over (or under) the selected arrow, so the drawn figure
+            // can show a reagent as its structure rather than a name.
+            let arrow_selected = matches!(
+                selected,
+                Some(Hit::Scheme { part: SchemePart::ArrowAbove | SchemePart::ArrowBelow, .. })
+            );
+            ui.label("On selected arrow:");
+            if ui
+                .add_enabled(arrow_selected, egui::Button::new("▲ structure above"))
+                .on_disabled_hover_text("Select an arrow (above/below) in the scheme first")
+                .clicked()
+                && let Some(Hit::Scheme { index, .. }) = selected
+            {
+                self.apply(Action::PlaceArrowStructure(index, SchemePart::ArrowAbove));
+            }
+            if ui
+                .add_enabled(arrow_selected, egui::Button::new("▼ structure below"))
+                .on_disabled_hover_text("Select an arrow (above/below) in the scheme first")
+                .clicked()
+                && let Some(Hit::Scheme { index, .. }) = selected
+            {
+                self.apply(Action::PlaceArrowStructure(index, SchemePart::ArrowBelow));
             }
         });
     }
@@ -459,7 +516,7 @@ impl ReactionApp {
                 matches!(self.reaction.scheme.items.get(index), Some(SchemeItem::Structure(_)));
             if is_structure {
                 if ui.button("✎ Edit in canvas").clicked() {
-                    action = Some(Action::EditSchemeStructureInCanvas(index));
+                    action = Some(Action::EditSchemeStructureInCanvas(StructureRef::Item(index)));
                     ui.close();
                 }
                 if ui.button("🧹 Clean up layout").clicked() {
@@ -473,7 +530,31 @@ impl ReactionApp {
                 ui.separator();
             }
             match part {
-                SchemePart::ArrowAbove | SchemePart::ArrowBelow | SchemePart::Text => {
+                // An arrow band either holds a structure (edit it on the canvas, or replace it)
+                // or is a text label (edit its markup); either way, the canvas structure can be
+                // dropped onto it.
+                SchemePart::ArrowAbove | SchemePart::ArrowBelow => {
+                    let has_structure =
+                        scheme_arrow_structure(&self.reaction.scheme, index, part).is_some();
+                    if has_structure {
+                        if ui.button("✎ Edit structure in canvas").clicked() {
+                            action = Some(Action::EditSchemeStructureInCanvas(
+                                StructureRef::ArrowLabel { index, part },
+                            ));
+                            ui.close();
+                        }
+                    } else if ui.button("✎ Edit text").clicked() {
+                        action = Some(Action::EditSchemeText(index, part));
+                        ui.close();
+                    }
+                    let verb = if has_structure { "⟳ Replace with canvas" } else { "＋ Structure from canvas" };
+                    if ui.button(verb).clicked() {
+                        action = Some(Action::PlaceArrowStructure(index, part));
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                SchemePart::Text => {
                     if ui.button("✎ Edit text").clicked() {
                         action = Some(Action::EditSchemeText(index, part));
                         ui.close();
@@ -532,19 +613,45 @@ impl ReactionApp {
                     self.status = "Cleaned up the structure's layout.".to_string();
                 }
             }
-            Action::EditSchemeStructureInCanvas(i) => {
-                if let Some(SchemeItem::Structure(mol)) = self.reaction.scheme.items.get(i) {
+            Action::EditSchemeStructureInCanvas(target) => {
+                // Read the molecule from whichever kind of slot the request names.
+                let (mol, sel) = match target {
+                    StructureRef::Item(i) => match self.reaction.scheme.items.get(i) {
+                        Some(SchemeItem::Structure(m)) => (
+                            Some(m.clone()),
+                            Hit::Scheme { index: i, part: SchemePart::Structure },
+                        ),
+                        _ => (None, Hit::Scheme { index: i, part: SchemePart::Structure }),
+                    },
+                    StructureRef::ArrowLabel { index, part } => (
+                        scheme_arrow_structure(&self.reaction.scheme, index, part).cloned(),
+                        Hit::Scheme { index, part },
+                    ),
+                };
+                if let Some(mol) = mol {
                     self.canvas.push_undo();
-                    self.canvas.molecule = mol.clone();
+                    self.canvas.molecule = mol;
                     self.canvas.selected_atoms.clear();
                     self.canvas.tool = Tool::Select;
                     // Link this slot to the canvas: every edit now flows back into it (and the
-                    // table) automatically, no Replace click needed.
-                    self.linked_structure = Some(i);
-                    self.editor.select(Some(Hit::Scheme { index: i, part: SchemePart::Structure }));
+                    // table, for a main-line structure) automatically, no Replace click needed.
+                    self.linked_structure = Some(target);
+                    self.editor.select(Some(sel));
                     self.status =
-                        "Editing this structure on the canvas — your changes update the table live."
+                        "Editing this structure on the canvas — your changes update the figure live."
                             .to_string();
+                }
+            }
+            Action::PlaceArrowStructure(index, part) => {
+                if let Some(mol) = self.canvas_structure() {
+                    if set_scheme_arrow_structure(&mut self.reaction.scheme, index, part, mol) {
+                        self.editor.select(Some(Hit::Scheme { index, part }));
+                        let where_ = if part == SchemePart::ArrowAbove { "above" } else { "below" };
+                        self.status =
+                            format!("Placed the canvas structure {where_} the arrow.");
+                    } else {
+                        self.status = "That scheme item is not an arrow.".to_string();
+                    }
                 }
             }
             Action::EditSchemeText(index, part) => {

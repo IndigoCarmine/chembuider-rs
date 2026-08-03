@@ -31,15 +31,74 @@ pub enum SchemeItem {
     Text(RichText),
 }
 
-/// A reaction arrow and the text riding on it.
+/// A label riding above or below a reaction arrow: nothing, some text, or a drawn structure.
+///
+/// A `Structure` label is the *same* [`Molecule`] a main-line structure carries, so it draws
+/// identically (same bond trimming, label anchoring and ring fills) — a reagent or catalyst
+/// shown as its structure rather than written out as a name.
+#[derive(Clone, Debug, Default)]
+pub enum ArrowLabel {
+    /// Nothing on this side of the shaft.
+    #[default]
+    Empty,
+    /// Rich text (reagents, a base, a solvent, a temperature).
+    Text(RichText),
+    /// A drawn structure.
+    Structure(Molecule),
+}
+
+impl ArrowLabel {
+    /// True when there is nothing on this side of the shaft.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// The rich text, when this label is text.
+    pub fn as_text(&self) -> Option<&RichText> {
+        match self {
+            Self::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The drawn structure, when this label is one.
+    pub fn as_structure(&self) -> Option<&Molecule> {
+        match self {
+            Self::Structure(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The drawn structure, mutably, when this label is one.
+    pub fn as_structure_mut(&mut self) -> Option<&mut Molecule> {
+        match self {
+            Self::Structure(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+/// Text folds to [`ArrowLabel::Text`], and empty text to [`ArrowLabel::Empty`], so the
+/// `.above("…")` / `.below("…")` builders keep taking plain markup.
+impl From<RichText> for ArrowLabel {
+    fn from(text: RichText) -> Self {
+        if text.is_empty() {
+            Self::Empty
+        } else {
+            Self::Text(text)
+        }
+    }
+}
+
+/// A reaction arrow and the labels riding on it.
 #[derive(Clone, Debug, Default)]
 pub struct Arrow {
-    /// Text above the shaft (reagents).
-    pub above: RichText,
-    /// Text below the shaft (base, solvent, temperature).
-    pub below: RichText,
+    /// Label above the shaft (reagents).
+    pub above: ArrowLabel,
+    /// Label below the shaft (base, solvent, temperature).
+    pub below: ArrowLabel,
     /// Explicit shaft length in pixels. `None` uses [`ReactionStyle::arrow_length`], widened
-    /// when necessary to fit the text.
+    /// when necessary to fit the label above or below it.
     pub length: Option<f32>,
 }
 
@@ -51,13 +110,25 @@ impl Arrow {
     /// Text above the shaft. `&str` goes through the [rich-text markup](crate::RichText)
     /// parser, so `"K_2CO_3"` gets real subscripts.
     pub fn above(mut self, text: impl Into<RichText>) -> Self {
-        self.above = text.into();
+        self.above = ArrowLabel::from(text.into());
         self
     }
 
     /// Text below the shaft.
     pub fn below(mut self, text: impl Into<RichText>) -> Self {
-        self.below = text.into();
+        self.below = ArrowLabel::from(text.into());
+        self
+    }
+
+    /// A structure above the shaft, drawn like a main-line scheme structure.
+    pub fn above_structure(mut self, molecule: Molecule) -> Self {
+        self.above = ArrowLabel::Structure(molecule);
+        self
+    }
+
+    /// A structure below the shaft, drawn like a main-line scheme structure.
+    pub fn below_structure(mut self, molecule: Molecule) -> Self {
+        self.below = ArrowLabel::Structure(molecule);
         self
     }
 
@@ -163,11 +234,47 @@ pub enum PlacedKind {
     Structure { origin: Vec2 },
     /// Pre-laid-out text (`+`, a free text item).
     Text(RunLayout),
-    /// Arrow shaft length plus the pre-laid-out text above and below it.
+    /// Arrow shaft length plus the pre-laid-out label above and below it.
     Arrow {
         length: f32,
-        above: RunLayout,
-        below: RunLayout,
+        above: PlacedArrowLabel,
+        below: PlacedArrowLabel,
+    },
+}
+
+/// Paint-ready form of one of an arrow's two labels.
+pub enum PlacedArrowLabel {
+    /// Nothing on this side of the shaft.
+    Empty,
+    /// Pre-laid-out text.
+    Text(RunLayout),
+    /// A structure whose molecule origin lands at `origin`, relative to the scheme's top-left
+    /// — the same coordinate a main-line [`PlacedKind::Structure`] uses.
+    Structure { origin: Vec2 },
+}
+
+impl PlacedArrowLabel {
+    /// True when this side of the shaft carries nothing.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
+
+/// A measured arrow label, before its structure origin is placed on the reaction line.
+enum ArrowLabelMeasure {
+    Empty,
+    Text(RunLayout),
+    Structure { bounds: Rect },
+}
+
+/// A measured scheme item, before the placement pass fixes structure origins to scheme
+/// coordinates.
+enum Measured {
+    Ready(PlacedKind),
+    Arrow {
+        length: f32,
+        above: ArrowLabelMeasure,
+        below: ArrowLabelMeasure,
     },
 }
 
@@ -181,7 +288,9 @@ pub fn measure_scheme(
     scratch: &mut ChemStructEditor,
 ) -> SchemeLayout {
     // (width, extent above the line, extent below the line, paint data)
-    let mut measured: Vec<(f32, f32, f32, PlacedKind)> = Vec::with_capacity(scheme.items.len());
+    let mut measured: Vec<(f32, f32, f32, Measured)> = Vec::with_capacity(scheme.items.len());
+    // Half the arrow head is the shaft's own extent; a label stacks on top of that.
+    let half_shaft = (style.arrow_width * 0.5).max(style.arrow_head_half_width);
 
     for item in &scheme.items {
         match item {
@@ -190,39 +299,49 @@ pub fn measure_scheme(
                 let half = bounds.height() * 0.5;
                 // Origin offset inside the item box: the box starts at the bounds' top-left.
                 let origin = Vec2::new(-bounds.min.x, -bounds.min.y);
-                measured.push((bounds.width(), half, half, PlacedKind::Structure { origin }));
+                measured.push((
+                    bounds.width(),
+                    half,
+                    half,
+                    Measured::Ready(PlacedKind::Structure { origin }),
+                ));
             }
             SchemeItem::Plus => {
                 let layout = text_layout(&RichText::plain("+"), style.plus_font_size, painter);
                 let half = layout.size.y * 0.5;
-                measured.push((layout.size.x, half, half, PlacedKind::Text(layout)));
+                measured.push((layout.size.x, half, half, Measured::Ready(PlacedKind::Text(layout))));
             }
             SchemeItem::Text(text) => {
                 let layout = text_layout(text, style.scheme_font_size, painter);
                 let half = layout.size.y * 0.5;
-                measured.push((layout.size.x, half, half, PlacedKind::Text(layout)));
+                measured.push((layout.size.x, half, half, Measured::Ready(PlacedKind::Text(layout))));
             }
             SchemeItem::Arrow(arrow) => {
-                let above = text_layout(&arrow.above, style.arrow_font_size, painter);
-                let below = text_layout(&arrow.below, style.arrow_font_size, painter);
-                let text_width = above.size.x.max(below.size.x);
+                let above =
+                    measure_arrow_label(&arrow.above, painter, style, structure_style, scratch);
+                let below =
+                    measure_arrow_label(&arrow.below, painter, style, structure_style, scratch);
+                let width = |m: &ArrowLabelMeasure| match m {
+                    ArrowLabelMeasure::Empty => 0.0,
+                    ArrowLabelMeasure::Text(t) => t.size.x,
+                    ArrowLabelMeasure::Structure { bounds } => bounds.width(),
+                };
+                let label_width = width(&above).max(width(&below));
                 let length = arrow
                     .length
-                    .unwrap_or_else(|| style.arrow_length.max(text_width + 2.0 * style.item_gap));
-                // Half the head is the arrow's own extent; text stacks on top of that.
-                let half_shaft = (style.arrow_width * 0.5).max(style.arrow_head_half_width);
-                let extent = |t: &RunLayout| {
-                    if t.is_empty() {
-                        half_shaft
-                    } else {
-                        half_shaft + style.arrow_text_gap + t.size.y
+                    .unwrap_or_else(|| style.arrow_length.max(label_width + 2.0 * style.item_gap));
+                let extent = |m: &ArrowLabelMeasure| match m {
+                    ArrowLabelMeasure::Empty => half_shaft,
+                    ArrowLabelMeasure::Text(t) => half_shaft + style.arrow_text_gap + t.size.y,
+                    ArrowLabelMeasure::Structure { bounds } => {
+                        half_shaft + style.arrow_text_gap + bounds.height()
                     }
                 };
                 measured.push((
                     length,
                     extent(&above),
                     extent(&below),
-                    PlacedKind::Arrow { length, above, below },
+                    Measured::Arrow { length, above, below },
                 ));
             }
         }
@@ -246,10 +365,35 @@ pub fn measure_scheme(
         );
         let kind = match kind {
             // Shift the structure's origin from item-box-relative to scheme-relative.
-            PlacedKind::Structure { origin } => PlacedKind::Structure {
+            Measured::Ready(PlacedKind::Structure { origin }) => PlacedKind::Structure {
                 origin: origin + rect.min.to_vec2(),
             },
-            other => other,
+            Measured::Ready(other) => other,
+            // Place each arrow-label structure so it is centred over the shaft and sits its
+            // own height clear of it, above or below the reaction line.
+            Measured::Arrow { length, above, below } => {
+                let shaft_center_x = rect.min.x + length * 0.5;
+                let place = |m: ArrowLabelMeasure, is_above: bool| -> PlacedArrowLabel {
+                    match m {
+                        ArrowLabelMeasure::Empty => PlacedArrowLabel::Empty,
+                        ArrowLabelMeasure::Text(t) => PlacedArrowLabel::Text(t),
+                        ArrowLabelMeasure::Structure { bounds } => {
+                            let ox = shaft_center_x - bounds.center().x;
+                            let oy = if is_above {
+                                (center_line - half_shaft - style.arrow_text_gap) - bounds.max.y
+                            } else {
+                                (center_line + half_shaft + style.arrow_text_gap) - bounds.min.y
+                            };
+                            PlacedArrowLabel::Structure { origin: Vec2::new(ox, oy) }
+                        }
+                    }
+                };
+                PlacedKind::Arrow {
+                    length,
+                    above: place(above, true),
+                    below: place(below, false),
+                }
+            }
         };
         items.push(PlacedItem { rect, kind });
         pen_x += width;
@@ -289,18 +433,36 @@ pub fn paint_scheme(
             (PlacedKind::Text(text), _) => {
                 text.paint(painter, Pos2::new(rect.min.x, line_y - text.size.y * 0.5));
             }
-            (PlacedKind::Arrow { length, above, below }, _) => {
+            (PlacedKind::Arrow { length, above, below }, SchemeItem::Arrow(arrow)) => {
                 draw_arrow(painter, Pos2::new(rect.min.x, line_y), *length, style);
                 let half_shaft = (style.arrow_width * 0.5).max(style.arrow_head_half_width);
-                if !above.is_empty() {
-                    let x = rect.min.x + (*length - above.size.x) * 0.5;
-                    let y = line_y - half_shaft - style.arrow_text_gap - above.size.y;
-                    above.paint(painter, Pos2::new(x, y));
+                // Text sides paint here; a structure side paints through the molecule renderer
+                // at the scheme-relative origin the layout placed it at.
+                match above {
+                    PlacedArrowLabel::Empty => {}
+                    PlacedArrowLabel::Text(t) => {
+                        let x = rect.min.x + (*length - t.size.x) * 0.5;
+                        let y = line_y - half_shaft - style.arrow_text_gap - t.size.y;
+                        t.paint(painter, Pos2::new(x, y));
+                    }
+                    PlacedArrowLabel::Structure { origin } => {
+                        if let Some(mol) = arrow.above.as_structure() {
+                            draw_structure(mol, painter, top_left + *origin, style, structure_style, scratch);
+                        }
+                    }
                 }
-                if !below.is_empty() {
-                    let x = rect.min.x + (*length - below.size.x) * 0.5;
-                    let y = line_y + half_shaft + style.arrow_text_gap;
-                    below.paint(painter, Pos2::new(x, y));
+                match below {
+                    PlacedArrowLabel::Empty => {}
+                    PlacedArrowLabel::Text(t) => {
+                        let x = rect.min.x + (*length - t.size.x) * 0.5;
+                        let y = line_y + half_shaft + style.arrow_text_gap;
+                        t.paint(painter, Pos2::new(x, y));
+                    }
+                    PlacedArrowLabel::Structure { origin } => {
+                        if let Some(mol) = arrow.below.as_structure() {
+                            draw_structure(mol, painter, top_left + *origin, style, structure_style, scratch);
+                        }
+                    }
                 }
             }
             // Measured and painted items are built from the same list, so the pairs always
@@ -395,6 +557,32 @@ pub fn draw_structure(
     structure_draw::draw_atom_labels(scratch, painter, origin, &labels);
 }
 
+/// Measure one arrow label: nothing, laid-out text, or a structure (whose screen bounds are
+/// kept so the placement pass can centre it over the shaft).
+fn measure_arrow_label(
+    label: &ArrowLabel,
+    painter: &Painter,
+    style: &ReactionStyle,
+    structure_style: &StyleConfig,
+    scratch: &mut ChemStructEditor,
+) -> ArrowLabelMeasure {
+    match label {
+        ArrowLabel::Empty => ArrowLabelMeasure::Empty,
+        ArrowLabel::Text(t) => {
+            let layout = text_layout(t, style.arrow_font_size, painter);
+            if layout.is_empty() {
+                ArrowLabelMeasure::Empty
+            } else {
+                ArrowLabelMeasure::Text(layout)
+            }
+        }
+        ArrowLabel::Structure(mol) => {
+            let bounds = structure_bounds(mol, painter, style, structure_style, scratch);
+            ArrowLabelMeasure::Structure { bounds }
+        }
+    }
+}
+
 fn text_layout(text: &RichText, size: f32, painter: &Painter) -> RunLayout {
     if text.is_empty() {
         return RunLayout::EMPTY;
@@ -461,8 +649,16 @@ mod tests {
             assert!(arrow.rect.max.y - layout.center_line > style.arrow_head_half_width);
             match &arrow.kind {
                 PlacedKind::Arrow { above, below, length } => {
-                    assert_eq!(above.text(), "MeI");
-                    assert_eq!(below.text(), "K2CO3", "subscripts flatten to plain digits");
+                    match above {
+                        PlacedArrowLabel::Text(t) => assert_eq!(t.text(), "MeI"),
+                        _ => panic!("MeI is text above the arrow"),
+                    }
+                    match below {
+                        PlacedArrowLabel::Text(t) => {
+                            assert_eq!(t.text(), "K2CO3", "subscripts flatten to plain digits")
+                        }
+                        _ => panic!("K2CO3 is text below the arrow"),
+                    }
                     assert!(*length >= style.arrow_length);
                 }
                 _ => panic!("item 1 should be the arrow"),
@@ -585,6 +781,77 @@ mod tests {
                 "expected a '{expected}' galley among {texts:?}"
             );
         }
+    }
+
+    /// An arrow can carry a *structure* above (or below) its shaft, measured and placed as a
+    /// molecule — the same object a main-line structure is — with the arrow widened to fit it.
+    #[test]
+    fn arrow_carries_a_structure_over_the_shaft() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::benzene())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()).below("cat."))
+            .structure(demo::benzene());
+        let style = ReactionStyle::default();
+        let sstyle = StyleConfig::default();
+        with_painter(|painter| {
+            let mut ed = scratch();
+            let layout = measure_scheme(&scheme, painter, &style, &sstyle, &mut ed);
+            let arrow = &layout.items[1];
+            match &arrow.kind {
+                PlacedKind::Arrow { above, below, length } => {
+                    let PlacedArrowLabel::Structure { origin } = above else {
+                        panic!("the biphenyl above the arrow is a structure");
+                    };
+                    assert!(matches!(below, PlacedArrowLabel::Text(_)), "'cat.' is text below");
+                    // Biphenyl is wider than a bare arrow, so the shaft grew to fit it.
+                    assert!(*length > style.arrow_length, "the arrow widened for the structure");
+                    // The structure sits above the reaction line, clear of the shaft.
+                    assert!(origin.y < layout.center_line);
+                }
+                _ => panic!("item 1 should be the arrow"),
+            }
+            // The arrow's box reaches a structure's height above the line.
+            assert!(
+                layout.center_line - arrow.rect.min.y > style.bond_length,
+                "the box must contain the structure above the shaft"
+            );
+        });
+    }
+
+    /// Painting an arrow that carries a structure draws that structure's bonds, not just the
+    /// shaft.
+    #[test]
+    fn painting_draws_an_arrow_structure() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::benzene())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()))
+            .structure(demo::benzene());
+        let style = ReactionStyle::default();
+        let sstyle = StyleConfig::default();
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let mut ed = scratch();
+        let output = ctx.run_ui(raw, |ui| {
+            let layout = measure_scheme(&scheme, ui.painter(), &style, &sstyle, &mut ed);
+            paint_scheme(&scheme, &layout, ui.painter(), Pos2::new(20.0, 20.0), &style, &sstyle, &mut ed);
+        });
+        let mut lines = 0usize;
+        fn walk(shape: &egui::Shape, lines: &mut usize) {
+            match shape {
+                egui::Shape::LineSegment { .. } => *lines += 1,
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, lines)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut lines);
+        }
+        // Two main-line benzenes plus the biphenyl (two rings) above the arrow, and the shaft:
+        // comfortably more bond lines than two rings alone would give.
+        assert!(lines > 24, "expected the arrow structure's bonds to paint, got {lines}");
     }
 
     /// An empty scheme measures to nothing instead of panicking.

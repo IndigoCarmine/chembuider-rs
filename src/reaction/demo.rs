@@ -68,6 +68,31 @@ pub fn anisole() -> Molecule {
     m
 }
 
+/// Biphenyl, C₁₂H₁₀ — two benzene rings joined by a single bond. The second ring sits three
+/// bond-lengths to the right of the first, so the connecting bond is a normal horizontal edge
+/// between the rings' facing vertices. Used to show a structure riding on a reaction arrow.
+pub fn biphenyl() -> Molecule {
+    let mut m = benzene();
+    m.name = "biphenyl".into();
+    // The right ring is the same benzene, shifted three bond-lengths to the right.
+    let right = benzene();
+    let dx = L * 3.0;
+    let ids: Vec<u32> = right
+        .atoms
+        .iter()
+        .map(|a| m.add_atom("C".into(), [a.pos[0] + dx, a.pos[1]], 0))
+        .collect();
+    for bond in &right.bonds {
+        let begin = ids[right.atoms.iter().position(|a| a.id == bond.begin).unwrap()];
+        let end = ids[right.atoms.iter().position(|a| a.id == bond.end).unwrap()];
+        m.add_bond(begin, end, bond.order.clone());
+    }
+    // Left ring's right-hand vertex (atoms[2] at [1.5L, -h]) to the right ring's left-hand
+    // vertex (atoms[5] at [-0.5L, -h] + dx = [2.5L, -h]): a horizontal bond of length L.
+    m.add_bond(m.atoms[2].id, ids[5], BondOrder::Single);
+    m
+}
+
 /// Iodomethane, CH₃I — one C–I bond; the methyl hydrogens are implicit.
 pub fn methyl_iodide() -> Molecule {
     let mut m = Molecule::default();

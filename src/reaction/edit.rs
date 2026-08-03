@@ -30,10 +30,11 @@
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind};
 
+use crate::molecule::Molecule;
 use crate::widget::rich_text::RichText;
 
 use super::model::{Analysis, Mass, Reaction};
-use super::scheme::{PlacedKind, ReactionScheme, SchemeItem};
+use super::scheme::{ArrowLabel, PlacedKind, ReactionScheme, SchemeItem};
 use super::stoich::{
     format_density, format_mass, format_molarity, format_number, format_percent, format_volume,
 };
@@ -359,12 +360,102 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
 /// The markup of a scheme item's text — the text an edit box starts with. Empty for parts
 /// that carry no text (a structure, a `+`, an arrow label that has not been written yet).
 pub fn scheme_text(scheme: &ReactionScheme, index: usize, part: SchemePart) -> String {
+    let text_markup = |l: &ArrowLabel| l.as_text().map(|t| t.to_markup()).unwrap_or_default();
     match (scheme.items.get(index), part) {
-        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => a.above.to_markup(),
-        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => a.below.to_markup(),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => text_markup(&a.above),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => text_markup(&a.below),
         (Some(SchemeItem::Text(t)), SchemePart::Text) => t.to_markup(),
         _ => String::new(),
     }
+}
+
+/// The structure drawn on an arrow's above/below label, if that label holds one.
+pub fn scheme_arrow_structure(
+    scheme: &ReactionScheme,
+    index: usize,
+    part: SchemePart,
+) -> Option<&Molecule> {
+    match (scheme.items.get(index), part) {
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => a.above.as_structure(),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => a.below.as_structure(),
+        _ => None,
+    }
+}
+
+/// Put a structure on an arrow's above/below label, replacing whatever was there. Returns
+/// `false` (changing nothing) when the item is not an arrow or the part is not an arrow band.
+pub fn set_scheme_arrow_structure(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+    molecule: Molecule,
+) -> bool {
+    let Some(SchemeItem::Arrow(a)) = scheme.items.get_mut(index) else {
+        return false;
+    };
+    match part {
+        SchemePart::ArrowAbove => a.above = ArrowLabel::Structure(molecule),
+        SchemePart::ArrowBelow => a.below = ArrowLabel::Structure(molecule),
+        _ => return false,
+    }
+    true
+}
+
+/// Clear an arrow's above/below label back to empty, returning the structure it held (if any).
+/// A text label is cleared too but comes back as `None`.
+pub fn take_scheme_arrow_structure(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+) -> Option<Molecule> {
+    let Some(SchemeItem::Arrow(a)) = scheme.items.get_mut(index) else {
+        return None;
+    };
+    let slot = match part {
+        SchemePart::ArrowAbove => &mut a.above,
+        SchemePart::ArrowBelow => &mut a.below,
+        _ => return None,
+    };
+    match std::mem::replace(slot, ArrowLabel::Empty) {
+        ArrowLabel::Structure(m) => Some(m),
+        // Text (or nothing) leaves the slot empty and reports no structure taken.
+        _ => None,
+    }
+}
+
+/// Move the main-line structure at `from` onto an arrow's above/below slot, taking it off the
+/// reaction line. The target slot must be empty and the two items must be a structure and an
+/// arrow; otherwise nothing changes and `None` comes back. On success the arrow's (possibly
+/// shifted, since a line item was removed) index is returned.
+///
+/// The caller is expected to follow up with
+/// [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the table columns
+/// re-derive from the structures that remain on the line.
+pub fn move_line_structure_to_arrow_slot(
+    scheme: &mut ReactionScheme,
+    from: usize,
+    arrow_index: usize,
+    part: SchemePart,
+) -> Option<usize> {
+    if scheme_arrow_structure(scheme, arrow_index, part).is_some() {
+        return None; // don't clobber a structure already there
+    }
+    if !matches!(scheme.items.get(arrow_index), Some(SchemeItem::Arrow(_))) {
+        return None;
+    }
+    let Some(SchemeItem::Structure(mol)) = scheme.items.get(from) else {
+        return None;
+    };
+    let mol = mol.clone();
+    scheme.remove(from);
+    let target = if from < arrow_index { arrow_index - 1 } else { arrow_index };
+    set_scheme_arrow_structure(scheme, target, part, mol).then_some(target)
+}
+
+/// Whether an arrow's above/below slot currently holds a *structure* (rather than text or
+/// nothing) — the parts a text edit box must refuse to open on.
+fn scheme_part_holds_structure(scheme: &ReactionScheme, index: usize, part: SchemePart) -> bool {
+    scheme_arrow_structure(scheme, index, part).is_some()
 }
 
 /// Write markup back into a scheme item's text. Returns `false` when the part carries no
@@ -376,8 +467,12 @@ pub fn set_scheme_text(
     markup: &str,
 ) -> bool {
     match (scheme.items.get_mut(index), part) {
-        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => a.above = RichText::parse(markup),
-        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => a.below = RichText::parse(markup),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => {
+            a.above = ArrowLabel::from(RichText::parse(markup))
+        }
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => {
+            a.below = ArrowLabel::from(RichText::parse(markup))
+        }
         (Some(SchemeItem::Text(t)), SchemePart::Text) => *t = RichText::parse(markup),
         _ => return false,
     }
@@ -464,6 +559,23 @@ pub fn scheme_drop_index(layout: &FigureLayout, top_left: Pos2, pointer: Pos2) -
         .count()
 }
 
+/// The arrow above/below band under `pointer`, if any — a drop slot for a dragged structure.
+pub fn arrow_slot_at(
+    scheme: &ReactionScheme,
+    layout: &FigureLayout,
+    top_left: Pos2,
+    pointer: Pos2,
+) -> Option<(usize, SchemePart)> {
+    match hit_test(scheme, layout, top_left, pointer) {
+        Some(Hit::Scheme { index, part })
+            if matches!(part, SchemePart::ArrowAbove | SchemePart::ArrowBelow) =>
+        {
+            Some((index, part))
+        }
+        _ => None,
+    }
+}
+
 /// A vertical caret marking where a dragged item will drop, spanning the scheme band.
 fn draw_drop_caret(
     painter: &egui::Painter,
@@ -545,19 +657,50 @@ pub enum EditTarget {
     SchemeText { index: usize, part: SchemePart },
 }
 
+/// A drawn structure in the scheme the host can be asked to open in a canvas editor — either a
+/// main-line structure item or one riding on an arrow's above/below label. This is what a
+/// double-click leaves for the host to pick up with [`ReactionEditor::take_edit_request`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureRef {
+    /// A main-line [`SchemeItem::Structure`] at this scheme index.
+    Item(usize),
+    /// A structure riding on an arrow's above/below label.
+    ArrowLabel { index: usize, part: SchemePart },
+}
+
 /// The open edit box: what it edits and what has been typed into it so far.
 struct Editing {
     target: EditTarget,
     text: String,
 }
 
-/// A scheme item being dragged to a new position on the reaction line.
+/// What a drag picked up.
+#[derive(Clone, Copy)]
+enum DragSource {
+    /// A main-line scheme item at this index (reorders along the line).
+    Item(usize),
+    /// A structure riding on an arrow's above/below label (moves between slots).
+    ArrowLabel { index: usize, part: SchemePart },
+}
+
+impl DragSource {
+    /// True when this source *is* the given arrow slot, so the pointer resting on its own slot
+    /// is not treated as a drop target.
+    fn is_slot(self, index: usize, part: SchemePart) -> bool {
+        matches!(self, Self::ArrowLabel { index: i, part: p } if i == index && p == part)
+    }
+}
+
+/// A scheme item being dragged: either reordered along the line, or dropped onto an arrow slot.
 #[derive(Clone, Copy)]
 struct DragReorder {
-    /// Index of the item picked up.
-    from: usize,
-    /// Where it will drop: the number of items that will sit to its left (`0..=items.len()`).
+    /// What was picked up.
+    source: DragSource,
+    /// Reorder slot for a main-line drag: the number of items that will sit to its left
+    /// (`0..=items.len()`).
     insert_at: usize,
+    /// The arrow above/below slot under the pointer, when the drop would land on one.
+    to_slot: Option<(usize, SchemePart)>,
 }
 
 /// Interactive front end for [`ReactionView`]: the same figure, plus click-to-edit.
@@ -576,8 +719,8 @@ pub struct ReactionEditor {
     error: Option<String>,
     /// Set when a scheme structure is double-clicked: the host reads it with
     /// [`take_edit_request`](Self::take_edit_request) and opens that structure in a molecule
-    /// editor of its own.
-    edit_request: Option<usize>,
+    /// editor of its own. Names either a main-line structure or one on an arrow label.
+    edit_request: Option<StructureRef>,
     /// What the pointer was over when the context menu (secondary click) opened; the host
     /// reads it with [`context_target`](Self::context_target) to build the menu.
     context_target: Option<Hit>,
@@ -616,10 +759,11 @@ impl ReactionEditor {
     }
 
     /// Take the pending "edit this structure" request, set when a scheme structure is
-    /// double-clicked. The host loads that structure (`reaction.scheme.items[index]`) into a
-    /// [`ChemStructEditor`](crate::widget::ChemStructEditor) and, once edited, writes it back —
-    /// e.g. through the selection this same double-click leaves on that structure.
-    pub fn take_edit_request(&mut self) -> Option<usize> {
+    /// double-clicked. The host loads that structure — [`StructureRef::Item`] reads
+    /// `reaction.scheme.items[index]`, [`StructureRef::ArrowLabel`] reads it with
+    /// [`scheme_arrow_structure`] — into a [`ChemStructEditor`](crate::widget::ChemStructEditor)
+    /// and, once edited, writes it back through the selection this same double-click leaves.
+    pub fn take_edit_request(&mut self) -> Option<StructureRef> {
         self.edit_request.take()
     }
 
@@ -675,7 +819,12 @@ impl ReactionEditor {
                 _ => return false,
             },
             EditTarget::SchemeText { index, part } => {
-                if !part.is_text() || index >= reaction.scheme.items.len() {
+                // A structure on an arrow label is edited on the canvas, not through the text
+                // box — refuse to open one on it.
+                if !part.is_text()
+                    || index >= reaction.scheme.items.len()
+                    || scheme_part_holds_structure(&reaction.scheme, index, part)
+                {
                     return false;
                 }
                 scheme_text(&reaction.scheme, index, part)
@@ -776,20 +925,41 @@ impl ReactionEditor {
             .hover_pos()
             .and_then(|p| hit_test(&reaction.scheme, &layout, rect.min, p));
 
-        // ── Drag to reorder a scheme item ──────────────────────────────────────
-        // Only scheme items reorder; a drag that starts on the table does nothing.
+        // ── Drag a scheme item ─────────────────────────────────────────────────
+        // A main-line item reorders; a structure on an arrow label moves between slots. A drag
+        // that starts on the table does nothing.
         if response.drag_started() {
             let start = response
                 .interact_pointer_pos()
                 .and_then(|p| hit_test(&reaction.scheme, &layout, rect.min, p));
-            if let Some(Hit::Scheme { index, .. }) = start {
-                self.drag = Some(DragReorder { from: index, insert_at: index });
+            let source = match start {
+                // A structure riding on an arrow band is picked up as a slot source.
+                Some(Hit::Scheme { index, part })
+                    if matches!(part, SchemePart::ArrowAbove | SchemePart::ArrowBelow)
+                        && scheme_arrow_structure(&reaction.scheme, index, part).is_some() =>
+                {
+                    Some(DragSource::ArrowLabel { index, part })
+                }
+                // Anything else on the reaction line reorders along it.
+                Some(Hit::Scheme { index, .. }) => Some(DragSource::Item(index)),
+                _ => None,
+            };
+            if let Some(source) = source {
+                let insert_at = match source {
+                    DragSource::Item(i) => i,
+                    DragSource::ArrowLabel { index, .. } => index,
+                };
+                self.drag = Some(DragReorder { source, insert_at, to_slot: None });
                 self.edit = None;
             }
         }
         if response.dragged() {
             if let (Some(drag), Some(p)) = (self.drag.as_mut(), response.interact_pointer_pos()) {
                 drag.insert_at = scheme_drop_index(&layout, rect.min, p);
+                // A drop onto an arrow band (that is not the source's own slot) takes priority
+                // over reordering: the structure lands in that slot.
+                drag.to_slot = arrow_slot_at(&reaction.scheme, &layout, rect.min, p)
+                    .filter(|&(ti, tp)| !drag.source.is_slot(ti, tp));
             }
         }
 
@@ -815,11 +985,18 @@ impl ReactionEditor {
                 outline(hit, Stroke::new(1.0, self.highlight.gamma_multiply(0.5)));
             }
         } else if let Some(drag) = self.drag {
-            outline(
-                Hit::Scheme { index: drag.from, part: SchemePart::Structure },
-                Stroke::new(1.5, self.highlight.gamma_multiply(0.7)),
-            );
-            draw_drop_caret(&painter, &layout, rect.min, drag.insert_at, self.highlight);
+            let source_hit = match drag.source {
+                DragSource::Item(index) => Hit::Scheme { index, part: SchemePart::Structure },
+                DragSource::ArrowLabel { index, part } => Hit::Scheme { index, part },
+            };
+            outline(source_hit, Stroke::new(1.5, self.highlight.gamma_multiply(0.7)));
+            // Landing on an arrow slot highlights that slot; otherwise a caret shows the
+            // reorder drop point.
+            if let Some((ti, tp)) = drag.to_slot {
+                outline(Hit::Scheme { index: ti, part: tp }, Stroke::new(2.0, self.highlight));
+            } else if matches!(drag.source, DragSource::Item(_)) {
+                draw_drop_caret(&painter, &layout, rect.min, drag.insert_at, self.highlight);
+            }
         }
 
         if self.drag.is_some() {
@@ -828,24 +1005,28 @@ impl ReactionEditor {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        // Commit the reorder when the drag ends: `insert_at` counts items left of the pointer,
-        // so once the moved item is pulled out its final index shifts down by one whenever it
-        // was dropped to the right of where it started.
+        // Commit the drag when it ends.
         if response.drag_stopped() {
             if let Some(drag) = self.drag.take() {
-                let target = if drag.insert_at > drag.from {
-                    drag.insert_at - 1
-                } else {
-                    drag.insert_at
-                };
-                let delta = target as isize - drag.from as isize;
-                if let Some(landed) = reaction.scheme.move_item(drag.from, delta) {
-                    // Reordering shifts the structure→column mapping, which is positional
-                    // (reactants before the arrow, products after). Re-derive every table
-                    // column from whatever structure now sits at its position.
-                    reaction.sync_structures_from_scheme();
-                    self.selection = Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                if let Some((ti, tp)) = drag.to_slot {
+                    // A structure was dropped onto an arrow slot.
+                    self.drop_into_arrow_slot(reaction, drag.source, ti, tp);
+                } else if let DragSource::Item(from) = drag.source {
+                    // Reorder along the line. `insert_at` counts items left of the pointer, so
+                    // once the moved item is pulled out its final index shifts down by one
+                    // whenever it was dropped to the right of where it started.
+                    let target = if drag.insert_at > from { drag.insert_at - 1 } else { drag.insert_at };
+                    let delta = target as isize - from as isize;
+                    if let Some(landed) = reaction.scheme.move_item(from, delta) {
+                        // Reordering shifts the structure→column mapping, which is positional
+                        // (reactants before the arrow, products after). Re-derive every table
+                        // column from whatever structure now sits at its position.
+                        reaction.sync_structures_from_scheme();
+                        self.selection =
+                            Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                    }
                 }
+                // An arrow-label source dropped nowhere useful just stays where it was.
             }
         }
 
@@ -853,12 +1034,24 @@ impl ReactionEditor {
         // next commits the first (the box loses focus) and then opens the second.
         self.edit_overlay(ui, reaction, &layout, rect.min);
 
-        // Double-click a structure to ask the host to open it in a molecule editor.
+        // Double-click a structure to ask the host to open it in a molecule editor — whether
+        // it is a main-line structure or one riding on an arrow label.
         if response.double_clicked() {
-            if let Some(Hit::Scheme { index, part: SchemePart::Structure }) = hover {
-                self.selection = Some(Hit::Scheme { index, part: SchemePart::Structure });
-                self.edit_request = Some(index);
-                self.edit = None;
+            match hover {
+                Some(Hit::Scheme { index, part: SchemePart::Structure }) => {
+                    self.selection = Some(Hit::Scheme { index, part: SchemePart::Structure });
+                    self.edit_request = Some(StructureRef::Item(index));
+                    self.edit = None;
+                }
+                Some(Hit::Scheme { index, part })
+                    if matches!(part, SchemePart::ArrowAbove | SchemePart::ArrowBelow)
+                        && scheme_arrow_structure(&reaction.scheme, index, part).is_some() =>
+                {
+                    self.selection = Some(Hit::Scheme { index, part });
+                    self.edit_request = Some(StructureRef::ArrowLabel { index, part });
+                    self.edit = None;
+                }
+                _ => {}
             }
         } else if response.clicked() {
             match hover {
@@ -877,6 +1070,51 @@ impl ReactionEditor {
         }
 
         response
+    }
+
+    /// Land a dragged structure on the arrow slot `(ti, tp)`.
+    ///
+    /// * From a **main-line** structure: move it off the line into the slot (only if the slot is
+    ///   empty), then re-derive the table columns. This is a delete-from-line plus place-on-arrow.
+    /// * From **another arrow slot**: swap the two, so above/below (or two arrows) trade
+    ///   structures.
+    fn drop_into_arrow_slot(
+        &mut self,
+        reaction: &mut Reaction,
+        source: DragSource,
+        ti: usize,
+        tp: SchemePart,
+    ) {
+        match source {
+            DragSource::Item(from) => {
+                if let Some(landed) =
+                    move_line_structure_to_arrow_slot(&mut reaction.scheme, from, ti, tp)
+                {
+                    reaction.sync_structures_from_scheme();
+                    self.selection = Some(Hit::Scheme { index: landed, part: tp });
+                }
+            }
+            DragSource::ArrowLabel { index, part } => {
+                let Some(src_mol) =
+                    scheme_arrow_structure(&reaction.scheme, index, part).cloned()
+                else {
+                    return;
+                };
+                // Whatever sits in the target slot goes back to the source (a swap); an empty
+                // target leaves the source empty.
+                let displaced = take_scheme_arrow_structure(&mut reaction.scheme, ti, tp);
+                set_scheme_arrow_structure(&mut reaction.scheme, ti, tp, src_mol);
+                match displaced {
+                    Some(d) => {
+                        set_scheme_arrow_structure(&mut reaction.scheme, index, part, d);
+                    }
+                    None => {
+                        take_scheme_arrow_structure(&mut reaction.scheme, index, part);
+                    }
+                }
+                self.selection = Some(Hit::Scheme { index: ti, part: tp });
+            }
+        }
     }
 
     /// The floating text box, in the style of the structure editor's own label editor: an
@@ -1395,11 +1633,12 @@ mod tests {
         let SchemeItem::Arrow(arrow) = &scheme.items[1] else {
             panic!("item 1 is the arrow")
         };
+        let below = arrow.below.as_text().expect("the label below is text");
         assert_eq!(
-            arrow.below.spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+            below.spans.iter().map(|s| s.text.as_str()).collect::<String>(),
             "Cs2CO3, DMF"
         );
-        assert!(arrow.below.spans.iter().any(|s| s.text == "2"
+        assert!(below.spans.iter().any(|s| s.text == "2"
             && s.style.script == crate::widget::rich_text::Script::Sub));
 
         // Nothing to write to is reported rather than silently dropped.
@@ -1602,6 +1841,107 @@ mod tests {
         assert!(matches!(scheme.items[1], SchemeItem::Arrow(_)));
     }
 
+    // ── Structures on arrow labels ──────────────────────────────────────────
+
+    /// A structure can be placed on an arrow's above/below label, read back, hit-tested and
+    /// taken off again — and a text box refuses to open on a structure label.
+    #[test]
+    fn arrow_label_structures_place_hit_and_refuse_the_text_box() {
+        let mut scheme = ReactionScheme::new()
+            .structure(demo::benzene())
+            .arrow(Arrow::new().below("cat."))
+            .structure(demo::benzene());
+
+        // Place biphenyl above the arrow (item 1).
+        assert!(set_scheme_arrow_structure(&mut scheme, 1, SchemePart::ArrowAbove, demo::biphenyl()));
+        assert!(scheme_arrow_structure(&scheme, 1, SchemePart::ArrowAbove).is_some());
+        // A non-arrow item, or a non-arrow part, refuses.
+        assert!(!set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, demo::benzene()));
+        assert!(!set_scheme_arrow_structure(&mut scheme, 1, SchemePart::Text, demo::benzene()));
+
+        let reaction = Reaction::new(scheme, Analysis::new());
+        with_figure(&reaction, |layout, top_left| {
+            // The above band now covers the drawn structure, and hit-tests to it.
+            let rect = scheme_item_rect(layout, top_left, 1, SchemePart::ArrowAbove).unwrap();
+            assert_eq!(
+                hit_test(&reaction.scheme, layout, top_left, rect.center()),
+                Some(Hit::Scheme { index: 1, part: SchemePart::ArrowAbove })
+            );
+            // And it is a drop slot the drag code can find.
+            assert_eq!(
+                arrow_slot_at(&reaction.scheme, layout, top_left, rect.center()),
+                Some((1, SchemePart::ArrowAbove))
+            );
+        });
+
+        // A text edit box opens on the (text) label below, but not on the structure above.
+        let mut editor = ReactionEditor::new();
+        assert!(!editor.begin_edit(
+            EditTarget::SchemeText { index: 1, part: SchemePart::ArrowAbove },
+            &reaction
+        ));
+        assert!(editor.begin_edit(
+            EditTarget::SchemeText { index: 1, part: SchemePart::ArrowBelow },
+            &reaction
+        ));
+
+        // Taking the structure off leaves the slot empty.
+        let mut scheme = reaction.scheme;
+        let taken = take_scheme_arrow_structure(&mut scheme, 1, SchemePart::ArrowAbove);
+        assert!(taken.is_some());
+        assert!(scheme_arrow_structure(&scheme, 1, SchemePart::ArrowAbove).is_none());
+    }
+
+    /// Dropping a *main-line* structure onto an empty arrow slot moves it off the line and
+    /// re-derives the columns; an occupied slot is left untouched.
+    #[test]
+    fn dragging_a_line_structure_onto_an_arrow_slot_moves_it() {
+        // [Structure(phenol), Arrow, Structure(anisole)]
+        let mut scheme = demo::williamson_ether_synthesis().scheme;
+        // Move the product (item 2) up onto the arrow's above slot.
+        let landed = move_line_structure_to_arrow_slot(&mut scheme, 2, 1, SchemePart::ArrowAbove);
+        assert_eq!(landed, Some(1), "the arrow keeps index 1 (removed item was to its right)");
+        assert_eq!(scheme.items.len(), 2, "the structure left the reaction line");
+        assert_eq!(
+            MolecularFormula::of(scheme_arrow_structure(&scheme, 1, SchemePart::ArrowAbove).unwrap())
+                .plain(),
+            "C7H8O",
+            "anisole now rides above the arrow"
+        );
+        // The slot is occupied now, so a second drop is refused rather than clobbering it.
+        assert!(move_line_structure_to_arrow_slot(&mut scheme, 0, 1, SchemePart::ArrowAbove).is_none());
+        // A non-structure source, or a non-arrow target, is refused too.
+        assert!(move_line_structure_to_arrow_slot(&mut scheme, 1, 1, SchemePart::ArrowBelow).is_none());
+    }
+
+    /// Two arrow-label structures swap when one is dropped on the other (the primitives the
+    /// drag handler composes for an arrow-label source).
+    #[test]
+    fn arrow_label_structures_swap_between_slots() {
+        let mut scheme = ReactionScheme::new().arrow(Arrow::new());
+        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, demo::benzene());
+        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, demo::phenol());
+
+        // Swap above <-> below with the same primitives `drop_into_arrow_slot` uses.
+        let src = scheme_arrow_structure(&scheme, 0, SchemePart::ArrowAbove).cloned().unwrap();
+        let displaced = take_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow);
+        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, src);
+        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, displaced.unwrap());
+
+        assert_eq!(
+            MolecularFormula::of(scheme_arrow_structure(&scheme, 0, SchemePart::ArrowAbove).unwrap())
+                .plain(),
+            "C6H6O",
+            "phenol moved up"
+        );
+        assert_eq!(
+            MolecularFormula::of(scheme_arrow_structure(&scheme, 0, SchemePart::ArrowBelow).unwrap())
+                .plain(),
+            "C6H6",
+            "benzene moved down"
+        );
+    }
+
     // ── The widget ──────────────────────────────────────────────────────────
 
     /// The whole edit cycle without a window: open a box on a cell, type, commit — and the
@@ -1685,8 +2025,9 @@ mod tests {
         let SchemeItem::Arrow(arrow) = &reaction.scheme.items[1] else {
             panic!("item 1 is the arrow")
         };
+        let above = arrow.above.as_text().expect("the label above is text");
         assert_eq!(
-            arrow.above.spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+            above.spans.iter().map(|s| s.text.as_str()).collect::<String>(),
             "Me2SO4"
         );
     }
