@@ -27,8 +27,11 @@ struct RelaxParams {
     k_rep: f32,
     dt_init: f32,
     dt_max: f32,
-    bond_cap: f32, // max |deviation| for bond spring (min-potential soft cap)
-    rep_cap: f32,  // max repulsion force magnitude
+    bond_cap: f32,  // max |deviation| for bond spring (min-potential soft cap)
+    rep_cap: f32,   // max repulsion force magnitude
+    // Upper bound on the bend term's L/r moment-arm factor, so a neighbour collapsing onto
+    // its centre cannot make the tangential force diverge.
+    angle_amp_max: f32,
 }
 
 // Maximum per-atom speed: prevents velocity runaway when initial forces are large.
@@ -49,6 +52,11 @@ const PARAMS: RelaxParams = RelaxParams {
     dt_max: 0.1,
     bond_cap: 3.0,
     rep_cap: 50.0,
+    // The L/r arm factor is exact physics, but only meaningful while the neighbour sits at
+    // a chemically sensible distance.  Below r = L/2 — the repulsion cutoff, i.e. the atoms
+    // are already on top of each other — the bond spring is the term that has to win, so
+    // the arm factor is frozen at its value there: L/(L/2) = 2.
+    angle_amp_max: 2.0,
 };
 
 // ─── Ring detection ───────────────────────────────────────────────────────────
@@ -302,16 +310,31 @@ impl CleanupState {
     /// Apply ring-crossing fix (phase-2 rescue): permute ring-atom positions into the
     /// correct angular order for any ring that has actual bond crossings, then reset
     /// velocities and FIRE state so the next step() starts fresh from the new positions.
-    /// Only called when phase 1 (normal FIRE) has failed to converge.
     pub fn apply_ring_fix(&mut self) {
         fix_ring_crossings(&mut self.pos, &self.cycles);
+        self.restart_from_current_positions();
+    }
+
+    /// Put the atoms back at a snapshot taken with `positions()` and restart from rest.
+    pub fn restore(&mut self, snapshot: &[(u32, [f32; 2])]) {
+        for &(id, p) in snapshot {
+            if let Some(q) = self.pos.get_mut(&id) {
+                *q = p;
+            }
+        }
+        self.restart_from_current_positions();
+    }
+
+    /// Positions jumped discontinuously: drop the accumulated velocity, put FIRE back to its
+    /// initial timestep/mixing, re-baseline the motion-convergence window, and recompute the
+    /// forces so the next `step` starts from a consistent state.
+    fn restart_from_current_positions(&mut self) {
         for v in self.vel.values_mut() {
             *v = [0.0, 0.0];
         }
         self.dt = PARAMS.dt_init;
         self.alpha = ALPHA_START;
         self.n_pos = 0;
-        // Positions jumped: re-baseline the motion-convergence reference.
         for (k, &id) in self.atom_ids.iter().enumerate() {
             self.ref_pos[k] = self.pos[&id];
         }
@@ -320,6 +343,22 @@ impl CleanupState {
             &self.pos, &self.bonds, &self.adj, &self.atom_ids,
             &self.bonded, &self.linear_atoms, &PARAMS, &mut self.forces,
         );
+    }
+
+    /// How many rings are currently drawn with their own bonds crossing each other — the one
+    /// defect `apply_ring_fix` repairs, and the score the rescue is accepted or rejected on.
+    ///
+    /// Whether to attempt the rescue used to be approximated by `has_rings && max_force() > 0.1`,
+    /// which only worked by accident: the bend term was not torque-free, so a relaxed cyclic
+    /// molecule always retained a residual force and the test was effectively always true.
+    /// Once the force field became conservative that proxy started reading "nothing wrong" for
+    /// tangled rings and the rescue stopped running.  Asking about the actual defect is both
+    /// correct and cheaper.
+    pub fn ring_crossing_count(&self) -> usize {
+        self.cycles
+            .iter()
+            .filter(|ring| ring.len() >= 3 && ring_has_crossing(&self.pos, ring))
+            .count()
     }
 
     pub fn max_force(&self) -> f32 {
@@ -508,18 +547,47 @@ pub fn cleanup_2d(mol: &mut Molecule) {
     }
     let mut state = CleanupState::new(mol);
     // Phase 1: normal FIRE.  Converges most molecules without any position permutation.
-    if state.step(100_000) {
-        state.apply(mol);
-        return;
-    }
-    // Phase 2: if significantly stuck and the molecule has rings, apply the ring-crossing
-    // fix (permute ring-atom positions to correct angular order) and continue FIRE.
-    // Only triggered when phase 1 fails; leaves trial=00-style molecules untouched.
-    if state.has_rings && state.max_force() > 0.1 {
-        state.apply_ring_fix();
-    }
-    state.step(100_000);
+    state.step(JOB_PHASE_BUDGET);
+    // Phase 2: the ring-crossing rescue, if phase 1 left a ring drawn inside-out.
+    ring_rescue(&mut state, |s| {
+        s.step(JOB_PHASE_BUDGET);
+        true
+    });
     state.apply(mol);
+}
+
+/// Phase 2, shared by every entry point.
+///
+/// Relaxation is local, so it happily settles into a minimum where a ring is drawn inside-out
+/// with its own bonds crossing.  `apply_ring_fix` permutes those ring atoms back into a valid
+/// angular order; `relax` then re-relaxes from there and returns false if it was cancelled.
+///
+/// A pass is kept only when it strictly reduced the number of crossed rings, and passes repeat
+/// while they keep helping.  Both halves of that rule are needed to leave `cleanup_2d`
+/// idempotent — the property `convergence_50_random` checks by cleaning twice:
+///
+///   * Without the accept/reject, a molecule that simply cannot be drawn crossing-free (a
+///     random 19-atom graph with 9 extra bonds is essentially never planar) would re-trigger
+///     the permutation on every cleanup and shuffle its ring atoms somewhere new each time.
+///   * Without the repeat, a molecule the rescue can still improve would be improved a bit
+///     more on each successive cleanup, which moves atoms just the same.
+///
+/// Repeating terminates quickly: an accepted pass strictly lowers the crossing count, so there
+/// can be at most one accepted pass per ring, and the run ends on the first rejected pass.
+fn ring_rescue(state: &mut CleanupState, mut relax: impl FnMut(&mut CleanupState) -> bool) {
+    for _ in 0..state.cycles.len().max(1) {
+        let before = state.ring_crossing_count();
+        if before == 0 {
+            return;
+        }
+        let snapshot = state.positions();
+        state.apply_ring_fix();
+        let completed = relax(state);
+        if !completed || state.ring_crossing_count() >= before {
+            state.restore(&snapshot);
+            return;
+        }
+    }
 }
 
 // ─── Background, cancellable cleanup job ──────────────────────────────────────
@@ -615,6 +683,10 @@ mod job_wasm {
         cancelled: Cell<bool>,
         done: Cell<bool>,
         positions: RefCell<Vec<(u32, [f32; 2])>>,
+        // Phase-2 (ring rescue) bookkeeping: the phase-1 result to fall back to, and the
+        // crossing count it has to beat.  See `ring_rescue` for why the retry is scored.
+        rescue_snapshot: RefCell<Vec<(u32, [f32; 2])>>,
+        crossings_before: Cell<usize>,
     }
 
     impl CleanupJob {
@@ -627,12 +699,11 @@ mod job_wasm {
                     cancelled: Cell::new(false),
                     done: Cell::new(true),
                     positions: RefCell::new(Vec::new()),
+                    rescue_snapshot: RefCell::new(Vec::new()),
+                    crossings_before: Cell::new(0),
                 };
             }
-            let mut state = CleanupState::new(mol);
-            if state.has_rings {
-                state.apply_ring_fix();
-            }
+            let state = CleanupState::new(mol);
             let positions = state.positions();
             Self {
                 state: RefCell::new(Some(state)),
@@ -641,6 +712,8 @@ mod job_wasm {
                 cancelled: Cell::new(false),
                 done: Cell::new(false),
                 positions: RefCell::new(positions),
+                rescue_snapshot: RefCell::new(Vec::new()),
+                crossings_before: Cell::new(0),
             }
         }
 
@@ -667,14 +740,26 @@ mod job_wasm {
 
                     let phase_exhausted = self.steps_done_in_phase.get() >= JOB_PHASE_BUDGET;
                     if converged || phase_exhausted {
-                        if self.phase.get() == 1 && !converged {
-                            if state.has_rings && state.max_force() > 0.1 {
-                                state.apply_ring_fix();
-                            }
-                            self.phase.set(2);
-                            self.steps_done_in_phase.set(0);
-                        } else {
+                        // Same schedule as `cleanup_2d` / `ring_rescue`, unrolled across polls:
+                        // retry the ring-crossing rescue while each pass keeps removing
+                        // crossings, and roll back the first pass that does not.
+                        let rejected = self.phase.get() == 2
+                            && state.ring_crossing_count() >= self.crossings_before.get();
+                        if rejected {
+                            state.restore(&self.rescue_snapshot.borrow());
+                            *self.positions.borrow_mut() = state.positions();
                             self.done.set(true);
+                        } else {
+                            let crossings = state.ring_crossing_count();
+                            if crossings > 0 {
+                                self.crossings_before.set(crossings);
+                                *self.rescue_snapshot.borrow_mut() = state.positions();
+                                state.apply_ring_fix();
+                                self.phase.set(2);
+                                self.steps_done_in_phase.set(0);
+                            } else {
+                                self.done.set(true);
+                            }
                         }
                     }
                 }
@@ -708,20 +793,15 @@ fn run_cleanup_job(
         done.store(true, Ordering::Relaxed);
         return;
     }
+    // Same two phases as `cleanup_2d`, just chunked so the worker can be cancelled and can
+    // publish intermediate positions for the live preview.
     let mut state = CleanupState::new(mol);
-    if state.has_rings {
-        state.apply_ring_fix();
-    }
-
-    // Phase 1.
-    let converged = run_phase(&mut state, cancel, shared);
-
-    // Phase 2: ring fix if still stuck, then continue (only if not cancelled).
-    if !converged && !cancel.load(Ordering::Relaxed) {
-        if state.has_rings && state.max_force() > 0.1 {
-            state.apply_ring_fix();
-        }
-        run_phase(&mut state, cancel, shared);
+    run_phase(&mut state, cancel, shared);
+    if !cancel.load(Ordering::Relaxed) {
+        ring_rescue(&mut state, |s| {
+            run_phase(s, cancel, shared);
+            !cancel.load(Ordering::Relaxed)
+        });
     }
 
     *shared.lock().unwrap() = state.positions();
@@ -876,22 +956,51 @@ fn compute_forces(
             let ta = [-(na[1] - cp[1]) / ra, (na[0] - cp[0]) / ra];
             let tb = [-(nb[1] - cp[1]) / rb, (nb[0] - cp[0]) / rb];
 
-            let f = p.k_angle * err;
+            // The bend acts as a torque τ = -∂E/∂gap = -k·err on the a–c–b wedge.  A torque
+            // is converted to a tangential force by dividing by the moment arm: |f| = τ/r.
+            // That 1/r is what makes the pair's torques about the centre cancel exactly
+            // (r_a·τ/r_a - r_b·τ/r_b = 0).  Applying the same |f| to both neighbours instead
+            // (the previous code) leaves a residual torque ∝ τ·(r_a - r_b), i.e. a
+            // non-conservative field that pumps angular momentum in forever: the molecule
+            // reaches its relaxed shape and then spins, so a motion-based convergence test
+            // never fires.  With the 1/r factor the angle term is exactly -∇E for
+            // E = Σ ½·(k_angle·L)·(gap-θ0)², hence torque-free by rotational invariance.
+            //
+            // The constant L only sets the scale (it cancels in the torque balance): it keeps
+            // the force magnitude at the equilibrium bond length identical to before, so the
+            // tuned k_angle/k_bond balance is unchanged for normal geometry.
+            //
+            // angle_amp_max bounds the 1/r blow-up for a neighbour collapsing onto the centre.
+            // The bound must rescale *both* magnitudes by the same factor: the torques cancel
+            // only while r_a·|f_a| = r_b·|f_b|, so flooring the two arms individually (or
+            // clipping just the larger force) would reintroduce exactly the spurious torque
+            // that the 1/r exists to remove.  A common positive rescale keeps the force
+            // parallel to the true gradient, so it still descends the energy — the same
+            // trust-region trick bond_cap / rep_cap already use.
+            let f = p.k_angle * err * L;
+            let mut fa_mag = f / ra;
+            let mut fb_mag = f / rb;
+            let amp = L / ra.min(rb);
+            if amp > p.angle_amp_max {
+                let s = p.angle_amp_max / amp;
+                fa_mag *= s;
+                fb_mag *= s;
+            }
             {
                 let fa = forces.get_mut(&id_a).unwrap();
-                fa[0] += f * ta[0];
-                fa[1] += f * ta[1];
+                fa[0] += fa_mag * ta[0];
+                fa[1] += fa_mag * ta[1];
             }
             {
                 let fb = forces.get_mut(&id_b).unwrap();
-                fb[0] -= f * tb[0];
-                fb[1] -= f * tb[1];
+                fb[0] -= fb_mag * tb[0];
+                fb[1] -= fb_mag * tb[1];
             }
             // Reaction on center atom: Newton's 3rd law — ensures zero net force
             {
                 let fc = forces.get_mut(&c_id).unwrap();
-                fc[0] += f * (tb[0] - ta[0]);
-                fc[1] += f * (tb[1] - ta[1]);
+                fc[0] += fb_mag * tb[0] - fa_mag * ta[0];
+                fc[1] += fb_mag * tb[1] - fa_mag * ta[1];
             }
         }
     }
@@ -1061,8 +1170,8 @@ mod tests {
                 return (true, step + 1, state.max_force());
             }
         }
-        // Phase 2: apply ring fix if stuck, then continue.
-        if state.has_rings && state.max_force() > 0.1 {
+        // Phase 2: untangle any inside-out ring, then continue.
+        if state.ring_crossing_count() > 0 {
             state.apply_ring_fix();
         }
         for step in 0..phase2 {
@@ -1169,6 +1278,91 @@ mod tests {
         cleanup_2d(&mut m);
         let after = angle_deg(&m, c0, c1, c2);
         assert!(after > 172.0, "sp carbon should straighten to ~180°, got {after:.1}");
+    }
+
+    /// Net force and net torque (about the origin) of the whole force field, plus the size
+    /// of the individual contributions so the check can be a relative one.
+    fn net_force_and_torque(st: &CleanupState) -> ([f32; 2], f32, f32) {
+        let (mut net, mut torque, mut scale) = ([0.0_f32; 2], 0.0_f32, 0.0_f32);
+        for &id in &st.atom_ids {
+            let f = st.forces[&id];
+            let r = st.pos[&id];
+            net[0] += f[0];
+            net[1] += f[1];
+            torque += r[0] * f[1] - r[1] * f[0];
+            scale += (f[0] * f[0] + f[1] * f[1]).sqrt() * (r[0] * r[0] + r[1] * r[1]).sqrt();
+        }
+        (net, torque, scale)
+    }
+
+    /// The relaxation potential depends only on the *shape* of the molecule — bond lengths and
+    /// the angles between a centre's neighbours — so it is invariant under rigid motion, and
+    /// its gradient must therefore have both zero net force and zero net torque.
+    ///
+    /// Regression test for a bend term that applied the same tangential force to both
+    /// neighbours regardless of how far each sat from the centre.  A torque becomes a force
+    /// only after dividing by the moment arm, so dropping that 1/r left a residual torque
+    /// ∝ k·err·(r_a − r_b): a non-conservative field that kept pumping angular momentum in.
+    /// Molecules reached their relaxed shape and then rotated forever, the motion-based
+    /// convergence test never fired, and two consecutive `cleanup_2d` calls returned the same
+    /// structure at different angles (`convergence_50_random` trials 22 / 27 / 39, which came
+    /// out as pure rotations of 45.9° / 134.2° with zero residual after de-rotation).
+    #[test]
+    fn force_field_has_no_net_force_or_torque() {
+        let mut rng = Lcg(0x0BAD_F00D_1234_5678);
+        let mut checked = 0usize;
+
+        for _ in 0..40 {
+            let n_atoms = rng.usize_range(3, 21);
+            let extra = rng.usize_range(0, n_atoms / 2 + 1);
+            let mut mol = random_molecule(&mut rng, n_atoms, extra, 6.0);
+
+            // Relax, then jiggle: a generic geometry with sane bond lengths.  Testing the
+            // relaxed structure alone would be vacuous — every force there is already ~0.
+            cleanup_2d(&mut mol);
+            for a in mol.atoms.iter_mut() {
+                a.pos[0] += rng.f32_range(-0.2, 0.2);
+                a.pos[1] += rng.f32_range(-0.2, 0.2);
+            }
+
+            let st = CleanupState::new(&mol);
+            // `angle_amp_max` knowingly trades exactness for a bounded force once an arm is
+            // shorter than L/2, i.e. the two atoms already overlap.  Skip those geometries.
+            let min_bond = st
+                .bonds
+                .iter()
+                .map(|&(a, b)| {
+                    let (p, q) = (st.pos[&a], st.pos[&b]);
+                    ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt()
+                })
+                .fold(f32::INFINITY, f32::min);
+            if min_bond < L * 0.5 {
+                continue;
+            }
+
+            let (net, torque, scale) = net_force_and_torque(&st);
+            let f_sum: f32 = st
+                .forces
+                .values()
+                .map(|f| (f[0] * f[0] + f[1] * f[1]).sqrt())
+                .sum::<f32>()
+                .max(1.0);
+
+            let net_mag = (net[0] * net[0] + net[1] * net[1]).sqrt();
+            assert!(
+                net_mag < 1e-3 * f_sum,
+                "net force {net_mag:.6} is not zero (Σ|F| = {f_sum:.3}): \
+                 the force field translates the whole molecule"
+            );
+            assert!(
+                torque.abs() < 1e-3 * scale.max(1.0),
+                "net torque {torque:.6} is not zero (Σ|r||F| = {scale:.3}): the force field \
+                 is non-conservative and will spin the molecule forever instead of converging"
+            );
+            checked += 1;
+        }
+
+        assert!(checked >= 20, "only {checked} structures were suitable for the check");
     }
 
     #[test]

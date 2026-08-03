@@ -26,6 +26,18 @@ pub struct Fragment {
     pub attach_idx: usize,
 }
 
+/// Fragments the crate builds in code rather than reading from JSON.
+///
+/// These are the *parametric* ones — an n-gon or an n-carbon chain is a formula, not a table of
+/// coordinates, so there is nothing here for a JSON file to duplicate. Every named group
+/// (OH, NH₂, CF₃, SiH₃, Boc, Cbz, …) lives in `assets/fragments/*.json` and reaches the editor
+/// through [`Config::resolve_fragment`](crate::Config::resolve_fragment), which consults its
+/// fragment list *first* and only falls through to [`Fragment::ring`] and [`Fragment::benzene`].
+///
+/// Hand-written copies of those groups used to sit here as well, and being unreachable is
+/// exactly how they went wrong: they were still spaced 1.0 apart long after the JSON moved to
+/// [`DEFAULT_BOND_LENGTH`](crate::widget::DEFAULT_BOND_LENGTH), and nothing failed, because
+/// nothing called them. They are gone; `assets/fragments/` is the single source.
 #[allow(dead_code)]
 impl Fragment {
     /// Regular n-membered carbocycle.
@@ -61,10 +73,16 @@ impl Fragment {
     }
 
     /// Linear chain of `n` carbons. atom[0] is attach point at origin.
+    ///
+    /// Spaced by [`DEFAULT_BOND_LENGTH`](crate::widget::DEFAULT_BOND_LENGTH), like everything
+    /// else the editor draws — fragment coordinates are absolute molecular units and are never
+    /// rescaled on insertion, so a unit step here would draw a chain two thirds the size of the
+    /// ring beside it.
     pub fn chain(n: usize) -> Self {
         assert!(n >= 1);
+        let l = crate::widget::DEFAULT_BOND_LENGTH;
         let atoms = (0..=n)
-            .map(|i| FragAtom { element: "C".into(), pos: [i as f32, 0.0], charge: 0 })
+            .map(|i| FragAtom { element: "C".into(), pos: [i as f32 * l, 0.0], charge: 0 })
             .collect();
         let bonds = (0..n)
             .map(|i| FragBond { begin: i, end: i + 1, order: BondOrder::Single })
@@ -72,290 +90,25 @@ impl Fragment {
         Fragment { name: format!("chain{n}"), atoms, bonds, attach_idx: 0 }
     }
 
-    /// Zigzag chain of `n` carbons (alternating ±60° from main axis).
+    /// Zigzag chain of `n` carbons (alternating ±60° from main axis), at
+    /// [`DEFAULT_BOND_LENGTH`](crate::widget::DEFAULT_BOND_LENGTH) per bond.
     pub fn zigzag(n: usize) -> Self {
         assert!(n >= 1);
+        let l = crate::widget::DEFAULT_BOND_LENGTH;
         let angle_step = std::f32::consts::PI / 3.0; // 60°
         let mut atoms: Vec<FragAtom> = vec![FragAtom { element: "C".into(), pos: [0.0, 0.0], charge: 0 }];
         let mut x = 0.0_f32;
         let mut y = 0.0_f32;
         for i in 0..n {
             let dy = if i % 2 == 0 { angle_step.sin() } else { -angle_step.sin() };
-            x += angle_step.cos();
-            y += dy;
+            x += angle_step.cos() * l;
+            y += dy * l;
             atoms.push(FragAtom { element: "C".into(), pos: [x, y], charge: 0 });
         }
         let bonds = (0..n)
             .map(|i| FragBond { begin: i, end: i + 1, order: BondOrder::Single })
             .collect();
         Fragment { name: format!("zigzag{n}"), atoms, bonds, attach_idx: 0 }
-    }
-
-    // --- Linear substituents ---
-
-    fn lin(name: &str, specs: &[(&str, i8)], orders: &[BondOrder]) -> Self {
-        let atoms = specs
-            .iter()
-            .enumerate()
-            .map(|(i, &(el, ch))| FragAtom { element: el.into(), pos: [i as f32, 0.0], charge: ch })
-            .collect();
-        let bonds = orders
-            .iter()
-            .enumerate()
-            .map(|(i, ord)| FragBond { begin: i, end: i + 1, order: ord.clone() })
-            .collect();
-        Fragment { name: name.into(), atoms, bonds, attach_idx: 0 }
-    }
-
-    pub fn oh() -> Self {
-        Self::lin("OH", &[("O", 0), ("H", 0)], &[BondOrder::Single])
-    }
-
-    pub fn ome() -> Self {
-        Self::lin("OMe", &[("O", 0), ("C", 0)], &[BondOrder::Single])
-    }
-
-    pub fn nh2() -> Self {
-        Self::lin("NH2", &[("N", 0), ("H", 0)], &[BondOrder::Single])
-    }
-
-    pub fn no2() -> Self {
-        Fragment {
-            name: "NO2".into(),
-            atoms: vec![
-                FragAtom { element: "N".into(), pos: [0.0, 0.0], charge: 1 },
-                FragAtom { element: "O".into(), pos: [1.0, 0.0], charge: 0 },
-                FragAtom { element: "O".into(), pos: [-0.5, 0.866], charge: -1 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Double },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    pub fn sh() -> Self {
-        Self::lin("SH", &[("S", 0), ("H", 0)], &[BondOrder::Single])
-    }
-
-    pub fn sih3() -> Self {
-        Fragment {
-            name: "SiH3".into(),
-            atoms: vec![
-                FragAtom { element: "Si".into(), pos: [0.0, 0.0], charge: 0 },
-                FragAtom { element: "H".into(),  pos: [1.0, 0.0],  charge: 0 },
-                FragAtom { element: "H".into(),  pos: [-0.5, 0.866], charge: 0 },
-                FragAtom { element: "H".into(),  pos: [-0.5, -0.866], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Single },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-                FragBond { begin: 0, end: 3, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    pub fn ph2() -> Self {
-        Fragment {
-            name: "PH2".into(),
-            atoms: vec![
-                FragAtom { element: "P".into(), pos: [0.0, 0.0], charge: 0 },
-                FragAtom { element: "H".into(), pos: [1.0, 0.0], charge: 0 },
-                FragAtom { element: "H".into(), pos: [-0.5, 0.866], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Single },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    pub fn phenyl() -> Self { Self::benzene() }
-
-    pub fn fluoro() -> Self {
-        Self::lin("F", &[("F", 0)], &[])
-    }
-
-    pub fn cf3() -> Self {
-        Fragment {
-            name: "CF3".into(),
-            atoms: vec![
-                FragAtom { element: "C".into(), pos: [0.0, 0.0], charge: 0 },
-                FragAtom { element: "F".into(), pos: [1.0, 0.0], charge: 0 },
-                FragAtom { element: "F".into(), pos: [-0.5, 0.866], charge: 0 },
-                FragAtom { element: "F".into(), pos: [-0.5, -0.866], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Single },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-                FragBond { begin: 0, end: 3, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    pub fn bromo() -> Self {
-        Self::lin("Br", &[("Br", 0)], &[])
-    }
-
-    pub fn chloro() -> Self {
-        Self::lin("Cl", &[("Cl", 0)], &[])
-    }
-
-    pub fn iodo() -> Self {
-        Self::lin("I", &[("I", 0)], &[])
-    }
-
-    pub fn hydrogen() -> Self {
-        Self::lin("H", &[("H", 0)], &[])
-    }
-
-    pub fn deuterium() -> Self {
-        Self::lin("D", &[("D", 0)], &[])
-    }
-
-    pub fn lithium() -> Self {
-        Self::lin("Li", &[("Li", 0)], &[])
-    }
-
-    pub fn me() -> Self {
-        Self::lin("Me", &[("C", 0)], &[])
-    }
-
-    pub fn mgbr() -> Self {
-        Self::lin("MgBr", &[("Mg", 0), ("Br", 0)], &[BondOrder::Single])
-    }
-
-    pub fn bh2() -> Self {
-        Fragment {
-            name: "BH2".into(),
-            atoms: vec![
-                FragAtom { element: "B".into(), pos: [0.0, 0.0], charge: 0 },
-                FragAtom { element: "H".into(), pos: [1.0, 0.0], charge: 0 },
-                FragAtom { element: "H".into(), pos: [-0.5, 0.866], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Single },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    /// Acetyl group: -C(=O)-CH3
-    pub fn acetyl() -> Self {
-        Fragment {
-            name: "Ac".into(),
-            atoms: vec![
-                FragAtom { element: "C".into(), pos: [0.0, 0.0], charge: 0 },
-                FragAtom { element: "O".into(), pos: [0.0, -1.0], charge: 0 },
-                FragAtom { element: "C".into(), pos: [1.0, 0.0], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Double },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    /// Ethyl group: -CH2-CH3
-    pub fn ethyl() -> Self {
-        Self::lin("Et", &[("C", 0), ("C", 0)], &[BondOrder::Single])
-    }
-
-    /// Methyl ester: -C(=O)-O-CH3
-    pub fn co2me() -> Self {
-        Fragment {
-            name: "CO2Me".into(),
-            atoms: vec![
-                FragAtom { element: "C".into(), pos: [0.0, 0.0], charge: 0 },
-                FragAtom { element: "O".into(), pos: [0.0, -1.0], charge: 0 },
-                FragAtom { element: "O".into(), pos: [1.0, 0.0], charge: 0 },
-                FragAtom { element: "C".into(), pos: [2.0, 0.0], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Double },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-                FragBond { begin: 2, end: 3, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    /// Azide group: -N3
-    pub fn azide() -> Self {
-        Fragment {
-            name: "N3".into(),
-            atoms: vec![
-                FragAtom { element: "N".into(), pos: [0.0, 0.0], charge: 1 },
-                FragAtom { element: "N".into(), pos: [1.0, 0.0], charge: -1 },
-                FragAtom { element: "N".into(), pos: [2.0, 0.0], charge: 0 },
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Double },
-                FragBond { begin: 1, end: 2, order: BondOrder::Double },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    /// Boc group: -C(=O)-O-C(CH3)3
-    pub fn boc() -> Self {
-        Fragment {
-            name: "Boc".into(),
-            atoms: vec![
-                FragAtom { element: "C".into(), pos: [0.0, 0.0],    charge: 0 }, // 0: carbonyl C
-                FragAtom { element: "O".into(), pos: [0.0, -1.0],   charge: 0 }, // 1: =O
-                FragAtom { element: "O".into(), pos: [1.0, 0.0],    charge: 0 }, // 2: -O-
-                FragAtom { element: "C".into(), pos: [2.0, 0.0],    charge: 0 }, // 3: tBu quaternary C
-                FragAtom { element: "C".into(), pos: [3.0, 0.0],    charge: 0 }, // 4: Me
-                FragAtom { element: "C".into(), pos: [2.0, -1.0],   charge: 0 }, // 5: Me
-                FragAtom { element: "C".into(), pos: [2.0,  1.0],   charge: 0 }, // 6: Me
-            ],
-            bonds: vec![
-                FragBond { begin: 0, end: 1, order: BondOrder::Double },
-                FragBond { begin: 0, end: 2, order: BondOrder::Single },
-                FragBond { begin: 2, end: 3, order: BondOrder::Single },
-                FragBond { begin: 3, end: 4, order: BondOrder::Single },
-                FragBond { begin: 3, end: 5, order: BondOrder::Single },
-                FragBond { begin: 3, end: 6, order: BondOrder::Single },
-            ],
-            attach_idx: 0,
-        }
-    }
-
-    /// Cbz group: -C(=O)-O-CH2-Ph
-    pub fn cbz() -> Self {
-        let ph = ring_positions(6);
-        let mut atoms = vec![
-            FragAtom { element: "C".into(), pos: [0.0, 0.0], charge: 0 }, // 0: carbonyl C
-            FragAtom { element: "O".into(), pos: [0.0, -1.0], charge: 0 }, // 1: =O
-            FragAtom { element: "O".into(), pos: [1.0, 0.0], charge: 0 }, // 2: -O-
-            FragAtom { element: "C".into(), pos: [2.0, 0.0], charge: 0 }, // 3: CH2
-        ];
-        // offset benzene positions by (3, 0)
-        for (i, &p) in ph.iter().enumerate() {
-            atoms.push(FragAtom { element: "C".into(), pos: [p[0] + 3.0, p[1]], charge: 0 });
-            let _ = i;
-        }
-        let mut bonds = vec![
-            FragBond { begin: 0, end: 1, order: BondOrder::Double },
-            FragBond { begin: 0, end: 2, order: BondOrder::Single },
-            FragBond { begin: 2, end: 3, order: BondOrder::Single },
-            FragBond { begin: 3, end: 4, order: BondOrder::Single }, // CH2 → ring atom 0
-        ];
-        for k in 0..6 {
-            bonds.push(FragBond {
-                begin: 4 + k,
-                end: 4 + (k + 1) % 6,
-                order: if k % 2 == 0 { BondOrder::Single } else { BondOrder::Double },
-            });
-        }
-        Fragment { name: "Cbz".into(), atoms, bonds, attach_idx: 0 }
     }
 }
 
@@ -429,12 +182,59 @@ impl Fragment {
     }
 }
 
-/// Regular n-gon positions: atom[0]=(0,0), atom[1]=(1,0), ring below.
+/// Which of a fragment's atoms sit on one of its rings.
+///
+/// Leaves are pruned until none are left; whatever survives is on a cycle. Used by
+/// [`Molecule::fragment_atoms_lost_to_snap`](crate::Molecule::fragment_atoms_lost_to_snap) to
+/// tell a wanted ring fusion from a substituent that would be silently re-rooted.
+pub fn ring_membership(frag: &Fragment) -> Vec<bool> {
+    let n = frag.atoms.len();
+    let mut alive = vec![true; n];
+    let mut degree = vec![0usize; n];
+    for b in &frag.bonds {
+        if b.begin < n && b.end < n && b.begin != b.end {
+            degree[b.begin] += 1;
+            degree[b.end] += 1;
+        }
+    }
+    loop {
+        let Some(leaf) = (0..n).find(|&i| alive[i] && degree[i] <= 1) else { break };
+        alive[leaf] = false;
+        degree[leaf] = 0;
+        for b in &frag.bonds {
+            if b.begin >= n || b.end >= n || b.begin == b.end {
+                continue;
+            }
+            let other = if b.begin == leaf {
+                b.end
+            } else if b.end == leaf {
+                b.begin
+            } else {
+                continue;
+            };
+            if alive[other] {
+                degree[other] = degree[other].saturating_sub(1);
+            }
+        }
+    }
+    alive
+}
+
+/// Regular n-gon positions: atom[0]=(0,0), atom[1]=(L,0), ring below, where L is
+/// [`DEFAULT_BOND_LENGTH`].
+///
+/// The edge length is not decorative. Fragment coordinates are *absolute* molecular units —
+/// [`Molecule::insert_fragment`] places a fragment on an atom by translation and rotation
+/// only, with no scaling — so whatever this returns is the size the ring appears on screen.
+/// Every hand-authored fragment (`assets/fragments/*.json`) spaces its bonds by 1.5, and so
+/// do chains and [`crate::widget::interact`]'s ring fusion; a **unit** n-gon here therefore
+/// drew ring-key rings at two thirds the size of everything beside them.
 pub fn ring_positions(n: usize) -> Vec<[f32; 2]> {
     use std::f32::consts::{PI, TAU};
-    let r = 1.0_f32 / (2.0 * (PI / n as f32).sin());
-    let center_y = -(r * r - 0.25_f32).sqrt();
-    let cx = 0.5_f32;
+    let l = crate::widget::DEFAULT_BOND_LENGTH;
+    let r = l / (2.0 * (PI / n as f32).sin());
+    let center_y = -(r * r - l * l * 0.25).sqrt();
+    let cx = l * 0.5;
     let cy = center_y;
     let alpha_0 = (0.0_f32 - cy).atan2(0.0_f32 - cx);
     (0..n)

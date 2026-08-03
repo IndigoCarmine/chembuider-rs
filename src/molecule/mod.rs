@@ -39,6 +39,15 @@ impl BondOrder {
         }
     }
 
+    /// What this bond contributes to each of its two atoms' valence.
+    pub fn valence(&self) -> i16 {
+        match self {
+            BondOrder::Single => 1,
+            BondOrder::Double => 2,
+            BondOrder::Triple => 3,
+        }
+    }
+
     pub fn mol2_type(&self) -> &'static str {
         match self {
             BondOrder::Single => "1",
@@ -48,12 +57,51 @@ impl BondOrder {
     }
 }
 
+/// Standard organic valence for implicit H calculation (the element's lowest
+/// common valence: S counts hydrogens like H₂S, not like a sulfone).
+///
+/// `None` for anything with no standard valence — a custom label, a metal, a group name —
+/// which is the signal that no hydrogen or over-valence conclusion may be drawn about it.
+pub fn normal_valence(element: &str) -> Option<u8> {
+    match element {
+        "C"  => Some(4),
+        "N"  => Some(3),
+        "O"  => Some(2),
+        "S"  => Some(2),
+        "P"  => Some(3),
+        "F" | "Cl" | "Br" | "I" => Some(1),
+        "B"  => Some(3),
+        "Si" => Some(4),
+        "H"  => Some(1),
+        _    => None,
+    }
+}
+
+/// Highest common valence: the threshold above which an atom is genuinely over-bonded.
+///
+/// Used by the over-valence warning and by [`Molecule::consume_excess_group_h`], so that
+/// hypervalent-but-normal S(VI) and P(V) centers (sulfones, sulfonamides, sulfates,
+/// phosphates) are neither flagged nor stripped of hydrogens.
+pub fn max_valence(element: &str) -> Option<u8> {
+    match element {
+        "S" => Some(6),
+        "P" => Some(5),
+        other => normal_valence(other),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Atom {
     pub id: u32,
     pub element: String,
     pub pos: [f32; 2],
     pub charge: i8,
+    /// A hydrogen that arrived as part of a group (OH, NH₂, SiH₃, …) rather than being drawn
+    /// on purpose. Such a hydrogen is the materialisation of a *label*: it is folded into its
+    /// heavy neighbour's text ("NH2") instead of getting a vertex of its own, and the label
+    /// re-derives it from valence. A hydrogen the user placed is an ordinary atom and is
+    /// always drawn. Meaningless on anything that is not a hydrogen.
+    pub group_h: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,7 +141,16 @@ impl Molecule {
 
     pub fn add_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
         let id = self.alloc_id();
-        self.atoms.push(Atom { id, element, pos, charge });
+        self.atoms.push(Atom { id, element, pos, charge, group_h: false });
+        id
+    }
+
+    /// Add an atom that a fragment brings with it. A fragment's hydrogens belong to the group
+    /// it draws (see [`Atom::group_h`]); everything else is an ordinary atom.
+    fn add_fragment_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
+        let id = self.alloc_id();
+        let group_h = element == "H";
+        self.atoms.push(Atom { id, element, pos, charge, group_h });
         id
     }
 
@@ -183,8 +240,153 @@ impl Molecule {
         seen.into_iter().collect()
     }
 
+    /// Total bond order carried by `atom_id`.
+    pub fn bond_order_sum(&self, atom_id: u32) -> i16 {
+        self.bonds_for_atom(atom_id).iter().map(|b| b.order.valence()).sum()
+    }
+
+    /// Drop the group hydrogens that `atom_id` no longer has room for, and only those.
+    ///
+    /// A fragment's hydrogens ([`Atom::group_h`]) are the materialisation of a *label*: the "2"
+    /// in NH₂ is a statement about the nitrogen's spare valence, not an atom the user asked
+    /// for. So when a bond arrives and that spare valence is gone, the honest thing is for the
+    /// hydrogens to go with it — Ph–N=N–Ph is what the two `n` keys meant, not a pair of
+    /// pentavalent nitrogens wearing a warning ring. **Call this from editing paths only**;
+    /// import, layout and fragment→molecule conversion all build graphs through
+    /// [`add_bond`](Self::add_bond) and must not have hydrogens quietly removed underneath them.
+    ///
+    /// Three things bound what it will take:
+    ///
+    /// - **Only group hydrogens.** One the user placed by hand (`h`) is an ordinary atom; it
+    ///   stays, and the over-valence warning it causes is correct and points at something the
+    ///   user can see and delete.
+    /// - **Only terminal ones**, so removing a hydrogen can never split the molecule.
+    /// - **Only the excess**, measured against [`max_valence`] — the same threshold the warning
+    ///   ring uses, so this removes exactly what would have been flagged and stops there. (The
+    ///   lower [`normal_valence`] would strip the hydrogen off every S the moment it picked up a
+    ///   second bond, which is wrong for sulfoxides and would break `s`+`Delete`, the app's only
+    ///   route to a bare sulfur.)
+    ///
+    /// Hydrogens go **highest id first**, i.e. most recently added first, which both makes the
+    /// choice independent of iteration order and agrees with
+    /// [`is_folded_h`](crate::widget::draw::is_folded_h): that folds the *lowest* ids into the
+    /// label, so the one this removes is the one that had already stopped being folded.
+    ///
+    /// Returns the ids removed.
+    pub fn consume_excess_group_h(&mut self, atom_id: u32) -> Vec<u32> {
+        let Some(atom) = self.atom_by_id(atom_id) else { return Vec::new() };
+        let Some(valence) = max_valence(&atom.element) else { return Vec::new() };
+        let limit = valence as i16 + atom.charge as i16;
+        let mut sum = self.bond_order_sum(atom_id);
+        if sum <= limit {
+            return Vec::new();
+        }
+
+        let mut candidates: Vec<(u32, i16)> = self
+            .bonds_for_atom(atom_id)
+            .iter()
+            .map(|b| (if b.begin == atom_id { b.end } else { b.begin }, b.order.valence()))
+            .filter(|&(other, _)| {
+                self.atom_by_id(other).is_some_and(|a| a.element == "H" && a.group_h)
+                    && self.bonds_for_atom(other).len() == 1
+            })
+            .collect();
+        candidates.sort_by_key(|&(h, _)| std::cmp::Reverse(h));
+
+        let mut removed = Vec::new();
+        for (h, contribution) in candidates {
+            if sum <= limit {
+                break;
+            }
+            self.remove_atom(h);
+            sum -= contribution;
+            removed.push(h);
+        }
+        removed
+    }
+
     /// Snap radius for merging overlapping atoms (molecular units).
     pub const SNAP_RADIUS: f32 = 0.4;
+
+    /// Where every fragment atom would land if the fragment were inserted at `attach_to` with
+    /// this `angle`/`flip` — the same transform [`insert_fragment`](Self::insert_fragment) uses,
+    /// exposed so a caller can inspect a placement *before* committing to it.
+    ///
+    /// The entry at `frag.attach_idx` is the attach atom's own position. Returns an empty vec
+    /// when there is nothing to place (missing atom, or a fragment of fewer than two atoms —
+    /// `insert_fragment` declines those too, so the two agree by construction).
+    pub fn fragment_placement(
+        &self,
+        frag: &fragment::Fragment,
+        attach_to: u32,
+        angle: f32,
+        flip: bool,
+    ) -> Vec<[f32; 2]> {
+        let Some(base_pos) = self.atom_by_id(attach_to).map(|a| a.pos) else {
+            return Vec::new();
+        };
+        if frag.atoms.len() < 2 {
+            return Vec::new();
+        }
+        let next_idx = (frag.attach_idx + 1) % frag.atoms.len();
+        let attach_raw = frag.atoms[frag.attach_idx].pos;
+        let next_raw = frag.atoms[next_idx].pos;
+        let raw_angle = (next_raw[1] - attach_raw[1]).atan2(next_raw[0] - attach_raw[0]);
+
+        // Canonicalize: rotate by -raw_angle, then optionally flip y, then rotate by angle.
+        let (sin_neg, cos_neg) = (-raw_angle).sin_cos();
+        let (sin_a, cos_a) = angle.sin_cos();
+
+        frag.atoms
+            .iter()
+            .map(|fa| {
+                let dx = fa.pos[0] - attach_raw[0];
+                let dy = fa.pos[1] - attach_raw[1];
+                // Step 1: canonicalize (rotate so raw_angle → 0)
+                let dx_c = dx * cos_neg - dy * sin_neg;
+                let dy_c = (dx * sin_neg + dy * cos_neg) * if flip { -1.0 } else { 1.0 };
+                // Step 2: rotate to target angle
+                let rx = dx_c * cos_a - dy_c * sin_a;
+                let ry = dx_c * sin_a + dy_c * cos_a;
+                [base_pos[0] + rx, base_pos[1] + ry]
+            })
+            .collect()
+    }
+
+    /// How many atoms the fragment would *lose* to `insert_fragment`'s snap at this placement.
+    ///
+    /// Not every snap is a loss, and telling the two apart is the whole job here.
+    ///
+    /// - A vertex **on one of the fragment's own rings** may land on an existing atom: the two
+    ///   rings then share the bond between them, which is ring fusion and exactly what `5` on a
+    ///   benzene carbon is for (indole, purine, the benzothiophene golden…). The fragment
+    ///   arrives whole; it just overlaps what was already drawn.
+    /// - Any **branch** atom that lands on one is pure loss. It is a substituent, so merging
+    ///   does not fuse anything — it re-roots that branch onto the neighbour (a *tert*-butyl
+    ///   that jumps off the silicon and onto the chain) or, for a terminal atom, drops it
+    ///   entirely against a bond that already exists. `c 1 S` drew SiH₂ this way.
+    ///
+    /// Ring membership is decided by pruning leaves until none are left; whatever survives is
+    /// on a cycle. [`best_fragment_placement`](crate::ChemStructEditor::best_fragment_placement)
+    /// rotates the placement until this count is zero.
+    pub fn fragment_atoms_lost_to_snap(
+        &self,
+        frag: &fragment::Fragment,
+        attach_to: u32,
+        angle: f32,
+        flip: bool,
+    ) -> usize {
+        let on_ring = fragment::ring_membership(frag);
+        self.fragment_placement(frag, attach_to, angle, flip)
+            .into_iter()
+            .enumerate()
+            .filter(|&(i, pos)| {
+                i != frag.attach_idx
+                    && !on_ring[i]
+                    && self.find_atom_near(pos, Self::SNAP_RADIUS).is_some()
+            })
+            .count()
+    }
 
     /// Fuse a Fragment onto an existing atom.
     /// `attach_to` becomes fragment.atoms[attach_idx].
@@ -198,23 +400,10 @@ impl Molecule {
         angle: f32,
         flip: bool,
     ) -> Vec<u32> {
-        let base_pos = match self.atom_by_id(attach_to) {
-            Some(a) => a.pos,
-            None => return vec![],
-        };
-
-        let next_idx = if frag.atoms.len() > 1 {
-            (frag.attach_idx + 1) % frag.atoms.len()
-        } else {
+        let positions = self.fragment_placement(frag, attach_to, angle, flip);
+        if positions.is_empty() {
             return vec![];
-        };
-        let attach_raw = frag.atoms[frag.attach_idx].pos;
-        let next_raw   = frag.atoms[next_idx].pos;
-        let raw_angle  = (next_raw[1] - attach_raw[1]).atan2(next_raw[0] - attach_raw[0]);
-
-        // Canonicalize: rotate by -raw_angle, then optionally flip y, then rotate by angle.
-        let (sin_neg, cos_neg) = (-raw_angle).sin_cos();
-        let (sin_a,   cos_a  ) = angle.sin_cos();
+        }
 
         let mut id_map: Vec<Option<u32>> = vec![None; frag.atoms.len()];
         id_map[frag.attach_idx] = Some(attach_to);
@@ -222,20 +411,12 @@ impl Molecule {
         let mut new_ids: Vec<u32> = Vec::new();
         for (i, fa) in frag.atoms.iter().enumerate() {
             if i == frag.attach_idx { continue; }
-            let dx = fa.pos[0] - attach_raw[0];
-            let dy = fa.pos[1] - attach_raw[1];
-            // Step 1: canonicalize (rotate so raw_angle → 0)
-            let dx_c =  dx * cos_neg - dy * sin_neg;
-            let dy_c = (dx * sin_neg + dy * cos_neg) * if flip { -1.0 } else { 1.0 };
-            // Step 2: rotate to target angle
-            let rx = dx_c * cos_a - dy_c * sin_a;
-            let ry = dx_c * sin_a + dy_c * cos_a;
-            let new_pos = [base_pos[0] + rx, base_pos[1] + ry];
+            let new_pos = positions[i];
             // Snap: if an existing atom is within SNAP_RADIUS, reuse it instead of creating a duplicate
             let new_id = if let Some(existing) = self.find_atom_near(new_pos, Self::SNAP_RADIUS) {
                 existing
             } else {
-                self.add_atom(fa.element.to_string(), new_pos, fa.charge)
+                self.add_fragment_atom(fa.element.to_string(), new_pos, fa.charge)
             };
             id_map[i]   = Some(new_id);
             if !new_ids.contains(&new_id) { new_ids.push(new_id); }
@@ -273,5 +454,112 @@ mod tests {
         want.sort();
         assert_eq!(got, want, "reaches the whole A component from any of its atoms");
         assert_eq!(m.connected_atoms(d), vec![d], "isolated atom is its own molecule");
+    }
+
+    /// A heavy atom carrying `n` group hydrogens, plus one heavy neighbour to bond onto.
+    fn with_group_h(element: &str, n: usize) -> (Molecule, u32, u32, Vec<u32>) {
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let x = m.add_atom(element.to_string(), [1.5, 0.0], 0);
+        m.add_bond(c, x, BondOrder::Single);
+        let hs = (0..n)
+            .map(|i| {
+                let h = m.add_fragment_atom("H".to_string(), [3.0, i as f32], 0);
+                m.add_bond(x, h, BondOrder::Single);
+                h
+            })
+            .collect();
+        (m, c, x, hs)
+    }
+
+    /// Nothing is consumed while the atom still has room, and exactly the excess goes when it
+    /// runs out. The count is what matters: an amine that lost *both* hydrogens the moment it
+    /// picked up a second bond would be as wrong as one that lost neither.
+    #[test]
+    fn only_the_excess_group_hydrogens_are_consumed() {
+        // N with two group hydrogens and one heavy bond: full, but not over.
+        let (mut m, _c, n, hs) = with_group_h("N", 2);
+        assert!(m.consume_excess_group_h(n).is_empty(), "a full valence is not an excess");
+        assert_eq!(m.atoms.len(), 4);
+
+        // A second heavy neighbour takes one of the three: exactly one hydrogen goes.
+        let c2 = m.add_atom("C".to_string(), [1.5, 1.5], 0);
+        m.add_bond(n, c2, BondOrder::Single);
+        assert_eq!(
+            m.consume_excess_group_h(n), vec![hs[1]],
+            "the excess is one hydrogen, and it is the most recently added",
+        );
+        assert!(m.atom_by_id(hs[0]).is_some(), "the other hydrogen is still needed");
+        assert_eq!(m.bond_order_sum(n), 3, "and the nitrogen is back at its valence");
+
+        // Raising that bond to a double takes the last one too.
+        let bid = m.bond_between(n, c2).expect("the bond exists").id;
+        m.bond_by_id_mut(bid).expect("the bond exists").order = BondOrder::Double;
+        assert_eq!(m.consume_excess_group_h(n), vec![hs[0]]);
+        assert_eq!(m.bond_order_sum(n), 3);
+    }
+
+    /// A hydrogen the user drew is an atom, not a label decoration: it is never taken, and the
+    /// over-valence it causes is the correct, visible answer.
+    #[test]
+    fn a_hand_placed_hydrogen_is_never_consumed() {
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 0);
+        m.add_bond(c, n, BondOrder::Single);
+        let explicit = m.add_atom("H".to_string(), [3.0, 0.0], 0);
+        m.add_bond(n, explicit, BondOrder::Single);
+        let c2 = m.add_atom("C".to_string(), [1.5, 1.5], 0);
+        m.add_bond(n, c2, BondOrder::Double);
+
+        assert!(m.consume_excess_group_h(n).is_empty(), "nothing here is a group's hydrogen");
+        assert!(m.atom_by_id(explicit).is_some());
+        assert_eq!(m.bond_order_sum(n), 4, "the nitrogen stays over-valence, visibly so");
+    }
+
+    /// The threshold is the element's *highest* common valence, the same one the warning ring
+    /// uses. Sulfur is where the two differ: an S–H on a sulfoxide sulfur is ordinary chemistry
+    /// and must survive, and only the seventh bond-order takes it.
+    #[test]
+    fn sulfur_is_measured_against_its_hypervalent_limit() {
+        let (mut m, _c, s, hs) = with_group_h("S", 1);
+        for (i, order) in [BondOrder::Double, BondOrder::Double].into_iter().enumerate() {
+            let o = m.add_atom("O".to_string(), [1.5, -(i as f32) - 1.0], 0);
+            m.add_bond(s, o, order);
+            assert!(
+                m.consume_excess_group_h(s).is_empty(),
+                "S(IV)/S(VI) is not over-valence, so its hydrogen stays",
+            );
+        }
+        assert_eq!(m.bond_order_sum(s), 6);
+
+        let c2 = m.add_atom("C".to_string(), [3.0, -3.0], 0);
+        m.add_bond(s, c2, BondOrder::Single);
+        assert_eq!(m.consume_excess_group_h(s), vec![hs[0]], "the seventh bond-order takes it");
+    }
+
+    /// Only *terminal* group hydrogens are candidates, so consuming one can never split the
+    /// molecule in two — a bridging hydrogen is left alone however over-valent its neighbour is.
+    #[test]
+    fn a_bridging_group_hydrogen_is_left_alone() {
+        let mut m = Molecule::default();
+        let o = m.add_atom("O".to_string(), [0.0, 0.0], 0);
+        let h = m.add_fragment_atom("H".to_string(), [1.5, 0.0], 0);
+        let far = m.add_atom("C".to_string(), [3.0, 0.0], 0);
+        let c1 = m.add_atom("C".to_string(), [0.0, 1.5], 0);
+        let c2 = m.add_atom("C".to_string(), [0.0, -1.5], 0);
+        for (a, b) in [(o, h), (h, far), (o, c1), (o, c2)] {
+            m.add_bond(a, b, BondOrder::Single);
+        }
+        assert!(m.consume_excess_group_h(o).is_empty(), "removing it would disconnect `far`");
+        assert_eq!(m.atoms.len(), 5);
+    }
+
+    /// Unknown elements have no valence to exceed, so nothing is ever taken from them.
+    #[test]
+    fn an_element_with_no_standard_valence_keeps_its_hydrogens() {
+        let (mut m, _c, x, _hs) = with_group_h("Zz", 3);
+        assert!(m.consume_excess_group_h(x).is_empty());
+        assert!(m.consume_excess_group_h(9999).is_empty(), "and a missing atom is not a panic");
     }
 }

@@ -1,10 +1,19 @@
-//! Fragment attachment test: for every `Fragment` constructor, attach it to a benzene ring as
-//! a pendant substituent and render the result to its own PNG for eyeballing.
+//! Fragment attachment test: for every fragment the editor ships, attach it to a benzene ring
+//! as a pendant substituent and render the result to its own PNG for eyeballing.
 //!
 //! Run with `cargo test --test fragment_attach -- --nocapture`; the images land in
-//! `target/fragment_test/` (one `benzene_<name>.png` per fragment, plus a `contact_sheet`-free
-//! set). PNG rendering (`molecule::image`) is Windows-only (resvg), so the image-writing part
-//! is gated on Windows; the attachment logic is checked on every platform.
+//! `target/fragment_test/` (one `benzene_<name>.png` per fragment). PNG rendering
+//! (`molecule::image`) is Windows-only (resvg), so the image-writing part is gated on Windows;
+//! the attachment logic is checked on every platform.
+//!
+//! **The fragments come from [`Config::embedded`]**, i.e. `assets/fragments/*.json` — the same
+//! set the running editor resolves names against. They used to come from a parallel set of
+//! hand-written `Fragment` constructors, which is how those constructors sat at a 1.0 bond
+//! length for months after the JSON moved to 1.5: this gallery was the only thing looking at
+//! them, and it never compared the two. The constructors are gone; what is rendered here is
+//! now what the user gets. `ring`/`benzene`/`chain`/`zigzag` stay, because they are formulas
+//! rather than coordinate tables and `Config::resolve_fragment` still falls back to the first
+//! two for the ring keys.
 //!
 //! Note on attachment: `Molecule::insert_fragment` *fuses* — it maps the fragment's root
 //! (`attach_idx`) onto the target atom, sharing it. That is right for ring fusion / label
@@ -14,7 +23,7 @@
 //! sensible fluorobenzene / phenol / aniline / biphenyl / … for every fragment.
 
 use chembuider_rs::molecule::fragment::Fragment;
-use chembuider_rs::{BondOrder, Molecule};
+use chembuider_rs::{BondOrder, Config, Molecule};
 
 /// Materialize a standalone `Fragment` (e.g. benzene) as its own `Molecule`.
 fn fragment_to_molecule(frag: &Fragment) -> Molecule {
@@ -48,7 +57,7 @@ fn centroid(mol: &Molecule) -> [f32; 2] {
 /// a single bond joins `attach_to` to the fragment's root. Works for single- and multi-atom
 /// fragments alike. Returns the id of the fragment's root atom.
 fn attach_pendant(mol: &mut Molecule, frag: &Fragment, attach_to: u32, angle: f32) -> u32 {
-    const BOND: f32 = 1.0; // standard bond length, matching the ring edges
+    const BOND: f32 = 1.5; // standard bond length, matching the ring edges
     let base = mol.atom_by_id(attach_to).expect("attach atom exists").pos;
     let root_raw = frag.atoms[frag.attach_idx].pos;
 
@@ -101,44 +110,31 @@ fn benzene_with(frag: &Fragment) -> Molecule {
     mol
 }
 
-/// Every fragment constructor, paired with the file-name stem for its rendered image.
-fn all_fragments() -> Vec<(&'static str, Fragment)> {
-    vec![
-        ("ring6", Fragment::ring(6)),
-        ("benzene", Fragment::benzene()),
-        ("chain3", Fragment::chain(3)),
-        ("zigzag3", Fragment::zigzag(3)),
-        ("oh", Fragment::oh()),
-        ("ome", Fragment::ome()),
-        ("nh2", Fragment::nh2()),
-        ("no2", Fragment::no2()),
-        ("sh", Fragment::sh()),
-        ("sih3", Fragment::sih3()),
-        ("ph2", Fragment::ph2()),
-        ("phenyl", Fragment::phenyl()),
-        ("fluoro", Fragment::fluoro()),
-        ("cf3", Fragment::cf3()),
-        ("bromo", Fragment::bromo()),
-        ("chloro", Fragment::chloro()),
-        ("iodo", Fragment::iodo()),
-        ("hydrogen", Fragment::hydrogen()),
-        ("deuterium", Fragment::deuterium()),
-        ("lithium", Fragment::lithium()),
-        ("me", Fragment::me()),
-        ("mgbr", Fragment::mgbr()),
-        ("bh2", Fragment::bh2()),
-        ("acetyl", Fragment::acetyl()),
-        ("ethyl", Fragment::ethyl()),
-        ("co2me", Fragment::co2me()),
-        ("azide", Fragment::azide()),
-        ("boc", Fragment::boc()),
-        ("cbz", Fragment::cbz()),
-    ]
+/// Every fragment the editor can resolve, paired with the file-name stem for its rendered
+/// image: the shipped JSON set plus the parametric constructors that back the ring keys.
+fn all_fragments() -> Vec<(String, Fragment)> {
+    let mut out: Vec<(String, Fragment)> = vec![
+        ("ring6".into(), Fragment::ring(6)),
+        ("chain3".into(), Fragment::chain(3)),
+        ("zigzag3".into(), Fragment::zigzag(3)),
+    ];
+    out.extend(
+        Config::embedded()
+            .fragments
+            .iter()
+            .map(|def| (def.name.clone(), def.to_fragment())),
+    );
+    out
 }
 
 #[test]
 fn attaches_every_fragment_to_benzene() {
     let frags = all_fragments();
+    assert!(
+        frags.len() > 40,
+        "the gallery should cover the whole shipped fragment set, got {}",
+        frags.len(),
+    );
 
     for (name, frag) in &frags {
         let before = 6; // bare benzene
