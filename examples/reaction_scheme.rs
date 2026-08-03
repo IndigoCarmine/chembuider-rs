@@ -10,20 +10,25 @@
 //!
 //! * **structures come from the canvas on the left.** Draw one with the ordinary
 //!   [`ChemStructEditor`], then *Add as reactant* / *Add as product* / *Add to scheme*.
-//!   There is no structure editing inside the figure — the canvas is the one place a
-//!   molecule is drawn.
+//! * **double-click a scheme structure** to load it back into the canvas, edit it, and write
+//!   it back with *Replace selected structure* — the round-trip for editing a drawn molecule.
+//! * **drag a scheme item** (structure, `+`, arrow, text) sideways to reorder the reaction
+//!   line; a caret shows where it will drop.
+//! * **right-click a scheme item** for its full menu: clean up the layout, edit in the canvas,
+//!   replace, move, delete — so the figure is fully operable without the side panel.
 //! * **click a cell of the table to edit it.** Only the rows that can hold an entered value
 //!   open a box (`Limiting?`, `Equivalents`, `Sample Mass`, …); everything else is derived
 //!   and recomputed as you type. `Limiting?` is a toggle.
 //! * **click above or below the arrow** to write its reagents and conditions; the usual
 //!   rich-text markup (`K_2CO_3`) applies.
-//! * **the panel on the right** deletes and reorders columns and scheme items.
+//! * **the panel on the right** mirrors those actions for columns and scheme items, but is no
+//!   longer required for the scheme — every scheme action has a direct gesture above.
 //!
 //! `--render` is unaffected by any of this: it runs the plain [`ReactionView`] paint path.
 //! See [`chembuider_rs::reaction::edit`] for the editing API this app is a host for.
 
 use chembuider_rs::egui;
-use chembuider_rs::reaction::edit::{EditTarget, Hit, SchemePart};
+use chembuider_rs::reaction::edit::{EditTarget, Hit, SchemePart, cleanup_scheme_structure};
 use chembuider_rs::reaction::{
     Analysis, Arrow, Mass, MolecularFormula, Product, Reactant, Reaction, ReactionEditor,
     ReactionScheme, SchemeItem, demo,
@@ -110,8 +115,8 @@ impl Default for ReactionApp {
             reaction: reference_reaction(),
             editor: ReactionEditor::new(),
             canvas,
-            status: "Draw on the canvas, then add it to the figure. Click a table cell or an \
-                     arrow label to edit it."
+            status: "Draw on the canvas, then add it to the figure. Double-click a structure to \
+                     edit it, drag scheme items to reorder, right-click for more."
                 .to_string(),
         }
     }
@@ -123,6 +128,10 @@ enum Action {
     RemoveSchemeItem(usize),
     MoveSchemeItem(usize, isize),
     ReplaceSchemeStructure(usize),
+    /// Relax the layout of a scheme structure with the automatic 2-D cleanup (課題A).
+    CleanupSchemeStructure(usize),
+    /// Load a scheme structure into the canvas so it can be edited, then written back (課題B).
+    EditSchemeStructureInCanvas(usize),
     EditSchemeText(usize, SchemePart),
     RemoveReactant(usize),
     RemoveProduct(usize),
@@ -167,7 +176,14 @@ impl eframe::App for ReactionApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
-                self.editor.show(ui, &mut self.reaction);
+                let response = self.editor.show(ui, &mut self.reaction);
+                // Right-click a scheme item for the same actions the inspector offers, so the
+                // figure is fully operable on its own — no side panel required (課題D).
+                self.scheme_context_menu(response);
+                // A double-click on a structure loads it into the canvas for editing (課題B).
+                if let Some(index) = self.editor.take_edit_request() {
+                    self.apply(Action::EditSchemeStructureInCanvas(index));
+                }
             });
         });
     }
@@ -252,9 +268,10 @@ impl ReactionApp {
             ui.separator();
 
             let selected = self.editor.selection();
-            let replaceable = matches!(selected, Some(Hit::Scheme { part: SchemePart::Structure, .. }));
+            let structure_selected =
+                matches!(selected, Some(Hit::Scheme { part: SchemePart::Structure, .. }));
             if ui
-                .add_enabled(replaceable, egui::Button::new("⟳ Replace selected structure"))
+                .add_enabled(structure_selected, egui::Button::new("⟳ Replace selected structure"))
                 .on_disabled_hover_text("Select a structure in the scheme first")
                 .clicked()
                 && let (Some(Hit::Scheme { index, .. }), Some(mol)) =
@@ -265,6 +282,14 @@ impl ReactionApp {
                 self.reaction.set_scheme_structure(index, mol);
                 self.status =
                     "Replaced the selected structure — the table below followed it.".to_string();
+            }
+            if ui
+                .add_enabled(structure_selected, egui::Button::new("🧹 Clean up selected"))
+                .on_disabled_hover_text("Select a structure in the scheme first")
+                .clicked()
+                && let Some(i) = self.editor.cleanup_selected_structure(&mut self.reaction)
+            {
+                self.status = format!("Cleaned up the layout of scheme structure {i}.");
             }
         });
     }
@@ -381,6 +406,63 @@ impl ReactionApp {
         }
     }
 
+    /// The figure's own right-click menu: everything the inspector does to a scheme item, plus
+    /// cleanup and "edit in canvas", reachable straight from the drawing. This is what makes
+    /// the right-hand panel optional (課題D).
+    fn scheme_context_menu(&mut self, response: egui::Response) {
+        let target = self.editor.context_target();
+        let mut action = None;
+        response.context_menu(|ui| {
+            let Some(Hit::Scheme { index, part }) = target else {
+                ui.label("Right-click a scheme item for actions");
+                return;
+            };
+            let is_structure =
+                matches!(self.reaction.scheme.items.get(index), Some(SchemeItem::Structure(_)));
+            if is_structure {
+                if ui.button("✎ Edit in canvas").clicked() {
+                    action = Some(Action::EditSchemeStructureInCanvas(index));
+                    ui.close();
+                }
+                if ui.button("🧹 Clean up layout").clicked() {
+                    action = Some(Action::CleanupSchemeStructure(index));
+                    ui.close();
+                }
+                if ui.button("⟳ Replace with canvas").clicked() {
+                    action = Some(Action::ReplaceSchemeStructure(index));
+                    ui.close();
+                }
+                ui.separator();
+            }
+            match part {
+                SchemePart::ArrowAbove | SchemePart::ArrowBelow | SchemePart::Text => {
+                    if ui.button("✎ Edit text").clicked() {
+                        action = Some(Action::EditSchemeText(index, part));
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                _ => {}
+            }
+            if ui.button("◀ Move left").clicked() {
+                action = Some(Action::MoveSchemeItem(index, -1));
+                ui.close();
+            }
+            if ui.button("▶ Move right").clicked() {
+                action = Some(Action::MoveSchemeItem(index, 1));
+                ui.close();
+            }
+            if ui.button("🗑 Delete").clicked() {
+                action = Some(Action::RemoveSchemeItem(index));
+                ui.close();
+            }
+        });
+        if let Some(action) = action {
+            self.editor.clear_context_target();
+            self.apply(action);
+        }
+    }
+
     fn apply(&mut self, action: Action) {
         // Any selection or open box may be pointing at an index that is about to move.
         self.editor.select(None);
@@ -399,6 +481,27 @@ impl ReactionApp {
                     self.reaction.set_scheme_structure(i, mol);
                     self.status =
                         "Replaced a scheme structure — the table column followed it.".to_string();
+                }
+            }
+            Action::CleanupSchemeStructure(i) => {
+                if cleanup_scheme_structure(&mut self.reaction.scheme, i) {
+                    self.editor.select(Some(Hit::Scheme { index: i, part: SchemePart::Structure }));
+                    self.status = "Cleaned up the structure's layout.".to_string();
+                }
+            }
+            Action::EditSchemeStructureInCanvas(i) => {
+                if let Some(SchemeItem::Structure(mol)) = self.reaction.scheme.items.get(i) {
+                    self.canvas.push_undo();
+                    self.canvas.molecule = mol.clone();
+                    self.canvas.selected_atoms.clear();
+                    self.canvas.tool = Tool::Select;
+                    // Leave the source selected so "Replace selected structure" writes the
+                    // edited canvas straight back into this slot.
+                    self.editor.select(Some(Hit::Scheme { index: i, part: SchemePart::Structure }));
+                    self.status =
+                        "Loaded the structure into the canvas — edit it, then ⟳ Replace selected \
+                         structure to write it back."
+                            .to_string();
                 }
             }
             Action::EditSchemeText(index, part) => {

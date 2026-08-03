@@ -50,7 +50,8 @@ pub mod view;
 
 pub use edit::{
     CellRef, EditTarget, Field, Hit, ParseError, ReactionEditor, SchemePart, Unit, cell_rect,
-    field_at, hit_test, parse_value, scheme_item_rect,
+    cleanup_scheme_structure, field_at, hit_test, parse_value, scheme_drop_index,
+    scheme_item_rect,
 };
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
 pub use model::{Analysis, Mass, Product, Reactant, Reaction, StructureRole};
