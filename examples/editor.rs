@@ -9,6 +9,7 @@
 //! (tools, stereo, paste, clean-up, fragments, config, MOL2 export) and a status bar. The
 //! widget itself is library code; everything here is host-app glue you'd write per application.
 
+use chembuider_rs::molecule::cdxml::to_cdxml;
 use chembuider_rs::molecule::mol2::to_mol2_string;
 use chembuider_rs::molecule::smiles::to_smiles;
 use chembuider_rs::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
@@ -204,6 +205,10 @@ impl App for EditorApp {
                 if ui.button("💾 Save MOL2").clicked() {
                     self.save_mol2();
                 }
+
+                if ui.button("💾 Export CDXML").clicked() {
+                    self.save_cdxml();
+                }
             });
         });
 
@@ -267,6 +272,36 @@ impl EditorApp {
         {
             match download_text_file("molecule.mol2", "chemical/x-mol2", &mol2_text) {
                 Ok(()) => self.status = "Downloaded molecule.mol2".to_string(),
+                Err(e) => self.status = format!("Download failed: {e:?}"),
+            }
+        }
+    }
+
+    fn save_cdxml(&mut self) {
+        if self.editor.molecule.atoms.is_empty() {
+            self.status = "Nothing to export — draw a molecule first.".to_string();
+            return;
+        }
+        let cdxml_text = to_cdxml(&self.editor.molecule);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("ChemDraw CDXML", &["cdxml"])
+                .set_file_name("molecule.cdxml")
+                .save_file()
+            {
+                match std::fs::write(&path, cdxml_text) {
+                    Ok(_) => self.status = format!("Saved: {}", path.display()),
+                    Err(e) => self.status = format!("Save failed: {e}"),
+                }
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            match download_text_file("molecule.cdxml", "chemical/x-cdxml", &cdxml_text) {
+                Ok(()) => self.status = "Downloaded molecule.cdxml".to_string(),
                 Err(e) => self.status = format!("Download failed: {e:?}"),
             }
         }
