@@ -30,7 +30,6 @@
 use chembuider_rs::egui;
 use chembuider_rs::reaction::edit::{
     EditTarget, Hit, SchemePart, StructureRef, cleanup_scheme_structure, scheme_arrow_structure,
-    set_scheme_arrow_structure,
 };
 use chembuider_rs::reaction::{
     Analysis, Arrow, Mass, MolecularFormula, Product, Reactant, Reaction, ReactionEditor,
@@ -48,6 +47,10 @@ fn reference_reaction() -> Reaction {
         .arrow(Arrow::new().above_structure(demo::biphenyl()).below("K_2CO_3"))
         .structure(demo::anisole());
 
+    // The reactant columns follow the scheme's structures in order: the main-line phenol
+    // first, then the biphenyl riding on the arrow (a reagent shown as its structure), then
+    // the two written-out reagents. Editing the biphenyl on the canvas now flows into its
+    // column, formula/MW and all (課題C).
     let analysis = Analysis::new()
         .reactant(
             Reactant::new(demo::phenol())
@@ -55,6 +58,11 @@ fn reference_reaction() -> Reaction {
                 .limiting()
                 .equivalents(1.00)
                 .sample_mass(Mass::grams(1.00)),
+        )
+        .reactant(
+            Reactant::new(demo::biphenyl())
+                .name("biphenyl (arrow reagent)")
+                .equivalents(1.00),
         )
         .reactant(Reactant::new(demo::methyl_iodide()).name("MeI").equivalents(1.10))
         .reactant(
@@ -255,11 +263,10 @@ impl ReactionApp {
                 StructureRef::Item(i) => {
                     self.reaction.set_scheme_structure(i, self.canvas.molecule.clone());
                 }
-                // An arrow-label structure is purely visual (no table column), so it is written
-                // straight back.
+                // An arrow-label structure feeds a reactant column too, so the syncing setter
+                // carries the edit into it — the table follows the reagent live (課題C).
                 StructureRef::ArrowLabel { index, part } => {
-                    set_scheme_arrow_structure(
-                        &mut self.reaction.scheme,
+                    self.reaction.set_scheme_arrow_structure(
                         index,
                         part,
                         self.canvas.molecule.clone(),
@@ -644,7 +651,8 @@ impl ReactionApp {
             }
             Action::PlaceArrowStructure(index, part) => {
                 if let Some(mol) = self.canvas_structure() {
-                    if set_scheme_arrow_structure(&mut self.reaction.scheme, index, part, mol) {
+                    // The syncing setter also re-derives the reagent's table column (課題C).
+                    if self.reaction.set_scheme_arrow_structure(index, part, mol) {
                         self.editor.select(Some(Hit::Scheme { index, part }));
                         let where_ = if part == SchemePart::ArrowAbove { "above" } else { "below" };
                         self.status =

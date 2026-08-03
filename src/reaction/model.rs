@@ -7,6 +7,7 @@
 
 use crate::molecule::Molecule;
 
+use super::edit::SchemePart;
 use super::scheme::{ReactionScheme, SchemeItem};
 
 /// A mass. Stored in grams; the constructors say which unit the caller had in mind.
@@ -261,6 +262,10 @@ impl Analysis {
 /// the ordinal counts structures of that role from the left, so it lines up with the column
 /// order of the matching [`Analysis`] block. A scheme with no arrow treats every structure as
 /// a reactant.
+///
+/// Structures riding on an arrow's above/below label are reagents; they too map to reactant
+/// columns, numbered *after* the main-line reactant structures — see
+/// [`Reaction::arrow_structure_role`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StructureRole {
     /// The n-th reactant structure of the scheme — matches `analysis.reactants[n]`.
@@ -383,12 +388,115 @@ impl Reaction {
     }
 
     /// Re-derive every analysis column that a scheme structure stands for, from the structure
-    /// currently drawn there. Use after a bulk change or a reorder, when individual
+    /// currently drawn there — main-line structures *and* structures riding on arrow labels.
+    /// Use after a bulk change or a reorder, when individual
     /// [`sync_structure_from_scheme`](Reaction::sync_structure_from_scheme) calls were not made.
     pub fn sync_structures_from_scheme(&mut self) {
         for i in 0..self.scheme.items.len() {
             self.sync_structure_from_scheme(i);
         }
+        // Arrow-label structures feed reactant columns appended after the main-line ones; a
+        // second pass keeps their formula/MW/stoichiometry in step too.
+        for i in 0..self.scheme.items.len() {
+            self.sync_arrow_structure_from_scheme(i, SchemePart::ArrowAbove);
+            self.sync_arrow_structure_from_scheme(i, SchemePart::ArrowBelow);
+        }
+    }
+
+    // ── Arrow-label structures ↔ reactant columns ────────────────────────────
+
+    /// How many main-line structures sit before the first arrow — the reactant structures whose
+    /// columns come first. Arrow-label reagent columns are numbered *after* these.
+    fn main_line_reactant_count(&self) -> usize {
+        let mut count = 0;
+        for item in &self.scheme.items {
+            match item {
+                SchemeItem::Arrow(_) => break,
+                SchemeItem::Structure(_) => count += 1,
+                _ => {}
+            }
+        }
+        count
+    }
+
+    /// Which analysis column the structure on an arrow's above/below label stands for.
+    ///
+    /// Arrow-label structures are reagents, so they map to **reactant** columns, appended after
+    /// the main-line reactant structures ([`main_line_reactant_count`](Reaction::main_line_reactant_count)):
+    /// the k-th arrow-label structure — counted above-before-below, in scheme order, over every
+    /// arrow — is `Reactant(main_line_reactant_count + k)`. A band carrying nothing, or text,
+    /// holds no column and returns `None`, so empty/text labels never consume a column ordinal.
+    ///
+    /// This keeps the positional main-line mapping untouched: a scheme with no arrow-label
+    /// structures numbers its reactants exactly as before.
+    pub fn arrow_structure_role(&self, index: usize, part: SchemePart) -> Option<StructureRole> {
+        let base = self.main_line_reactant_count();
+        let mut k = 0usize;
+        for (i, item) in self.scheme.items.iter().enumerate() {
+            let SchemeItem::Arrow(arrow) = item else { continue };
+            for (p, label) in [
+                (SchemePart::ArrowAbove, &arrow.above),
+                (SchemePart::ArrowBelow, &arrow.below),
+            ] {
+                if label.as_structure().is_some() {
+                    if i == index && p == part {
+                        return Some(StructureRole::Reactant(base + k));
+                    }
+                    k += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Copy the structure on an arrow band into the reactant column it
+    /// [stands for](Reaction::arrow_structure_role), so the table follows the drawn reagent.
+    ///
+    /// Returns `true` when a matching column existed and was updated. `false` means the band
+    /// carries no structure, or the analysis has no column for it (the arrow reagent then
+    /// stands for nothing in the table, exactly as a surplus main-line structure does).
+    pub fn sync_arrow_structure_from_scheme(&mut self, index: usize, part: SchemePart) -> bool {
+        let Some(StructureRole::Reactant(col)) = self.arrow_structure_role(index, part) else {
+            return false;
+        };
+        let Some(SchemeItem::Arrow(arrow)) = self.scheme.items.get(index) else {
+            return false;
+        };
+        let label = match part {
+            SchemePart::ArrowAbove => &arrow.above,
+            SchemePart::ArrowBelow => &arrow.below,
+            _ => return false,
+        };
+        let Some(molecule) = label.as_structure().cloned() else {
+            return false;
+        };
+        match self.analysis.reactants.get_mut(col) {
+            Some(r) => {
+                r.molecule = molecule;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Put a structure on an arrow's above/below band and carry it into the reactant column it
+    /// stands for, so the table's formula, MW and stoichiometry follow — the arrow-label
+    /// counterpart of [`set_scheme_structure`](Reaction::set_scheme_structure).
+    ///
+    /// Returns `false` (changing nothing) when the item is not an arrow or the part is not a
+    /// band. Placing a structure can shift the ordinal of later arrow reagents, so this does a
+    /// full [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme).
+    pub fn set_scheme_arrow_structure(
+        &mut self,
+        index: usize,
+        part: SchemePart,
+        molecule: Molecule,
+    ) -> bool {
+        if !super::edit::set_scheme_arrow_structure(&mut self.scheme, index, part, molecule) {
+            return false;
+        }
+        self.sync_structures_from_scheme();
+        true
     }
 }
 
@@ -497,5 +605,74 @@ mod tests {
         // The co-reagents that are only arrow text keep their own molecules.
         assert_eq!(a.reactants[1].formula.plain(), "CH3I");
         assert_eq!(a.reactants[2].formula.plain(), "CK2O3");
+    }
+
+    /// A structure riding on an arrow label feeds a reactant column, numbered after the
+    /// main-line reactant structures; empty/text bands hold no column (課題C).
+    #[test]
+    fn arrow_label_structures_feed_reactant_columns() {
+        // phenol + [biphenyl above / "cat." below the arrow] → anisole.
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()).below("cat."))
+            .structure(demo::anisole());
+        // One main-line reactant (phenol), so the arrow reagent takes reactant column 1.
+        let analysis = Analysis::new()
+            .reactant(Reactant::new(demo::phenol()).limiting().sample_mass(Mass::grams(1.0)))
+            .reactant(Reactant::new(demo::benzene()).equivalents(1.0)) // placeholder for the reagent
+            .product(Product::new(demo::anisole()));
+        let mut reaction = Reaction::new(scheme, analysis);
+
+        // The biphenyl above the arrow resolves to reactant column 1…
+        assert_eq!(
+            reaction.arrow_structure_role(1, SchemePart::ArrowAbove),
+            Some(StructureRole::Reactant(1))
+        );
+        // …and the text ("cat.") band below holds no column.
+        assert_eq!(reaction.arrow_structure_role(1, SchemePart::ArrowBelow), None);
+        // A non-arrow item has no arrow role either.
+        assert_eq!(reaction.arrow_structure_role(0, SchemePart::ArrowAbove), None);
+
+        // Syncing re-derives column 1 from the biphenyl drawn over the arrow.
+        reaction.sync_structures_from_scheme();
+        let a = reaction.analysis.compute();
+        assert_eq!(a.reactants[0].formula.plain(), "C6H6O", "the main-line phenol keeps column 0");
+        assert_eq!(a.reactants[1].formula.plain(), "C12H10", "biphenyl feeds column 1");
+        assert!((a.reactants[1].mw.unwrap() - 154.21).abs() < 0.1, "MW re-derived from the reagent");
+
+        // Changing the arrow structure follows into the column, entered stoichiometry kept.
+        assert!(reaction.set_scheme_arrow_structure(1, SchemePart::ArrowAbove, demo::phenol()));
+        let a = reaction.analysis.compute();
+        assert_eq!(a.reactants[1].formula.plain(), "C6H6O", "the reagent column followed the redraw");
+        assert_eq!(reaction.analysis.reactants[1].equivalents, Some(1.0), "its equivalents survived");
+
+        // A non-arrow target refuses.
+        assert!(!reaction.set_scheme_arrow_structure(0, SchemePart::ArrowAbove, demo::benzene()));
+    }
+
+    /// Two arrow reagents number in scheme order (above before below), so their columns are
+    /// stable and distinct (課題C).
+    #[test]
+    fn arrow_reagents_number_in_scheme_order() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::methyl_iodide())
+            .arrow(
+                Arrow::new()
+                    .above_structure(demo::biphenyl())
+                    .below_structure(demo::benzene()),
+            )
+            .structure(demo::anisole());
+        let reaction = Reaction::new(scheme, Analysis::new());
+        // Two main-line reactant structures (phenol, MeI), so arrow reagents start at column 2.
+        assert_eq!(
+            reaction.arrow_structure_role(3, SchemePart::ArrowAbove),
+            Some(StructureRole::Reactant(2))
+        );
+        assert_eq!(
+            reaction.arrow_structure_role(3, SchemePart::ArrowBelow),
+            Some(StructureRole::Reactant(3))
+        );
     }
 }

@@ -452,6 +452,69 @@ pub fn move_line_structure_to_arrow_slot(
     set_scheme_arrow_structure(scheme, target, part, mol).then_some(target)
 }
 
+/// Swap a main-line structure with a structure already riding on an arrow slot, losslessly:
+/// the arrow slot ends up holding the (former) main-line structure and the main-line position
+/// holds what the slot had. Neither leaves the figure, so this is the *occupied*-slot
+/// counterpart of [`move_line_structure_to_arrow_slot`] (which only accepts an empty slot).
+///
+/// Returns `false` (changing nothing) unless `from` is a main-line structure **and** the slot
+/// holds a structure; a text- or empty-occupied slot is not swappable. The caller should follow
+/// up with [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the
+/// reactant columns re-derive from the structures that now sit at each position.
+pub fn swap_line_structure_with_arrow_slot(
+    scheme: &mut ReactionScheme,
+    from: usize,
+    arrow_index: usize,
+    part: SchemePart,
+) -> bool {
+    let Some(slot_mol) = scheme_arrow_structure(scheme, arrow_index, part).cloned() else {
+        return false; // only a structure-occupied slot is swappable
+    };
+    let Some(SchemeItem::Structure(line_mol)) = scheme.items.get(from) else {
+        return false;
+    };
+    let line_mol = line_mol.clone();
+    set_scheme_arrow_structure(scheme, arrow_index, part, line_mol);
+    scheme.items[from] = SchemeItem::Structure(slot_mol);
+    true
+}
+
+/// Move the structure on an arrow band back onto the reaction line: insert it as a new
+/// [`SchemeItem::Structure`] at `insert_at` (a slot in `0..=items.len()`, as
+/// [`scheme_drop_index`] reports) and clear the band to [`ArrowLabel::Empty`]. Returns the
+/// index the structure landed at, or `None` when the band carries no structure.
+///
+/// Nothing is removed, so `insert_at` is used directly. The caller should follow up with
+/// [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the columns
+/// re-derive around the structure that rejoined the line.
+pub fn move_arrow_structure_to_line(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+    insert_at: usize,
+) -> Option<usize> {
+    let mol = take_scheme_arrow_structure(scheme, index, part)?;
+    let at = insert_at.min(scheme.items.len());
+    scheme.items.insert(at, SchemeItem::Structure(mol));
+    Some(at)
+}
+
+/// The arrow band's label, when the item is an arrow and the part names a band.
+fn arrow_label(scheme: &ReactionScheme, index: usize, part: SchemePart) -> Option<&ArrowLabel> {
+    match (scheme.items.get(index), part) {
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => Some(&a.above),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => Some(&a.below),
+        _ => None,
+    }
+}
+
+/// Whether an arrow band currently holds *text* — a target a dragged structure must not
+/// clobber, so the drag routing steers clear of it (a line structure dropped there reorders
+/// along the line instead).
+fn arrow_slot_holds_text(scheme: &ReactionScheme, index: usize, part: SchemePart) -> bool {
+    arrow_label(scheme, index, part).is_some_and(|l| l.as_text().is_some())
+}
+
 /// Whether an arrow's above/below slot currently holds a *structure* (rather than text or
 /// nothing) — the parts a text edit box must refuse to open on.
 fn scheme_part_holds_structure(scheme: &ReactionScheme, index: usize, part: SchemePart) -> bool {
@@ -696,11 +759,17 @@ impl DragSource {
 struct DragReorder {
     /// What was picked up.
     source: DragSource,
-    /// Reorder slot for a main-line drag: the number of items that will sit to its left
-    /// (`0..=items.len()`).
+    /// Reorder slot for a main-line drag, and the insertion slot an arrow-label structure would
+    /// rejoin the line at: the number of items that will sit to its left (`0..=items.len()`).
     insert_at: usize,
-    /// The arrow above/below slot under the pointer, when the drop would land on one.
+    /// The arrow above/below slot under the pointer, when the drop would land on one. Only slots
+    /// that can *accept* a structure — empty or structure-occupied, never text — and never the
+    /// source's own slot.
     to_slot: Option<(usize, SchemePart)>,
+    /// Whether the pointer is over any arrow band. For an arrow-label source this is what tells
+    /// "resting on a band" (its own, or a text one — do nothing) apart from "over the reaction
+    /// line" (drop the structure back onto the line).
+    over_band: bool,
 }
 
 /// Interactive front end for [`ReactionView`]: the same figure, plus click-to-edit.
@@ -949,17 +1018,28 @@ impl ReactionEditor {
                     DragSource::Item(i) => i,
                     DragSource::ArrowLabel { index, .. } => index,
                 };
-                self.drag = Some(DragReorder { source, insert_at, to_slot: None });
+                self.drag =
+                    Some(DragReorder { source, insert_at, to_slot: None, over_band: false });
                 self.edit = None;
             }
         }
         if response.dragged() {
             if let (Some(drag), Some(p)) = (self.drag.as_mut(), response.interact_pointer_pos()) {
+                let source = drag.source;
                 drag.insert_at = scheme_drop_index(&layout, rect.min, p);
-                // A drop onto an arrow band (that is not the source's own slot) takes priority
-                // over reordering: the structure lands in that slot.
-                drag.to_slot = arrow_slot_at(&reaction.scheme, &layout, rect.min, p)
-                    .filter(|&(ti, tp)| !drag.source.is_slot(ti, tp));
+                // A drop onto an arrow band takes priority over reordering: the structure lands
+                // in that slot. Only an *acceptable* slot counts — not the source's own, and not
+                // a text label (dropping a structure there would clobber the text, so it is left
+                // to reorder along the line instead).
+                drag.to_slot = arrow_slot_at(&reaction.scheme, &layout, rect.min, p).filter(
+                    |&(ti, tp)| {
+                        !source.is_slot(ti, tp) && !arrow_slot_holds_text(&reaction.scheme, ti, tp)
+                    },
+                );
+                drag.over_band = matches!(
+                    hit_test(&reaction.scheme, &layout, rect.min, p),
+                    Some(Hit::Scheme { part: SchemePart::ArrowAbove | SchemePart::ArrowBelow, .. })
+                );
             }
         }
 
@@ -990,12 +1070,19 @@ impl ReactionEditor {
                 DragSource::ArrowLabel { index, part } => Hit::Scheme { index, part },
             };
             outline(source_hit, Stroke::new(1.5, self.highlight.gamma_multiply(0.7)));
-            // Landing on an arrow slot highlights that slot; otherwise a caret shows the
-            // reorder drop point.
+            // Landing on an arrow slot highlights that slot; otherwise a caret shows where the
+            // item drops on the reaction line — for a main-line reorder, or an arrow-label
+            // structure rejoining the line (which only happens when the pointer left the bands).
             if let Some((ti, tp)) = drag.to_slot {
                 outline(Hit::Scheme { index: ti, part: tp }, Stroke::new(2.0, self.highlight));
-            } else if matches!(drag.source, DragSource::Item(_)) {
-                draw_drop_caret(&painter, &layout, rect.min, drag.insert_at, self.highlight);
+            } else {
+                let on_line = match drag.source {
+                    DragSource::Item(_) => true,
+                    DragSource::ArrowLabel { .. } => !drag.over_band,
+                };
+                if on_line {
+                    draw_drop_caret(&painter, &layout, rect.min, drag.insert_at, self.highlight);
+                }
             }
         }
 
@@ -1009,24 +1096,43 @@ impl ReactionEditor {
         if response.drag_stopped() {
             if let Some(drag) = self.drag.take() {
                 if let Some((ti, tp)) = drag.to_slot {
-                    // A structure was dropped onto an arrow slot.
+                    // A structure was dropped onto an arrow slot (move, or a lossless swap).
                     self.drop_into_arrow_slot(reaction, drag.source, ti, tp);
-                } else if let DragSource::Item(from) = drag.source {
-                    // Reorder along the line. `insert_at` counts items left of the pointer, so
-                    // once the moved item is pulled out its final index shifts down by one
-                    // whenever it was dropped to the right of where it started.
-                    let target = if drag.insert_at > from { drag.insert_at - 1 } else { drag.insert_at };
-                    let delta = target as isize - from as isize;
-                    if let Some(landed) = reaction.scheme.move_item(from, delta) {
-                        // Reordering shifts the structure→column mapping, which is positional
-                        // (reactants before the arrow, products after). Re-derive every table
-                        // column from whatever structure now sits at its position.
-                        reaction.sync_structures_from_scheme();
-                        self.selection =
-                            Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                } else {
+                    match drag.source {
+                        DragSource::Item(from) => {
+                            // Reorder along the line. `insert_at` counts items left of the
+                            // pointer, so once the moved item is pulled out its final index
+                            // shifts down by one whenever it was dropped to the right of where
+                            // it started.
+                            let target =
+                                if drag.insert_at > from { drag.insert_at - 1 } else { drag.insert_at };
+                            let delta = target as isize - from as isize;
+                            if let Some(landed) = reaction.scheme.move_item(from, delta) {
+                                // Reordering shifts the structure→column mapping, which is
+                                // positional (reactants before the arrow, products after).
+                                // Re-derive every table column from whatever structure now sits
+                                // at its position.
+                                reaction.sync_structures_from_scheme();
+                                self.selection =
+                                    Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                            }
+                        }
+                        DragSource::ArrowLabel { index, part } => {
+                            // Off the bands and onto the reaction line: drop the arrow structure
+                            // back onto the line as a main-line structure. Resting on any band
+                            // (its own slot, or a text one) leaves it where it was.
+                            if !drag.over_band {
+                                self.drop_arrow_structure_onto_line(
+                                    reaction,
+                                    index,
+                                    part,
+                                    drag.insert_at,
+                                );
+                            }
+                        }
                     }
                 }
-                // An arrow-label source dropped nowhere useful just stays where it was.
             }
         }
 
@@ -1072,10 +1178,14 @@ impl ReactionEditor {
         response
     }
 
-    /// Land a dragged structure on the arrow slot `(ti, tp)`.
+    /// Land a dragged structure on the arrow slot `(ti, tp)`. The slot is always one the drag
+    /// routing already vetted as *acceptable* — empty or structure-occupied, never text.
     ///
-    /// * From a **main-line** structure: move it off the line into the slot (only if the slot is
-    ///   empty), then re-derive the table columns. This is a delete-from-line plus place-on-arrow.
+    /// * From a **main-line** structure onto an **empty** slot: move it off the line into the
+    ///   slot, then re-derive the table columns (delete-from-line plus place-on-arrow).
+    /// * From a **main-line** structure onto a **structure-occupied** slot: swap the two
+    ///   losslessly — the line position takes the slot's structure and the slot takes the
+    ///   dragged one — then re-derive (課題A).
     /// * From **another arrow slot**: swap the two, so above/below (or two arrows) trade
     ///   structures.
     fn drop_into_arrow_slot(
@@ -1087,7 +1197,14 @@ impl ReactionEditor {
     ) {
         match source {
             DragSource::Item(from) => {
-                if let Some(landed) =
+                if scheme_arrow_structure(&reaction.scheme, ti, tp).is_some() {
+                    // Occupied by a structure: trade places rather than refuse (課題A).
+                    if swap_line_structure_with_arrow_slot(&mut reaction.scheme, from, ti, tp) {
+                        reaction.sync_structures_from_scheme();
+                        self.selection =
+                            Some(Hit::Scheme { index: from, part: SchemePart::Structure });
+                    }
+                } else if let Some(landed) =
                     move_line_structure_to_arrow_slot(&mut reaction.scheme, from, ti, tp)
                 {
                     reaction.sync_structures_from_scheme();
@@ -1112,8 +1229,27 @@ impl ReactionEditor {
                         take_scheme_arrow_structure(&mut reaction.scheme, index, part);
                     }
                 }
+                // Arrow-label structures feed reactant columns, and a swap can move which slot
+                // holds which — re-derive so the columns follow.
+                reaction.sync_structures_from_scheme();
                 self.selection = Some(Hit::Scheme { index: ti, part: tp });
             }
+        }
+    }
+
+    /// Drop the structure riding on an arrow band back onto the reaction line, inserting it at
+    /// `insert_at`, then re-derive the table columns (課題B). The band is left empty.
+    fn drop_arrow_structure_onto_line(
+        &mut self,
+        reaction: &mut Reaction,
+        index: usize,
+        part: SchemePart,
+        insert_at: usize,
+    ) {
+        if let Some(at) = move_arrow_structure_to_line(&mut reaction.scheme, index, part, insert_at)
+        {
+            reaction.sync_structures_from_scheme();
+            self.selection = Some(Hit::Scheme { index: at, part: SchemePart::Structure });
         }
     }
 
@@ -1940,6 +2076,95 @@ mod tests {
             "C6H6",
             "benzene moved down"
         );
+    }
+
+    /// Dropping a main-line structure onto a slot that already holds one swaps them, losslessly
+    /// — neither leaves the figure, and the line keeps its length (課題A).
+    #[test]
+    fn dragging_a_line_structure_onto_an_occupied_slot_swaps() {
+        // [Structure(phenol), Arrow(above = biphenyl), Structure(anisole)]
+        let mut scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()))
+            .structure(demo::anisole());
+
+        assert!(swap_line_structure_with_arrow_slot(&mut scheme, 0, 1, SchemePart::ArrowAbove));
+        assert_eq!(scheme.items.len(), 3, "a swap keeps the reaction line's length");
+        // The line position now holds biphenyl; the slot holds the (former line) phenol.
+        let SchemeItem::Structure(m) = &scheme.items[0] else { panic!("item 0 is a structure") };
+        assert_eq!(MolecularFormula::of(m).plain(), "C12H10", "biphenyl came down onto the line");
+        assert_eq!(
+            MolecularFormula::of(scheme_arrow_structure(&scheme, 1, SchemePart::ArrowAbove).unwrap())
+                .plain(),
+            "C6H6O",
+            "phenol went up onto the arrow"
+        );
+
+        // A text- or empty-occupied slot is not swappable (no structure to trade back).
+        let mut text_slot = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above("cat."));
+        assert!(!swap_line_structure_with_arrow_slot(&mut text_slot, 0, 1, SchemePart::ArrowAbove));
+        let mut empty_slot = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new());
+        assert!(!swap_line_structure_with_arrow_slot(&mut empty_slot, 0, 1, SchemePart::ArrowAbove));
+        // A non-structure source is refused too.
+        assert!(!swap_line_structure_with_arrow_slot(&mut scheme, 1, 1, SchemePart::ArrowAbove));
+    }
+
+    /// Dragging a structure off an arrow band back onto the reaction line inserts it as a
+    /// main-line structure and empties the band (課題B).
+    #[test]
+    fn dragging_an_arrow_structure_onto_the_line_inserts_it() {
+        // [Structure(phenol), Arrow(above = biphenyl), Structure(anisole)]
+        let mut scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()))
+            .structure(demo::anisole());
+
+        // Drop biphenyl back onto the line at slot 3 (after anisole).
+        let landed = move_arrow_structure_to_line(&mut scheme, 1, SchemePart::ArrowAbove, 3);
+        assert_eq!(landed, Some(3));
+        assert_eq!(scheme.items.len(), 4, "the structure rejoined the line");
+        let SchemeItem::Structure(m) = &scheme.items[3] else { panic!("item 3 is a structure") };
+        assert_eq!(MolecularFormula::of(m).plain(), "C12H10");
+        // The band is empty now.
+        assert!(scheme_arrow_structure(&scheme, 1, SchemePart::ArrowAbove).is_none());
+        let SchemeItem::Arrow(a) = &scheme.items[1] else { panic!("item 1 is the arrow") };
+        assert!(a.above.is_empty(), "the arrow band is back to empty");
+
+        // An empty (or text) band yields nothing to move.
+        assert!(move_arrow_structure_to_line(&mut scheme, 1, SchemePart::ArrowAbove, 0).is_none());
+    }
+
+    /// The swap keeps the reactant→column mapping aligned: after biphenyl and phenol trade
+    /// places, re-syncing re-derives each column from the structure now standing there (課題A+C).
+    #[test]
+    fn swapping_keeps_reactant_columns_aligned() {
+        use crate::reaction::model::{Product, Reactant};
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()))
+            .structure(demo::anisole());
+        let analysis = Analysis::new()
+            .reactant(Reactant::new(demo::phenol()).limiting().sample_mass(Mass::grams(1.0)))
+            .reactant(Reactant::new(demo::benzene()).equivalents(1.0)) // the arrow reagent's column
+            .product(Product::new(demo::anisole()));
+        let mut reaction = Reaction::new(scheme, analysis);
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reaction.analysis.compute().reactants[1].formula.plain(), "C12H10");
+
+        assert!(swap_line_structure_with_arrow_slot(
+            &mut reaction.scheme,
+            0,
+            1,
+            SchemePart::ArrowAbove
+        ));
+        reaction.sync_structures_from_scheme();
+        let a = reaction.analysis.compute();
+        assert_eq!(a.reactants[0].formula.plain(), "C12H10", "biphenyl now on the line, column 0");
+        assert_eq!(a.reactants[1].formula.plain(), "C6H6O", "phenol now over the arrow, column 1");
     }
 
     // ── The widget ──────────────────────────────────────────────────────────
