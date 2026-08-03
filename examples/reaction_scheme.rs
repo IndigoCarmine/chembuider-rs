@@ -260,8 +260,11 @@ impl ReactionApp {
                 && let (Some(Hit::Scheme { index, .. }), Some(mol)) =
                     (selected, self.canvas_structure())
             {
-                self.reaction.scheme.items[index] = SchemeItem::Structure(mol);
-                self.status = "Replaced the selected structure with the canvas.".to_string();
+                // The syncing setter carries the new structure into its analysis column, so
+                // the table's formula, MW and stoichiometry redraw with the scheme.
+                self.reaction.set_scheme_structure(index, mol);
+                self.status =
+                    "Replaced the selected structure — the table below followed it.".to_string();
             }
         });
     }
@@ -392,8 +395,10 @@ impl ReactionApp {
             }
             Action::ReplaceSchemeStructure(i) => {
                 if let Some(mol) = self.canvas_structure() {
-                    self.reaction.scheme.items[i] = SchemeItem::Structure(mol);
-                    self.status = "Replaced a scheme structure with the canvas.".to_string();
+                    // Redraw the structure and carry it into its table column in one step.
+                    self.reaction.set_scheme_structure(i, mol);
+                    self.status =
+                        "Replaced a scheme structure — the table column followed it.".to_string();
                 }
             }
             Action::EditSchemeText(index, part) => {

@@ -7,7 +7,7 @@
 
 use crate::molecule::Molecule;
 
-use super::scheme::ReactionScheme;
+use super::scheme::{ReactionScheme, SchemeItem};
 
 /// A mass. Stored in grams; the constructors say which unit the caller had in mind.
 ///
@@ -254,11 +254,36 @@ impl Analysis {
     }
 }
 
+/// The role a drawn scheme structure plays in the analysis, decided by where it sits
+/// relative to the reaction arrow.
+///
+/// Structures to the left of the first arrow are reactants, those to its right are products;
+/// the ordinal counts structures of that role from the left, so it lines up with the column
+/// order of the matching [`Analysis`] block. A scheme with no arrow treats every structure as
+/// a reactant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureRole {
+    /// The n-th reactant structure of the scheme — matches `analysis.reactants[n]`.
+    Reactant(usize),
+    /// The n-th product structure of the scheme — matches `analysis.products[n]`.
+    Product(usize),
+}
+
 /// A reaction scheme plus its stoichiometry table — the whole figure.
 ///
 /// The two halves are deliberately independent: the scheme in the reference figure draws
 /// MeI and K₂CO₃ as text over and under the arrow, while the table still gives them a full
 /// column each.
+///
+/// The drawn structures are none the less the source of truth for the columns they *do*
+/// stand for: editing a structure in the scheme is meant to move its formula, weight and the
+/// whole stoichiometry with it. That link is positional — see [`structure_role`] — and the
+/// [`set_scheme_structure`] / [`sync_structures_from_scheme`] methods carry the change from
+/// the scheme into the matching [`Analysis`] column so the table redraws in step.
+///
+/// [`structure_role`]: Reaction::structure_role
+/// [`set_scheme_structure`]: Reaction::set_scheme_structure
+/// [`sync_structures_from_scheme`]: Reaction::sync_structures_from_scheme
 #[derive(Clone, Debug, Default)]
 pub struct Reaction {
     pub scheme: ReactionScheme,
@@ -269,16 +294,208 @@ impl Reaction {
     pub fn new(scheme: ReactionScheme, analysis: Analysis) -> Self {
         Self { scheme, analysis }
     }
+
+    /// Which analysis column the structure drawn at scheme item `scheme_index` stands for, or
+    /// `None` when that item is not a structure (an arrow, a `+`, free text, or out of range).
+    ///
+    /// Structures before the first arrow are reactants, those after it products; the ordinal
+    /// counts structures of that role left to right, so it indexes straight into
+    /// [`Analysis::reactants`] or [`Analysis::products`].
+    pub fn structure_role(&self, scheme_index: usize) -> Option<StructureRole> {
+        if !matches!(self.scheme.items.get(scheme_index), Some(SchemeItem::Structure(_))) {
+            return None;
+        }
+        let mut seen_arrow = false;
+        let mut reactants = 0usize;
+        let mut products = 0usize;
+        for (i, item) in self.scheme.items.iter().enumerate() {
+            match item {
+                SchemeItem::Arrow(_) => seen_arrow = true,
+                SchemeItem::Structure(_) => {
+                    let role = if seen_arrow {
+                        StructureRole::Product(products)
+                    } else {
+                        StructureRole::Reactant(reactants)
+                    };
+                    if i == scheme_index {
+                        return Some(role);
+                    }
+                    if seen_arrow {
+                        products += 1;
+                    } else {
+                        reactants += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Copy the molecule drawn at scheme item `scheme_index` into the analysis column that
+    /// plays the same [role](Reaction::structure_role), so the table's formula, MW and
+    /// stoichiometry follow the drawn structure.
+    ///
+    /// Returns `true` when a matching column existed and was updated. `false` means the item
+    /// is not a structure, or the scheme draws more structures of that role than the analysis
+    /// has columns for (the extra ones stand for nothing in the table).
+    pub fn sync_structure_from_scheme(&mut self, scheme_index: usize) -> bool {
+        let Some(role) = self.structure_role(scheme_index) else {
+            return false;
+        };
+        let Some(SchemeItem::Structure(molecule)) = self.scheme.items.get(scheme_index) else {
+            return false;
+        };
+        let molecule = molecule.clone();
+        match role {
+            StructureRole::Reactant(n) => match self.analysis.reactants.get_mut(n) {
+                Some(r) => {
+                    r.molecule = molecule;
+                    true
+                }
+                None => false,
+            },
+            StructureRole::Product(n) => match self.analysis.products.get_mut(n) {
+                Some(p) => {
+                    p.molecule = molecule;
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// Replace the structure drawn at scheme item `scheme_index`, carrying the change into the
+    /// matching analysis column so the table follows. Returns `false` (and changes nothing)
+    /// when the item is not a structure.
+    ///
+    /// This is the structure-editing counterpart of typing into a table cell: both leave the
+    /// figure re-derivable from what is drawn.
+    pub fn set_scheme_structure(&mut self, scheme_index: usize, molecule: Molecule) -> bool {
+        match self.scheme.items.get_mut(scheme_index) {
+            Some(item) if matches!(item, SchemeItem::Structure(_)) => {
+                *item = SchemeItem::Structure(molecule);
+            }
+            _ => return false,
+        }
+        self.sync_structure_from_scheme(scheme_index);
+        true
+    }
+
+    /// Re-derive every analysis column that a scheme structure stands for, from the structure
+    /// currently drawn there. Use after a bulk change or a reorder, when individual
+    /// [`sync_structure_from_scheme`](Reaction::sync_structure_from_scheme) calls were not made.
+    pub fn sync_structures_from_scheme(&mut self) {
+        for i in 0..self.scheme.items.len() {
+            self.sync_structure_from_scheme(i);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reaction::demo;
+    use crate::reaction::scheme::Arrow;
 
     #[test]
     fn mass_units_round_trip() {
         assert_eq!(Mass::milligrams(700.0).as_grams(), 0.7);
         assert_eq!(Mass::grams(1.0).as_milligrams(), 1000.0);
         assert_eq!(Mass::kilograms(0.5).as_grams(), 500.0);
+    }
+
+    /// A scheme structure is a reactant before the arrow and a product after it; the ordinal
+    /// counts structures of that role, so it indexes straight into the analysis columns.
+    #[test]
+    fn structure_roles_split_at_the_arrow() {
+        let reaction = demo::williamson_ether_synthesis();
+        assert_eq!(reaction.structure_role(0), Some(StructureRole::Reactant(0)));
+        assert_eq!(reaction.structure_role(1), None, "the arrow is not a structure");
+        assert_eq!(reaction.structure_role(2), Some(StructureRole::Product(0)));
+        assert_eq!(reaction.structure_role(9), None, "out of range");
+
+        // Two reagents drawn before the arrow, two products after it: the ordinals run in
+        // drawn order within each block.
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::methyl_iodide())
+            .arrow(Arrow::new())
+            .structure(demo::anisole())
+            .plus()
+            .structure(demo::potassium_carbonate());
+        let reaction = Reaction::new(scheme, Analysis::new());
+        assert_eq!(reaction.structure_role(0), Some(StructureRole::Reactant(0)));
+        assert_eq!(reaction.structure_role(2), Some(StructureRole::Reactant(1)));
+        assert_eq!(reaction.structure_role(4), Some(StructureRole::Product(0)));
+        assert_eq!(reaction.structure_role(6), Some(StructureRole::Product(1)));
+    }
+
+    /// Replacing a drawn scheme structure carries its formula, weight and stoichiometry into
+    /// the matching analysis column, so the table below the scheme follows.
+    #[test]
+    fn editing_a_scheme_structure_updates_the_table() {
+        let mut reaction = demo::williamson_ether_synthesis();
+
+        // Baseline: the drawn phenol is reactant column 0, anisole is product column 0.
+        let before = reaction.analysis.compute();
+        assert_eq!(before.reactants[0].formula.plain(), "C6H6O");
+        assert!((before.reactants[0].mw.unwrap() - 94.11).abs() < 0.01);
+        assert_eq!(before.products[0].formula.plain(), "C7H8O");
+
+        // Redraw the reactant (scheme item 0) as anisole: the table's reactant column follows,
+        // formula and MW re-derived, and the whole column's stoichiometry with it.
+        assert!(reaction.set_scheme_structure(0, demo::anisole()));
+        let after = reaction.analysis.compute();
+        assert_eq!(after.reactants[0].formula.plain(), "C7H8O", "formula followed the drawing");
+        assert!((after.reactants[0].mw.unwrap() - 108.14).abs() < 0.01, "MW re-derived");
+        // 1.00 g of MW 108.14 is 9.25 mmol, down from phenol's 10.63 mmol — the scale moved.
+        assert!((after.reactants[0].moles.unwrap().value - 1.0 / 108.14).abs() < 1e-6);
+
+        // Redraw the product (scheme item 2) as phenol: the product column follows too.
+        assert!(reaction.set_scheme_structure(2, demo::phenol()));
+        assert_eq!(
+            reaction.analysis.compute().products[0].formula.plain(),
+            "C6H6O",
+            "the product column followed the drawn structure"
+        );
+    }
+
+    /// A structure the table has no column for, and a non-structure item, are left alone.
+    #[test]
+    fn syncing_a_structure_without_a_column_is_a_no_op() {
+        // A scheme structure but an empty analysis: nothing to sync into.
+        let mut reaction = Reaction::new(
+            ReactionScheme::new().structure(demo::phenol()),
+            Analysis::new(),
+        );
+        assert!(!reaction.sync_structure_from_scheme(0), "no reactant column exists");
+
+        // Replacing the arrow's slot (not a structure) does nothing and reports it.
+        let mut reaction = demo::williamson_ether_synthesis();
+        assert!(!reaction.set_scheme_structure(1, demo::phenol()));
+        let SchemeItem::Arrow(_) = &reaction.scheme.items[1] else {
+            panic!("item 1 must still be the arrow, untouched");
+        };
+    }
+
+    /// A bulk resync re-derives every column that a scheme structure stands for.
+    #[test]
+    fn bulk_sync_redraws_every_linked_column() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        // Poke new structures straight into the scheme, bypassing the syncing setter …
+        reaction.scheme.items[0] = SchemeItem::Structure(demo::anisole());
+        reaction.scheme.items[2] = SchemeItem::Structure(demo::phenol());
+        // … the table is stale until a resync.
+        assert_eq!(reaction.analysis.compute().reactants[0].formula.plain(), "C6H6O");
+
+        reaction.sync_structures_from_scheme();
+        let a = reaction.analysis.compute();
+        assert_eq!(a.reactants[0].formula.plain(), "C7H8O");
+        assert_eq!(a.products[0].formula.plain(), "C6H6O");
+        // The co-reagents that are only arrow text keep their own molecules.
+        assert_eq!(a.reactants[1].formula.plain(), "CH3I");
+        assert_eq!(a.reactants[2].formula.plain(), "CK2O3");
     }
 }

@@ -53,7 +53,7 @@ pub use edit::{
     field_at, hit_test, parse_value, scheme_item_rect,
 };
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
-pub use model::{Analysis, Mass, Product, Reactant, Reaction};
+pub use model::{Analysis, Mass, Product, Reactant, Reaction, StructureRole};
 pub use scheme::{Arrow, ReactionScheme, SchemeItem, SchemeLayout};
 pub use stoich::{
     AnalysisResult, Formatted, Origin, ProductAnalysis, Quantity, ReactantAnalysis, format_mass,
