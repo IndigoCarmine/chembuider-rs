@@ -268,6 +268,8 @@ impl RichText {
             baseline: f32,
             shift: f32,
             bold_offset: Option<f32>,
+            size: f32,
+            italic: bool,
         }
         let mut parts: Vec<RichGalleyPart> = Vec::with_capacity(self.spans.len());
         let mut pen_x = 0.0_f32;
@@ -297,7 +299,15 @@ impl RichText {
             let baseline = galley_baseline(&galley);
             let bold_offset = span.style.bold.then(|| (style.size * BOLD_STRIKE).max(0.3));
             let advance = galley.rect.width() + bold_offset.unwrap_or(0.0);
-            placed.push(Pending { galley, x: pen_x, baseline, shift, bold_offset });
+            placed.push(Pending {
+                galley,
+                x: pen_x,
+                baseline,
+                shift,
+                bold_offset,
+                size: style.size * scale,
+                italic: span.style.italic,
+            });
             pen_x += advance;
         }
 
@@ -318,6 +328,8 @@ impl RichText {
                 galley: p.galley,
                 offset: Vec2::new(p.x, top),
                 bold_offset: p.bold_offset,
+                size: p.size,
+                italic: p.italic,
             });
         }
         RichGalley { parts, size: Vec2::new(pen_x, height) }
@@ -380,6 +392,25 @@ pub struct RichGalleyPart {
     /// `Some(dx)` for faux-bold: the galley is painted twice, the second time shifted
     /// right by `dx` (double-strike emboldening — egui's default fonts have no bold face).
     pub bold_offset: Option<f32>,
+    /// Font size this span was laid out at (base size, or `size * SCRIPT_SCALE` for scripts).
+    /// Backends that re-emit the text (e.g. SVG export) need it to match the glyph size.
+    pub size: f32,
+    /// Whether this span is italic (shape differs; SVG export needs it).
+    pub italic: bool,
+}
+
+/// One glyph of a laid-out [`RichGalley`], positioned so a non-egui backend (the SVG image
+/// export) can place the exact same character at the exact same spot egui would. `x`/`baseline_y`
+/// are relative to the galley's top-left; `baseline_y` is the text baseline (SVG's default text
+/// anchor point), so the two renderers share one label geometry.
+pub struct PlacedGlyph {
+    pub chr: char,
+    pub x: f32,
+    pub baseline_y: f32,
+    pub size: f32,
+    pub italic: bool,
+    /// Faux-bold double-strike offset (paint the glyph twice, second shifted by this).
+    pub bold_offset: Option<f32>,
 }
 
 /// The result of laying out a [`RichText`]: ready to paint, knows its size.
@@ -411,6 +442,28 @@ impl RichGalley {
         let rect = align.anchor_size(anchor, self.size);
         self.paint(painter, rect.min);
         rect
+    }
+
+    /// Every glyph of the laid-out text, positioned (relative to the galley's top-left) so a
+    /// non-egui backend can reproduce egui's exact layout. `baseline_y` uses egui's own glyph
+    /// baseline (`row.pos.y + glyph.pos.y`), which is what SVG's `<text>` anchors to.
+    pub fn glyph_placements(&self) -> Vec<PlacedGlyph> {
+        let mut out = Vec::new();
+        for part in &self.parts {
+            for row in &part.galley.rows {
+                for glyph in &row.row.glyphs {
+                    out.push(PlacedGlyph {
+                        chr: glyph.chr,
+                        x: part.offset.x + row.pos.x + glyph.pos.x,
+                        baseline_y: part.offset.y + row.pos.y + glyph.pos.y,
+                        size: part.size,
+                        italic: part.italic,
+                        bold_offset: part.bold_offset,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Bounding rect (relative to this galley's top-left) of a range of characters of the

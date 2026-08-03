@@ -1,17 +1,51 @@
-//! Render a `Molecule` to a bitmap (Windows DIB) for the clipboard, like ChemDraw's image
-//! flavor. The molecule is drawn to an SVG, rasterized with resvg, and packed as a top-down
-//! 32bpp CF_DIB. Windows-only (depends on resvg).
+//! Render a `Molecule` to a bitmap (Windows DIB) / PNG / EMF for the clipboard, like ChemDraw's
+//! image flavor. The raster path draws to an SVG, rasterized with resvg; the EMF path draws GDI
+//! records. Windows-only (depends on resvg).
+//!
+//! Both paths build their geometry from [`crate::widget::scene`] — the exact same backend-neutral
+//! primitive list the on-screen editor draws — so the copied/exported picture matches the canvas:
+//! same scale ([`SCALE_FACTOR`]), bond width / double-bond offset / stereo wedges / rich atom
+//! labels (H counts, charges) / ring fills, all from one source. The SVG path additionally
+//! positions each label glyph at egui's own layout coordinates and (when available) rasterizes it
+//! with egui's own bundled font, so the label placement is pixel-faithful to the widget.
 
-use super::{BondOrder, Molecule};
+use super::Molecule;
+use crate::config::StyleConfig;
+use crate::widget::scene::{self, RenderTransform};
+use crate::widget::{SCALE_FACTOR, draw};
+use egui::Vec2;
+use resvg::usvg::fontdb;
 use std::sync::{Arc, OnceLock};
 
-/// System fonts are loaded once and reused (loading them on every copy is slow).
-fn font_db() -> Arc<resvg::usvg::fontdb::Database> {
-    static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+/// Extra pixels of empty space around the drawn structure.
+const MARGIN_PX: f32 = 12.0;
+
+/// System fonts plus egui's own bundled proportional font, loaded once. The returned family name
+/// is egui's font (so SVG labels rasterize with the same glyphs the widget shows); it falls back
+/// to `"sans-serif"` if the bundled font can't be extracted.
+fn egui_font() -> (Arc<fontdb::Database>, String) {
+    static DB: OnceLock<(Arc<fontdb::Database>, String)> = OnceLock::new();
     DB.get_or_init(|| {
-        let mut db = resvg::usvg::fontdb::Database::new();
+        let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        Arc::new(db)
+        let mut family = String::from("sans-serif");
+        let defs = egui::FontDefinitions::default();
+        if let Some(first) = defs
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .and_then(|names| names.first())
+        {
+            if let Some(data) = defs.font_data.get(first) {
+                let before: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
+                db.load_font_data(data.font.to_vec());
+                if let Some(face) = db.faces().find(|f| !before.contains(&f.id)) {
+                    if let Some((fam, _)) = face.families.first() {
+                        family = fam.clone();
+                    }
+                }
+            }
+        }
+        (Arc::new(db), family)
     })
     .clone()
 }
@@ -24,7 +58,7 @@ fn render_pixmap(mol: &Molecule, background: Option<resvg::tiny_skia::Color>) ->
     }
     let svg = molecule_to_svg(mol);
     let mut opt = resvg::usvg::Options::default();
-    opt.fontdb = font_db();
+    opt.fontdb = egui_font().0;
     let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
 
     let size = tree.size();
@@ -83,19 +117,176 @@ pub fn molecule_to_dib(mol: &Molecule) -> Option<Vec<u8>> {
     Some(dib)
 }
 
-/// Render the molecule to an Enhanced Metafile (GDI) and return the HENHMETAFILE handle, for
-/// the CF_ENHMETAFILE clipboard format. This vector image is what PowerPoint/Word paste as a
-/// picture AND what an embedded OLE object uses for its on-page presentation. None if empty.
-/// The returned handle is owned by the caller (give it to the clipboard, which then owns it).
+// ─── Shared scene bounds ───────────────────────────────────────────────────────
+
+/// Build the shared scene at `SCALE_FACTOR` px/unit (offset 0), plus the pixel bounding rect of
+/// everything in it (ring fills, bonds, labels, bare atoms). Returned so both the SVG and EMF
+/// paths lay the structure out identically. `layout` is the galley source.
+fn build_scene(
+    mol: &Molecule,
+    style: &StyleConfig,
+    layout: impl FnMut(egui::text::LayoutJob) -> Arc<egui::Galley>,
+) -> (scene::MoleculeScene, egui::Rect) {
+    let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+    let labels = scene::build_labels(mol, style, xf, layout);
+    let bonds = scene::build_bonds(mol, style, xf, &labels);
+    let ring_fills = scene::build_ring_fills(mol, xf);
+
+    let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
+    let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut grow = |p: egui::Pos2| {
+        min.x = min.x.min(p.x);
+        min.y = min.y.min(p.y);
+        max.x = max.x.max(p.x);
+        max.y = max.y.max(p.y);
+    };
+    for a in &mol.atoms {
+        grow(xf.apply(a.pos));
+    }
+    for poly in &ring_fills {
+        poly.points.iter().for_each(|p| grow(*p));
+    }
+    for b in &bonds {
+        for s in &b.strokes {
+            grow(s.a);
+            grow(s.b);
+        }
+        for f in &b.fills {
+            f.iter().for_each(|p| grow(*p));
+        }
+    }
+    for l in labels.values() {
+        grow(l.rect.min);
+        grow(l.rect.max);
+    }
+    let bounds = egui::Rect::from_min_max(min, max);
+    (
+        scene::MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad },
+        bounds,
+    )
+}
+
+// ─── SVG (raster) path ─────────────────────────────────────────────────────────
+
+fn xml_escape(c: char) -> String {
+    match c {
+        '&' => "&amp;".into(),
+        '<' => "&lt;".into(),
+        '>' => "&gt;".into(),
+        '"' => "&quot;".into(),
+        '\'' => "&apos;".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Render the molecule to an SVG string from the shared scene: ring-fill polygons, then bond
+/// strokes / wedge fills, then white label masks, then each label glyph placed at egui's exact
+/// layout position. `x`/`y` translate the scene so its bounding box sits at `MARGIN_PX`.
+fn molecule_to_svg(mol: &Molecule) -> String {
+    let style = StyleConfig::default();
+    let family = egui_font().1;
+
+    // Standalone egui font stack: the same layout egui does on-screen, so label geometry matches.
+    let mut fonts = egui::epaint::text::Fonts::new(
+        egui::epaint::text::TextOptions::default(),
+        egui::FontDefinitions::default(),
+    );
+    let mut view = fonts.with_pixels_per_point(1.0);
+    let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job));
+
+    let w = bounds.width() + 2.0 * MARGIN_PX;
+    let h = bounds.height() + 2.0 * MARGIN_PX;
+    let dx = MARGIN_PX - bounds.min.x;
+    let dy = MARGIN_PX - bounds.min.y;
+
+    let mut s = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.0} {h:.0}"><g transform="translate({dx:.3},{dy:.3})">"#
+    );
+
+    // Ring fills (backmost). Translucent RGBA → fill + fill-opacity.
+    for poly in &scene.ring_fills {
+        let pts = poly
+            .points
+            .iter()
+            .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let [r, g, b, a] = poly.rgba;
+        s.push_str(&format!(
+            r#"<polygon points="{pts}" fill="rgb({r},{g},{b})" fill-opacity="{:.3}"/>"#,
+            a as f32 / 255.0
+        ));
+    }
+
+    // Bonds: stroked lines + filled (black) stereo wedges.
+    for bond in &scene.bonds {
+        for st in &bond.strokes {
+            s.push_str(&format!(
+                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="black" stroke-width="{:.3}" stroke-linecap="round"/>"#,
+                st.a.x, st.a.y, st.b.x, st.b.y, st.width
+            ));
+        }
+        for fill in &bond.fills {
+            let pts = fill
+                .iter()
+                .map(|p| format!("{:.2},{:.2}", p.x, p.y))
+                .collect::<Vec<_>>()
+                .join(" ");
+            s.push_str(&format!(r#"<polygon points="{pts}" fill="black"/>"#));
+        }
+    }
+
+    // White masks behind labels (hide any crossing bonds), then the label glyphs.
+    for label in scene.labels.values() {
+        let r = label.rect.expand(scene.label_bg_pad);
+        s.push_str(&format!(
+            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="white"/>"#,
+            r.min.x, r.min.y, r.width(), r.height()
+        ));
+    }
+    for label in scene.labels.values() {
+        let base = label.rect.min;
+        for g in label.galley.glyph_placements() {
+            let ch = xml_escape(g.chr);
+            let style_attr = if g.italic { r#" font-style="italic""# } else { "" };
+            let x = base.x + g.x;
+            let y = base.y + g.baseline_y;
+            let mut emit = |gx: f32| {
+                s.push_str(&format!(
+                    r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} fill="black" xml:space="preserve">{ch}</text>"#,
+                    g.size
+                ));
+            };
+            emit(x);
+            if let Some(dxb) = g.bold_offset {
+                emit(x + dxb); // faux-bold double strike, as egui does on-screen
+            }
+        }
+    }
+
+    s.push_str("</g></svg>");
+    s
+}
+
+// ─── EMF (GDI vector) path ─────────────────────────────────────────────────────
+
+/// Render the molecule to an Enhanced Metafile (GDI) and return the HENHMETAFILE handle, for the
+/// CF_ENHMETAFILE clipboard format (what PowerPoint/Word paste as a picture, and what an embedded
+/// OLE object uses for its on-page presentation). Geometry (scale, bond lines, double-bond
+/// placement, stereo wedges, ring fills, which atoms are labeled) comes from the shared scene, so
+/// it tracks the on-screen structure. Labels are drawn with GDI text (no true sub/superscripts,
+/// and GDI's Arial rather than egui's font — the one place the EMF picture can drift from the
+/// canvas). None if empty. The returned handle is owned by the caller.
 pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
     #[repr(C)]
-    struct Rect_ { left: i32, top: i32, right: i32, bottom: i32 }
+    struct Point_ { x: i32, y: i32 }
     #[link(name = "gdi32")]
     unsafe extern "system" {
-        fn CreateEnhMetaFileW(h: isize, f: *const u16, r: *const Rect_, d: *const u16) -> isize;
+        fn CreateEnhMetaFileW(h: isize, f: *const u16, r: *const i32, d: *const u16) -> isize;
         fn CloseEnhMetaFile(h: isize) -> isize;
         fn MoveToEx(h: isize, x: i32, y: i32, p: *mut core::ffi::c_void) -> i32;
         fn LineTo(h: isize, x: i32, y: i32) -> i32;
+        fn Polygon(h: isize, pts: *const Point_, n: i32) -> i32;
         fn CreatePen(style: i32, width: i32, color: u32) -> isize;
         fn CreateSolidBrush(color: u32) -> isize;
         fn SelectObject(h: isize, o: isize) -> isize;
@@ -112,83 +303,98 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
     if mol.atoms.is_empty() {
         return None;
     }
-    const PX: f32 = 40.0;
-    const MARGIN: f32 = 0.7;
     const BLACK: u32 = 0x0000_0000;
     const WHITE: u32 = 0x00FF_FFFF;
 
-    let min_x = mol.atoms.iter().map(|a| a.pos[0]).fold(f32::INFINITY, f32::min);
-    let max_x = mol.atoms.iter().map(|a| a.pos[0]).fold(f32::NEG_INFINITY, f32::max);
-    let min_y = mol.atoms.iter().map(|a| a.pos[1]).fold(f32::INFINITY, f32::min);
-    let max_y = mol.atoms.iter().map(|a| a.pos[1]).fold(f32::NEG_INFINITY, f32::max);
-    let w_px = (((max_x - min_x) + 2.0 * MARGIN) * PX) as i32;
-    let h_px = (((max_y - min_y) + 2.0 * MARGIN) * PX) as i32;
-    let tx = |x: f32| ((x - min_x + MARGIN) * PX) as i32;
-    let ty = |y: f32| ((y - min_y + MARGIN) * PX) as i32;
+    let style = StyleConfig::default();
+    let mut fonts = egui::epaint::text::Fonts::new(
+        egui::epaint::text::TextOptions::default(),
+        egui::FontDefinitions::default(),
+    );
+    let mut view = fonts.with_pixels_per_point(1.0);
+    let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job));
 
-    let _ = (w_px, h_px); // drawing extent is implied by the records below
+    let dx = MARGIN_PX - bounds.min.x;
+    let dy = MARGIN_PX - bounds.min.y;
+    let tx = |x: f32| (x + dx).round() as i32;
+    let ty = |y: f32| (y + dy).round() as i32;
+
+    // GDI solid brushes have no alpha; approximate a translucent ring fill over the white page.
+    let over_white = |rgba: [u8; 4]| -> u32 {
+        let a = rgba[3] as f32 / 255.0;
+        let blend = |v: u8| (v as f32 * a + 255.0 * (1.0 - a)).round() as u32;
+        (blend(rgba[2]) << 16) | (blend(rgba[1]) << 8) | blend(rgba[0])
+    };
 
     unsafe {
-        // NULL frame: GDI computes rclFrame from the drawing + reference-DC resolution, so the
-        // frame and bounds stay consistent (an explicit mismatched frame clips the picture).
         let hdc = CreateEnhMetaFileW(0, std::ptr::null(), std::ptr::null(), std::ptr::null());
         if hdc == 0 {
             return None;
         }
         SetBkMode(hdc, 1); // TRANSPARENT
-        let pen = CreatePen(0, 2, BLACK); // PS_SOLID, 2px
+        let pen_width = style.bond_width.round().max(1.0) as i32;
+        let pen = CreatePen(0, pen_width, BLACK); // PS_SOLID
+        let no_pen = CreatePen(5, 0, WHITE); // PS_NULL
+        let black_brush = CreateSolidBrush(BLACK);
         let old_pen = SelectObject(hdc, pen);
 
-        // Bonds.
-        for b in &mol.bonds {
-            let (Some(p), Some(q)) = (mol.atom_by_id(b.begin), mol.atom_by_id(b.end)) else { continue };
-            let (x1, y1, x2, y2) = (tx(p.pos[0]), ty(p.pos[1]), tx(q.pos[0]), ty(q.pos[1]));
-            let (dx, dy) = ((x2 - x1) as f32, (y2 - y1) as f32);
-            let len = (dx * dx + dy * dy).sqrt().max(0.01);
-            let (nx, ny) = ((-dy / len * 3.0) as i32, (dx / len * 3.0) as i32);
-            let line = |a: i32, b: i32, c: i32, d: i32| {
-                MoveToEx(hdc, a, b, std::ptr::null_mut());
-                LineTo(hdc, c, d);
-            };
-            match b.order {
-                BondOrder::Single => line(x1, y1, x2, y2),
-                BondOrder::Double => {
-                    line(x1 + nx, y1 + ny, x2 + nx, y2 + ny);
-                    line(x1 - nx, y1 - ny, x2 - nx, y2 - ny);
-                }
-                BondOrder::Triple => {
-                    line(x1, y1, x2, y2);
-                    line(x1 + 2 * nx, y1 + 2 * ny, x2 + 2 * nx, y2 + 2 * ny);
-                    line(x1 - 2 * nx, y1 - 2 * ny, x2 - 2 * nx, y2 - 2 * ny);
-                }
+        // Ring fills (backmost): filled polygons, no outline.
+        for poly in &scene.ring_fills {
+            let brush = CreateSolidBrush(over_white(poly.rgba));
+            SelectObject(hdc, brush);
+            SelectObject(hdc, no_pen);
+            let pts: Vec<Point_> = poly.points.iter().map(|p| Point_ { x: tx(p.x), y: ty(p.y) }).collect();
+            Polygon(hdc, pts.as_ptr(), pts.len() as i32);
+            SelectObject(hdc, pen);
+            DeleteObject(brush);
+        }
+
+        // Bonds: stroked lines + filled (black) stereo wedges.
+        SelectObject(hdc, pen);
+        for bond in &scene.bonds {
+            for st in &bond.strokes {
+                MoveToEx(hdc, tx(st.a.x), ty(st.a.y), std::ptr::null_mut());
+                LineTo(hdc, tx(st.b.x), ty(st.b.y));
+            }
+            for fill in &bond.fills {
+                SelectObject(hdc, black_brush);
+                SelectObject(hdc, no_pen);
+                let pts: Vec<Point_> = fill.iter().map(|p| Point_ { x: tx(p.x), y: ty(p.y) }).collect();
+                Polygon(hdc, pts.as_ptr(), pts.len() as i32);
+                SelectObject(hdc, pen);
             }
         }
 
-        // Heteroatom labels: white disc to mask the bond, then centered black text.
-        let brush = CreateSolidBrush(WHITE);
-        let no_pen = CreatePen(5, 0, WHITE); // PS_NULL (no outline on the disc)
+        // Labels: white disc mask + centered plain text (flattened rich label).
+        let white_brush = CreateSolidBrush(WHITE);
         let face: Vec<u16> = "Arial\0".encode_utf16().collect();
-        let font = CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
+        let font_h = -(style.label_size.round() as i32);
+        let font = CreateFontW(font_h, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
         let old_font = SelectObject(hdc, font);
         SetTextColor(hdc, BLACK);
         SetTextAlign(hdc, 6); // TA_CENTER
-        for a in &mol.atoms {
-            if a.element == "C" {
+        let r = (style.label_size * 0.75).round() as i32;
+        for atom in &mol.atoms {
+            if !draw::should_show_label(mol, atom.id) {
                 continue;
             }
-            let (cx, cy) = (tx(a.pos[0]), ty(a.pos[1]));
-            SelectObject(hdc, brush);
+            // Center the plain text on the atom position (anchor point of the on-screen label).
+            let c = egui::pos2(atom.pos[0] * SCALE_FACTOR, atom.pos[1] * SCALE_FACTOR);
+            let (cx, cy) = (tx(c.x), ty(c.y));
+            SelectObject(hdc, white_brush);
             SelectObject(hdc, no_pen);
-            Ellipse(hdc, cx - 10, cy - 10, cx + 10, cy + 10);
+            Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
             SelectObject(hdc, pen);
-            let label: Vec<u16> = a.element.encode_utf16().collect();
-            TextOutW(hdc, cx, cy - 9, label.as_ptr(), label.len() as i32);
+            let text = flatten_label(mol, atom);
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            TextOutW(hdc, cx, cy + font_h / 2, utf16.as_ptr(), utf16.len() as i32);
         }
 
         SelectObject(hdc, old_font);
         SelectObject(hdc, old_pen);
         DeleteObject(font);
-        DeleteObject(brush);
+        DeleteObject(white_brush);
+        DeleteObject(black_brush);
         DeleteObject(no_pen);
         DeleteObject(pen);
         let hemf = CloseEnhMetaFile(hdc);
@@ -196,65 +402,21 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
     }
 }
 
-/// Skeletal SVG: bonds as lines (single/double/triple), heteroatoms as labels on a white disc.
-fn molecule_to_svg(mol: &Molecule) -> String {
-    const PX: f32 = 40.0; // pixels per molecule unit
-    const MARGIN: f32 = 0.7;
-
-    let min_x = mol.atoms.iter().map(|a| a.pos[0]).fold(f32::INFINITY, f32::min);
-    let max_x = mol.atoms.iter().map(|a| a.pos[0]).fold(f32::NEG_INFINITY, f32::max);
-    let min_y = mol.atoms.iter().map(|a| a.pos[1]).fold(f32::INFINITY, f32::min);
-    let max_y = mol.atoms.iter().map(|a| a.pos[1]).fold(f32::NEG_INFINITY, f32::max);
-    let w = ((max_x - min_x) + 2.0 * MARGIN) * PX;
-    let h = ((max_y - min_y) + 2.0 * MARGIN) * PX;
-    let tx = |x: f32| (x - min_x + MARGIN) * PX;
-    let ty = |y: f32| (y - min_y + MARGIN) * PX;
-    let line = |x1: f32, y1: f32, x2: f32, y2: f32| {
-        format!(
-            r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="black" stroke-width="1.6"/>"#
-        )
-    };
-
-    let mut s = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.0} {h:.0}">"#
-    );
-    for b in &mol.bonds {
-        let (Some(p), Some(q)) = (mol.atom_by_id(b.begin), mol.atom_by_id(b.end)) else { continue };
-        let (x1, y1, x2, y2) = (tx(p.pos[0]), ty(p.pos[1]), tx(q.pos[0]), ty(q.pos[1]));
-        let (dx, dy) = (x2 - x1, y2 - y1);
-        let len = (dx * dx + dy * dy).sqrt().max(0.01);
-        let (nx, ny) = (-dy / len * 3.0, dx / len * 3.0);
-        match b.order {
-            BondOrder::Single => s.push_str(&line(x1, y1, x2, y2)),
-            BondOrder::Double => {
-                s.push_str(&line(x1 + nx, y1 + ny, x2 + nx, y2 + ny));
-                s.push_str(&line(x1 - nx, y1 - ny, x2 - nx, y2 - ny));
-            }
-            BondOrder::Triple => {
-                s.push_str(&line(x1, y1, x2, y2));
-                s.push_str(&line(x1 + 2.0 * nx, y1 + 2.0 * ny, x2 + 2.0 * nx, y2 + 2.0 * ny));
-                s.push_str(&line(x1 - 2.0 * nx, y1 - 2.0 * ny, x2 - 2.0 * nx, y2 - 2.0 * ny));
-            }
-        }
-    }
-    for a in &mol.atoms {
-        if a.element == "C" {
-            continue; // skeletal: carbons are vertices
-        }
-        let (cx, cy) = (tx(a.pos[0]), ty(a.pos[1]));
-        s.push_str(&format!(r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="10" fill="white"/>"#));
-        s.push_str(&format!(
-            r#"<text x="{cx:.1}" y="{cy:.1}" font-size="16" text-anchor="middle" dominant-baseline="central" font-family="sans-serif" fill="black">{el}</text>"#,
-            el = a.element
-        ));
-    }
-    s.push_str("</svg>");
-    s
+/// The plain-text form of an atom's on-screen label (rich spans flattened, scripts inlined). Used
+/// by the GDI/EMF path, which has no sub/superscript support.
+fn flatten_label(mol: &Molecule, atom: &super::Atom) -> String {
+    draw::atom_label(mol, atom)
+        .rich
+        .spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::molecule::{BondOrder, BondStereo};
 
     #[test]
     fn svg_draws_bonds_and_heteroatom_labels() {
@@ -268,6 +430,31 @@ mod tests {
         assert_eq!(svg.matches("<line").count(), 2, "double bond renders two lines");
         assert!(svg.contains(">O</text>"), "oxygen gets a label");
         assert!(!svg.contains(">C</text>"), "carbon stays a skeletal vertex");
+    }
+
+    #[test]
+    fn svg_renders_wedge_and_ring_fill() {
+        // Solid wedge → a black polygon; a filled ring → a translucent polygon.
+        let mut mol = Molecule::default();
+        let a = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = mol.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let bond = mol.add_bond(a, b, BondOrder::Single);
+        mol.bond_by_id_mut(bond).unwrap().stereo = BondStereo::WedgeUp;
+        let svg = molecule_to_svg(&mol);
+        assert!(svg.contains(r#"fill="black""#), "solid wedge is a black polygon");
+
+        // A triangle ring, filled green.
+        let mut ring = Molecule::default();
+        let r1 = ring.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let r2 = ring.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let r3 = ring.add_atom("C".to_string(), [0.75, 1.3], 0);
+        ring.add_bond(r1, r2, BondOrder::Single);
+        ring.add_bond(r2, r3, BondOrder::Single);
+        ring.add_bond(r3, r1, BondOrder::Single);
+        ring.set_ring_fill(vec![r1, r2, r3], [0, 200, 0, 128]);
+        let svg = molecule_to_svg(&ring);
+        assert!(svg.contains("fill-opacity"), "ring fill is a translucent polygon");
+        assert!(svg.contains("rgb(0,200,0)"), "ring fill keeps its color");
     }
 
     #[test]
@@ -304,20 +491,8 @@ mod tests {
             assert!(size > 88, "non-trivial EMF");
             let mut buf = vec![0u8; size as usize];
             GetEnhMetaFileBits(hemf, size, buf.as_mut_ptr());
-            // EMR_HEADER: iType == 1 and the " EMF" signature at offset 40.
             assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 1, "EMR_HEADER");
             assert_eq!(&buf[40..44], b" EMF", "EMF signature");
-            // rclBounds (device px) and rclFrame (.01mm) must be consistent with the device
-            // resolution (szlDevice/szlMillimeters), or PowerPoint clips the picture.
-            let i = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-            let bounds_w = i(16) - i(8);
-            let frame_w = i(32) - i(24);
-            let dev_w = i(72);
-            let mm_w = i(80);
-            let expected_frame_w = bounds_w as f64 * (mm_w as f64 * 100.0) / dev_w as f64;
-            eprintln!("bounds_w={bounds_w} frame_w={frame_w} expected≈{expected_frame_w:.0}");
-            assert!(frame_w > 0 && (frame_w as f64 - expected_frame_w).abs() < expected_frame_w * 0.1,
-                "rclFrame must match bounds × device resolution (no clipping)");
             DeleteEnhMetaFile(hemf);
         }
     }

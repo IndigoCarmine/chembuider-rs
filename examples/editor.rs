@@ -77,6 +77,8 @@ struct EditorApp {
     status: String,
     /// Name field for the "Save Fragment" feature.
     fragment_name: String,
+    /// Color for the "Fill Ring" feature.
+    ring_color: egui::Color32,
 }
 
 impl Default for EditorApp {
@@ -88,6 +90,7 @@ impl Default for EditorApp {
             editor,
             status: "Ready — Bond tool active. Click to place atoms, drag between atoms to draw bonds.".to_string(),
             fragment_name: String::new(),
+            ring_color: egui::Color32::from_rgb(120, 200, 255),
         }
     }
 }
@@ -190,6 +193,29 @@ impl App for EditorApp {
                         Ok(_) => self.status = "Config saved to chembuilder_config.json".to_string(),
                         Err(e) => self.status = format!("Config save failed: {e}"),
                     }
+                }
+
+                ui.separator();
+
+                // Ring fill: pick a color, then fill the ring the selection/hotspot points at.
+                // (Select an atom on the ring with the Select tool, or hover it, then click.)
+                ui.label("Ring:");
+                ui.color_edit_button_srgba(&mut self.ring_color);
+                if ui.button("🎨 Fill Ring").clicked() {
+                    let c = self.ring_color;
+                    let rgba = [c.r(), c.g(), c.b(), c.a()];
+                    self.status = if self.editor.fill_selected_ring(rgba) {
+                        "Filled the ring through the selected/hotspot atom.".to_string()
+                    } else {
+                        "Select (or hover) an atom that sits on a ring first.".to_string()
+                    };
+                }
+                if ui.button("🧹 Unfill Ring").clicked() {
+                    self.status = if self.editor.clear_selected_ring_fill() {
+                        "Removed the ring fill.".to_string()
+                    } else {
+                        "No ring fill on the selected/hotspot atom.".to_string()
+                    };
                 }
 
                 ui.separator();

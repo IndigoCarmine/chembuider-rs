@@ -115,11 +115,28 @@ pub struct Bond {
     pub stereo: BondStereo,
 }
 
+/// A colored fill painted inside a ring, *behind* the bond lines (ChemDraw's ring shading).
+///
+/// The ring is stored as the ordered list of the atom **ids** on its cycle (the polygon is
+/// their positions connected in order) plus a straight (un-premultiplied) RGBA color. Storing
+/// ids — not coordinates — keeps the fill attached to the atoms as they move, and makes the
+/// value serde-portable and backend-agnostic: the drawing code turns it into the same fill
+/// polygon primitive for both the on-screen (egui) and exported (SVG/EMF) renderers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RingFill {
+    /// Atom ids forming the ring, in cyclic (polygon) order.
+    pub atoms: Vec<u32>,
+    /// Straight (un-premultiplied) RGBA fill color.
+    pub color: [u8; 4],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Molecule {
     pub name: String,
     pub atoms: Vec<Atom>,
     pub bonds: Vec<Bond>,
+    /// Colored ring interiors (drawn behind bonds). Empty for a plain structure.
+    pub ring_fills: Vec<RingFill>,
     next_id: u32,
 }
 
@@ -129,6 +146,7 @@ impl Default for Molecule {
             name: "MOL".to_string(),
             atoms: Vec::new(),
             bonds: Vec::new(),
+            ring_fills: Vec::new(),
             next_id: 1,
         }
     }
@@ -168,6 +186,8 @@ impl Molecule {
     pub fn remove_atom(&mut self, id: u32) {
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
+        // A ring fill whose cycle lost an atom no longer describes a ring — drop it.
+        self.ring_fills.retain(|rf| !rf.atoms.contains(&id));
     }
 
     pub fn remove_bond(&mut self, id: u32) {
@@ -245,6 +265,87 @@ impl Molecule {
     /// Total bond order carried by `atom_id`.
     pub fn bond_order_sum(&self, atom_id: u32) -> i16 {
         self.bonds_for_atom(atom_id).iter().map(|b| b.order.valence()).sum()
+    }
+
+    // ─── Rings ────────────────────────────────────────────────────────────────
+
+    /// Shortest path (inclusive vertex list `[src, …, dst]`) over the bond graph, never
+    /// traversing the single undirected edge `forbid`. `None` if `dst` is unreachable.
+    fn shortest_path(&self, src: u32, dst: u32, forbid: (u32, u32)) -> Option<Vec<u32>> {
+        use std::collections::VecDeque;
+        let mut prev: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::from([src]);
+        let mut queue: VecDeque<u32> = VecDeque::from([src]);
+        while let Some(u) = queue.pop_front() {
+            if u == dst {
+                let mut path = vec![dst];
+                let mut cur = dst;
+                while cur != src {
+                    cur = prev[&cur];
+                    path.push(cur);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for n in self.neighbor_atom_ids(u) {
+                let is_forbidden = (u == forbid.0 && n == forbid.1) || (u == forbid.1 && n == forbid.0);
+                if is_forbidden {
+                    continue;
+                }
+                if visited.insert(n) {
+                    prev.insert(n, u);
+                    queue.push_back(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// The smallest ring (cycle) that passes through `atom_id`, as its atom ids in cyclic
+    /// order, or `None` when the atom is on no ring. Found by, for each neighbour `n`, taking
+    /// the shortest path from `n` back to the atom that does *not* reuse the direct `atom—n`
+    /// bond: that path plus the atom closes a cycle, and the shortest such cycle is the ring.
+    pub fn smallest_ring_containing(&self, atom_id: u32) -> Option<Vec<u32>> {
+        self.atom_by_id(atom_id)?;
+        let mut best: Option<Vec<u32>> = None;
+        for n in self.neighbor_atom_ids(atom_id) {
+            if let Some(path) = self.shortest_path(n, atom_id, (atom_id, n)) {
+                // path = [n, …, atom_id]; ring = [atom_id, n, …] (drop the trailing atom_id).
+                if path.len() >= 3 {
+                    let mut ring = Vec::with_capacity(path.len());
+                    ring.push(atom_id);
+                    ring.extend_from_slice(&path[..path.len() - 1]);
+                    if best.as_ref().map_or(true, |b| ring.len() < b.len()) {
+                        best = Some(ring);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Add (or replace) a ring fill on the given cyclic atom-id list with `color` (straight
+    /// RGBA). An existing fill covering the same set of atoms is replaced, so re-filling a ring
+    /// recolors it rather than stacking translucent layers.
+    pub fn set_ring_fill(&mut self, atoms: Vec<u32>, color: [u8; 4]) {
+        let key = {
+            let mut s = atoms.clone();
+            s.sort_unstable();
+            s
+        };
+        self.ring_fills.retain(|rf| {
+            let mut s = rf.atoms.clone();
+            s.sort_unstable();
+            s != key
+        });
+        self.ring_fills.push(RingFill { atoms, color });
+    }
+
+    /// Remove any ring fill whose cycle contains `atom_id`. Returns true if one was removed.
+    pub fn clear_ring_fill_containing(&mut self, atom_id: u32) -> bool {
+        let before = self.ring_fills.len();
+        self.ring_fills.retain(|rf| !rf.atoms.contains(&atom_id));
+        self.ring_fills.len() != before
     }
 
     /// Drop the group hydrogens that `atom_id` no longer has room for, and only those.
@@ -563,5 +664,74 @@ mod tests {
         let (mut m, _c, x, _hs) = with_group_h("Zz", 3);
         assert!(m.consume_excess_group_h(x).is_empty());
         assert!(m.consume_excess_group_h(9999).is_empty(), "and a missing atom is not a panic");
+    }
+
+    /// A ring of `n` carbons, returned with the atom ids in order.
+    fn carbon_ring(n: usize) -> (Molecule, Vec<u32>) {
+        let mut m = Molecule::default();
+        let ids: Vec<u32> = (0..n)
+            .map(|k| {
+                let a = (k as f32) * std::f32::consts::TAU / n as f32;
+                m.add_atom("C".to_string(), [a.cos(), a.sin()], 0)
+            })
+            .collect();
+        for k in 0..n {
+            m.add_bond(ids[k], ids[(k + 1) % n], BondOrder::Single);
+        }
+        (m, ids)
+    }
+
+    #[test]
+    fn smallest_ring_finds_the_cycle_through_an_atom() {
+        let (m, ids) = carbon_ring(6);
+        let ring = m.smallest_ring_containing(ids[0]).expect("benzene atom is on a ring");
+        assert_eq!(ring.len(), 6, "the six-membered ring");
+        assert_eq!(ring[0], ids[0], "the queried atom leads the cycle");
+        // Every ring atom appears exactly once, and they are all the ring's atoms.
+        let mut got = ring.clone();
+        got.sort_unstable();
+        let mut want = ids.clone();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn smallest_ring_prefers_the_smaller_of_fused_rings() {
+        // A cyclohexane fused to a cyclopropane sharing an edge (ids[0]-ids[1]).
+        let (mut m, ids) = carbon_ring(6);
+        let bridge = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        m.add_bond(ids[0], bridge, BondOrder::Single);
+        m.add_bond(ids[1], bridge, BondOrder::Single);
+        let ring = m.smallest_ring_containing(ids[0]).unwrap();
+        assert_eq!(ring.len(), 3, "the 3-membered ring is smaller than the 6-membered one");
+        assert!(ring.contains(&bridge) && ring.contains(&ids[1]));
+    }
+
+    #[test]
+    fn a_chain_atom_is_on_no_ring() {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        assert!(m.smallest_ring_containing(a).is_none());
+    }
+
+    #[test]
+    fn ring_fill_is_set_replaced_and_pruned() {
+        let (mut m, ids) = carbon_ring(6);
+        let ring = m.smallest_ring_containing(ids[0]).unwrap();
+        m.set_ring_fill(ring.clone(), [1, 2, 3, 4]);
+        assert_eq!(m.ring_fills.len(), 1);
+
+        // Re-filling the same ring (any rotation) replaces rather than stacks.
+        let mut rotated = ring.clone();
+        rotated.rotate_left(2);
+        m.set_ring_fill(rotated, [9, 9, 9, 255]);
+        assert_eq!(m.ring_fills.len(), 1);
+        assert_eq!(m.ring_fills[0].color, [9, 9, 9, 255]);
+
+        // Deleting a ring atom drops the now-meaningless fill.
+        m.remove_atom(ids[0]);
+        assert!(m.ring_fills.is_empty(), "a fill whose ring lost an atom is removed");
     }
 }
