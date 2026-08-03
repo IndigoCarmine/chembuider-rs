@@ -204,6 +204,54 @@ impl Analysis {
         self.products.push(p);
         self
     }
+
+    // ── Mutation (the editing UI drives these) ───────────────────────────────
+
+    /// Append a reactant column; returns its index.
+    pub fn add_reactant(&mut self, r: Reactant) -> usize {
+        self.reactants.push(r);
+        self.reactants.len() - 1
+    }
+
+    /// Append a product column; returns its index.
+    pub fn add_product(&mut self, p: Product) -> usize {
+        self.products.push(p);
+        self.products.len() - 1
+    }
+
+    /// Make `index` *the* limiting reagent, clearing the flag on every other column — a
+    /// reaction has at most one, and the whole table is scaled from it.
+    ///
+    /// `None` leaves the reaction without a declared limiting reagent. That is a legal
+    /// state, not an error: [`compute`](Analysis::compute) then falls back on the first
+    /// reagent whose own entries pin an amount down (a weighed sample, or a stock
+    /// concentration × volume), and if none does, every derived amount is simply blank.
+    pub fn set_limiting(&mut self, index: Option<usize>) {
+        for (i, r) in self.reactants.iter_mut().enumerate() {
+            r.limiting = Some(i) == index;
+        }
+    }
+
+    /// Index of the declared limiting reagent, if there is one.
+    pub fn limiting(&self) -> Option<usize> {
+        self.reactants.iter().position(|r| r.limiting)
+    }
+
+    /// Drop a reactant column, returning it. Out-of-range indices are ignored.
+    ///
+    /// Deleting the limiting reagent leaves the reaction *without* one rather than promoting
+    /// a neighbour. A promoted neighbour would carry no amount of its own — it was entered
+    /// in equivalents — so the numbers would not actually come back, they would only look as
+    /// if they had, silently rescaled to nothing. Blank derived cells until the user names a
+    /// new limiting reagent and gives it a mass is the honest state to show.
+    pub fn remove_reactant(&mut self, index: usize) -> Option<Reactant> {
+        (index < self.reactants.len()).then(|| self.reactants.remove(index))
+    }
+
+    /// Drop a product column, returning it. Out-of-range indices are ignored.
+    pub fn remove_product(&mut self, index: usize) -> Option<Product> {
+        (index < self.products.len()).then(|| self.products.remove(index))
+    }
 }
 
 /// A reaction scheme plus its stoichiometry table — the whole figure.

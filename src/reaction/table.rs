@@ -162,9 +162,19 @@ pub fn product_cells(p: &ProductAnalysis) -> Vec<Cell> {
     ]
 }
 
+/// Which half of the analysis a block shows. Carried by the block itself so that code
+/// addressing a cell (hit-testing, editing) never has to guess from the title or from how
+/// many blocks happen to be present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    Reactants,
+    Products,
+}
+
 /// One framed block of the table.
 #[derive(Clone, Debug)]
 pub struct TableBlock {
+    pub kind: BlockKind,
     /// Drawn italic and letter-spaced above the frame's top-left corner.
     pub title: String,
     pub row_labels: Vec<String>,
@@ -184,6 +194,7 @@ impl AnalysisTable {
         let mut blocks = Vec::new();
         if !result.reactants.is_empty() {
             blocks.push(TableBlock {
+                kind: BlockKind::Reactants,
                 title: "Reactants".into(),
                 row_labels: REACTANT_ROWS.iter().map(|s| s.to_string()).collect(),
                 columns: result.reactants.iter().map(reactant_cells).collect(),
@@ -191,6 +202,7 @@ impl AnalysisTable {
         }
         if !result.products.is_empty() {
             blocks.push(TableBlock {
+                kind: BlockKind::Products,
                 title: "Products".into(),
                 row_labels: PRODUCT_ROWS.iter().map(|s| s.to_string()).collect(),
                 columns: result.products.iter().map(product_cells).collect(),
@@ -201,6 +213,12 @@ impl AnalysisTable {
 
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    /// Position of a block in [`blocks`](Self::blocks) — the same index its
+    /// [`BlockLayout`] has. `None` when that half of the analysis is empty and was left out.
+    pub fn block_index(&self, kind: BlockKind) -> Option<usize> {
+        self.blocks.iter().position(|b| b.kind == kind)
     }
 }
 

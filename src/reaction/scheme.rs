@@ -110,6 +110,32 @@ impl ReactionScheme {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+
+    // ── Mutation (the editing UI drives these) ───────────────────────────────
+
+    /// Append an item; returns its index.
+    pub fn add(&mut self, item: SchemeItem) -> usize {
+        self.items.push(item);
+        self.items.len() - 1
+    }
+
+    /// Drop an item, returning it. Out-of-range indices are ignored.
+    pub fn remove(&mut self, index: usize) -> Option<SchemeItem> {
+        (index < self.items.len()).then(|| self.items.remove(index))
+    }
+
+    /// Move an item `delta` places along the reaction line, clamped to the ends. Returns the
+    /// index it ended up at, or `None` when there was nothing at `index`.
+    pub fn move_item(&mut self, index: usize, delta: isize) -> Option<usize> {
+        if index >= self.items.len() {
+            return None;
+        }
+        let last = self.items.len() - 1;
+        let target = (index as isize + delta).clamp(0, last as isize) as usize;
+        let item = self.items.remove(index);
+        self.items.insert(target, item);
+        Some(target)
+    }
 }
 
 // ─── Layout ──────────────────────────────────────────────────────────────────

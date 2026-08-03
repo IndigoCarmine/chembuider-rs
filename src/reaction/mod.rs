@@ -7,7 +7,10 @@
 //! Everything in the table is derived from the drawn structures. `Formula` and `MW` come
 //! from counting the atoms the renderer displays (implicit hydrogens included, see
 //! [`formula`]), and the amounts fall out of the limiting reagent (see [`stoich`]).
-//! There is no editing UI: a figure is built from code.
+//!
+//! A figure can be built from code, as below, or edited from the UI with
+//! [`ReactionEditor`] — the same figure, with the entered cells and the arrow labels
+//! clickable. See [`edit`] for what is editable and how typed quantities are read.
 //!
 //! ```no_run
 //! use chembuider_rs::reaction::{
@@ -35,6 +38,7 @@
 //! See `examples/reaction_scheme.rs` for a complete host application.
 
 pub mod demo;
+pub mod edit;
 pub mod formula;
 pub mod model;
 pub mod scheme;
@@ -44,6 +48,10 @@ pub mod table;
 pub mod text;
 pub mod view;
 
+pub use edit::{
+    CellRef, EditTarget, Field, Hit, ParseError, ReactionEditor, SchemePart, Unit, cell_rect,
+    field_at, hit_test, parse_value, scheme_item_rect,
+};
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
 pub use model::{Analysis, Mass, Product, Reactant, Reaction};
 pub use scheme::{Arrow, ReactionScheme, SchemeItem, SchemeLayout};
@@ -52,6 +60,6 @@ pub use stoich::{
     format_moles, format_number, format_percent,
 };
 pub use style::ReactionStyle;
-pub use table::{AnalysisTable, Cell, PRODUCT_ROWS, REACTANT_ROWS, TableBlock};
+pub use table::{AnalysisTable, BlockKind, Cell, PRODUCT_ROWS, REACTANT_ROWS, TableBlock};
 pub use text::{Run, RunLayout};
 pub use view::{FigureLayout, ReactionView};

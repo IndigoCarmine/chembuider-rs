@@ -204,6 +204,56 @@ impl RichText {
         out
     }
 
+    /// The markup that would [`parse`](Self::parse) back to this text — the inverse of the
+    /// parser, so an already-built [`RichText`] can be handed to a text box and edited.
+    ///
+    /// Scripts always come out braced (`K_{2}CO_{3}` rather than `K_2CO_3`) and every
+    /// character the grammar reserves is escaped, which makes the output unambiguous rather
+    /// than shortest. Parsing it again reproduces the same spans, which is the property that
+    /// matters; a caller keeping the user's original spelling should keep the string.
+    ///
+    /// Colours are a paint-time concern the markup has no syntax for and are dropped.
+    pub fn to_markup(&self) -> String {
+        let mut out = String::new();
+        let (mut bold, mut italic) = (false, false);
+        for span in &self.spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            if span.style.bold != bold {
+                out.push_str("**");
+                bold = span.style.bold;
+            }
+            if span.style.italic != italic {
+                out.push_str("//");
+                italic = span.style.italic;
+            }
+            let open = match span.style.script {
+                Script::Normal => "",
+                Script::Sub => "_{",
+                Script::Super => "^{",
+            };
+            out.push_str(open);
+            for c in span.text.chars() {
+                if matches!(c, '\\' | '*' | '/' | '^' | '_' | '{' | '}') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            if !open.is_empty() {
+                out.push('}');
+            }
+        }
+        // Close whatever is still open, so the string stands on its own.
+        if bold {
+            out.push_str("**");
+        }
+        if italic {
+            out.push_str("//");
+        }
+        out
+    }
+
     /// Lay the text out with `layout` (any source of galleys: a [`egui::Painter`], a
     /// `FontsView`, …). `style` provides the base font size / color / family.
     pub fn layout_with(
@@ -531,6 +581,36 @@ mod tests {
             spans("^{a_b}c"),
             vec![("a".into(), sup()), ("b".into(), sub()), ("c".into(), normal())]
         );
+    }
+
+    /// [`RichText::to_markup`] is the parser's inverse: whatever the editing UI hands to a
+    /// text box has to parse back to the very same spans, or an edit would silently rewrite
+    /// the text it was only meant to show.
+    #[test]
+    fn markup_round_trips_through_to_markup() {
+        for markup in [
+            "MeI",
+            "K_2CO_3",
+            "SO_4^{2-}",
+            "**bold** and //italic//",
+            "**b_2**",
+            "N/A",
+            "50 °C, 12 h",
+            "",
+        ] {
+            let parsed = RichText::parse(markup);
+            let round = RichText::parse(&parsed.to_markup());
+            assert_eq!(
+                round.spans, parsed.spans,
+                "'{markup}' → '{}' did not survive re-parsing",
+                parsed.to_markup()
+            );
+        }
+        // Scripts always come back braced, and the reserved characters are escaped.
+        assert_eq!(RichText::parse("K_2CO_3").to_markup(), "K_{2}CO_{3}");
+        assert_eq!(RichText::plain("a_b^c*d").to_markup(), r"a\_b\^c\*d");
+        // A style left open at the end is closed, so the string stands on its own.
+        assert_eq!(RichText::parse("a**b").to_markup(), "a**b**");
     }
 
     #[test]

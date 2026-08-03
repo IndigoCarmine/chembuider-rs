@@ -1,20 +1,34 @@
-//! Reaction scheme + stoichiometry table, reproducing the ChemDraw *Analysis* figure:
+//! Reaction scheme + stoichiometry table, as an editor:
 //!
 //! ```text
 //! cargo run --example reaction_scheme                       # open a window
 //! cargo run --example reaction_scheme -- --render out.png   # headless render to a PNG
 //! ```
 //!
-//! The figure is built entirely from code — there is no editing UI for schemes. Everything
-//! in the table is derived: `Formula` and `MW` are counted off the drawn structures, and the
-//! amounts follow from the limiting reagent (phenol, 1.00 g) and the entered equivalents.
-//! See [`chembuider_rs::reaction`] for the API, and `demo::williamson_ether_synthesis` for
-//! the exact reaction assembled below.
+//! The window starts on the ChemDraw *Analysis* figure it has always drawn (phenol + MeI /
+//! K₂CO₃ → anisole) and lets you take it apart:
+//!
+//! * **structures come from the canvas on the left.** Draw one with the ordinary
+//!   [`ChemStructEditor`], then *Add as reactant* / *Add as product* / *Add to scheme*.
+//!   There is no structure editing inside the figure — the canvas is the one place a
+//!   molecule is drawn.
+//! * **click a cell of the table to edit it.** Only the rows that can hold an entered value
+//!   open a box (`Limiting?`, `Equivalents`, `Sample Mass`, …); everything else is derived
+//!   and recomputed as you type. `Limiting?` is a toggle.
+//! * **click above or below the arrow** to write its reagents and conditions; the usual
+//!   rich-text markup (`K_2CO_3`) applies.
+//! * **the panel on the right** deletes and reorders columns and scheme items.
+//!
+//! `--render` is unaffected by any of this: it runs the plain [`ReactionView`] paint path.
+//! See [`chembuider_rs::reaction::edit`] for the editing API this app is a host for.
 
 use chembuider_rs::egui;
+use chembuider_rs::reaction::edit::{EditTarget, Hit, SchemePart};
 use chembuider_rs::reaction::{
-    Analysis, Arrow, Mass, Product, Reactant, Reaction, ReactionScheme, ReactionView, demo,
+    Analysis, Arrow, Mass, MolecularFormula, Product, Reactant, Reaction, ReactionEditor,
+    ReactionScheme, SchemeItem, demo,
 };
+use chembuider_rs::{ChemStructEditor, Molecule, Tool};
 
 /// The reference figure: PhOH + MeI / K₂CO₃ → PhOMe, 700 mg isolated (60.92 %).
 fn reference_reaction() -> Reaction {
@@ -60,7 +74,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 620.0])
+            .with_inner_size([1500.0, 860.0])
             .with_title("ChemBuilder — Reaction Scheme & Analysis"),
         ..Default::default()
     };
@@ -80,27 +94,389 @@ fn main() {}
 
 struct ReactionApp {
     reaction: Reaction,
-    view: ReactionView,
+    /// Keep the editor between frames: it owns the view, which owns the drawing context.
+    editor: ReactionEditor,
+    /// The one place structures are drawn. Everything in the figure was taken from here.
+    canvas: ChemStructEditor,
+    status: String,
 }
 
 impl Default for ReactionApp {
     fn default() -> Self {
+        let mut canvas = ChemStructEditor::default();
+        // Something to take into the figure straight away, so the flow is discoverable.
+        canvas.molecule = demo::benzene();
         Self {
             reaction: reference_reaction(),
-            // Keep the view between frames: it owns the structure drawing context.
-            view: ReactionView::new(),
+            editor: ReactionEditor::new(),
+            canvas,
+            status: "Draw on the canvas, then add it to the figure. Click a table cell or an \
+                     arrow label to edit it."
+                .to_string(),
         }
     }
+}
+
+/// A structural edit queued while the inspector list is being drawn, applied once the
+/// iteration over the reaction is over.
+enum Action {
+    RemoveSchemeItem(usize),
+    MoveSchemeItem(usize, isize),
+    ReplaceSchemeStructure(usize),
+    EditSchemeText(usize, SchemePart),
+    RemoveReactant(usize),
+    RemoveProduct(usize),
+    ReplaceReactant(usize),
+    ReplaceProduct(usize),
+    SetLimiting(Option<usize>),
 }
 
 impl eframe::App for ReactionApp {
     // eframe 0.34+ hands us the root viewport Ui; panels are shown inside it.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::both().show(ui, |ui| {
-                self.view.show(ui, &self.reaction);
+        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(&self.status);
+                // Clicks on the figure are handled inside the editor, so the selection is
+                // what says where they landed.
+                if let Some(hit) = self.editor.selection() {
+                    ui.separator();
+                    ui.weak(describe(hit, &self.reaction));
+                }
+                if let Some(error) = self.editor.error() {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(180, 40, 40), error);
+                }
             });
         });
+
+        egui::Panel::left("canvas")
+            .default_size(420.0)
+            .show(ui, |ui| {
+                ui.label("Structure canvas — draw here, then add it to the figure above.");
+                self.canvas.ui(ui);
+            });
+
+        egui::Panel::right("inspector")
+            .default_size(330.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
+                self.editor.show(ui, &mut self.reaction);
+            });
+        });
+    }
+}
+
+impl ReactionApp {
+    /// The structure currently on the canvas, or `None` (with a complaint in the status bar)
+    /// when there is nothing drawn.
+    fn canvas_structure(&mut self) -> Option<Molecule> {
+        if self.canvas.molecule.atoms.is_empty() {
+            self.status = "Nothing on the canvas — draw a structure first.".to_string();
+            return None;
+        }
+        Some(self.canvas.molecule.clone())
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Canvas:");
+            for (tool, label) in [
+                (Tool::Select, "⬚ Select"),
+                (Tool::Bond, "✏ Bond"),
+                (Tool::Eraser, "✖ Eraser"),
+            ] {
+                if ui
+                    .selectable_label(self.canvas.tool == tool, label)
+                    .clicked()
+                {
+                    self.canvas.tool = tool;
+                }
+            }
+            if ui.button("🗑 Clear").clicked() {
+                self.canvas.molecule = Molecule::default();
+                self.canvas.selected_atoms.clear();
+            }
+            if ui.button("📋 Paste").clicked() {
+                self.canvas.paste_clipboard();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Add from canvas:");
+            if ui.button("➕ Reactant").clicked()
+                && let Some(mol) = self.canvas_structure()
+            {
+                let i = self.reaction.analysis.add_reactant(Reactant::new(mol).equivalents(1.0));
+                self.status = format!("Added reactant column {}.", i + 1);
+            }
+            if ui.button("➕ Product").clicked()
+                && let Some(mol) = self.canvas_structure()
+            {
+                let i = self.reaction.analysis.add_product(Product::new(mol));
+                self.status = format!("Added product column {}.", i + 1);
+            }
+            if ui.button("➕ To scheme").clicked()
+                && let Some(mol) = self.canvas_structure()
+            {
+                self.reaction.scheme.add(SchemeItem::Structure(mol));
+                self.status = "Added the structure to the scheme.".to_string();
+            }
+
+            ui.separator();
+
+            ui.label("Insert into scheme:");
+            if ui.button("➕ plus").clicked() {
+                self.reaction.scheme.add(SchemeItem::Plus);
+            }
+            if ui.button("➕ arrow").clicked() {
+                let i = self.reaction.scheme.add(SchemeItem::Arrow(Arrow::new()));
+                self.editor.begin_edit(
+                    EditTarget::SchemeText { index: i, part: SchemePart::ArrowAbove },
+                    &self.reaction,
+                );
+                self.status = "Added an arrow — type its reagents, e.g. K_2CO_3.".to_string();
+            }
+            if ui.button("➕ text").clicked() {
+                let i = self.reaction.scheme.add(SchemeItem::Text("text".into()));
+                self.editor
+                    .begin_edit(EditTarget::SchemeText { index: i, part: SchemePart::Text }, &self.reaction);
+            }
+
+            ui.separator();
+
+            let selected = self.editor.selection();
+            let replaceable = matches!(selected, Some(Hit::Scheme { part: SchemePart::Structure, .. }));
+            if ui
+                .add_enabled(replaceable, egui::Button::new("⟳ Replace selected structure"))
+                .on_disabled_hover_text("Select a structure in the scheme first")
+                .clicked()
+                && let (Some(Hit::Scheme { index, .. }), Some(mol)) =
+                    (selected, self.canvas_structure())
+            {
+                self.reaction.scheme.items[index] = SchemeItem::Structure(mol);
+                self.status = "Replaced the selected structure with the canvas.".to_string();
+            }
+        });
+    }
+
+    /// The right-hand panel: one row per scheme item and per table column, carrying the
+    /// operations that have nowhere to live inside the drawn figure — delete, reorder,
+    /// replace the structure, and the products' stoichiometric coefficient.
+    fn inspector(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
+
+        ui.heading("Scheme");
+        if self.reaction.scheme.is_empty() {
+            ui.weak("(empty)");
+        }
+        for (i, item) in self.reaction.scheme.items.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(item_label(item));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                        action = Some(Action::RemoveSchemeItem(i));
+                    }
+                    if ui.small_button("▶").on_hover_text("Move right").clicked() {
+                        action = Some(Action::MoveSchemeItem(i, 1));
+                    }
+                    if ui.small_button("◀").on_hover_text("Move left").clicked() {
+                        action = Some(Action::MoveSchemeItem(i, -1));
+                    }
+                    match item {
+                        SchemeItem::Structure(_) => {
+                            if ui.small_button("⟳").on_hover_text("Replace with the canvas").clicked() {
+                                action = Some(Action::ReplaceSchemeStructure(i));
+                            }
+                        }
+                        SchemeItem::Arrow(_) => {
+                            if ui.small_button("below").clicked() {
+                                action = Some(Action::EditSchemeText(i, SchemePart::ArrowBelow));
+                            }
+                            if ui.small_button("above").clicked() {
+                                action = Some(Action::EditSchemeText(i, SchemePart::ArrowAbove));
+                            }
+                        }
+                        SchemeItem::Text(_) => {
+                            if ui.small_button("✎").on_hover_text("Edit").clicked() {
+                                action = Some(Action::EditSchemeText(i, SchemePart::Text));
+                            }
+                        }
+                        SchemeItem::Plus => {}
+                    }
+                });
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.heading("Reactants");
+        let limiting = self.reaction.analysis.limiting();
+        for (i, r) in self.reaction.analysis.reactants.iter().enumerate() {
+            ui.horizontal(|ui| {
+                // A radio button says what the `Limiting?` row says: at most one, and
+                // clicking the current one clears it.
+                if ui
+                    .radio(limiting == Some(i), MolecularFormula::of(&r.molecule).plain())
+                    .on_hover_text("Limiting reagent")
+                    .clicked()
+                {
+                    action = Some(Action::SetLimiting((limiting != Some(i)).then_some(i)));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("🗑").on_hover_text("Delete column").clicked() {
+                        action = Some(Action::RemoveReactant(i));
+                    }
+                    if ui.small_button("⟳").on_hover_text("Replace with the canvas").clicked() {
+                        action = Some(Action::ReplaceReactant(i));
+                    }
+                });
+            });
+        }
+        if self.reaction.analysis.reactants.is_empty() {
+            ui.weak("(none)");
+        } else if limiting.is_none() {
+            ui.weak("No limiting reagent — the derived amounts stay blank.");
+        }
+
+        ui.add_space(8.0);
+        ui.heading("Products");
+        for (i, p) in self.reaction.analysis.products.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(MolecularFormula::of(&p.molecule).plain());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("🗑").on_hover_text("Delete column").clicked() {
+                        action = Some(Action::RemoveProduct(i));
+                    }
+                    if ui.small_button("⟳").on_hover_text("Replace with the canvas").clicked() {
+                        action = Some(Action::ReplaceProduct(i));
+                    }
+                    // The stoichiometric coefficient has no row in the table (the reference
+                    // figure has none), so it is edited here. A drag value cannot be invalid,
+                    // which is why this one field is not a text box.
+                    ui.add(
+                        egui::DragValue::new(&mut p.coefficient)
+                            .speed(0.05)
+                            .range(0.0..=100.0)
+                            .prefix("× "),
+                    )
+                    .on_hover_text("Moles of product per mole of limiting reagent");
+                });
+            });
+        }
+        if self.reaction.analysis.products.is_empty() {
+            ui.weak("(none)");
+        }
+
+        if let Some(action) = action {
+            self.apply(action);
+        }
+    }
+
+    fn apply(&mut self, action: Action) {
+        // Any selection or open box may be pointing at an index that is about to move.
+        self.editor.select(None);
+        self.editor.cancel_edit();
+        match action {
+            Action::RemoveSchemeItem(i) => {
+                self.reaction.scheme.remove(i);
+                self.status = "Removed a scheme item.".to_string();
+            }
+            Action::MoveSchemeItem(i, delta) => {
+                self.reaction.scheme.move_item(i, delta);
+            }
+            Action::ReplaceSchemeStructure(i) => {
+                if let Some(mol) = self.canvas_structure() {
+                    self.reaction.scheme.items[i] = SchemeItem::Structure(mol);
+                    self.status = "Replaced a scheme structure with the canvas.".to_string();
+                }
+            }
+            Action::EditSchemeText(index, part) => {
+                self.editor
+                    .begin_edit(EditTarget::SchemeText { index, part }, &self.reaction);
+                self.editor.select(Some(Hit::Scheme { index, part }));
+            }
+            Action::RemoveReactant(i) => {
+                let was_limiting = self.reaction.analysis.remove_reactant(i).is_some_and(|r| r.limiting);
+                self.status = if was_limiting {
+                    "Removed the limiting reagent — pick a new one and give it a mass.".to_string()
+                } else {
+                    "Removed a reactant column.".to_string()
+                };
+            }
+            Action::RemoveProduct(i) => {
+                self.reaction.analysis.remove_product(i);
+                self.status = "Removed a product column.".to_string();
+            }
+            Action::ReplaceReactant(i) => {
+                if let Some(mol) = self.canvas_structure() {
+                    self.reaction.analysis.reactants[i].molecule = mol;
+                    self.status = "Replaced a reactant with the canvas structure.".to_string();
+                }
+            }
+            Action::ReplaceProduct(i) => {
+                if let Some(mol) = self.canvas_structure() {
+                    self.reaction.analysis.products[i].molecule = mol;
+                    self.status = "Replaced a product with the canvas structure.".to_string();
+                }
+            }
+            Action::SetLimiting(index) => {
+                self.reaction.analysis.set_limiting(index);
+                self.status = match index {
+                    Some(i) => format!("Column {} is now the limiting reagent.", i + 1),
+                    None => "No limiting reagent declared.".to_string(),
+                };
+            }
+        }
+    }
+}
+
+/// What the current selection is, for the status bar — the figure has no other way to say
+/// which of its cells a click landed on.
+fn describe(hit: Hit, reaction: &Reaction) -> String {
+    use chembuider_rs::reaction::{PRODUCT_ROWS, REACTANT_ROWS};
+    match hit {
+        Hit::Cell(cell) => {
+            let (block, rows) = match cell.block {
+                chembuider_rs::reaction::BlockKind::Reactants => ("Reactants", &REACTANT_ROWS),
+                chembuider_rs::reaction::BlockKind::Products => ("Products", &PRODUCT_ROWS),
+            };
+            let row = rows.get(cell.row).copied().unwrap_or("?");
+            let editable = if cell.field().is_some() { "" } else { " (computed)" };
+            format!("{block} column {} — {row}{editable}", cell.column + 1)
+        }
+        Hit::Scheme { index, part } => {
+            let what = reaction
+                .scheme
+                .items
+                .get(index)
+                .map(item_label)
+                .unwrap_or_default();
+            match part {
+                SchemePart::ArrowAbove => format!("scheme item {index} — arrow, above"),
+                SchemePart::ArrowBelow => format!("scheme item {index} — arrow, below"),
+                _ => format!("scheme item {index} — {what}"),
+            }
+        }
+    }
+}
+
+/// One line of the inspector's scheme list. Plain words rather than symbols: egui's default
+/// font stack has no glyph for `⬡` or `→`, and a missing-glyph box names nothing at all.
+fn item_label(item: &SchemeItem) -> String {
+    match item {
+        SchemeItem::Structure(m) => MolecularFormula::of(m).plain(),
+        SchemeItem::Plus => "plus".to_string(),
+        SchemeItem::Arrow(_) => "arrow".to_string(),
+        SchemeItem::Text(t) => {
+            let flat: String = t.spans.iter().map(|s| s.text.as_str()).collect();
+            format!("text \"{flat}\"")
+        }
     }
 }
 
