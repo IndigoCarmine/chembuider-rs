@@ -1,0 +1,57 @@
+//! Reaction schemes and ChemDraw-style stoichiometry ("Analysis") tables.
+//!
+//! A [`Reaction`] is a [`ReactionScheme`] — structures, `+` separators and an arrow carrying
+//! its conditions — plus an [`Analysis`], the reagents with the quantities the chemist
+//! actually entered. [`ReactionView`] draws both: the scheme on top, the table underneath.
+//!
+//! Everything in the table is derived from the drawn structures. `Formula` and `MW` come
+//! from counting the atoms the renderer displays (implicit hydrogens included, see
+//! [`formula`]), and the amounts fall out of the limiting reagent (see [`stoich`]).
+//! There is no editing UI: a figure is built from code.
+//!
+//! ```no_run
+//! use chembuider_rs::reaction::{
+//!     Analysis, Arrow, Mass, Product, Reactant, Reaction, ReactionScheme, ReactionView, demo,
+//! };
+//!
+//! let scheme = ReactionScheme::new()
+//!     .structure(demo::phenol())
+//!     .arrow(Arrow::new().above("MeI").below("K_2CO_3"))
+//!     .structure(demo::anisole());
+//!
+//! let analysis = Analysis::new()
+//!     .reactant(Reactant::new(demo::phenol()).limiting().equivalents(1.0)
+//!                                            .sample_mass(Mass::grams(1.0)))
+//!     .reactant(Reactant::new(demo::methyl_iodide()).equivalents(1.10))
+//!     .reactant(Reactant::new(demo::potassium_carbonate()).equivalents(3.00))
+//!     .product(Product::new(demo::anisole()).measured_mass(Mass::milligrams(700.0)));
+//!
+//! let reaction = Reaction::new(scheme, analysis);
+//! let mut view = ReactionView::new(); // keep this between frames, it owns a drawing context
+//! # let ui: &mut chembuider_rs::egui::Ui = unimplemented!();
+//! view.show(ui, &reaction);
+//! ```
+//!
+//! See `examples/reaction_scheme.rs` for a complete host application.
+
+pub mod demo;
+pub mod formula;
+pub mod model;
+pub mod scheme;
+pub mod stoich;
+pub mod style;
+pub mod table;
+pub mod text;
+pub mod view;
+
+pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
+pub use model::{Analysis, Mass, Product, Reactant, Reaction};
+pub use scheme::{Arrow, ReactionScheme, SchemeItem, SchemeLayout};
+pub use stoich::{
+    AnalysisResult, Formatted, Origin, ProductAnalysis, Quantity, ReactantAnalysis, format_mass,
+    format_moles, format_number, format_percent,
+};
+pub use style::ReactionStyle;
+pub use table::{AnalysisTable, Cell, PRODUCT_ROWS, REACTANT_ROWS, TableBlock};
+pub use text::{Run, RunLayout};
+pub use view::{FigureLayout, ReactionView};

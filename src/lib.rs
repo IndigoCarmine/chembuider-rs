@@ -20,6 +20,7 @@
 
 pub mod config;
 pub mod molecule;
+pub mod reaction;
 pub mod widget;
 
 /// Windows clipboard plumbing (CDX / image / OLE), used internally by the widget.

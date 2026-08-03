@@ -678,7 +678,7 @@ fn max_valence(element: &str) -> Option<u8> {
 /// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
 /// implicit H needed to satisfy valence. Computed as `valence + charge` minus the
 /// bond-order sum to *non-folded* neighbors, which naturally includes both.
-fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
+pub(crate) fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
     let Some(atom) = mol.atom_by_id(atom_id) else { return 0 };
     let Some(valence) = normal_valence(&atom.element) else { return 0 };
     // A lone atom (no bonds yet) shows just its symbol — placing "O"/"N"/"S" at the cursor
