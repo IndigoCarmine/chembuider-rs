@@ -22,6 +22,11 @@ struct ClipAtom {
     element: String,
     pos: [f32; 2],
     charge: i8,
+    /// Carried across so a copy/paste does not turn a group's folded hydrogen into a drawn
+    /// one. Defaulted, so clipboard text (and the test fixtures) written before it existed
+    /// still parse.
+    #[serde(default)]
+    group_h: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -258,7 +263,7 @@ impl ChemStructEditor {
 
         let atoms = ids.iter().map(|&id| {
             let a = self.molecule.atom_by_id(id).unwrap();
-            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge }
+            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge, group_h: a.group_h }
         }).collect();
         let bonds = self.molecule.bonds.iter().filter_map(|b| {
             Some(ClipBond {
@@ -321,8 +326,12 @@ impl ChemStructEditor {
         self.push_undo();
         const OFFSET: [f32; 2] = [DEFAULT_BOND_LENGTH, DEFAULT_BOND_LENGTH];
         let new_ids: Vec<u32> = clip.atoms.iter().map(|a| {
-            self.molecule.add_atom(a.element.clone(),
-                [a.pos[0] + OFFSET[0], a.pos[1] + OFFSET[1]], a.charge)
+            let id = self.molecule.add_atom(a.element.clone(),
+                [a.pos[0] + OFFSET[0], a.pos[1] + OFFSET[1]], a.charge);
+            if let Some(atom) = self.molecule.atom_by_id_mut(id) {
+                atom.group_h = a.group_h;
+            }
+            id
         }).collect();
         for b in &clip.bonds {
             if let (Some(&begin), Some(&end)) = (new_ids.get(b.begin), new_ids.get(b.end)) {
@@ -574,7 +583,56 @@ impl ChemStructEditor {
     /// `angle` is the direction from the attach atom toward the fragment's next atom.
     /// `flip`  is true when mirroring the fragment across that axis gives better clearance
     /// from existing bonds (i.e. the bulk of the ring/group should go the other way).
+    ///
+    /// The angle starts at [`best_new_bond_angle`](Self::best_new_bond_angle) — which only
+    /// decides where the *first* bond leaves and knows nothing about the rest of the group
+    /// hanging off it — and is then rotated, in 60° steps, until the fragment stops losing
+    /// atoms to [`insert_fragment`](crate::Molecule::insert_fragment)'s snap (see
+    /// [`fragment_atoms_lost_to_snap`](crate::Molecule::fragment_atoms_lost_to_snap), which
+    /// defines what counts as a loss and what is a wanted ring fusion).
+    ///
+    /// That second step is not cosmetic. `best_new_bond_angle` puts the new bond 120° away
+    /// from the one the atom already has, and a three-fold group (SiH₃, CF₃, TMS, TBS) branches
+    /// ±120° off *its own* axis — so one branch points straight back down the existing bond and
+    /// lands exactly where the neighbour already sits, one bond-length out. The snap then
+    /// merged the two and the group quietly arrived short: `c 1 S` drew SiH₂.
     pub fn best_fragment_placement(
+        &self,
+        atom_id: u32,
+        frag: &crate::molecule::fragment::Fragment,
+    ) -> (f32, bool) {
+        let (angle, flip) = self.preferred_fragment_placement(atom_id, frag);
+        if self.molecule.fragment_atoms_lost_to_snap(frag, atom_id, angle, flip) == 0 {
+            return (angle, flip);
+        }
+
+        // Rotate away from the preferred angle, nearest first, and prefer un-mirroring over
+        // rotating: both keep more of the preferred layout than the next step out does. 60° is
+        // the step because it is the grid everything else in the editor is drawn on.
+        const STEP: f32 = std::f32::consts::FRAC_PI_3;
+        let mut best = (angle, flip, usize::MAX);
+        for turns in [0.0, 1.0, -1.0, 2.0, -2.0, 3.0] {
+            let candidate = normalize_angle(angle + turns * STEP);
+            for mirrored in [flip, !flip] {
+                let lost =
+                    self.molecule.fragment_atoms_lost_to_snap(frag, atom_id, candidate, mirrored);
+                if lost == 0 {
+                    return (candidate, mirrored);
+                }
+                if lost < best.2 {
+                    best = (candidate, mirrored, lost);
+                }
+            }
+        }
+        // Nowhere is clear — a fully enclosed atom. Take the least-bad orientation and let the
+        // snap do what it can; there is no room left to draw the group whole.
+        (best.0, best.1)
+    }
+
+    /// The orientation [`best_fragment_placement`](Self::best_fragment_placement) would like,
+    /// before it checks whether the fragment actually fits there: the standard bond angle, plus
+    /// the mirroring that keeps the fragment's bulk clear of the atom's existing neighbours.
+    fn preferred_fragment_placement(
         &self,
         atom_id: u32,
         frag: &crate::molecule::fragment::Fragment,

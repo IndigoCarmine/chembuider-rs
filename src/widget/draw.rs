@@ -1,6 +1,6 @@
 use super::ChemStructEditor;
 use super::rich_text::{RichGalley, RichText, RichTextStyle};
-use crate::molecule::{BondOrder, BondStereo};
+use crate::molecule::{max_valence, normal_valence, BondOrder, BondStereo};
 use std::collections::HashMap;
 
 // Visual sizes (bond width, label size, etc.) are user-configurable via `config.style`
@@ -412,6 +412,11 @@ pub fn draw_atom_labels(
     let z = editor.zoom;
     let bg = editor.config.style.atom_bg_radius * z;
     for atom in &editor.molecule.atoms {
+        // A folded hydrogen is drawn nowhere, so a ring around it is a marker hovering in
+        // empty space — which is exactly how a lasso-selected NH2 used to look.
+        if is_folded_h(&editor.molecule, atom.id) {
+            continue;
+        }
         let sp = editor.mol_to_screen(atom.pos, center);
         let is_hovered  = editor.hovered_atom  == Some(atom.id);
         let is_selected = editor.selected_atoms.contains(&atom.id);
@@ -585,18 +590,43 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// A terminal hydrogen bonded to a single heavy (non-H) atom. Such H atoms are
-/// folded into the heavy atom's label (e.g. N–H renders as "NH2"), so they are
-/// not drawn as separate vertices and their bond is suppressed. Deuterium ("D")
-/// is treated as a normal atom, never folded.
+/// A hydrogen that is drawn inside its heavy neighbour's label instead of on the canvas,
+/// so it gets no vertex of its own and its bond is suppressed (N–H renders as "NH2").
+///
+/// Three conditions, and the last two are what keep the folding honest:
+///
+/// - Exactly one bond, to a heavy (non-H) atom. Deuterium ("D") is a normal atom, never folded.
+/// - It came in with a group ([`Atom::group_h`](crate::molecule::Atom::group_h)) — `n` inserts
+///   NH₂, whose hydrogen is really just the "2" in the label. A hydrogen the user asked for by
+///   name is an atom like any other; folding it made it vanish outright.
+/// - Its neighbour's label still has room for it. [`displayed_h_count`] derives the label's
+///   hydrogens from the *heavy* bond sum, so once those fill the valence the label shows no
+///   hydrogen at all and there is nothing left to fold into. An invisible hydrogen was the
+///   sole cause of the over-valence ring on both nitrogens of a Ph–N=N–Ph drawn from two `n`
+///   keys: a warning the user could neither see the reason for nor delete.
 pub fn is_folded_h(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
     let Some(atom) = mol.atom_by_id(atom_id) else { return false };
-    if atom.element != "H" { return false; }
+    if atom.element != "H" || !atom.group_h { return false; }
     let bonds = mol.bonds_for_atom(atom_id);
     if bonds.len() != 1 { return false; }
     let b = bonds[0];
     let other = if b.begin == atom_id { b.end } else { b.begin };
-    mol.atom_by_id(other).map_or(false, |n| n.element != "H")
+    let Some(heavy) = mol.atom_by_id(other) else { return false };
+    if heavy.element == "H" { return false; }
+    let Some(valence) = normal_valence(&heavy.element) else { return false };
+
+    // Room left on the neighbour: its valence, minus every bond that is not a group hydrogen,
+    // minus the group hydrogens folded ahead of this one. Ordering those by id makes the
+    // choice stable when a group brings more hydrogens than the atom can show (SiH₃ on a
+    // silicon that has since grown a second bond).
+    let used: i16 = mol.bonds_for_atom(other).iter().map(|nb| {
+        let n = if nb.begin == other { nb.end } else { nb.begin };
+        match mol.atom_by_id(n) {
+            Some(a) if a.element == "H" && a.group_h => (n < atom_id) as i16,
+            _ => nb.order.valence(),
+        }
+    }).sum();
+    used < valence as i16 + heavy.charge as i16
 }
 
 fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
@@ -621,14 +651,7 @@ fn should_show_label(editor: &ChemStructEditor, atom_id: u32) -> bool {
 pub fn is_valence_invalid(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
     let Some(atom) = mol.atom_by_id(atom_id) else { return false };
     let Some(valence) = max_valence(&atom.element) else { return false };
-    let bond_sum: i16 = mol.bonds_for_atom(atom_id).iter()
-        .map(|b| match b.order {
-            crate::molecule::BondOrder::Single => 1,
-            crate::molecule::BondOrder::Double => 2,
-            crate::molecule::BondOrder::Triple => 3,
-        })
-        .sum();
-    bond_sum > valence as i16 + atom.charge as i16
+    mol.bond_order_sum(atom_id) > valence as i16 + atom.charge as i16
 }
 
 /// Draw a dashed circle (used as the over-valence warning ring).
@@ -648,33 +671,6 @@ fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, 
     }
 }
 
-/// Standard organic valence for implicit H calculation (the element's lowest
-/// common valence: S counts hydrogens like H₂S, not like a sulfone).
-fn normal_valence(element: &str) -> Option<u8> {
-    match element {
-        "C"  => Some(4),
-        "N"  => Some(3),
-        "O"  => Some(2),
-        "S"  => Some(2),
-        "P"  => Some(3),
-        "F" | "Cl" | "Br" | "I" => Some(1),
-        "B"  => Some(3),
-        "Si" => Some(4),
-        "H"  => Some(1),
-        _    => None,
-    }
-}
-
-/// Highest common valence, used by the over-valence warning so hypervalent-but-normal
-/// S(VI) and P(V) centers (sulfones, sulfonamides, sulfates, phosphates) are not flagged.
-fn max_valence(element: &str) -> Option<u8> {
-    match element {
-        "S" => Some(6),
-        "P" => Some(5),
-        other => normal_valence(other),
-    }
-}
-
 /// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
 /// implicit H needed to satisfy valence. Computed as `valence + charge` minus the
 /// bond-order sum to *non-folded* neighbors, which naturally includes both.
@@ -691,11 +687,7 @@ fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
             let other = if b.begin == atom_id { b.end } else { b.begin };
             !is_folded_h(mol, other)
         })
-        .map(|b| match b.order {
-            crate::molecule::BondOrder::Single => 1_i16,
-            crate::molecule::BondOrder::Double => 2,
-            crate::molecule::BondOrder::Triple => 3,
-        })
+        .map(|b| b.order.valence())
         .sum();
     // Positive charge raises effective valence (e.g. N+ = 4), negative lowers it
     let effective = valence as i16 + atom.charge as i16;
@@ -734,6 +726,14 @@ mod tests {
 
     fn label(mol: &Molecule, id: u32) -> String {
         atom_label_text(mol, mol.atom_by_id(id).unwrap())
+    }
+
+    /// The real NH₂ group, from the same embedded fragment set the editor uses — so these
+    /// tests see the geometry that actually ships rather than a hand-written stand-in.
+    fn nh2() -> crate::molecule::fragment::Fragment {
+        crate::Config::embedded()
+            .resolve_fragment("NH2")
+            .expect("NH2 is a built-in fragment")
     }
 
     /// A lone (unbonded) atom shows just its symbol — no implicit H (so placing O/N/S reads
@@ -845,6 +845,49 @@ mod tests {
         let rich = atom_label(&m, m.atom_by_id(o).unwrap()).rich;
         assert_eq!(rich.spans.last().map(|s| (s.text.as_str(), s.style.script)),
                    Some(("2-", Script::Super)));
+    }
+
+    /// Only a *group's* hydrogen folds into the label. One the user drew is an ordinary
+    /// atom, and folding it made it disappear completely — no vertex, no bond, no label.
+    #[test]
+    fn only_a_groups_hydrogen_folds_into_the_label() {
+        // Drawn on purpose: its own vertex, and it counts against the neighbour's valence
+        // like any other bond (C–H with three implicit hydrogens is still methane).
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let h = m.add_atom("H".to_string(), [1.5, 0.0], 0);
+        m.add_bond(c, h, BondOrder::Single);
+        assert!(!is_folded_h(&m, h), "a hydrogen placed by hand must stay visible");
+        assert_eq!(label(&m, h), "H");
+
+        // Arrived inside an NH2 group: label decoration, folded into "NH2".
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 0);
+        m.add_bond(c, n, BondOrder::Single);
+        let group = m.insert_fragment(&nh2(), n, 0.0, false);
+        assert!(is_folded_h(&m, group[0]), "a group's hydrogen belongs in its label");
+        assert_eq!(label(&m, n), "NH2");
+    }
+
+    /// A group hydrogen stays folded only while the label can still show it: once the heavy
+    /// bonds fill the valence there is no implicit hydrogen left to hide inside, so it is
+    /// drawn — which is what keeps the over-valence warning pointing at something visible.
+    #[test]
+    fn a_group_hydrogen_unfolds_when_the_label_has_no_room() {
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 0);
+        m.add_bond(c, n, BondOrder::Single);
+        let h = m.insert_fragment(&nh2(), n, 0.0, false)[0];
+        assert!(is_folded_h(&m, h), "one heavy bond leaves the label two hydrogens to show");
+
+        // A second heavy neighbour, double-bonded: N now has three bond-orders of its own.
+        let n2 = m.add_atom("N".to_string(), [1.5, 1.5], 0);
+        m.add_bond(n, n2, BondOrder::Double);
+        assert!(!is_folded_h(&m, h), "with no implicit hydrogen left, the group's must be drawn");
+        assert_eq!(label(&m, n), "N", "the label shows no hydrogen it is not holding");
+        assert!(is_valence_invalid(&m, n), "four bond-orders on N is over-valence, visibly so");
     }
 
     /// Hydrogens flip to the free side: a terminal O whose bond comes from the RIGHT

@@ -3,6 +3,46 @@ use crate::config::{AtomAction, BondAction, ResolvedAtomAction, SelectionAction}
 use crate::molecule::{BondOrder, BondStereo};
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Group-hydrogen bookkeeping
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Strip the group hydrogens that the bonds just drawn have left no room for on `atoms`.
+///
+/// The rule lives on [`Molecule::consume_excess_group_h`]; what belongs *here* is deciding
+/// when it applies. It is called from the **editing** paths only — every place a user action
+/// adds a bond or raises a bond order — and deliberately not hooked into
+/// [`Molecule::add_bond`](crate::molecule::Molecule::add_bond), which is also how ChemDraw
+/// import, the cleanup/canonicalisation passes and fragment→molecule conversion build their
+/// graphs. Those must reproduce their input exactly, hydrogens included.
+///
+/// Only the two atoms of a new bond can have gained valence, so callers pass those (plus, for
+/// a fragment or ring insertion, everything the insertion touched).
+///
+/// Editor state pointing at a removed hydrogen is cleaned up here; the atom hotspot is left
+/// to the caller, which knows what it should fall back to.
+fn consume_group_h(editor: &mut ChemStructEditor, atoms: &[u32]) {
+    for &id in atoms {
+        for h in editor.molecule.consume_excess_group_h(id) {
+            editor.selected_atoms.remove(&h);
+            if editor.hovered_atom == Some(h) { editor.hovered_atom = None; }
+        }
+    }
+}
+
+/// Cycle a bond's order (the mouse gesture for "make this a double bond"), consuming any
+/// group hydrogen the *increase* leaves no room for. A wrap back to single removes nothing.
+fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
+    let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) else { return };
+    let next = bond.order.cycle();
+    let grew = next.valence() > bond.order.valence();
+    bond.order = next;
+    let (begin, end) = (bond.begin, bond.end);
+    if grew {
+        consume_group_h(editor, &[begin, end]);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Public tool handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -50,16 +90,15 @@ pub fn process_bond_tool(
                 });
             if target_id != src_id {
                 if let Some(existing) = editor.molecule.bond_between(src_id, target_id).map(|b| b.id) {
-                    if let Some(bond) = editor.molecule.bond_by_id_mut(existing) {
-                        bond.order = bond.order.cycle();
-                        modified = true;
-                    }
+                    cycle_bond_order(editor, existing);
+                    modified = true;
                 } else {
                     let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
                     if bid != 0 {
                         if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
                             bond.stereo = editor.current_bond_stereo.clone();
                         }
+                        consume_group_h(editor, &[src_id, target_id]);
                     }
                     modified = true;
                 }
@@ -80,24 +119,23 @@ pub fn process_bond_tool(
             let new_id = find_or_create_atom(editor, new_pos, center);
             if new_id != atom_id {
                 if let Some(existing) = editor.molecule.bond_between(atom_id, new_id).map(|b| b.id) {
-                    if let Some(bond) = editor.molecule.bond_by_id_mut(existing) {
-                        bond.order = bond.order.cycle();
-                        modified = true;
-                    }
+                    cycle_bond_order(editor, existing);
+                    modified = true;
                 } else {
                     let bid = editor.molecule.add_bond(atom_id, new_id, editor.current_bond_order.clone());
                     if bid != 0 {
                         if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
                             bond.stereo = editor.current_bond_stereo.clone();
                         }
+                        consume_group_h(editor, &[atom_id, new_id]);
                     }
                     modified = true;
                 }
             }
             editor.hotspot_atom = Some(new_id);
         } else if let Some(bond_id) = editor.hovered_bond {
-            if let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
-                bond.order = bond.order.cycle();
+            if editor.molecule.bond_by_id_mut(bond_id).is_some() {
+                cycle_bond_order(editor, bond_id);
                 modified = true;
             }
         } else {
@@ -540,6 +578,15 @@ fn dispatch_bond_key(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> 
 // Action applicators
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Whether `element` carries chemistry a skeleton fragment must not silently discard.
+///
+/// Carbon is the skeleton's own default, and hydrogen (or an isotope label for it) is a cap
+/// rather than a structural position — everything else is information the user typed in and
+/// expects to still be there afterwards.
+fn is_heteroatom(element: &str) -> bool {
+    !matches!(element, "C" | "H" | "D" | "T")
+}
+
 fn apply_atom_action(editor: &mut ChemStructEditor, atom_id: u32, action: ResolvedAtomAction) {
     match action {
         ResolvedAtomAction::InsertFragment(frag) => {
@@ -553,21 +600,52 @@ fn apply_atom_action(editor: &mut ChemStructEditor, atom_id: u32, action: Resolv
                 editor.hotspot_atom = Some(atom_id);
             } else {
                 // `insert_fragment` merges the fragment's attach atom into the existing one by
-                // ID only — it doesn't touch its element/charge. Set those first (mirrors
-                // `expand_label`), or e.g. pressing 'o' on a C would bond a new O onto an atom
-                // still labeled "C" instead of turning it into the O of an O-H.
-                let root_elem = frag.atoms[frag.attach_idx].element.clone();
-                let root_charge = frag.atoms[frag.attach_idx].charge;
-                if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
-                    atom.element = root_elem;
-                    atom.charge = root_charge;
+                // ID only — it doesn't touch its element/charge. Which of the two elements wins
+                // is decided here, and it depends on what kind of fragment this is:
+                //
+                // - **Heteroatom-rooted** (OH, NH2, OMe, NO2, …): the root element *is* what the
+                //   key means, so it overwrites (mirrors `expand_label`). Pressing 'o' on a C
+                //   must turn that atom into the O of an O–H, not bond a new O onto an atom
+                //   still labelled "C".
+                // - **Carbon-rooted** (benzene, the ring keys, Et, Ac, Boc, …): the fragment is
+                //   a skeleton grown *from* the atom and says nothing about what that atom is,
+                //   so an existing heteroatom is kept — `a` on an N is pyridine, not a benzene
+                //   with the nitrogen erased. Charge is kept with it, or an N⁺ would silently
+                //   lose its charge the moment a ring grew off it.
+                //
+                // Hydrogen is deliberately not preserved: it is a terminal cap, never a ring
+                // vertex or a chain atom, so a skeleton grown from one has to take it over.
+                let keep_existing = frag.atoms[frag.attach_idx].element == "C"
+                    && editor.molecule.atom_by_id(atom_id)
+                        .is_some_and(|a| is_heteroatom(&a.element));
+                if !keep_existing {
+                    let root_elem = frag.atoms[frag.attach_idx].element.clone();
+                    let root_charge = frag.atoms[frag.attach_idx].charge;
+                    if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
+                        atom.element = root_elem;
+                        atom.charge = root_charge;
+                    }
                 }
 
                 // Detect best orientation: angle + flip to keep ring bulk away from existing bonds
                 let (angle, flip) = editor.best_fragment_placement(atom_id, &frag);
                 let new_ids = editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
-                if let Some(&last) = new_ids.last() {
-                    editor.hotspot_atom = Some(last);
+
+                // The fragment's bonds are new bonds on the atom it landed on, so any group
+                // hydrogen that atom was already wearing may now have nowhere to sit: growing
+                // a ring off an NH₂ nitrogen is pyridine, not a pentavalent N. The fragment's
+                // own atoms are included because a snapped-on atom gains bonds the same way.
+                let mut touched = vec![atom_id];
+                touched.extend(new_ids.iter().copied());
+                consume_group_h(editor, &touched);
+
+                // The hotspot goes to the last new atom that still exists — `s` on a saturated
+                // centre inserts an S–H whose hydrogen is consumed on the spot, and parking the
+                // hotspot on a removed atom would leave a keyboard user with no way to move it.
+                if !new_ids.is_empty() {
+                    let alive = new_ids.iter().rev().copied()
+                        .find(|&id| editor.molecule.atom_by_id(id).is_some());
+                    editor.hotspot_atom = Some(alive.unwrap_or(atom_id));
                 }
             }
         }
@@ -597,8 +675,17 @@ fn apply_bond_action(editor: &mut ChemStructEditor, bond_id: u32, action: &BondA
         }
         BondAction::Order { order } => {
             if let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
+                // Raising the order consumes valence on both ends — this is the key that turns
+                // two `n`-inserted NH₂ nitrogens into the N=N of an azobenzene, and their group
+                // hydrogens have to go with the valence they were standing in for. Lowering it
+                // frees valence instead, and must not take a hydrogen with it.
+                let grew = order.valence() > bond.order.valence();
                 bond.order = order.clone();
                 bond.stereo = BondStereo::None;
+                let (begin, end) = (bond.begin, bond.end);
+                if grew {
+                    consume_group_h(editor, &[begin, end]);
+                }
             }
             true
         }
@@ -653,7 +740,9 @@ fn extend_chain(editor: &mut ChemStructEditor, from_atom_id: u32, n: usize) {
         };
         let new_id = editor.molecule.find_atom_near(new_pos, snap)
             .unwrap_or_else(|| editor.molecule.add_atom("C".to_string(), new_pos, 0));
-        editor.molecule.add_bond(current, new_id, BondOrder::Single);
+        if editor.molecule.add_bond(current, new_id, BondOrder::Single) != 0 {
+            consume_group_h(editor, &[current, new_id]);
+        }
         if new_id == current { break; } // guard: snapped to self
         current = new_id;
     }
@@ -661,6 +750,13 @@ fn extend_chain(editor: &mut ChemStructEditor, from_atom_id: u32, n: usize) {
 }
 
 /// Fuse an n-membered ring onto a bond, sharing that bond as one edge.
+///
+/// The polygon's side is the **shared bond's own length**, not [`DEFAULT_BOND_LENGTH`]: the new
+/// ring keeps that edge, so it is the only side length for which the ring can be both regular
+/// and closed. Sizing the circumradius from the constant while anchoring the ring on the real
+/// endpoints left every ring fused onto a bond of some other length lopsided — on a 1.0-long
+/// bond a fused three-ring came out with 0.35 edges. This also matches
+/// [`fuse_fragment_onto_bond`], which scales its fragment by `blen / flen` for the same reason.
 fn fuse_ring_onto_bond(editor: &mut ChemStructEditor, bond_id: u32, n: usize) {
     if n < 3 { return; }
     let (a_id, b_id) = {
@@ -674,23 +770,30 @@ fn fuse_ring_onto_bond(editor: &mut ChemStructEditor, bond_id: u32, n: usize) {
     };
 
     use std::f32::consts::PI;
-    let l = DEFAULT_BOND_LENGTH;
-    let r = l / (2.0 * (PI / n as f32).sin());
-    // Place ring on the "free" side of the bond
     let mx = (pa[0] + pb[0]) * 0.5;
     let my = (pa[1] + pb[1]) * 0.5;
     let dx = pb[0] - pa[0];
     let dy = pb[1] - pa[1];
     let len = (dx * dx + dy * dy).sqrt().max(0.001);
-    // Perpendicular: choose side away from majority of existing neighbors
+    // The shared edge is one side of the polygon, so it sets the polygon's scale.
+    let l = len;
+    let r = l / (2.0 * (PI / n as f32).sin());
+    // Centre, at `perp_len` off the midpoint along the bond's left normal. Which side of the
+    // bond the ring lands on therefore follows the bond's begin→end orientation.
     let perp_len = (r * r - l * l * 0.25).max(0.0).sqrt();
     let cx = mx + (-dy / len) * perp_len;
     let cy = my + ( dx / len) * perp_len;
 
+    // Walk the circle from `a` in the direction that reaches `b` first, so `ring_atoms` is the
+    // polygon's own vertex order. The centre sits at `+perp`, which puts `b` one step *ahead*
+    // of `a` — stepping backwards instead re-created `b`'s own position as the last vertex and
+    // left the vertex beyond it missing, so the "ring" closed through a chord (a diameter, for
+    // a six-ring) and a zero-length bond.
     let alpha_a = (pa[1] - cy).atan2(pa[0] - cx);
+    let step = std::f32::consts::TAU / n as f32;
     let mut ring_atoms: Vec<u32> = vec![a_id, b_id];
     for k in 2..n {
-        let angle = alpha_a - k as f32 * std::f32::consts::TAU / n as f32;
+        let angle = alpha_a + k as f32 * step;
         let pos = [cx + r * angle.cos(), cy + r * angle.sin()];
         let new_id = editor.molecule.add_atom("C".to_string(), pos, 0);
         ring_atoms.push(new_id);
@@ -703,6 +806,9 @@ fn fuse_ring_onto_bond(editor: &mut ChemStructEditor, bond_id: u32, n: usize) {
             editor.molecule.add_bond(a, b, BondOrder::Single);
         }
     }
+    // Both shared atoms picked up a ring bond; a hydrogen they were only holding on spare
+    // valence has none left.
+    consume_group_h(editor, &ring_atoms);
 }
 
 /// Fuse a named fragment onto a bond, sharing that bond as one edge.
@@ -894,6 +1000,10 @@ fn fuse_fragment_onto_bond(
             }
         }
     }
+
+    // Last, once the Kekulé repair has settled every order: the fused ring is new valence on
+    // both shared atoms, so any group hydrogen they no longer have room for goes.
+    consume_group_h(editor, &id_map);
 }
 
 /// How many double bonds `atom_id` currently carries.
@@ -1076,7 +1186,13 @@ fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
 
     // Pick direction & flip, then insert the fragment in-place
     let (angle, flip) = editor.best_fragment_placement(atom_id, &frag);
-    editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
+    let new_ids = editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
+
+    // Same rule as the atom key that inserts a fragment: expanding "SiH3" onto a silicon that
+    // already carries two bonds writes one hydrogen too many, and it is not one the user typed.
+    let mut touched = vec![atom_id];
+    touched.extend(new_ids);
+    consume_group_h(editor, &touched);
 
     true
 }
@@ -1318,6 +1434,76 @@ mod tests {
             .filter(|bd| bd.order == BondOrder::Double)
             .count();
         assert_eq!(doubles, 3, "aromatic benzene should have 3 double bonds");
+    }
+
+    /// Cycling a bond's order is the mouse gesture for "make this a double bond", and it takes
+    /// valence from both ends exactly as the `2`/`3` keys do — so a group's hydrogen goes with
+    /// it. Cycling back down to single frees valence and must take nothing.
+    #[test]
+    fn cycling_a_bond_order_consumes_only_on_the_way_up() {
+        let mut e = editor();
+        let c = e.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let n = e.molecule.add_atom("N".to_string(), [1.5, 0.0], 0);
+        let bid = e.molecule.add_bond(c, n, BondOrder::Single);
+        let nh2 = crate::Config::embedded()
+            .resolve_fragment("NH2")
+            .expect("NH2 is a built-in fragment");
+        let h = e.molecule.insert_fragment(&nh2, n, 0.0, false)[0];
+
+        cycle_bond_order(&mut e, bid); // single → double: N is at 2 + 1 = 3, exactly full
+        assert!(e.molecule.atom_by_id(h).is_some(), "a full valence is not an excess");
+
+        cycle_bond_order(&mut e, bid); // double → triple: 3 + 1 = 4, over
+        assert!(e.molecule.atom_by_id(h).is_none(), "the group's hydrogen has nowhere left to sit");
+        assert_eq!(e.molecule.atoms.len(), 2);
+
+        // Triple → single wraps back around; there is nothing left to take and nothing to undo.
+        cycle_bond_order(&mut e, bid);
+        assert_eq!(e.molecule.atoms.len(), 2);
+        assert_eq!(e.molecule.bond_between(c, n).map(|b| b.order.clone()), Some(BondOrder::Single));
+    }
+
+    /// A ring fused onto an existing bond must be a *regular* polygon **on that bond**.
+    ///
+    /// This pins down two separate ways the polygon used to come out wrong.
+    ///
+    /// **Scale.** The fused ring inherits the shared edge, so the only polygon that is both
+    /// regular and closed is the one whose side equals that edge's actual length. The
+    /// circumradius was sized from `DEFAULT_BOND_LENGTH` while the ring was anchored on the
+    /// real endpoints, so any bond that was not exactly 1.5 long — a fragment's own bond, a
+    /// dragged atom, a ring built at another scale — came out lopsided: on a 1.0 bond a fused
+    /// three-ring measured 0.35 across one edge. (`fuse_fragment_onto_bond` has always matched
+    /// the bond it is given, scaling by `blen / flen`; the ring path now agrees with it.)
+    ///
+    /// **Vertex order.** The walk ran the wrong way round the circle, so the last vertex landed
+    /// exactly on `b` and the vertex past it was never placed. Even on a perfectly ordinary
+    /// 1.5 bond that left two atoms sharing one position and one "edge" cutting across the
+    /// ring — `c a Shift+ArrowRight 6` really did produce a 3.00-long bond and a zero atom
+    /// separation. Topology-only tests never saw it: the result is still an n-cycle.
+    #[test]
+    fn fused_ring_is_regular_on_any_bond_length() {
+        for shared in [1.0_f32, DEFAULT_BOND_LENGTH, 2.4] {
+            for n in 3..=8usize {
+                let mut e = ChemStructEditor::default();
+                let a = e.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+                let b = e.molecule.add_atom("C".to_string(), [shared, 0.0], 0);
+                let bond_id = e.molecule.add_bond(a, b, BondOrder::Single);
+
+                fuse_ring_onto_bond(&mut e, bond_id, n);
+
+                assert_eq!(e.molecule.atoms.len(), n, "ring {n} on a {shared} bond: atom count");
+                assert_eq!(e.molecule.bonds.len(), n, "ring {n} on a {shared} bond: not closed");
+                for bd in &e.molecule.bonds {
+                    let p = e.molecule.atom_by_id(bd.begin).unwrap().pos;
+                    let q = e.molecule.atom_by_id(bd.end).unwrap().pos;
+                    let len = (p[0] - q[0]).hypot(p[1] - q[1]);
+                    assert!(
+                        (len - shared).abs() < 0.01,
+                        "ring {n} fused onto a {shared} bond has a {len:.3} edge — not regular",
+                    );
+                }
+            }
+        }
     }
 }
 
