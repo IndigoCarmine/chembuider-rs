@@ -220,14 +220,31 @@ impl ChemStructEditor {
         }
     }
 
-    /// Fill the ring the current selection points at: the smallest ring through the hotspot
-    /// atom, or through any selected atom. Convenience for a toolbar "fill ring" action before
-    /// a dedicated canvas ring-picking gesture is wired up. Returns false when nothing is
-    /// selected or the seed atom is on no ring.
+    /// Fill the ring the current selection points at.
+    ///
+    /// A selection of two or more atoms *is* the ring the user means, so it wins over the
+    /// hotspot (which only follows the cursor and, on a fused ring, may sit on the wrong cycle):
+    /// the ring confined to the selected atoms is filled — the four-membered ring for the four
+    /// atoms of a square fused onto benzene, the hexagon for benzene's six. When the selection
+    /// encloses no ring of its own we fall back to a single seed, still preferring an explicit
+    /// selection over the hotspot; a lone selected atom or a bare hotspot keeps the old
+    /// smallest-ring-through-the-seed behavior. Returns false when nothing is selected/hovered
+    /// or the seed atom is on no ring.
     pub fn fill_selected_ring(&mut self, color: [u8; 4]) -> bool {
+        if self.selected_atoms.len() >= 2 {
+            let sel: Vec<u32> = self.selected_atoms.iter().copied().collect();
+            if let Some(ring) = self.molecule.ring_from_atoms(&sel) {
+                self.push_undo();
+                self.molecule.set_ring_fill(ring, color);
+                return true;
+            }
+        }
         let seed = self
-            .hotspot_atom
-            .or_else(|| self.selected_atoms.iter().copied().min());
+            .selected_atoms
+            .iter()
+            .copied()
+            .min()
+            .or(self.hotspot_atom);
         match seed {
             Some(a) => self.fill_ring_at(a, color),
             None => false,
@@ -1149,6 +1166,92 @@ mod clipboard_tests {
         // Undo (the fill recorded a snapshot) removes it again.
         assert!(e.undo());
         assert!(e.molecule.ring_fills.is_empty());
+    }
+
+    // Benzene (6-ring) with a 4-ring fused onto its b0—b1 edge, plus the two square-only atoms.
+    // Returns (editor, benzene_ids, square_only_s0, square_only_s1).
+    fn fused_benzene_and_square() -> (ChemStructEditor, Vec<u32>, u32, u32) {
+        use std::f32::consts::TAU;
+        let mut e = ChemStructEditor::default();
+        let b: Vec<u32> = (0..6)
+            .map(|k| {
+                let a = (k as f32) * TAU / 6.0;
+                e.molecule.add_atom("C".to_string(), [a.cos(), a.sin()], 0)
+            })
+            .collect();
+        for k in 0..6 {
+            e.molecule.add_bond(b[k], b[(k + 1) % 6], BondOrder::Single);
+        }
+        // Square: b1—s0—s1—b0, sharing the b0—b1 edge with benzene.
+        let s0 = e.molecule.add_atom("C".to_string(), [2.0, 0.5], 0);
+        let s1 = e.molecule.add_atom("C".to_string(), [2.0, -0.5], 0);
+        e.molecule.add_bond(b[1], s0, BondOrder::Single);
+        e.molecule.add_bond(s0, s1, BondOrder::Single);
+        e.molecule.add_bond(s1, b[0], BondOrder::Single);
+        (e, b, s0, s1)
+    }
+
+    // Every consecutive pair (including the wrap) of a filled ring must be a real bond, or the
+    // fill polygon self-intersects. Also returns the fill's atoms as an unordered set.
+    fn assert_ring_is_a_cycle(e: &ChemStructEditor) -> std::collections::HashSet<u32> {
+        let ring = &e.molecule.ring_fills[0].atoms;
+        for w in 0..ring.len() {
+            let (u, v) = (ring[w], ring[(w + 1) % ring.len()]);
+            assert!(
+                e.molecule.neighbor_atom_ids(u).contains(&v),
+                "polygon edge {u}->{v} must be a real bond (cyclic order)"
+            );
+        }
+        ring.iter().copied().collect()
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_the_selected_ring_on_a_fused_bicyclic() {
+        // Bug repro: selecting the square's four atoms must fill the square, even when the
+        // hotspot sits on a benzene-only atom (the cursor must not override the selection).
+        let (mut e, b, s0, s1) = fused_benzene_and_square();
+        e.selected_atoms = [b[0], b[1], s0, s1].into_iter().collect();
+        e.hotspot_atom = Some(b[3]); // on benzene, off the square
+
+        assert!(e.fill_selected_ring([255, 0, 0, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 1);
+        let filled = assert_ring_is_a_cycle(&e);
+        assert_eq!(
+            filled,
+            [b[0], b[1], s0, s1].into_iter().collect(),
+            "the four selected atoms — the square — are filled, not benzene"
+        );
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_benzene_when_benzene_is_selected() {
+        // The mirror case: selecting benzene's six atoms fills the hexagon, even with the
+        // hotspot parked on a square-only atom.
+        let (mut e, b, s0, _s1) = fused_benzene_and_square();
+        e.selected_atoms = b.iter().copied().collect();
+        e.hotspot_atom = Some(s0); // on the square, off benzene
+
+        assert!(e.fill_selected_ring([0, 0, 255, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 1);
+        let filled = assert_ring_is_a_cycle(&e);
+        assert_eq!(
+            filled,
+            b.iter().copied().collect(),
+            "the six selected atoms — benzene — are filled, not the square"
+        );
+    }
+
+    #[test]
+    fn fill_selected_ring_falls_back_to_seed_when_selection_forms_no_ring() {
+        // A selection that encloses no ring of its own falls back to the smallest ring through
+        // the lowest selected atom (still preferring the selection over the hotspot).
+        let (mut e, b, s0, _s1) = fused_benzene_and_square();
+        // b[0] and s0 do not form a cycle by themselves; b[0] is on both rings, and its
+        // smallest ring is the 4-membered square.
+        e.selected_atoms = [b[0], s0].into_iter().collect();
+        e.hotspot_atom = Some(b[3]);
+        assert!(e.fill_selected_ring([0, 200, 0, 255]));
+        assert_eq!(e.molecule.ring_fills[0].atoms.len(), 4, "fell back to b0's smallest ring");
     }
 
     #[test]

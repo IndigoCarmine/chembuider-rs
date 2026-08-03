@@ -324,6 +324,102 @@ impl Molecule {
         best
     }
 
+    /// Shortest path like [`shortest_path`](Self::shortest_path), but confined to the vertex
+    /// set `allowed`: BFS never steps onto an atom outside it. Both `src` and `dst` are assumed
+    /// to be in `allowed`.
+    fn shortest_path_within(
+        &self,
+        src: u32,
+        dst: u32,
+        forbid: (u32, u32),
+        allowed: &std::collections::HashSet<u32>,
+    ) -> Option<Vec<u32>> {
+        use std::collections::VecDeque;
+        let mut prev: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::from([src]);
+        let mut queue: VecDeque<u32> = VecDeque::from([src]);
+        while let Some(u) = queue.pop_front() {
+            if u == dst {
+                let mut path = vec![dst];
+                let mut cur = dst;
+                while cur != src {
+                    cur = prev[&cur];
+                    path.push(cur);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for n in self.neighbor_atom_ids(u) {
+                if !allowed.contains(&n) {
+                    continue;
+                }
+                let is_forbidden =
+                    (u == forbid.0 && n == forbid.1) || (u == forbid.1 && n == forbid.0);
+                if is_forbidden {
+                    continue;
+                }
+                if visited.insert(n) {
+                    prev.insert(n, u);
+                    queue.push_back(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// The smallest ring through `atom_id` whose every vertex lies within `allowed`, in cyclic
+    /// order — [`smallest_ring_containing`](Self::smallest_ring_containing) restricted to a
+    /// vertex set. `None` when no such ring stays inside the set.
+    fn smallest_ring_within(
+        &self,
+        atom_id: u32,
+        allowed: &std::collections::HashSet<u32>,
+    ) -> Option<Vec<u32>> {
+        self.atom_by_id(atom_id)?;
+        let mut best: Option<Vec<u32>> = None;
+        for n in self.neighbor_atom_ids(atom_id) {
+            if !allowed.contains(&n) {
+                continue;
+            }
+            if let Some(path) = self.shortest_path_within(n, atom_id, (atom_id, n), allowed) {
+                if path.len() >= 3 {
+                    let mut ring = Vec::with_capacity(path.len());
+                    ring.push(atom_id);
+                    ring.extend_from_slice(&path[..path.len() - 1]);
+                    if best.as_ref().map_or(true, |b| ring.len() < b.len()) {
+                        best = Some(ring);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// The ring a *selection* of atoms means, in cyclic (polygon) order, or `None` if the
+    /// selected atoms enclose no ring.
+    ///
+    /// The search is confined to `atoms`, so on a fused ring the caller's selection — not a
+    /// shared vertex's globally smallest ring — decides which cycle is filled: selecting exactly
+    /// the four atoms of a square fused onto benzene yields the square, and selecting benzene's
+    /// six yields the hexagon, even though the two share an edge. When the selection encloses
+    /// more than one ring (e.g. both fused rings selected whole) the smallest enclosed ring
+    /// wins. Returns the smallest ring found over all selected atoms as seeds.
+    pub fn ring_from_atoms(&self, atoms: &[u32]) -> Option<Vec<u32>> {
+        let allowed: std::collections::HashSet<u32> = atoms.iter().copied().collect();
+        if allowed.len() < 3 {
+            return None;
+        }
+        let mut best: Option<Vec<u32>> = None;
+        for &start in &allowed {
+            if let Some(ring) = self.smallest_ring_within(start, &allowed) {
+                if best.as_ref().map_or(true, |b| ring.len() < b.len()) {
+                    best = Some(ring);
+                }
+            }
+        }
+        best
+    }
+
     /// Add (or replace) a ring fill on the given cyclic atom-id list with `color` (straight
     /// RGBA). An existing fill covering the same set of atoms is replaced, so re-filling a ring
     /// recolors it rather than stacking translucent layers.
