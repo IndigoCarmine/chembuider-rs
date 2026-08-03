@@ -10,6 +10,7 @@
 //! widget itself is library code; everything here is host-app glue you'd write per application.
 
 use chembuider_rs::molecule::mol2::to_mol2_string;
+use chembuider_rs::molecule::smiles::to_smiles;
 use chembuider_rs::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use eframe::{egui, App};
 
@@ -123,6 +124,16 @@ impl App for EditorApp {
                 }
 
                 ui.separator();
+
+                if ui.button("🧬 Copy SMILES").clicked() {
+                    let smiles = to_smiles(&self.editor.molecule);
+                    self.status = if smiles.is_empty() {
+                        "Nothing drawn, so no SMILES to copy.".to_string()
+                    } else {
+                        ui.ctx().copy_text(smiles.clone());
+                        format!("Copied SMILES: {smiles}")
+                    };
+                }
 
                 if ui.button("📋 Paste").clicked() {
                     self.status = if self.editor.paste_clipboard() {

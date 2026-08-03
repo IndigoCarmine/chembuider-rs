@@ -3,7 +3,7 @@
 *[English README →](README.md)*
 
 Rust 製の **2D 化学構造式エディタ** を提供する [egui](https://github.com/emilk/egui) ウィジェット
-ライブラリです。骨格式、立体結合、環・官能基テンプレート、2D 自動クリーンアップ、MOL2 出力、
+ライブラリです。骨格式、立体結合、環・官能基テンプレート、2D 自動クリーンアップ、MOL2 / SMILES 出力、
 そして（Windows 上では）ChemDraw 互換のクリップボード連携をサポートします。
 
 中心となる型は [`ChemStructEditor`](src/widget/mod.rs) で、アプリ内に1つ保持して毎フレーム
@@ -28,7 +28,8 @@ Rust 製の **2D 化学構造式エディタ** を提供する [egui](https://gi
 - **2D クリーンアップ** — 力学モデルによるレイアウト緩和。**バックグラウンドスレッド**で実行され
   UI を固めず、途中キャンセルも可能。
 - **原子価ヒント** — 結合数が過剰な原子を赤い破線の円で警告。
-- **エクスポート** — `molecule::mol2::to_mol2_string` で Tripos **MOL2** 形式を出力。
+- **エクスポート** — `molecule::mol2::to_mol2_string` で Tripos **MOL2** 形式を、
+  `molecule::smiles::to_smiles` で正準 **SMILES**（ケクレ表記・決定論的・立体情報なし）を出力。
 - **クリップボード（Windows）** — 構造を ChemDraw 互換の **CDX**・透過**画像**・**OLE** オブジェクト
   としてコピー/ペースト。PowerPoint に貼り付けると編集可能な ChemDraw 図として埋め込まれます。
 
@@ -163,7 +164,7 @@ Windows ツールチェインで発生する wgpu-hal の Direct3D12 ビルド�
 ```
 src/lib.rs            ライブラリのルートと公開 API
 src/widget/           ChemStructEditor ウィジェット（描画 + 操作）
-src/molecule/         データモデル、MOL2、2D クリーンアップ、CDX/画像/OLE（Windows）
+src/molecule/         データモデル、MOL2、SMILES、2D クリーンアップ、CDX/画像/OLE（Windows）
 src/config.rs         ショートカット、スタイル、フラグメントライブラリ
 src/bin/clipdump.rs   診断ツール: クリップボードの各フォーマットをダンプ（Windows）
 examples/editor.rs    完全なホストアプリ

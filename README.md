@@ -4,7 +4,7 @@
 
 An [egui](https://github.com/emilk/egui) widget library for drawing and editing **2D chemical
 structure diagrams** in Rust — skeletal formulas, stereo bonds, ring & functional-group
-templates, automatic 2D clean-up, MOL2 export, and (on Windows) ChemDraw-compatible
+templates, automatic 2D clean-up, MOL2 / SMILES export, and (on Windows) ChemDraw-compatible
 clipboard interop.
 
 The core type is [`ChemStructEditor`](src/widget/mod.rs): an immediate-mode widget you hold in
@@ -29,7 +29,8 @@ for a complete one.
 - **2D clean-up** — force-directed layout relaxation that runs on a background thread (never
   freezes the UI) and can be cancelled.
 - **Valence hints** — over-bonded atoms are flagged with a red dashed circle.
-- **Export** — Tripos **MOL2** via `molecule::mol2::to_mol2_string`.
+- **Export** — Tripos **MOL2** via `molecule::mol2::to_mol2_string`, and canonical **SMILES**
+  via `molecule::smiles::to_smiles` (Kekulé, deterministic, no stereochemistry).
 - **Clipboard (Windows)** — copy/paste structures as ChemDraw-compatible **CDX**, a
   transparent **image**, and an **OLE** object, so a paste into PowerPoint embeds an editable
   ChemDraw drawing.
@@ -164,7 +165,7 @@ Direct3D12 build issue on current Windows toolchains.
 ```
 src/lib.rs            library root & public API
 src/widget/           the ChemStructEditor widget (drawing + interaction)
-src/molecule/         data model, MOL2, 2D clean-up, CDX/image/OLE (Windows)
+src/molecule/         data model, MOL2, SMILES, 2D clean-up, CDX/image/OLE (Windows)
 src/config.rs         shortcuts, style, fragment library
 src/bin/clipdump.rs   diagnostic tool: dump clipboard formats (Windows)
 examples/editor.rs    full host application

@@ -2,6 +2,7 @@ pub mod mol2;
 pub mod fragment;
 pub mod canonical;
 pub mod cleanup;
+pub mod smiles;
 #[cfg(windows)]
 pub mod cdx;
 #[cfg(windows)]
