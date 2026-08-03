@@ -55,11 +55,15 @@ pub fn process_bond_tool(
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
 
-    // ── Drag tracking: dragging from an atom always draws a bond, never moves it — the
-    // Bond tool's own gesture list is "drag atom→atom to draw a bond"; repositioning atoms
-    // via drag is Select tool's job (`process_select_tool`), not this one. ─────────────────
+    // ── Drag tracking ────────────────────────────────────────────────────────
+    // Dragging *from an atom* always draws a bond, never moves it — the Bond tool's own
+    // gesture list is "drag atom→atom to draw a bond"; repositioning atoms via drag is the
+    // Select tool's job (`process_select_tool`), not this one.
+    //
+    // Dragging *from empty canvas* (no atom and no bond under the press) instead runs the same
+    // rubber-band selection the Select tool offers, so a user can marquee-select without
+    // leaving the Bond tool. A drag that begins on a bond keeps the Bond tool's old no-op.
     if response.drag_started() {
-        editor.push_undo(); // snapshot before drag adds a bond/atom
         // `drag_started()` only fires once the pointer has moved past egui's drag threshold,
         // so by now `mouse` (the *current* position) may already be well past the atom the
         // drag actually started on. Hit-test at the press origin instead, or a fast drag off
@@ -67,40 +71,60 @@ pub fn process_bond_tool(
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
         // Prefer hit atom; fall back to currently hovered atom for slight-miss tolerance
         editor.bond_start = editor.hit_test_atom(origin, center).or(editor.hovered_atom);
-        editor.preview_end_screen = Some(mouse);
+        if editor.bond_start.is_some() {
+            editor.push_undo(); // snapshot before the drag adds a bond/atom
+            editor.preview_end_screen = Some(mouse);
+        } else if editor.hit_test_bond(origin, center).is_none() {
+            // Empty space: start a rubber-band selection instead of a bond. No undo snapshot —
+            // selection does not mutate the molecule.
+            lasso_begin(editor, mouse);
+        }
     }
 
     if response.dragged() {
-        editor.preview_end_screen = Some(mouse);
+        if editor.bond_start.is_some() {
+            editor.preview_end_screen = Some(mouse);
+        } else if editor.drag_origin_screen.is_some() {
+            // Extend the rubber-band path; `draw_overlays` renders it, same as the Select tool.
+            editor.lasso_path.push(mouse);
+        }
     }
 
     if response.drag_stopped() {
-        let start_id   = editor.bond_start.take();
-        let end_screen = editor.preview_end_screen.take();
+        if editor.bond_start.is_none() && editor.drag_origin_screen.is_some() {
+            // Empty-space drag: commit the rubber-band selection and tear its state down.
+            lasso_select(editor, center);
+            editor.lasso_path.clear();
+            editor.drag_origin_screen = None;
+            editor.preview_end_screen = None;
+        } else {
+            let start_id   = editor.bond_start.take();
+            let end_screen = editor.preview_end_screen.take();
 
-        if let (Some(src_id), Some(end)) = (start_id, end_screen) {
-            let target_id = editor.hit_test_atom(end, center)
-                .or_else(|| {
-                    let mol_pos = editor.screen_to_mol(end, center);
-                    editor.molecule.find_atom_near(mol_pos, crate::molecule::Molecule::SNAP_RADIUS)
-                })
-                .unwrap_or_else(|| {
-                    let mol_pos = editor.screen_to_mol(end, center);
-                    editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0)
-                });
-            if target_id != src_id {
-                if let Some(existing) = editor.molecule.bond_between(src_id, target_id).map(|b| b.id) {
-                    cycle_bond_order(editor, existing);
-                    modified = true;
-                } else {
-                    let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
-                    if bid != 0 {
-                        if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
-                            bond.stereo = editor.current_bond_stereo.clone();
+            if let (Some(src_id), Some(end)) = (start_id, end_screen) {
+                let target_id = editor.hit_test_atom(end, center)
+                    .or_else(|| {
+                        let mol_pos = editor.screen_to_mol(end, center);
+                        editor.molecule.find_atom_near(mol_pos, crate::molecule::Molecule::SNAP_RADIUS)
+                    })
+                    .unwrap_or_else(|| {
+                        let mol_pos = editor.screen_to_mol(end, center);
+                        editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0)
+                    });
+                if target_id != src_id {
+                    if let Some(existing) = editor.molecule.bond_between(src_id, target_id).map(|b| b.id) {
+                        cycle_bond_order(editor, existing);
+                        modified = true;
+                    } else {
+                        let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
+                        if bid != 0 {
+                            if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
+                                bond.stereo = editor.current_bond_stereo.clone();
+                            }
+                            consume_group_h(editor, &[src_id, target_id]);
                         }
-                        consume_group_h(editor, &[src_id, target_id]);
+                        modified = true;
                     }
-                    modified = true;
                 }
             }
         }
@@ -210,6 +234,38 @@ fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rubber-band (lasso) selection — shared by the Select and Bond tools
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Begin a rubber-band selection: reset the in-progress path and remember the drag origin.
+///
+/// Factored out so the Bond tool can start the exact same gesture the Select tool does when a
+/// drag begins over empty canvas (no atom and no bond under the press).
+fn lasso_begin(editor: &mut ChemStructEditor, mouse: egui::Pos2) {
+    editor.lasso_path.clear();
+    editor.drag_origin_screen = Some(mouse);
+}
+
+/// Finish a rubber-band selection: replace the selection with every atom whose screen position
+/// falls inside the drawn polygon. A polygon needs at least three vertices to bound an area, so
+/// a path too short to be a real lasso (a mere flick) selects nothing and leaves the selection
+/// untouched.
+///
+/// Does not clear `lasso_path`/`drag_origin_screen`; the caller owns that teardown, since the
+/// Select tool clears them on every drag-stop regardless of which sub-gesture actually ran.
+fn lasso_select(editor: &mut ChemStructEditor, center: egui::Pos2) {
+    if editor.lasso_path.len() > 2 {
+        editor.selected_atoms.clear();
+        let lasso = editor.lasso_path.clone();
+        let hits: Vec<u32> = editor.molecule.atoms.iter().filter_map(|atom| {
+            let sp = editor.mol_to_screen(atom.pos, center);
+            if is_point_in_polygon(sp, &lasso) { Some(atom.id) } else { None }
+        }).collect();
+        editor.selected_atoms.extend(hits);
+    }
+}
+
 pub fn process_select_tool(
     editor: &mut ChemStructEditor,
     response: &egui::Response,
@@ -244,8 +300,7 @@ pub fn process_select_tool(
     }
 
     if response.drag_started() {
-        editor.lasso_path.clear();
-        editor.drag_origin_screen = Some(mouse);
+        lasso_begin(editor, mouse);
         // Alt+drag with a selection rotates the molecule around its centroid.
         if ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty() {
             editor.push_undo();
@@ -295,14 +350,8 @@ pub fn process_select_tool(
             // rotation finished
         } else if editor.dragging_atom.is_some() {
             editor.dragging_atom = None;
-        } else if editor.lasso_path.len() > 2 {
-            editor.selected_atoms.clear();
-            let lasso = editor.lasso_path.clone();
-            let hits: Vec<u32> = editor.molecule.atoms.iter().filter_map(|atom| {
-                let sp = editor.mol_to_screen(atom.pos, center);
-                if is_point_in_polygon(sp, &lasso) { Some(atom.id) } else { None }
-            }).collect();
-            editor.selected_atoms.extend(hits);
+        } else {
+            lasso_select(editor, center);
         }
         editor.lasso_path.clear();
         editor.drag_origin_screen = None;
@@ -1300,6 +1349,82 @@ mod tests {
         assert_eq!(editor.molecule.bonds.len(), 1, "dragging from an atom to empty space should bond it to the new atom");
         let pos_after = editor.molecule.atom_by_id(atom_id).unwrap().pos;
         assert_eq!(pos_before, pos_after, "the source atom must stay put, not be moved by the drag");
+    }
+
+    /// Bond tool: a drag that *begins over empty canvas* (no atom, no bond under the press)
+    /// runs the same rubber-band selection the Select tool offers, rather than doing nothing.
+    /// The atom enclosed by the marquee is selected; one outside it is not; and nothing is
+    /// created or moved.
+    #[test]
+    fn bond_tool_drag_from_empty_space_rubber_band_selects() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, crate::Tool::Bond);
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let center = screen_rect.center();
+
+        // Two atoms, far enough apart that a small marquee around one excludes the other.
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [4.0, 0.0], 0);
+        let a_screen = editor.mol_to_screen([0.0, 0.0], center);
+
+        // A rectangular path around atom `a`. Every corner is >15px (NODE_HIT_RADIUS_PX) from
+        // any atom, so the press begins in genuinely empty space.
+        let corners = [
+            a_screen + egui::vec2(-40.0, -40.0),
+            a_screen + egui::vec2( 40.0, -40.0),
+            a_screen + egui::vec2( 40.0,  40.0),
+            a_screen + egui::vec2(-40.0,  40.0),
+            a_screen + egui::vec2(-40.0, -40.0),
+        ];
+
+        // Move to the first corner, then press there (empty space).
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(corners[0])]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: corners[0], button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        // Drag around the box, one move per frame, to build up the lasso polygon.
+        for c in &corners[1..] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(*c)]);
+        }
+        // Release to commit the selection.
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: *corners.last().unwrap(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]);
+
+        assert!(editor.selected_atoms.contains(&a), "atom inside the marquee should be selected");
+        assert!(!editor.selected_atoms.contains(&b), "atom outside the marquee must not be selected");
+        assert_eq!(editor.molecule.atoms.len(), 2, "rubber-band selection must not create atoms");
+        assert!(editor.molecule.bonds.is_empty(), "rubber-band selection must not create bonds");
+    }
+
+    /// Bond tool: a drag that *begins on an atom* still draws a bond (the empty-space marquee
+    /// must not have cannibalised the tool's core gesture).
+    #[test]
+    fn bond_tool_drag_from_atom_still_draws_bond_after_marquee_support() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let center = screen_rect.center();
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let a_screen = editor.mol_to_screen([0.0, 0.0], center);
+        let end = a_screen + egui::vec2(150.0, 80.0); // empty space, past the drag threshold
+
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(a_screen)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: a_screen, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(end)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![
+            egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]);
+
+        assert_eq!(editor.molecule.atoms.len(), 2, "dragging from an atom into empty space should create a bonded atom");
+        assert_eq!(editor.molecule.bonds.len(), 1, "and bond it to the source atom");
+        assert!(editor.selected_atoms.is_empty(), "a bond-draw drag must not select anything");
+        let _ = a;
     }
 
     /// Dragging from one existing atom onto another draws a bond between them (both atoms

@@ -820,6 +820,8 @@ impl ChemStructEditor {
                 self.hotspot_bond = None;
                 self.bond_start = None;
                 self.lasso_path.clear();
+                self.drag_origin_screen = None;
+                self.preview_end_screen = None;
             }
         }
 
