@@ -75,6 +75,35 @@ fn render_pixmap(mol: &Molecule, background: Option<resvg::tiny_skia::Color>) ->
     Some(pixmap)
 }
 
+/// Points per pixel of the drawing: its 1.5-unit bond is ChemDraw's 14.4 pt one.
+pub const PT_PER_PX: f32 = 14.4 / (1.5 * SCALE_FACTOR);
+
+/// A picture of the structure for a document (transparent PNG, at most `max_side` pixels a
+/// side), drawn in ChemDraw's style, and the size it is drawn at, in points at ChemDraw's
+/// scale. `None` with no atoms.
+pub fn preview_png(mol: &Molecule, max_side: u32) -> Option<(Vec<u8>, [f32; 2])> {
+    if mol.atoms.is_empty() {
+        return None;
+    }
+    let svg = molecule_to_svg_styled(mol, &StyleConfig::chemdraw());
+    let mut opt = resvg::usvg::Options::default();
+    opt.fontdb = egui_font().0;
+    let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
+    let size = tree.size();
+    let scale = (max_side as f32 / size.width().max(size.height())).min(1.0);
+    let w = (size.width() * scale).ceil().max(1.0) as u32;
+    let h = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let png = pixmap.encode_png().ok()?;
+    Some((png, [size.width() * PT_PER_PX, size.height() * PT_PER_PX]))
+}
+
+/// An empty transparent PNG of `w` × `h` pixels (the picture of an object with nothing drawn yet).
+pub fn blank_png(w: u32, h: u32) -> Vec<u8> {
+    resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).and_then(|p| p.encode_png().ok()).unwrap_or_default()
+}
+
 /// PNG bytes of the structure with a TRANSPARENT background (modern Office pastes the registered
 /// "PNG" format as an image).
 pub fn molecule_to_png(mol: &Molecule) -> Option<Vec<u8>> {
@@ -183,7 +212,11 @@ fn xml_escape(c: char) -> String {
 /// strokes / wedge fills, then white label masks, then each label glyph placed at egui's exact
 /// layout position. `x`/`y` translate the scene so its bounding box sits at `MARGIN_PX`.
 fn molecule_to_svg(mol: &Molecule) -> String {
-    let style = StyleConfig::default();
+    molecule_to_svg_styled(mol, &StyleConfig::default())
+}
+
+/// [`molecule_to_svg`] in `style`.
+fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> String {
     let family = egui_font().1;
 
     // Standalone egui font stack: the same layout egui does on-screen, so label geometry matches.
@@ -192,7 +225,7 @@ fn molecule_to_svg(mol: &Molecule) -> String {
         egui::FontDefinitions::default(),
     );
     let mut view = fonts.with_pixels_per_point(1.0);
-    let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job));
+    let (scene, bounds) = build_scene(mol, style, |job| view.layout_job(job));
 
     let w = bounds.width() + 2.0 * MARGIN_PX;
     let h = bounds.height() + 2.0 * MARGIN_PX;
@@ -417,6 +450,24 @@ fn flatten_label(mol: &Molecule, atom: &super::Atom) -> String {
 mod tests {
     use super::*;
     use crate::molecule::{BondOrder, BondStereo};
+
+    #[test]
+    fn preview_is_drawn_at_chemdraws_scale() {
+        let mut mol = Molecule::default();
+        let a = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = mol.add_atom("C".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(a, b, crate::molecule::BondOrder::Single);
+        let (png, [w, h]) = preview_png(&mol, 2400).expect("a picture");
+        assert_eq!(&png[1..4], b"PNG");
+        // One 14.4 pt bond plus the margins on both sides.
+        assert!((w - (14.4 + 2.0 * MARGIN_PX * PT_PER_PX)).abs() < 2.0, "width {w} pt");
+        assert!(h > 0.0);
+        let (small, _) = preview_png(&mol, 20).unwrap();
+        let width = u32::from_be_bytes([small[16], small[17], small[18], small[19]]);
+        assert!(width <= 20, "fits {width}");
+        assert!(preview_png(&Molecule::default(), 100).is_none());
+        assert_eq!(&blank_png(4, 2)[1..4], b"PNG");
+    }
 
     #[test]
     fn svg_draws_bonds_and_heteroatom_labels() {

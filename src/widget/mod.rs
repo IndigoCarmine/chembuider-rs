@@ -452,6 +452,9 @@ impl ChemStructEditor {
         for a in &other.atoms {
             let pos = [a.pos[0] - cx + target[0], a.pos[1] - cy + target[1]];
             let id = self.molecule.add_atom(a.element.clone(), pos, a.charge);
+            if let Some(atom) = self.molecule.atom_by_id_mut(id) {
+                atom.group_h = a.group_h;
+            }
             map.insert(a.id, id);
         }
         for b in &other.bonds {
