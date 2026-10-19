@@ -8,6 +8,15 @@ description = "An egui widget library for drawing and editing 2D chemical struct
 name = "chembuider_rs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "chembuilder-office"
+path = "src/bin/chembuilder-office.rs"
+required-features = ["office"]
+
+[features]
+# The external editor for ibisOffice's embedded ChemDraw objects (`chembuilder-office`).
+office = ["dep:eframe", "dep:interprocess", "dep:base64"]
+
 [dependencies]
 egui = "0.35.0"
 serde = { version = "1", features = ["derive"] }
@@ -32,10 +41,13 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "Document", "Window"] }
 
-# CDX export + ChemDraw-compatible clipboard (text/CDX/image/OLE) are Windows-only.
+# The ChemDraw-compatible clipboard (CDX/image/OLE) and image export are Windows-only.
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
-cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs" }
 resvg = "0.47.0"
 cfb = "0.14.0"
 uuid = "1"
+# `office`: ibisOffice's local-socket protocol (a named pipe) and its window.
+interprocess = { version = "2.4", optional = true }
+base64 = { version = "0.22", optional = true }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }

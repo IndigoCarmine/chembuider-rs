@@ -150,6 +150,30 @@ RichText::parse("SO_4^{2-}")                            // あるいは Painter 
 `Config::save()` はそれらを書き戻します。新しいフラグメントは example アプリのツールバーから
 直接保存できます。
 
+## ibisOffice で ChemDraw オブジェクトを編集する
+
+`chembuilder-office`（feature `office`、Windows）は ibisOffice の外部エディタです。
+埋め込まれる構造式は ChemDraw のオブジェクト（`ChemDraw_x64.Document.6.0`、`CONTENTS` に CDX）
+なので、ibisOffice で保存したファイルは PowerPoint/Word/Excel + ChemDraw でそのまま開いて編集
+でき、その逆も同様です。
+
+```sh
+cargo build --release --features office --bin chembuilder-office
+target/release/chembuilder-office --install-ibis-handler   # %APPDATA%\ibisOffice\embed-handlers\chembuilder.toml を書き出す
+```
+
+ibisOffice では次のことができます。
+
+- ChemDraw オブジェクトをダブルクリックすると ChemBuilder で編集でき、編集は自動的に文書へ反映されます
+- ChemDraw（または ChemBuilder）でコピーした構造式を Ctrl+V すると ChemDraw オブジェクトとして貼り付けられます
+- 挿入 ▸ オブジェクト ▸ ChemBuilder で新規作成、▸ ファイルから で `.cdx` を挿入できます
+- オブジェクトを Ctrl+C すると Office や ChemDraw にそのまま貼り付けられます
+
+Office が保存した ChemDraw のプレビュー（ベクター EMF）は画面上では ChemBuilder が描き直します。
+ファイル内のプレビューはオブジェクトを編集するまで元のまま保持されます。単体で
+`chembuilder-office file.cdx` と起動すると CDX ファイルを編集できます。プロトコルは ibisOffice
+が公開している仕様から実装しており、ibisOffice のコードは含みません。
+
 ## 対応プラットフォーム
 
 エディタ本体はクロスプラットフォームです。CDX / 画像 / OLE の**クリップボード**機能は Windows

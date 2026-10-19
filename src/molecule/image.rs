@@ -75,6 +75,35 @@ fn render_pixmap(mol: &Molecule, background: Option<resvg::tiny_skia::Color>) ->
     Some(pixmap)
 }
 
+/// Points per pixel of the drawing: its 1.5-unit bond is ChemDraw's 14.4 pt one.
+pub const PT_PER_PX: f32 = 14.4 / (1.5 * SCALE_FACTOR);
+
+/// A picture of the structure for a document (transparent PNG, at most `max_side` pixels a
+/// side), drawn in ChemDraw's style, and the size it is drawn at, in points at ChemDraw's
+/// scale. `None` with no atoms.
+pub fn preview_png(mol: &Molecule, max_side: u32) -> Option<(Vec<u8>, [f32; 2])> {
+    if mol.atoms.is_empty() {
+        return None;
+    }
+    let svg = molecule_to_svg_styled(mol, &StyleConfig::chemdraw());
+    let mut opt = resvg::usvg::Options::default();
+    opt.fontdb = egui_font().0;
+    let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
+    let size = tree.size();
+    let scale = (max_side as f32 / size.width().max(size.height())).min(1.0);
+    let w = (size.width() * scale).ceil().max(1.0) as u32;
+    let h = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let png = pixmap.encode_png().ok()?;
+    Some((png, [size.width() * PT_PER_PX, size.height() * PT_PER_PX]))
+}
+
+/// An empty transparent PNG of `w` × `h` pixels (the picture of an object with nothing drawn yet).
+pub fn blank_png(w: u32, h: u32) -> Vec<u8> {
+    resvg::tiny_skia::Pixmap::new(w.max(1), h.max(1)).and_then(|p| p.encode_png().ok()).unwrap_or_default()
+}
+
 /// PNG bytes of the structure with a TRANSPARENT background (modern Office pastes the registered
 /// "PNG" format as an image).
 pub fn molecule_to_png(mol: &Molecule) -> Option<Vec<u8>> {
@@ -180,10 +209,14 @@ fn xml_escape(c: char) -> String {
 }
 
 /// Render the molecule to an SVG string from the shared scene: ring-fill polygons, then bond
-/// strokes / wedge fills, then white label masks, then each label glyph placed at egui's exact
-/// layout position. `x`/`y` translate the scene so its bounding box sits at `MARGIN_PX`.
+/// strokes / wedge fills (with a hole cut under each label), then each label glyph placed at
+/// egui's exact layout position. The background stays transparent. `x`/`y` translate the scene so its bounding box sits at `MARGIN_PX`.
 fn molecule_to_svg(mol: &Molecule) -> String {
-    let style = StyleConfig::default();
+    molecule_to_svg_styled(mol, &StyleConfig::default())
+}
+
+/// [`molecule_to_svg`] in `style`.
+fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> String {
     let family = egui_font().1;
 
     // Standalone egui font stack: the same layout egui does on-screen, so label geometry matches.
@@ -192,7 +225,7 @@ fn molecule_to_svg(mol: &Molecule) -> String {
         egui::FontDefinitions::default(),
     );
     let mut view = fonts.with_pixels_per_point(1.0);
-    let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job));
+    let (scene, bounds) = build_scene(mol, style, |job| view.layout_job(job));
 
     let w = bounds.width() + 2.0 * MARGIN_PX;
     let h = bounds.height() + 2.0 * MARGIN_PX;
@@ -202,6 +235,24 @@ fn molecule_to_svg(mol: &Molecule) -> String {
     let mut s = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.0} {h:.0}"><g transform="translate({dx:.3},{dy:.3})">"#
     );
+
+    // Labels cut a hole through the ring fills and bonds under them (rather than covering them
+    // with white), so the background stays transparent around the labels.
+    let masked = !scene.labels.is_empty();
+    if masked {
+        let (x, y) = (bounds.min.x - MARGIN_PX, bounds.min.y - MARGIN_PX);
+        s.push_str(&format!(
+            r#"<defs><mask id="labels" maskUnits="userSpaceOnUse" x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}"><rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" fill="white"/>"#
+        ));
+        for label in scene.labels.values() {
+            let r = label.rect.expand(scene.label_bg_pad);
+            s.push_str(&format!(
+                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="black"/>"#,
+                r.min.x, r.min.y, r.width(), r.height()
+            ));
+        }
+        s.push_str(r#"</mask></defs><g mask="url(#labels)">"#);
+    }
 
     // Ring fills (backmost). Translucent RGBA → fill + fill-opacity.
     for poly in &scene.ring_fills {
@@ -236,13 +287,8 @@ fn molecule_to_svg(mol: &Molecule) -> String {
         }
     }
 
-    // White masks behind labels (hide any crossing bonds), then the label glyphs.
-    for label in scene.labels.values() {
-        let r = label.rect.expand(scene.label_bg_pad);
-        s.push_str(&format!(
-            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="white"/>"#,
-            r.min.x, r.min.y, r.width(), r.height()
-        ));
+    if masked {
+        s.push_str("</g>");
     }
     for label in scene.labels.values() {
         let base = label.rect.min;
@@ -295,7 +341,9 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         fn SetTextAlign(h: isize, a: u32) -> u32;
         fn SetTextColor(h: isize, c: u32) -> u32;
         fn TextOutW(h: isize, x: i32, y: i32, s: *const u16, c: i32) -> i32;
-        fn Ellipse(h: isize, l: i32, t: i32, r: i32, b: i32) -> i32;
+        fn ExcludeClipRect(h: isize, l: i32, t: i32, r: i32, b: i32) -> i32;
+        fn SaveDC(h: isize) -> i32;
+        fn RestoreDC(h: isize, saved: i32) -> i32;
         #[allow(clippy::too_many_arguments)]
         fn CreateFontW(ch: i32, cw: i32, esc: i32, ori: i32, wt: i32, it: u32, un: u32, so: u32,
             cs: u32, op: u32, cp: u32, q: u32, pf: u32, face: *const u16) -> isize;
@@ -319,7 +367,8 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
     let tx = |x: f32| (x + dx).round() as i32;
     let ty = |y: f32| (y + dy).round() as i32;
 
-    // GDI solid brushes have no alpha; approximate a translucent ring fill over the white page.
+    // GDI solid brushes have no alpha; approximate a translucent ring fill over a white page
+    // (the one part of the EMF picture that assumes a white background).
     let over_white = |rgba: [u8; 4]| -> u32 {
         let a = rgba[3] as f32 / 255.0;
         let blend = |v: u8| (v as f32 * a + 255.0 * (1.0 - a)).round() as u32;
@@ -337,6 +386,25 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         let no_pen = CreatePen(5, 0, WHITE); // PS_NULL
         let black_brush = CreateSolidBrush(BLACK);
         let old_pen = SelectObject(hdc, pen);
+
+        // Shown labels, centered on their atoms (the anchor point of the on-screen label).
+        let r = (style.label_size * 0.75).round() as i32;
+        let labels: Vec<(i32, i32, String)> = mol
+            .atoms
+            .iter()
+            .filter(|atom| draw::should_show_label(mol, atom.id))
+            .map(|atom| {
+                let c = egui::pos2(atom.pos[0] * SCALE_FACTOR, atom.pos[1] * SCALE_FACTOR);
+                (tx(c.x), ty(c.y), flatten_label(mol, atom))
+            })
+            .collect();
+
+        // Ring fills and bonds are clipped out around each label (rather than covered with
+        // white), so the background stays transparent there.
+        let saved = SaveDC(hdc);
+        for &(cx, cy, _) in &labels {
+            ExcludeClipRect(hdc, cx - r, cy - r, cx + r, cy + r);
+        }
 
         // Ring fills (backmost): filled polygons, no outline.
         for poly in &scene.ring_fills {
@@ -365,35 +433,22 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
             }
         }
 
-        // Labels: white disc mask + centered plain text (flattened rich label).
-        let white_brush = CreateSolidBrush(WHITE);
+        // Labels: centered plain text (flattened rich label), unclipped.
+        RestoreDC(hdc, saved);
         let face: Vec<u16> = "Arial\0".encode_utf16().collect();
         let font_h = -(style.label_size.round() as i32);
         let font = CreateFontW(font_h, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
         let old_font = SelectObject(hdc, font);
         SetTextColor(hdc, BLACK);
         SetTextAlign(hdc, 6); // TA_CENTER
-        let r = (style.label_size * 0.75).round() as i32;
-        for atom in &mol.atoms {
-            if !draw::should_show_label(mol, atom.id) {
-                continue;
-            }
-            // Center the plain text on the atom position (anchor point of the on-screen label).
-            let c = egui::pos2(atom.pos[0] * SCALE_FACTOR, atom.pos[1] * SCALE_FACTOR);
-            let (cx, cy) = (tx(c.x), ty(c.y));
-            SelectObject(hdc, white_brush);
-            SelectObject(hdc, no_pen);
-            Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-            SelectObject(hdc, pen);
-            let text = flatten_label(mol, atom);
+        for (cx, cy, text) in &labels {
             let utf16: Vec<u16> = text.encode_utf16().collect();
-            TextOutW(hdc, cx, cy + font_h / 2, utf16.as_ptr(), utf16.len() as i32);
+            TextOutW(hdc, *cx, cy + font_h / 2, utf16.as_ptr(), utf16.len() as i32);
         }
 
         SelectObject(hdc, old_font);
         SelectObject(hdc, old_pen);
         DeleteObject(font);
-        DeleteObject(white_brush);
         DeleteObject(black_brush);
         DeleteObject(no_pen);
         DeleteObject(pen);
@@ -419,6 +474,24 @@ mod tests {
     use crate::molecule::{BondOrder, BondStereo};
 
     #[test]
+    fn preview_is_drawn_at_chemdraws_scale() {
+        let mut mol = Molecule::default();
+        let a = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = mol.add_atom("C".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(a, b, crate::molecule::BondOrder::Single);
+        let (png, [w, h]) = preview_png(&mol, 2400).expect("a picture");
+        assert_eq!(&png[1..4], b"PNG");
+        // One 14.4 pt bond plus the margins on both sides.
+        assert!((w - (14.4 + 2.0 * MARGIN_PX * PT_PER_PX)).abs() < 2.0, "width {w} pt");
+        assert!(h > 0.0);
+        let (small, _) = preview_png(&mol, 20).unwrap();
+        let width = u32::from_be_bytes([small[16], small[17], small[18], small[19]]);
+        assert!(width <= 20, "fits {width}");
+        assert!(preview_png(&Molecule::default(), 100).is_none());
+        assert_eq!(&blank_png(4, 2)[1..4], b"PNG");
+    }
+
+    #[test]
     fn svg_draws_bonds_and_heteroatom_labels() {
         let mut mol = Molecule::default();
         let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
@@ -430,6 +503,31 @@ mod tests {
         assert_eq!(svg.matches("<line").count(), 2, "double bond renders two lines");
         assert!(svg.contains(">O</text>"), "oxygen gets a label");
         assert!(!svg.contains(">C</text>"), "carbon stays a skeletal vertex");
+    }
+
+    #[test]
+    fn labels_cut_holes_instead_of_painting_white() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let o = mol.add_atom("O".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(c, o, BondOrder::Single);
+        let svg = molecule_to_svg(&mol);
+        assert!(svg.contains(r#"<mask id="labels""#), "labels mask the drawing");
+        assert!(svg.contains(r#"mask="url(#labels)""#));
+        assert_eq!(svg.matches(r#"fill="white""#).count(), 1, "the only white is the mask's own");
+
+        // Without labels there is no mask at all.
+        let mut bare = Molecule::default();
+        let a = bare.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = bare.add_atom("C".to_string(), [1.5, 0.0], 0);
+        bare.add_bond(a, b, BondOrder::Single);
+        assert!(!molecule_to_svg(&bare).contains("mask"));
+
+        // The preview has a transparent background and no white box behind the label.
+        let (png, _) = preview_png(&mol, 2400).unwrap();
+        let pixmap = resvg::tiny_skia::Pixmap::decode_png(&png).unwrap();
+        assert!(pixmap.data().chunks_exact(4).any(|p| p[3] == 0), "background is transparent");
+        assert!(!pixmap.data().chunks_exact(4).any(|p| p == [255, 255, 255, 255]), "no white boxes");
     }
 
     #[test]

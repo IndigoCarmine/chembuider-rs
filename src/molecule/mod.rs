@@ -4,8 +4,9 @@ pub mod fragment;
 pub mod canonical;
 pub mod cleanup;
 pub mod smiles;
-#[cfg(windows)]
 pub mod cdx;
+pub mod cdx_codec;
+pub mod elements;
 #[cfg(windows)]
 pub mod image;
 #[cfg(windows)]

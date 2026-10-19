@@ -177,6 +177,28 @@ fn def_wavy_amplitude() -> f32 { 3.0 }
 fn def_label_trim_pad() -> f32 { 2.0 }
 fn def_label_bg_pad() -> f32 { 1.0 }
 
+impl StyleConfig {
+    /// ChemDraw's drawing style (its ACS-like default: 10 pt labels and 0.6 pt lines on a
+    /// 14.4 pt bond), in the editor's pixels: how a structure is drawn for a document, so it
+    /// sits beside ones drawn in ChemDraw.
+    pub fn chemdraw() -> Self {
+        let pt = crate::widget::SCALE_FACTOR * 1.5 / 14.4;
+        Self {
+            label_size: 10.0 * pt,
+            bond_width: 0.6 * pt,
+            double_bond_offset: 2.6 * pt,
+            atom_bg_radius: def_atom_bg_radius(),
+            wedge_width: 1.3 * pt,
+            bold_width: 2.0 * pt,
+            dash_len: 0.8 * pt,
+            dash_gap: 1.2 * pt,
+            wavy_amplitude: 1.2 * pt,
+            label_trim_pad: 1.2 * pt,
+            label_bg_pad: 0.8 * pt,
+        }
+    }
+}
+
 impl Default for StyleConfig {
     fn default() -> Self {
         Self {

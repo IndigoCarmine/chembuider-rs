@@ -13,10 +13,12 @@ use std::io::{Cursor, Write};
 
 /// ChemDraw's OLE class id, in raw CFBF directory-entry byte order
 /// ({41BA6D21-A02E-11CE-8FD9-0020AFD1F20C}, captured from ChemDraw's clipboard).
-const CHEMDRAW_CLSID: [u8; 16] = [
+pub const CHEMDRAW_CLSID: [u8; 16] = [
     0x21, 0x6d, 0xba, 0x41, 0x2e, 0xa0, 0xce, 0x11, 0x8f, 0xd9, 0x00, 0x20, 0xaf, 0xd1, 0xf2, 0x0c,
 ];
-const CHEMDRAW_USER_TYPE: &str = "CS ChemDraw 64-bit Drawing";
+pub const CHEMDRAW_USER_TYPE: &str = "CS ChemDraw 64-bit Drawing";
+/// ChemDraw's ProgID (64-bit ChemDraw, as Office writes it into documents).
+pub const CHEMDRAW_PROG_ID: &str = "ChemDraw_x64.Document.6.0";
 
 /// ChemDraw's `\x01CompObj` stream verbatim (identifies the embedded object's server: CLSID,
 /// user-type "CS ChemDraw 64-bit Drawing", clipboard format, ProgID "ChemDraw_x64.Document.6.0").

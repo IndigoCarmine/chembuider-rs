@@ -28,6 +28,10 @@ pub mod widget;
 #[cfg(windows)]
 mod clipboard;
 
+/// ChemBuilder as ibisOffice's editor for embedded ChemDraw objects.
+#[cfg(all(windows, feature = "office"))]
+pub mod office;
+
 /// Shared harness for driving the widget through synthetic egui frames in tests.
 #[cfg(test)]
 pub(crate) mod testkit;

@@ -168,7 +168,7 @@ pub fn draw_atom_labels(
 /// `Right` is the normal reading order ("OH", "NH2"); `Left` mirrors it ("HO", "H2N")
 /// so the hydrogens point into free space when the bonds come from the right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HSide {
+pub(crate) enum HSide {
     Right,
     Left,
 }
@@ -178,7 +178,7 @@ enum HSide {
 /// hydrogens flip there. Near-vertical sums inside the deadzone and unbonded atoms keep
 /// the default `Right`. (Vertical H placement — H above/below for straight-up bonds, as
 /// ChemDraw does in crowded rings — is a possible future refinement.)
-fn h_side(mol: &crate::molecule::Molecule, atom_id: u32) -> HSide {
+pub(crate) fn h_side(mol: &crate::molecule::Molecule, atom_id: u32) -> HSide {
     const H_FLIP_DEADZONE: f32 = 0.1;
     let Some(atom) = mol.atom_by_id(atom_id) else { return HSide::Right };
     let mut sum_x = 0.0_f32;

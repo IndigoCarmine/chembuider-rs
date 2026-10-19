@@ -1,7 +1,5 @@
 //! Convert a `Molecule` into ChemDraw **CDXML** (the XML serialization of the CDX format,
-//! extension `.cdxml`). Unlike the binary [`cdx`](super::cdx) writer — which is Windows-only
-//! because it rides the `cdx-file-rs`/`cfb`/`clipboard-win` stack for the clipboard — CDXML is
-//! plain text, so this module is fully cross-platform (no `#[cfg(windows)]` gate). It follows the
+//! extension `.cdxml`). It follows the
 //! same design as [`mol2`](super::mol2): a pure function that takes a `&Molecule` and returns a
 //! `String`. Output only; no parsing.
 //!
@@ -152,16 +150,8 @@ fn xml_escape(input: &str) -> String {
     out
 }
 
-/// Atomic number for common element symbols (None → treated as carbon / default node by ChemDraw).
-/// Mirrors the table in the binary [`cdx`](super::cdx) writer; kept local because that module is
-/// Windows-gated and this one must build everywhere.
 fn atomic_number(el: &str) -> Option<u16> {
-    Some(match el {
-        "H" => 1, "He" => 2, "Li" => 3, "Be" => 4, "B" => 5, "C" => 6, "N" => 7, "O" => 8,
-        "F" => 9, "Ne" => 10, "Na" => 11, "Mg" => 12, "Al" => 13, "Si" => 14, "P" => 15,
-        "S" => 16, "Cl" => 17, "Ar" => 18, "K" => 19, "Ca" => 20, "Br" => 35, "I" => 53,
-        _ => return None,
-    })
+    super::elements::atomic_number(el)
 }
 
 #[cfg(test)]

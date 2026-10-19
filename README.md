@@ -152,6 +152,30 @@ reads `chembuilder_config.json` and a `fragments/` directory from the working di
 `Config::save()` writes them back. New fragments can be saved straight from the example app's
 toolbar.
 
+## Editing ChemDraw objects in ibisOffice
+
+`chembuilder-office` (feature `office`, Windows) is an external editor for
+[ibisOffice](https://github.com/IndigoCarmine/ibis-office): its embedded structures are ChemDraw
+objects (`ChemDraw_x64.Document.6.0`, the CDX in `CONTENTS`), so a file saved in ibisOffice opens
+in PowerPoint/Word/Excel with ChemDraw, and the other way round.
+
+```sh
+cargo build --release --features office --bin chembuilder-office
+target/release/chembuilder-office --install-ibis-handler   # writes %APPDATA%\ibisOffice\embed-handlers\chembuilder.toml
+```
+
+In ibisOffice, then:
+
+- double-click a ChemDraw object to edit it here; each edit goes back to the document;
+- Ctrl+V a structure copied in ChemDraw (or ChemBuilder) to paste it as a ChemDraw object;
+- Insert ▸ Object ▸ ChemBuilder for a new one, or ▸ From File for a `.cdx`;
+- Ctrl+C an object to paste it into Office or ChemDraw.
+
+ChemDraw's own pictures of objects (vector EMF) are drawn by ChemBuilder on the screen; the
+file keeps them until an object is edited. Run by hand, `chembuilder-office file.cdx` edits a
+CDX file. The protocol is implemented from ibisOffice's published description and shares no
+code with it.
+
 ## Platform support
 
 The editor is cross-platform. The CDX / image / OLE **clipboard** features are Windows-only
