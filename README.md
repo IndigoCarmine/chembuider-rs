@@ -223,5 +223,6 @@ Pre-1.0 and evolving; the public API may change between minor versions.
 
 ## License
 
-Copyright © 2026 IndigoCarmine. All rights reserved. See [LICENSE](LICENSE).
-The licensing terms are still to be determined.
+Copyright © 2026 IndigoCarmine.
+
+Licensed under the [GNU General Public License, version 2 or (at your option) any later version](LICENSE) (GPL-2.0-or-later).

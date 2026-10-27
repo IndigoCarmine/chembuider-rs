@@ -221,5 +221,6 @@ assets/               デフォルト設定と組み込みフラグメント JSO
 
 ## ライセンス
 
-Copyright © 2026 IndigoCarmine. All rights reserved. [LICENSE](LICENSE) を参照してください。
-ライセンス条項は今後決定予定です。
+Copyright © 2026 IndigoCarmine.
+
+[GNU General Public License バージョン 2、または（任意で）それ以降のバージョン](LICENSE)（GPL-2.0-or-later）の下でライセンスされています。
