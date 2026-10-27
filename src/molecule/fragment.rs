@@ -152,8 +152,9 @@ impl Fragment {
     /// JSON), and the code that saves fragments builds their path from it. Refused: the empty
     /// name; path separators (`/`, `\`), `:` (a Windows drive or stream) and `..`; control
     /// characters; a trailing `.` or whitespace (Windows drops them, so the file would not be
-    /// the one named); and the Windows device names `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
-    /// `LPT1`–`LPT9`, also with an extension (`NUL.x`), in any case.
+    /// the one named); and the Windows device names `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
+    /// `CONOUT$`, `COM1`–`COM9`, `COM¹`–`COM³`, `LPT1`–`LPT9`, `LPT¹`–`LPT³`, also with an
+    /// extension (`NUL.x`) or trailing spaces before it (`CON .x`), in any case.
     ///
     /// Every place that writes `fragments/<name>.json` calls this first, and fragments whose
     /// name fails it are skipped when loading.
@@ -171,10 +172,16 @@ impl Fragment {
             return Err(format!("fragment name {name:?} ends with a dot or whitespace"));
         }
         let device = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+        // Windows also reserves COM¹–COM³ / LPT¹–LPT³ (superscript digits).
         let numbered = |prefix: &str| {
-            device.strip_prefix(prefix).is_some_and(|d| matches!(d.as_bytes(), [b'1'..=b'9']))
+            device.strip_prefix(prefix).is_some_and(|d| {
+                matches!(d, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            })
         };
-        if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT") {
+        if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+            || numbered("COM")
+            || numbered("LPT")
+        {
             return Err(format!("fragment name {name:?} is a reserved device name on Windows"));
         }
         Ok(())
@@ -384,13 +391,14 @@ mod tests {
             "", "../evil", "..", "a..b", "a/b", "/abs", "a\\b", "C:x", "x:stream", "tab\there",
             "nl\n", "nul\0", "trailing.", "trailing ", "trailing\t", "CON", "con", "Prn", "AUX",
             "NUL", "NUL.x", "nul.tar.gz", "CON .x", "COM1", "com9", "LPT1", "lpt9.json",
+            "COM¹", "lpt²", "COM³.json", "CONIN$", "conout$.x",
         ];
         for name in bad {
             assert!(Fragment::validate_name(name).is_err(), "{name:?} must be refused");
         }
         let good = [
             "OH", "CO2Me", "C12H25", "benzene", "ring6", "my group", "N-Boc", "a.b", "COM",
-            "COM0", "COM10", "LPT", "CONx", "Nul2", ".hidden", "Ph",
+            "COM0", "COM10", "LPT", "CONx", "Nul2", ".hidden", "Ph", "COM⁴", "CONIN", "CONOUT",
         ];
         for name in good {
             assert!(Fragment::validate_name(name).is_ok(), "{name:?} must be accepted");
