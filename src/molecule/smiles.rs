@@ -598,26 +598,54 @@ impl<'a> Search<'a> {
         // order the bonds happen to sit in `Molecule::bonds` — a ring-fusion carbon carries two
         // of them, and without this the same molecule built two ways writes `C2=CC=CC=C21` one
         // time and `C2=CC=CC=C12` the next.
-        let mut pos = vec![usize::MAX; self.sk.len()];
-        let mut next = 0usize;
-        self.number(self.root, &mut pos, &mut next);
+        let pos = self.number();
 
+        // Atoms are written in the same depth-first order they were numbered in, with the
+        // tree walked through an explicit stack (the tree can be as deep as the component is
+        // large). Each atom's work is pushed in reverse so that it pops in writing order:
+        // a branch is `(` bond atom-and-subtree `)`, and the last child is written unbranched.
         let mut out = String::new();
         let mut open: HashMap<usize, u8> = HashMap::new();
         let mut free = [true; 100];
-        self.write(self.root, &pos, &mut out, &mut open, &mut free);
+        let mut todo = vec![Write::Atom(self.root)];
+        while let Some(w) = todo.pop() {
+            match w {
+                Write::Text(t) => out.push_str(t),
+                Write::Atom(i) => {
+                    self.write_atom(i, &pos, &mut out, &mut open, &mut free);
+                    let kids = &self.children[i];
+                    for (k, &b) in kids.iter().enumerate().rev() {
+                        let last = k + 1 == kids.len();
+                        if !last {
+                            todo.push(Write::Text(")"));
+                        }
+                        todo.push(Write::Atom(self.sk.other(b, i)));
+                        todo.push(Write::Text(bond_symbol(self.sk.order(b))));
+                        if !last {
+                            todo.push(Write::Text("("));
+                        }
+                    }
+                }
+            }
+        }
         out
     }
 
-    fn number(&self, i: usize, pos: &mut Vec<usize>, next: &mut usize) {
-        pos[i] = *next;
-        *next += 1;
-        for &b in &self.children[i] {
-            self.number(self.sk.other(b, i), pos, next);
+    /// Each atom's position in depth-first preorder, children in the order they are written.
+    fn number(&self) -> Vec<usize> {
+        let mut pos = vec![usize::MAX; self.sk.len()];
+        let mut next = 0usize;
+        let mut todo = vec![self.root];
+        while let Some(i) = todo.pop() {
+            pos[i] = next;
+            next += 1;
+            todo.extend(self.children[i].iter().rev().map(|&b| self.sk.other(b, i)));
         }
+        pos
     }
 
-    fn write(
+    /// An atom's token followed by its ring-closure digits.
+    fn write_atom(
         &self,
         i: usize,
         pos: &[usize],
@@ -646,20 +674,15 @@ impl<'a> Search<'a> {
                 }
             }
         }
-
-        let kids = &self.children[i];
-        for (k, &b) in kids.iter().enumerate() {
-            let last = k + 1 == kids.len();
-            if !last {
-                out.push('(');
-            }
-            out.push_str(bond_symbol(self.sk.order(b)));
-            self.write(self.sk.other(b, i), pos, out, open, free);
-            if !last {
-                out.push(')');
-            }
-        }
     }
+}
+
+/// One pending piece of [`Search::render`]'s output.
+enum Write {
+    /// An atom, its ring digits and then everything below it in the tree.
+    Atom(usize),
+    /// A bond symbol or a branch parenthesis.
+    Text(&'static str),
 }
 
 /// Ring-closure numbers past 9 need the `%nn` escape, single digits must not use it.
@@ -1243,6 +1266,36 @@ mod tests {
         assert_eq!(want.len(), cases.len(), "characterization.txt is out of step with the cases");
         for ((name, m), want) in cases.iter().zip(want) {
             assert_eq!(characterization_line(name, m), want, "{name}");
+        }
+    }
+
+    /// [`to_smiles`] runs on the UI thread, on whatever came in off the clipboard, so the depth
+    /// of the structure must never become the depth of the call stack: an overflow there is not
+    /// a panic but an abort that takes every unsaved drawing with it. A 256 KiB stack is a
+    /// quarter of the smallest main-thread stack a desktop platform gives (Windows, 1 MiB); the
+    /// recursive writer already overflowed it at three hundred atoms, so a thousand leaves a
+    /// wide margin. (Exhaustive search is quadratic on a chain, which is what keeps N modest.)
+    #[test]
+    fn a_long_chain_or_ring_does_not_exhaust_a_small_stack() {
+        const N: usize = 1000;
+        for ring in [false, true] {
+            let m = carbon_path(N, ring);
+            let s = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || to_smiles(&m))
+                .expect("spawn a thread with a small stack")
+                .join()
+                .expect("to_smiles panicked");
+
+            let want = if ring {
+                format!("C1{}C1", "C".repeat(N - 2))
+            } else {
+                "C".repeat(N)
+            };
+            assert_eq!(s, want, "ring: {ring}");
+            let (parsed, _) = parse(&s);
+            assert_eq!(parsed.atoms.len(), N, "ring: {ring}");
+            assert_eq!(parsed.bonds.len(), if ring { N } else { N - 1 }, "ring: {ring}");
         }
     }
 
