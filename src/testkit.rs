@@ -327,9 +327,11 @@ pub(crate) fn script_fixtures() -> Vec<(String, crate::molecule::Molecule)> {
 /// screen), `Noop` is skipped, and a `clip` line is emitted whenever the clip rect changes.
 ///
 /// Coordinates are rounded to 3 decimals so the fingerprint does not hinge on the last bits
-/// of float arithmetic. Text is recorded by its string, section colours and font sizes and
-/// its rounded position, not by its glyph geometry, so it does not depend on how the font
-/// is rasterized.
+/// of float arithmetic. Text is recorded by its string, section colours, font sizes and
+/// families, its rounded position and the shape-level paint attributes (override colour,
+/// opacity, angle, fallback colour, underline), not by its glyph geometry, so it does not
+/// depend on how the font is rasterized. Rects and paths carry every attribute that changes
+/// what they paint (corner radius, stroke kind, blur, pixel rounding, angle, brush).
 ///
 /// One ordering is deliberately not pinned: within a run of consecutive unstroked rects of
 /// the same fill colour, the lines are sorted. Painting one colour over itself gives the same
@@ -411,12 +413,23 @@ fn fp_shape(shape: &egui::Shape, out: &mut Vec<FpLine>) {
         }
         Shape::Rect(r) => {
             let unstroked = r.stroke.width == 0.0 || r.stroke.color.a() == 0;
+            let cr = r.corner_radius;
             out.push(FpLine {
                 text: format!(
-                    "rect {} fill={} stroke={}",
+                    "rect {} fill={} stroke={} corner={}/{}/{}/{} kind={:?} blur={} round_px={:?} \
+                     angle={} brush={}",
                     fp_rect(r.rect),
                     fp_color(r.fill),
                     fp_stroke(r.stroke),
+                    cr.nw,
+                    cr.ne,
+                    cr.sw,
+                    cr.se,
+                    r.stroke_kind,
+                    fp_num(r.blur_width),
+                    r.round_to_pixels,
+                    fp_num(r.angle),
+                    if r.brush.is_some() { "set" } else { "none" },
                 ),
                 plain_fill: unstroked.then_some(r.fill),
             });
@@ -450,12 +463,13 @@ fn fp_shape(shape: &egui::Shape, out: &mut Vec<FpLine>) {
             };
             let pts: Vec<String> = p.points.iter().map(|q| fp_pos(*q)).collect();
             format!(
-                "path closed={} fill={} stroke={}/{} pts=[{}]",
+                "path closed={} fill={} stroke={}/{} pts=[{}] kind={:?}",
                 p.closed,
                 fp_color(p.fill),
                 fp_num(p.stroke.width),
                 stroke_color,
                 pts.join(" "),
+                p.stroke.kind,
             )
         }
         Shape::Text(t) => {
@@ -472,7 +486,21 @@ fn fp_shape(shape: &egui::Shape, out: &mut Vec<FpLine>) {
                     )
                 })
                 .collect();
-            format!("text {:?} at={} sections=[{}]", job.text, fp_pos(t.pos), sections.join(" "))
+            let families: Vec<String> =
+                job.sections.iter().map(|s| format!("{:?}", s.format.font_id.family)).collect();
+            format!(
+                "text {:?} at={} sections=[{}] families=[{}] override={} opacity={} angle={} \
+                 fallback={} underline={}",
+                job.text,
+                fp_pos(t.pos),
+                sections.join(" "),
+                families.join(" "),
+                t.override_text_color.map_or_else(|| "none".to_string(), fp_color),
+                fp_num(t.opacity_factor),
+                fp_num(t.angle),
+                fp_color(t.fallback_color),
+                fp_stroke(t.underline),
+            )
         }
         Shape::Mesh(m) => format!("mesh vertices={} indices={}", m.vertices.len(), m.indices.len()),
         Shape::QuadraticBezier(b) => {
