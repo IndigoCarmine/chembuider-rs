@@ -302,13 +302,12 @@ impl Config {
         if let Some(def) = self.fragments.iter().find(|f| f.name == name) {
             return Some(def.to_fragment());
         }
-        if let Some(size) = name
+        if let Some(ring) = name
             .strip_prefix("ring")
             .and_then(|s| s.parse::<usize>().ok())
+            .and_then(ring_of_size)
         {
-            if (3..=12).contains(&size) {
-                return Some(Fragment::ring(size));
-            }
+            return Some(ring);
         }
         if name == "benzene" {
             return Some(Fragment::benzene());
@@ -322,13 +321,23 @@ impl Config {
                 .resolve_fragment(fragment)
                 .map(ResolvedAtomAction::InsertFragment),
             AtomAction::Ring { ring } => {
-                Some(ResolvedAtomAction::InsertFragment(Fragment::ring(*ring)))
+                ring_of_size(*ring).map(ResolvedAtomAction::InsertFragment)
             }
             AtomAction::Chain { chain } => Some(ResolvedAtomAction::ExtendChain(*chain, false)),
             AtomAction::Zigzag { zigzag } => Some(ResolvedAtomAction::ExtendChain(*zigzag, true)),
             AtomAction::Charge { charge } => Some(ResolvedAtomAction::ModifyCharge(*charge)),
         }
     }
+}
+
+/// Ring sizes a config value may ask for, whether as a `"ringN"` fragment name or a
+/// `{"ring": N}` atom shortcut. Both come from user-editable files, so anything outside this
+/// range resolves to nothing instead of reaching [`Fragment::ring`], which asserts `n >= 3`.
+const RING_SIZES: std::ops::RangeInclusive<usize> = 3..=12;
+
+/// The n-membered carbocycle, if `n` is a ring size config values may ask for.
+fn ring_of_size(n: usize) -> Option<Fragment> {
+    RING_SIZES.contains(&n).then(|| Fragment::ring(n))
 }
 
 /// Resolved atom action ready for the editor to execute.
@@ -473,5 +482,44 @@ pub fn ring_fragment_def(n: usize) -> FragmentDef {
         atoms,
         bonds,
         attach_idx: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        // Never `Config::load` — that reads the developer's own config and `fragments/`.
+        Config::embedded()
+    }
+
+    fn ring_action(ring: usize) -> Option<ResolvedAtomAction> {
+        cfg().atom_action_to_fragment(&AtomAction::Ring { ring })
+    }
+
+    /// `ring` comes from the user-editable `chembuilder_config.json`; an out-of-range size
+    /// must resolve to no action rather than reach `Fragment::ring`'s `assert!(n >= 3)`.
+    #[test]
+    fn ring_shortcut_outside_valid_sizes_resolves_to_none() {
+        for ring in [0, 1, 2, 13, 1000] {
+            assert!(ring_action(ring).is_none(), "ring {ring}");
+        }
+    }
+
+    /// The `{"ring": N}` shortcut and the `"ringN"` fragment name accept the same sizes.
+    #[test]
+    fn ring_shortcut_and_ring_name_accept_the_same_sizes() {
+        for n in 0..=20 {
+            let by_action = match ring_action(n) {
+                Some(ResolvedAtomAction::InsertFragment(f)) => Some(f.atoms.len()),
+                Some(_) => panic!("ring {n} must insert a fragment"),
+                None => None,
+            };
+            let by_name = cfg()
+                .resolve_fragment(&format!("ring{n}"))
+                .map(|f| f.atoms.len());
+            assert_eq!(by_action, by_name, "ring {n}");
+        }
     }
 }
