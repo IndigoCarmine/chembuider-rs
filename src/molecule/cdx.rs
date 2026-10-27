@@ -54,13 +54,15 @@ const NODE_EXTERNAL_CONNECTION_POINT: i16 = 12;
 const ALIGN_LEFT: u8 = 1;
 const ALIGN_RIGHT: u8 = 3;
 
-/// The most nodes a document's structures may have, and the most bonds, for [`read_cdx`] to
-/// read it. The largest real drawings (a long polymer, a big reaction scheme in ChemDraw) have a
-/// few thousand atoms and bonds; these leave a margin of more than twenty times that. A CDX
-/// beyond them is no drawing to edit but bytes that would keep the reader, and an Office host
-/// waiting on a Render or Import, busy (a bare node and bond take about 30 bytes, so a pipe
-/// frame of 256 MiB could hold millions), and the editor's own work on a molecule (drawing,
-/// looking atoms and bonds up) is not made for such sizes either.
+/// The most atoms, and the most bonds, a document's structures may make for [`read_cdx`] to
+/// read it: its nodes and bonds, and the hydrogens (with their bonds) that the nodes' hydrogen
+/// counts add, counted as if every node got them. The largest real drawings (a long polymer, a
+/// big reaction scheme in ChemDraw) have a few thousand atoms and bonds; these leave a margin
+/// of more than twenty times that. A CDX beyond them is no drawing to edit but bytes that would
+/// keep the reader, and an Office host waiting on a Render or Import, busy (a bare node and
+/// bond take about 30 bytes, so a pipe frame of 256 MiB could hold millions), and the editor's
+/// own work on a molecule (drawing, looking atoms and bonds up) is not made for such sizes
+/// either.
 const MAX_READ_ATOMS: usize = 100_000;
 /// See [`MAX_READ_ATOMS`].
 const MAX_READ_BONDS: usize = 100_000;
@@ -525,10 +527,8 @@ fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
         let pos = [x as f32, y as f32];
         let atom = mol.add_atom(element, pos, charge);
         atoms.insert(node.id, atom);
-        if node_type == NODE_ELEMENT
-            && let Some(h) = node.prop_int(PROP_ATOM_NUM_HYDROGENS).filter(|&h| h > 0)
-        {
-            hydrogens.push((atom, pos, h.min(8) as usize));
+        if let Some(h) = hydrogen_count(node) {
+            hydrogens.push((atom, pos, h));
         }
     }
     for bond in frag.children.iter().filter(|c| c.tag == OBJ_BOND) {
@@ -571,20 +571,35 @@ fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
     }
 }
 
-/// Add up the nodes and bonds of `obj`'s structures, the ones [`read_container`] reads.
-fn count_structures(obj: &CdxObject, nodes: &mut usize, bonds: &mut usize) {
+/// The hydrogens an element node's count (NH4+) gives it, as many as [`read_fragment`] adds
+/// for them: at most 8 (and only to a node that ends up with no bonds).
+fn hydrogen_count(node: &CdxObject) -> Option<usize> {
+    if node.prop_i16(PROP_NODE_TYPE).unwrap_or(NODE_ELEMENT) != NODE_ELEMENT {
+        return None;
+    }
+    node.prop_int(PROP_ATOM_NUM_HYDROGENS).filter(|&h| h > 0).map(|h| h.min(8) as usize)
+}
+
+/// Add up the most atoms and bonds [`read_container`] can make of `obj`'s structures: a node
+/// and a bond each, and each node's hydrogens with their bonds, whether or not the node ends up
+/// with bonds of its own (which would leave its hydrogens out).
+fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut usize) {
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => {
                 for c in &child.children {
                     match c.tag {
-                        OBJ_NODE => *nodes += 1,
+                        OBJ_NODE => {
+                            let h = hydrogen_count(c).unwrap_or(0);
+                            *atoms += 1 + h;
+                            *bonds += h;
+                        }
                         OBJ_BOND => *bonds += 1,
                         _ => {}
                     }
                 }
             }
-            OBJ_GROUP => count_structures(child, nodes, bonds),
+            OBJ_GROUP => count_structures(child, atoms, bonds),
             _ => {}
         }
     }
@@ -605,12 +620,13 @@ fn read_container(obj: &CdxObject, mol: &mut Molecule, others: &mut usize) {
 pub fn read_cdx(bytes: &[u8]) -> Option<CdxImport> {
     let doc = cdx_codec::parse(bytes).filter(|d| d.tag == OBJ_DOCUMENT)?;
     let pages = || doc.children.iter().filter(|c| c.tag == OBJ_PAGE);
-    let (mut nodes, mut bonds) = (0, 0);
+    let (mut atoms, mut bonds) = (0, 0);
     for page in pages() {
-        count_structures(page, &mut nodes, &mut bonds);
+        count_structures(page, &mut atoms, &mut bonds);
     }
-    // Checked before anything is built. Hydrogen counts add at most 8 atoms a node.
-    if nodes > MAX_READ_ATOMS || bonds > MAX_READ_BONDS {
+    // Checked before anything is built, on an upper bound of what reading makes (hydrogens
+    // included): the molecule read never has more atoms or bonds than the limits.
+    if atoms > MAX_READ_ATOMS || bonds > MAX_READ_BONDS {
         return None;
     }
     let mut molecule = Molecule::default();
@@ -870,8 +886,9 @@ mod tests {
     }
 
     /// A CDX document with one fragment per entry of `chains`: a chain of that many carbons,
-    /// each bonded to the next, plus every bond of the chain `repeats` more times.
-    fn chain_document(chains: &[usize], repeats: usize) -> Vec<u8> {
+    /// each with a hydrogen count of `hydrogens` when that is not 0, and the chain's bonds, each
+    /// from one carbon to the next, given `passes` times (none at all when 0).
+    fn chain_document(chains: &[usize], passes: usize, hydrogens: i16) -> Vec<u8> {
         let mut next = 1;
         let mut id = || {
             next += 1;
@@ -884,9 +901,12 @@ mod tests {
             for (k, &node) in nodes.iter().enumerate() {
                 let mut obj = CdxObject::new(OBJ_NODE, node);
                 obj.set(PROP_2D_POSITION, point(0.0, k as f64 * SCALE));
+                if hydrogens != 0 {
+                    obj.set(PROP_ATOM_NUM_HYDROGENS, hydrogens.to_le_bytes().to_vec());
+                }
                 frag.children.push(obj);
             }
-            for _ in 0..=repeats {
+            for _ in 0..passes {
                 for pair in nodes.windows(2) {
                     let mut bond = CdxObject::new(OBJ_BOND, id());
                     bond.set(PROP_BOND_BEGIN, pair[0].to_le_bytes().to_vec());
@@ -903,10 +923,10 @@ mod tests {
 
     #[test]
     fn reads_a_chain_as_large_as_allowed_and_drops_repeated_bonds() {
-        let import = read_cdx(&chain_document(&[MAX_READ_ATOMS / 2], 1)).expect("within the limits");
+        let import = read_cdx(&chain_document(&[MAX_READ_ATOMS / 2], 2, 0)).expect("within the limits");
         assert_eq!(import.molecule.atoms.len(), MAX_READ_ATOMS / 2);
         assert_eq!(import.molecule.bonds.len(), MAX_READ_ATOMS / 2 - 1, "a bond given twice is one bond");
-        let import = read_cdx(&chain_document(&[MAX_READ_ATOMS / 2, MAX_READ_ATOMS / 2], 0)).expect("within the limits");
+        let import = read_cdx(&chain_document(&[MAX_READ_ATOMS / 2, MAX_READ_ATOMS / 2], 1, 0)).expect("within the limits");
         assert_eq!(import.molecule.atoms.len(), MAX_READ_ATOMS);
         assert_eq!(import.molecule.bonds.len(), MAX_READ_ATOMS - 2);
     }
@@ -914,11 +934,30 @@ mod tests {
     #[test]
     fn refuses_documents_with_more_atoms_or_bonds_than_allowed() {
         // In one fragment, and across fragments of one document.
-        assert!(read_cdx(&chain_document(&[MAX_READ_ATOMS + 1], 0)).is_none());
-        assert!(read_cdx(&chain_document(&[MAX_READ_ATOMS / 2 + 1, MAX_READ_ATOMS / 2], 0)).is_none());
+        assert!(read_cdx(&chain_document(&[MAX_READ_ATOMS + 1], 1, 0)).is_none());
+        assert!(read_cdx(&chain_document(&[MAX_READ_ATOMS / 2 + 1, MAX_READ_ATOMS / 2], 1, 0)).is_none());
         // Bonds over the limit, even when they repeat bonds already there.
-        assert!(read_cdx(&chain_document(&[MAX_READ_BONDS / 2 + 2], 1)).is_none());
-        assert!(cdx_bytes_to_molecule(&chain_document(&[MAX_READ_ATOMS + 1], 0)).is_none());
+        assert!(read_cdx(&chain_document(&[MAX_READ_BONDS / 2 + 2], 2, 0)).is_none());
+        assert!(cdx_bytes_to_molecule(&chain_document(&[MAX_READ_ATOMS + 1], 1, 0)).is_none());
+    }
+
+    #[test]
+    fn counts_the_hydrogens_nodes_bring_against_the_limits() {
+        // Carbons on their own, each with eight hydrogens (more are read as eight): nine atoms
+        // and eight bonds a node.
+        let n = MAX_READ_ATOMS / 9;
+        for h in [8, 100] {
+            let mol = read_cdx(&chain_document(&[n], 0, h)).expect("within the limits").molecule;
+            assert_eq!(mol.atoms.len(), 9 * n);
+            assert_eq!(mol.bonds.len(), 8 * n);
+            assert!(mol.atoms.iter().filter(|a| a.element == "H").all(|a| a.group_h));
+        }
+        assert!(read_cdx(&chain_document(&[n + 1], 0, 8)).is_none(), "too many atoms with the hydrogens");
+        // Hydrogens counted, and their bonds, even on a node whose bonds leave them out.
+        let n = MAX_READ_BONDS / 3 + 2;
+        assert!(2 * n <= MAX_READ_ATOMS && 2 * (n - 1) <= MAX_READ_BONDS);
+        assert!(read_cdx(&chain_document(&[n], 2, 0)).is_some());
+        assert!(read_cdx(&chain_document(&[n], 2, 1)).is_none(), "too many bonds with the hydrogens");
     }
 
     #[test]
