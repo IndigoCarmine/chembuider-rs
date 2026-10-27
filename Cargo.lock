@@ -296,7 +296,7 @@ dependencies = [
 [[package]]
 name = "cdx-file-rs"
 version = "0.1.0"
-source = "git+https://github.com/IndigoCarmine/cdx_file_rs?rev=87ebf5d2b3bb19e148d6f142638ee47a5fd3d67d#87ebf5d2b3bb19e148d6f142638ee47a5fd3d67d"
+source = "git+https://github.com/IndigoCarmine/cdx_file_rs?rev=b29982e5ca67fdcaaff7961e3562a7e2387e0a04#b29982e5ca67fdcaaff7961e3562a7e2387e0a04"
 dependencies = [
  "binrw",
  "byteorder",
