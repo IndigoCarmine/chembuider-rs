@@ -761,6 +761,16 @@ impl DragSource {
     fn is_slot(self, index: usize, part: SchemePart) -> bool {
         matches!(self, Self::ArrowLabel { index: i, part: p } if i == index && p == part)
     }
+
+    /// True when what was picked up is a structure — the only thing an arrow slot can take.
+    /// A `+`, a text item or an arrow (including one picked up by its own empty band) is not,
+    /// so passing over a band leaves it reordering along the line.
+    fn carries_structure(self, scheme: &ReactionScheme) -> bool {
+        match self {
+            Self::Item(i) => matches!(scheme.items.get(i), Some(SchemeItem::Structure(_))),
+            Self::ArrowLabel { index, part } => scheme_arrow_structure(scheme, index, part).is_some(),
+        }
+    }
 }
 
 /// A scheme item being dragged: either reordered along the line, or dropped onto an arrow slot.
@@ -771,9 +781,9 @@ struct DragReorder {
     /// Reorder slot for a main-line drag, and the insertion slot an arrow-label structure would
     /// rejoin the line at: the number of items that will sit to its left (`0..=items.len()`).
     insert_at: usize,
-    /// The arrow above/below slot under the pointer, when the drop would land on one. Only slots
-    /// that can *accept* a structure — empty or structure-occupied, never text — and never the
-    /// source's own slot.
+    /// The arrow above/below slot under the pointer, when the drop would land on one. Only while
+    /// a structure is being dragged, only slots that can *accept* it — empty or
+    /// structure-occupied, never text — and never the source's own slot.
     to_slot: Option<(usize, SchemePart)>,
     /// Whether the pointer is over any arrow band. For an arrow-label source this is what tells
     /// "resting on a band" (its own, or a text one — do nothing) apart from "over the reaction
@@ -1052,12 +1062,16 @@ impl ReactionEditor {
                 let source = drag.source;
                 drag.insert_at = scheme_drop_index(&layout, rect.min, p);
                 // A drop onto an arrow band takes priority over reordering: the structure lands
-                // in that slot. Only an *acceptable* slot counts — not the source's own, and not
-                // a text label (dropping a structure there would clobber the text, so it is left
-                // to reorder along the line instead).
+                // in that slot. Only a dragged *structure* is offered a slot, and only an
+                // *acceptable* one — not the source's own, and not a text label (dropping a
+                // structure there would clobber the text, so it is left to reorder along the
+                // line instead). Anything else stays a reorder.
+                let carries_structure = source.carries_structure(&reaction.scheme);
                 drag.to_slot = arrow_slot_at(&reaction.scheme, &layout, rect.min, p).filter(
                     |&(ti, tp)| {
-                        !source.is_slot(ti, tp) && !arrow_slot_holds_text(&reaction.scheme, ti, tp)
+                        carries_structure
+                            && !source.is_slot(ti, tp)
+                            && !arrow_slot_holds_text(&reaction.scheme, ti, tp)
                     },
                 );
                 drag.over_band = matches!(
@@ -2530,6 +2544,139 @@ mod tests {
         );
         assert!(editor.take_scheme_rearranged(), "the reorder is reported");
         assert!(!editor.take_scheme_rearranged(), "and only once");
+    }
+
+    /// Through the widget, with a real pointer: only a dragged *structure* is offered an arrow
+    /// slot. A `+` (or the arrow itself, picked up by one of its own empty bands) passing over a
+    /// band is still a reorder — no slot is targeted, and letting go moves it along the line.
+    /// A structure over the same band still targets it and lands there.
+    #[test]
+    fn only_a_dragged_structure_targets_an_arrow_slot() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        /// Press at `start`, cross the drag threshold at `nudge`, move to `end`, and return
+        /// the slot the drag is targeting there (before letting go).
+        fn drag_to(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            start: Pos2,
+            nudge: Pos2,
+            end: Pos2,
+        ) -> Option<(usize, SchemePart)> {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(ctx, editor, reaction, vec![button(start, true)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(nudge)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the item up");
+            editor.drag.and_then(|d| d.to_slot)
+        }
+        let scheme = || {
+            ReactionScheme::new()
+                .structure(demo::phenol())
+                .plus()
+                .structure(demo::benzene())
+                .arrow(Arrow::new())
+                .structure(demo::anisole())
+        };
+
+        // A `+` dragged over the arrow's empty above band: no slot, and the drop reorders.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let plus = scheme_item_rect(&layout, origin, 1, SchemePart::Plus).unwrap();
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        // Just right of the arrow's centre, so four items sit left of the pointer.
+        let end = band.center() + Vec2::new(4.0, 0.0);
+        assert_eq!(scheme_drop_index(&layout, origin, end), 4);
+        let start = plus.left_center() + Vec2::new(1.0, 0.0);
+        let nudge = plus.right_center() - Vec2::new(1.0, 0.0);
+        let to_slot = drag_to(&ctx, &mut editor, &mut reaction, start, nudge, end);
+        assert_eq!(to_slot, None, "a `+` is not offered the arrow slot");
+        frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+        assert!(!editor.is_dragging());
+        assert!(
+            matches!(reaction.scheme.items[3], SchemeItem::Plus),
+            "the `+` reordered to just after the arrow"
+        );
+        let SchemeItem::Arrow(a) = &reaction.scheme.items[2] else { panic!("item 2 is the arrow") };
+        assert!(a.above.is_empty(), "the band was left alone");
+        assert!(editor.take_scheme_rearranged(), "the reorder is reported");
+
+        // The arrow itself, picked up by its own empty above band and held there: its own band
+        // is not a drop target, and letting go in place moves nothing.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        let start = band.center() - Vec2::new(10.0, 0.0);
+        let end = band.center() - Vec2::new(1.0, 0.0);
+        let to_slot = drag_to(&ctx, &mut editor, &mut reaction, start, end, end);
+        assert_eq!(to_slot, None, "the arrow is not offered its own band");
+        frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+        assert_eq!(reaction.scheme.items.len(), 5);
+        assert!(matches!(reaction.scheme.items[1], SchemeItem::Plus), "nothing moved");
+        let SchemeItem::Arrow(a) = &reaction.scheme.items[3] else { panic!("item 3 is the arrow") };
+        assert!(a.above.is_empty() && a.below.is_empty(), "the bands were left alone");
+        assert!(!editor.take_scheme_rearranged(), "dropped back in place");
+
+        // A structure over the same band still targets it, and lands on it.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let benzene = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        let start = benzene.center();
+        let to_slot = drag_to(
+            &ctx,
+            &mut editor,
+            &mut reaction,
+            start,
+            start + Vec2::new(12.0, 0.0),
+            band.center(),
+        );
+        assert_eq!(to_slot, Some((3, SchemePart::ArrowAbove)));
+        frame(&ctx, &mut editor, &mut reaction, vec![button(band.center(), false)]);
+        assert!(
+            scheme_arrow_structure(&reaction.scheme, 2, SchemePart::ArrowAbove)
+                .is_some_and(|m| *m == demo::benzene()),
+            "benzene now rides above the arrow"
+        );
+        assert!(editor.take_scheme_rearranged());
     }
 
     /// Through the widget, with a real pointer and keyboard: picking up a scheme item while the
