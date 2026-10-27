@@ -144,7 +144,19 @@ impl Tab {
                     self.changed_outside = true;
                     return Ok(());
                 }
-                std::fs::write(&path, &cdx_bytes).map_err(|e| e.to_string())?;
+                if let Err(e) = std::fs::write(&path, &cdx_bytes) {
+                    // A write that fails after truncating (disk full, a network drive gone)
+                    // leaves the file empty or half written. That is ours, not another
+                    // program's change, so it is what the next try compares against and
+                    // writes over in full. If it cannot be read either, `on_disk` is left
+                    // alone: the next try fails to read it too and reports that instead.
+                    match std::fs::read(&path) {
+                        Ok(bytes) => *on_disk = Some(bytes),
+                        Err(r) if r.kind() == std::io::ErrorKind::NotFound => *on_disk = None,
+                        Err(_) => {}
+                    }
+                    return Err(e.to_string());
+                }
                 *on_disk = Some(cdx_bytes);
             }
         }
