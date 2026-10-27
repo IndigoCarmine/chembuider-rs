@@ -1,5 +1,4 @@
 pub mod mol2;
-pub mod cdxml;
 pub mod fragment;
 pub mod canonical;
 pub mod cleanup;

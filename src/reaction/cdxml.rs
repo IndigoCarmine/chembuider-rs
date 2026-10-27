@@ -99,7 +99,8 @@ impl ReactionStyle {
 
 // ─── Writing ─────────────────────────────────────────────────────────────────
 
-/// `scheme` as a ChemDraw document (write it with [`cdx_codec::write`] or [`cdxml_of`]). The
+/// `scheme` as a ChemDraw document (write it with [`cdx_codec::write`] or
+/// [`cdx::cdxml_of_document`]). The
 /// painter measures text; `scratch` is a drawing context for structures, as for
 /// [`measure_scheme`].
 pub fn scheme_document(
@@ -118,11 +119,6 @@ pub fn scheme_document(
     structure_style.label_trim_pad *= to_pt;
     let layout = measure_scheme(scheme, painter, &pt_style, &structure_style, scratch);
     Writer::new(&pt_style).document(scheme, &layout)
-}
-
-/// A ChemDraw document as CDXML text.
-pub fn cdxml_of(doc: &CdxObject) -> String {
-    cdx::cdxml_of_document(doc)
 }
 
 /// What one scheme item became: the objects that stand for it in a step.

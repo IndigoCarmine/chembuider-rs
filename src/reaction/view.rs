@@ -166,7 +166,7 @@ impl ReactionView {
 
     /// The figure's scheme as CDXML text.
     pub fn scheme_cdxml(&mut self, painter: &Painter, scheme: &ReactionScheme) -> String {
-        super::cdxml::cdxml_of(&self.scheme_document(painter, scheme))
+        crate::molecule::cdx::cdxml_of_document(&self.scheme_document(painter, scheme))
     }
 
     /// The figure's scheme as a binary CDX file.

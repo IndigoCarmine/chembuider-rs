@@ -43,7 +43,7 @@ const PROP_LABEL_ALIGNMENT: u16 = 0x0705;
 pub(crate) const PROP_UTF8_TEXT: u16 = 0x0709;
 const PROP_BOND_ORDER: u16 = 0x0600;
 const PROP_BOND_DISPLAY: u16 = 0x0601;
-const PROP_BOND_DOUBLE_POSITION: u16 = 0x0602;
+const PROP_BOND_DOUBLE_POSITION: u16 = 0x0603;
 const PROP_BOND_BEGIN: u16 = 0x0604;
 const PROP_BOND_END: u16 = 0x0605;
 
@@ -239,7 +239,7 @@ pub(super) struct NodeLabel {
 }
 
 /// How an atom is written as a node of a ChemDraw document. One set of rules for both of
-/// ChemDraw's formats, the binary CDX here and its XML form ([`super::cdxml`]), so the two
+/// ChemDraw's formats, the binary CDX here and its XML form ([`molecule_to_cdxml`]), so the two
 /// describe the same structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NodeRules {
@@ -529,8 +529,19 @@ pub(crate) fn new_document() -> CdxObject {
     doc
 }
 
-/// A new ChemDraw document holding `mol` (an empty page when it has no atoms).
+/// A new ChemDraw document holding `mol` (an empty page when it has no atoms), as CDX bytes.
 pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
+    cdx_codec::write(&molecule_document(mol))
+}
+
+/// The same document as [`molecule_to_cdx_document`], written as CDXML: one object tree, two
+/// encodings, so both formats describe the same structure.
+pub fn molecule_to_cdxml(mol: &Molecule) -> String {
+    cdxml_of_document(&molecule_document(mol))
+}
+
+/// A new ChemDraw document holding `mol`, as its object tree.
+fn molecule_document(mol: &Molecule) -> CdxObject {
     let mut doc = new_document();
     let mut next = 0;
     let mut page = CdxObject::new(OBJ_PAGE, {
@@ -542,7 +553,7 @@ pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
         doc.props.insert(1, (PROP_BOUNDING_BOX, rect(bbox)));
     }
     doc.children.push(page);
-    cdx_codec::write(&doc)
+    doc
 }
 
 /// Serialize `mol` to CDX bytes, or None if empty (nothing to put on the clipboard).
@@ -1332,15 +1343,13 @@ mod tests {
         bytes
     }
 
-    /// Both writers write [`writer_fixture`] byte for byte as they did when the golden files were
+    /// The writer writes [`writer_fixture`] byte for byte as they did when the golden files were
     /// saved (before the writers looked atoms up from an index), so a change to how they find
     /// their way around the molecule changes nothing they write.
     #[test]
     fn writers_keep_their_output() {
         let m = writer_fixture();
         assert_eq!(cdx_without_version(&m), include_bytes!("../../tests/fixtures/writer_golden.cdx"));
-        let golden = include_str!("../../tests/fixtures/writer_golden.cdxml").replace("\r\n", "\n");
-        assert_eq!(super::super::cdxml::to_cdxml(&m), golden);
     }
 
     /// A zigzag chain of `n` atoms, every tenth an NH whose hydrogen is folded into its label.
@@ -1374,9 +1383,109 @@ mod tests {
             let cdx = molecule_to_cdx_document(&m);
             let t_cdx = t.elapsed();
             let t = std::time::Instant::now();
-            let xml = super::super::cdxml::to_cdxml(&m);
+            let xml = molecule_to_cdxml(&m);
             let t_xml = t.elapsed();
             println!("{n:>7} atoms: cdx {t_cdx:?} ({} bytes), cdxml {t_xml:?} ({} bytes)", cdx.len(), xml.len());
         }
+    }
+
+    // ── CDXML: the same document, written as XML ────────────────────────────
+
+    fn count(hay: &str, needle: &str) -> usize {
+        hay.matches(needle).count()
+    }
+
+    /// A CDXML document reads back to the molecule the CDX one does.
+    fn assert_cdxml_reads_like_cdx(m: &Molecule) -> String {
+        let xml = molecule_to_cdxml(m);
+        let from_xml = read_cdxml(&xml).expect("CDXML reads").molecule;
+        let from_cdx = read_cdx(&molecule_to_cdx_document(m)).expect("CDX reads").molecule;
+        assert_eq!(from_xml, from_cdx, "{xml}");
+        let read = cdx_file_rs::cdxml::parse_cdxml_with_warnings(&xml).unwrap();
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        xml
+    }
+
+    #[test]
+    fn cdxml_is_the_cdx_document_written_as_xml() {
+        let xml = assert_cdxml_reads_like_cdx(&writer_fixture());
+        assert!(xml.starts_with("<?xml ") && xml.contains("<!DOCTYPE CDXML"));
+        // ChemDraw's own style: 14.4 pt, as ChemDraw stores it.
+        assert!(xml.contains("BondLength=\"14.399994\""), "{xml}");
+        assert!(xml.contains("<font id=\"3\" charset=\"iso-8859-1\" name=\"Arial\"/>"), "{xml}");
+    }
+
+    #[test]
+    fn cdxml_names_elements_charges_and_bond_styles() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let o = mol.add_atom("O".to_string(), [1.5, 0.0], -1);
+        let n = mol.add_atom("N".to_string(), [0.0, 1.5], 0);
+        let up = mol.add_bond(c, o, BondOrder::Single);
+        mol.bond_by_id_mut(up).unwrap().stereo = BondStereo::WedgeUp;
+        let down = mol.add_bond(c, n, BondOrder::Single);
+        mol.bond_by_id_mut(down).unwrap().stereo = BondStereo::WedgeDown;
+        let xml = assert_cdxml_reads_like_cdx(&mol);
+        assert_eq!(count(&xml, "Element="), 2, "carbon is the default node: {xml}");
+        assert!(xml.contains("Element=\"8\"") && xml.contains("Element=\"7\""), "{xml}");
+        assert!(xml.contains("Charge=\"-1\""), "{xml}");
+        assert!(xml.contains("Display=\"WedgeBegin\"") && xml.contains("Display=\"WedgedHashBegin\""), "{xml}");
+    }
+
+    #[test]
+    fn cdxml_keeps_the_bond_menus_orders_styles_and_double_positions() {
+        let mut mol = Molecule::default();
+        let atoms: Vec<u32> = (0..6).map(|k| mol.add_atom("C".to_string(), [k as f32, 0.0], 0)).collect();
+        let mut bond = |k: usize, order: BondOrder, stereo: BondStereo, position: DoublePosition| {
+            let id = mol.add_bond(atoms[k], atoms[k + 1], order);
+            let b = mol.bond_by_id_mut(id).unwrap();
+            b.stereo = stereo;
+            b.double_position = position;
+        };
+        bond(0, BondOrder::Quadruple, BondStereo::None, DoublePosition::Auto);
+        bond(1, BondOrder::Single, BondStereo::Hashed, DoublePosition::Auto);
+        bond(2, BondOrder::Single, BondStereo::HollowWedge, DoublePosition::Auto);
+        bond(3, BondOrder::Single, BondStereo::Dative, DoublePosition::Auto);
+        bond(4, BondOrder::Double, BondStereo::None, DoublePosition::Left);
+        let xml = assert_cdxml_reads_like_cdx(&mol);
+        assert_eq!(count(&xml, "Order=\"4\""), 1, "{xml}");
+        assert_eq!(count(&xml, "Display=\"Hash\""), 1, "{xml}");
+        assert_eq!(count(&xml, "Display=\"HollowWedgeBegin\""), 1, "{xml}");
+        assert_eq!(count(&xml, "Order=\"dative\""), 1, "{xml}");
+        assert_eq!(count(&xml, "DoublePosition=\"Left\""), 1, "{xml}");
+        assert!(!xml.contains("Display2"), "the double bond's side is its own property: {xml}");
+        // And back: the side the user chose survives CDX.
+        let read = read_cdx(&molecule_to_cdx_document(&mol)).unwrap().molecule;
+        assert!(read.bonds.iter().any(|b| b.double_position == DoublePosition::Left));
+    }
+
+    #[test]
+    fn cdxml_labels_are_unspecified_nodes_with_their_text() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let ester = mol.add_atom("CO_2Et".to_string(), [0.0, -1.5], 0);
+        let odd = mol.add_atom("R&D<1>".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(c, ester, BondOrder::Single);
+        mol.add_bond(c, odd, BondOrder::Single);
+        let xml = assert_cdxml_reads_like_cdx(&mol);
+        assert_eq!(count(&xml, "NodeType=\"Unspecified\""), 2, "{xml}");
+        assert!(xml.contains(">CO</s><s font=\"3\" size=\"10\" face=\"32\" color=\"0\">2</s>"), "{xml}");
+        assert!(xml.contains("R&amp;D&lt;1&gt;") && !xml.contains("R&D"), "{xml}");
+    }
+
+    #[test]
+    fn cdxml_folds_group_hydrogens_into_the_label() {
+        // H2N–CH3, with one hydrogen of the NH2 an atom brought in by the group.
+        let mut mol = Molecule::default();
+        let n = mol.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let c = mol.add_atom("C".to_string(), [1.3, 0.75], 0);
+        mol.add_bond(n, c, BondOrder::Single);
+        let h = mol.add_atom("H".to_string(), [-1.0, 0.5], 0);
+        mol.atom_by_id_mut(h).unwrap().group_h = true;
+        mol.add_bond(n, h, BondOrder::Single);
+        let xml = molecule_to_cdxml(&mol);
+        assert_eq!(count(&xml, "<n "), 2, "the group's hydrogen is not a node: {xml}");
+        assert_eq!(count(&xml, "<b "), 1, "nor is its bond: {xml}");
+        assert!(xml.contains("NumHydrogens=\"2\"") && xml.contains("LabelAlignment=\"Right\""), "{xml}");
     }
 }

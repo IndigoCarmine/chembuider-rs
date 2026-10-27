@@ -10,7 +10,7 @@
 //! Analysis side panel (formula, exact mass, MW, ESI m/z, elemental analysis). The
 //! widget itself is library code; everything here is host-app glue you'd write per application.
 
-use chembuider_rs::molecule::cdxml::to_cdxml;
+use chembuider_rs::molecule::cdx::molecule_to_cdxml;
 use chembuider_rs::molecule::mol2::to_mol2_string;
 use chembuider_rs::molecule::smiles::to_smiles;
 use chembuider_rs::widget::analysis::AnalysisPanel;
@@ -355,7 +355,7 @@ impl EditorApp {
             self.status = "Nothing to export — draw a molecule first.".to_string();
             return;
         }
-        let cdxml_text = to_cdxml(&self.editor.molecule);
+        let cdxml_text = molecule_to_cdxml(&self.editor.molecule);
 
         #[cfg(not(target_arch = "wasm32"))]
         {

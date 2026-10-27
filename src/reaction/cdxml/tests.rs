@@ -95,7 +95,7 @@ fn a_multi_step_scheme_survives_cdxml() {
     assert_eq!(count(&doc, OBJ_CHEMICAL_PROPERTY), 6);
     assert_eq!(count(&doc, OBJ_GRAPHIC), 4);
 
-    let xml = cdxml_of(&doc);
+    let xml = cdx::cdxml_of_document(&doc);
     assert!(xml.contains("<step") && xml.contains("<chemicalproperty"), "{xml}");
     let read = scheme_from_cdxml(&xml).expect("a scheme");
     assert_eq!(outline(&read), outline(&scheme));
@@ -136,7 +136,7 @@ fn reagents_keep_their_scripts_and_a_structure_on_the_arrow_stays_there() {
         .structure(demo::methyl_iodide())
         .arrow(Arrow::new().above_structure(demo::biphenyl()).below("K_2CO_3, Δ"))
         .structure(demo::anisole());
-    let read = scheme_from_cdxml(&cdxml_of(&document(&scheme))).expect("a scheme");
+    let read = scheme_from_cdxml(&cdx::cdxml_of_document(&document(&scheme))).expect("a scheme");
     assert_eq!(outline(&read), outline(&scheme));
 }
 
@@ -169,7 +169,7 @@ fn chemdraw_units_keep_the_row_limit_in_proportion() {
 #[test]
 fn written_cdxml_reads_back_without_warnings() {
     for scheme in [demo::multi_step_scheme().scheme, demo::williamson_ether_synthesis().scheme] {
-        let xml = cdxml_of(&document(&scheme));
+        let xml = cdx::cdxml_of_document(&document(&scheme));
         let read = cdx_file_rs::cdxml::parse_cdxml_with_warnings(&xml).unwrap();
         assert!(read.warnings.is_empty(), "{:?}", read.warnings);
     }
