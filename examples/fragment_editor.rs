@@ -16,9 +16,14 @@
 //! loads at startup.
 
 use chembuider_rs::molecule::fragment::Fragment;
-use chembuider_rs::widget::SCALE_FACTOR;
+use chembuider_rs::widget::FitOptions;
 use chembuider_rs::{ChemStructEditor, Molecule, Tool};
 use eframe::{egui, App};
+
+/// How a loaded fragment is framed: fragments are small, so allow up to 2x before stopping,
+/// and keep a 60 px margin around the drawing (atoms and their labels).
+const LOAD_FIT: FitOptions =
+    FitOptions { margin: 60.0, min_zoom: 0.2, max_zoom: 2.0, keep_zoom: false };
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -44,8 +49,6 @@ struct FragmentEditorApp {
     fragments: Vec<String>,
     /// Index into `fragments` currently chosen in the Load combo.
     selected_load: usize,
-    /// After a load, re-fit the view on the next frame (when the canvas rect is known).
-    pending_fit: bool,
     status: String,
 }
 
@@ -57,7 +60,6 @@ impl Default for FragmentEditorApp {
             attach_atom: None,
             fragments: Vec::new(),
             selected_load: 0,
-            pending_fit: false,
             status: "Draw a fragment (Bond tool), type a name, then 💾 Save. Attach point defaults \
                      to the first atom — override it with 🎯 Set Attach on a selected atom."
                 .to_string(),
@@ -69,6 +71,8 @@ impl Default for FragmentEditorApp {
 
 impl App for FragmentEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Set by a successful Load in the toolbar; the canvas below fits the view this frame.
+        let mut loaded = false;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 // ── Tools ──────────────────────────────────────────────────────
@@ -140,7 +144,10 @@ impl App for FragmentEditorApp {
                 if ui.button("📂 Load").clicked() {
                     if let Some(name) = self.fragments.get(self.selected_load).cloned() {
                         self.status = match self.load_fragment(&name) {
-                            Ok(msg) => msg,
+                            Ok(msg) => {
+                                loaded = true;
+                                msg
+                            }
                             Err(e) => format!("Load failed: {e}"),
                         };
                     } else {
@@ -178,10 +185,10 @@ impl App for FragmentEditorApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // A load happened last frame with no canvas rect yet; fit now that we have one.
-            if self.pending_fit {
-                fit_view(&mut self.editor, ui.available_rect_before_wrap());
-                self.pending_fit = false;
+            // The toolbar and status panels are laid out by now, so the rect `editor.ui` is
+            // about to fill is known: fit on it in the same frame as the load.
+            if loaded {
+                self.editor.fit_view_with(ui.ctx(), ui.available_rect_before_wrap(), LOAD_FIT);
             }
             self.editor.ui(ui);
         });
@@ -235,7 +242,6 @@ impl FragmentEditorApp {
         self.attach_atom = Some(attach_id);
         self.editor.hotspot_atom = Some(attach_id);
         self.name = frag.name.clone();
-        self.pending_fit = true;
         Ok(format!(
             "Loaded '{}' ({} atoms); attach = atom #{attach_id}.",
             frag.name,
@@ -293,27 +299,4 @@ impl FragmentEditorApp {
             frag.atoms.len()
         ))
     }
-}
-
-/// Zoom/pan the editor so the molecule fills `canvas` with a comfortable margin. Adapted from
-/// `examples/render_gallery.rs`'s `fit_view` (screen-space transform is affine in zoom/pan, so
-/// centering the centroid means `pan = -centroid * zoom * SCALE_FACTOR`).
-fn fit_view(editor: &mut ChemStructEditor, canvas: egui::Rect) {
-    if editor.molecule.atoms.is_empty() {
-        return;
-    }
-    let xs = editor.molecule.atoms.iter().map(|a| a.pos[0]);
-    let ys = editor.molecule.atoms.iter().map(|a| a.pos[1]);
-    let (min_x, max_x) = xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
-    let (min_y, max_y) = ys.fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
-    let w = (max_x - min_x).max(1.0) * SCALE_FACTOR;
-    let h = (max_y - min_y).max(1.0) * SCALE_FACTOR;
-    let zoom = ((canvas.width() - 120.0) / w).min((canvas.height() - 100.0) / h);
-    editor.zoom = zoom.clamp(0.2, 2.0);
-    let cx = (min_x + max_x) * 0.5;
-    let cy = (min_y + max_y) * 0.5;
-    editor.pan = egui::vec2(
-        -cx * editor.zoom * SCALE_FACTOR,
-        -cy * editor.zoom * SCALE_FACTOR,
-    );
 }
