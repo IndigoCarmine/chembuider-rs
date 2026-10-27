@@ -170,13 +170,6 @@ pub fn process_bond_tool(
         }
     }
 
-    // ── Middle-click pan ─────────────────────────────────────────────────────
-    if ui.input(|i| i.pointer.middle_down()) {
-        if let Some(delta) = ui.input(|i| i.pointer.delta()).into() {
-            editor.pan += delta;
-        }
-    }
-
     // ── Hover + Delete: remove the atom or bond under the cursor ─────────────
     let delete_pressed =
         ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));

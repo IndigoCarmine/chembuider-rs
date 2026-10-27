@@ -1050,15 +1050,23 @@ impl ChemStructEditor {
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let tool_modified = if label_editing || cleaning || ui.ctx().egui_wants_keyboard_input() {
-            false
-        } else {
+        let canvas_input = !(label_editing || cleaning || ui.ctx().egui_wants_keyboard_input());
+        let tool_modified = if canvas_input {
             match self.tool.clone() {
                 Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
                 Tool::Select => interact::process_select_tool(self, &response, center, ui),
                 Tool::Eraser => interact::process_eraser_tool(self, &response, center),
             }
+        } else {
+            false
         };
+
+        // Middle-button drag pans the camera, whatever the tool. It runs after the tool
+        // handler so the tool still sees this frame's pre-pan view, as the Bond tool did when
+        // the pan lived inside it.
+        if canvas_input && ui.input(|i| i.pointer.middle_down()) {
+            self.pan += ui.input(|i| i.pointer.delta());
+        }
         let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
@@ -1552,9 +1560,59 @@ mod view_tests {
 
     #[test]
     fn middle_drag_pans_by_the_pointer_delta_in_the_bond_tool() {
-        let ctx = egui::Context::default();
-        let mut editor = ChemStructEditor::default();
+        let editor = ChemStructEditor::default();
         assert_eq!(editor.tool, Tool::Bond);
+        assert_middle_drag_pans(editor);
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_select_tool() {
+        assert_middle_drag_pans(ChemStructEditor { tool: Tool::Select, ..Default::default() });
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_eraser_tool() {
+        assert_middle_drag_pans(ChemStructEditor { tool: Tool::Eraser, ..Default::default() });
+    }
+
+    /// A focused text field keeps the canvas from reacting to input, the camera included.
+    #[test]
+    fn middle_drag_does_not_pan_while_a_text_field_has_focus() {
+        for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
+            let ctx = egui::Context::default();
+            let mut editor = ChemStructEditor { tool: tool.clone(), ..Default::default() };
+            let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+            let field = egui::Id::new("some_text_field");
+            let p0 = egui::pos2(300.0, 200.0);
+            let p1 = egui::pos2(340.0, 170.0);
+            let frame = |editor: &mut ChemStructEditor, events: Vec<egui::Event>| {
+                let raw = egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(raw, |ui| {
+                    ui.memory_mut(|m| m.request_focus(field));
+                    editor.ui(ui);
+                });
+            };
+            frame(&mut editor, vec![egui::Event::PointerMoved(p0)]);
+            frame(&mut editor, vec![egui::Event::PointerButton {
+                pos: p0,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: Default::default(),
+            }]);
+            let pan_start = editor.pan;
+            frame(&mut editor, vec![egui::Event::PointerMoved(p1)]);
+            assert_eq!(editor.pan, pan_start, "{tool:?}: no pan while a text field has focus");
+        }
+    }
+
+    fn assert_middle_drag_pans(mut editor: ChemStructEditor) {
+        let ctx = egui::Context::default();
+        let tool = editor.tool.clone();
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
         let p0 = egui::pos2(300.0, 200.0);
         let p1 = egui::pos2(340.0, 170.0);
@@ -1569,9 +1627,9 @@ mod view_tests {
         }]);
         let pan_start = editor.pan;
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p1)]);
-        assert_eq!(editor.pan, pan_start + (p1 - p0), "pan follows the middle-drag delta");
+        assert_eq!(editor.pan, pan_start + (p1 - p0), "{tool:?}: pan follows the middle-drag delta");
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p2)]);
-        assert_eq!(editor.pan, pan_start + (p2 - p0), "pan accumulates over the drag");
+        assert_eq!(editor.pan, pan_start + (p2 - p0), "{tool:?}: pan accumulates over the drag");
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
             pos: p2,
             button: egui::PointerButton::Middle,
@@ -1580,6 +1638,6 @@ mod view_tests {
         }]);
         let pan_end = editor.pan;
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
-        assert_eq!(editor.pan, pan_end, "moving after the release does not pan");
+        assert_eq!(editor.pan, pan_end, "{tool:?}: moving after the release does not pan");
     }
 }
