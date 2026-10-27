@@ -603,6 +603,13 @@ impl ChemStructEditor {
         ViewTransform::new(self.zoom, self.pan, center)
     }
 
+    /// Zoom by `factor` about the screen point `anchor` (see [`ViewTransform::zoomed_about`]).
+    fn zoom_about(&mut self, factor: f32, anchor: egui::Pos2, center: egui::Pos2) {
+        let zoomed = self.view(center).zoomed_about(factor, anchor);
+        self.zoom = zoomed.zoom;
+        self.pan = zoomed.pan;
+    }
+
     pub fn mol_to_screen(&self, pos: [f32; 2], center: egui::Pos2) -> egui::Pos2 {
         self.view(center).mol_to_screen(pos)
     }
@@ -884,18 +891,11 @@ impl ChemStructEditor {
         if let Some(mouse_pos) = mouse_pos {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                let factor = (scroll * 0.002).exp();
-                let before = self.screen_to_mol(mouse_pos, center);
-                self.zoom = (self.zoom * factor).clamp(0.1, 20.0);
-                let after = self.mol_to_screen(before, center);
-                self.pan += mouse_pos - after;
+                self.zoom_about((scroll * 0.002).exp(), mouse_pos, center);
             }
             let zoom_delta = ui.input(|i| i.zoom_delta());
             if (zoom_delta - 1.0).abs() > f32::EPSILON {
-                let before = self.screen_to_mol(mouse_pos, center);
-                self.zoom = (self.zoom * zoom_delta).clamp(0.1, 20.0);
-                let after = self.mol_to_screen(before, center);
-                self.pan += mouse_pos - after;
+                self.zoom_about(zoom_delta, mouse_pos, center);
             }
         }
 
@@ -1450,6 +1450,82 @@ mod view_tests {
             (editor.zoom - zoom_before).abs() > 1e-3,
             "the scroll must actually have zoomed (zoom stayed {})",
             editor.zoom
+        );
+    }
+
+    #[test]
+    fn pinch_zoom_keeps_the_point_under_the_cursor_fixed_and_is_clamped() {
+        let ctx = egui::Context::default();
+        let mut editor =
+            ChemStructEditor { zoom: 1.3, pan: egui::vec2(25.0, -15.0), ..Default::default() };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let cursor = egui::pos2(500.0, 120.0);
+        for _ in 0..2 {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+        }
+        assert!(editor.pointer_active, "the cursor must be over the canvas");
+        let before = editor.last_mouse_mol;
+
+        for (factor, zoom) in [(1.5_f32, 1.3_f32 * 1.5), (0.5, 1.3 * 1.5 * 0.5)] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::Zoom(factor)]);
+            assert!((editor.zoom - zoom).abs() <= 1e-5, "pinch {factor}: zoom {}", editor.zoom);
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+            let after = editor.last_mouse_mol;
+            assert!(
+                (after[0] - before[0]).abs() <= 1e-3 && (after[1] - before[1]).abs() <= 1e-3,
+                "pinch {factor}: the molecule point under the cursor moved from {before:?} to {after:?}"
+            );
+        }
+        for (factor, bound) in [(1.0e4_f32, 20.0_f32), (1.0e-4, 0.1)] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::Zoom(factor)]);
+            assert_eq!(editor.zoom, bound, "pinch {factor} should end at the clamp bound");
+        }
+    }
+
+    #[test]
+    fn select_drag_moves_the_atom_by_the_pointer_delta_in_molecule_units() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor {
+            tool: Tool::Select,
+            zoom: 1.7,
+            pan: egui::vec2(-20.0, 30.0),
+            ..Default::default()
+        };
+        let id = editor.molecule.add_atom("C".to_string(), [0.5, -0.25], 0);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let center = screen_rect.center();
+        let p0 = editor.mol_to_screen([0.5, -0.25], center);
+
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p0,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        // The first 5 px step stays under egui's drag threshold, so it is not a drag yet and
+        // does not move the atom; the drag (and the atom) follows from the next step on.
+        let step = egui::vec2(4.0, -3.0);
+        let mut p = p0 + step;
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+        let drag_from = p;
+        for _ in 0..5 {
+            p += step;
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+        }
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        let moved = p - drag_from;
+        let s = 1.7 * SCALE_FACTOR;
+        let pos = editor.molecule.atom_by_id(id).unwrap().pos;
+        assert!(
+            (pos[0] - (0.5 + moved.x / s)).abs() <= 1e-4
+                && (pos[1] - (-0.25 + moved.y / s)).abs() <= 1e-4,
+            "atom ended at {pos:?} after a {moved:?} drag"
         );
     }
 
