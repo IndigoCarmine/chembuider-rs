@@ -403,8 +403,8 @@ pub fn set_scheme_arrow_structure(
         return false;
     };
     match part {
-        SchemePart::ArrowAbove => a.above = ArrowLabel::Structure(molecule),
-        SchemePart::ArrowBelow => a.below = ArrowLabel::Structure(molecule),
+        SchemePart::ArrowAbove => a.above = ArrowLabel::Structure(molecule.into()),
+        SchemePart::ArrowBelow => a.below = ArrowLabel::Structure(molecule.into()),
         _ => return false,
     }
     true
@@ -426,7 +426,7 @@ pub fn take_scheme_arrow_structure(
         _ => return None,
     };
     match std::mem::replace(slot, ArrowLabel::Empty) {
-        ArrowLabel::Structure(m) => Some(m),
+        ArrowLabel::Structure(m) => Some(m.into_molecule()),
         // Text (or nothing) leaves the slot empty and reports no structure taken.
         _ => None,
     }
@@ -455,7 +455,7 @@ pub fn move_line_structure_to_arrow_slot(
     let Some(SchemeItem::Structure(mol)) = scheme.items.get(from) else {
         return None;
     };
-    let mol = mol.clone();
+    let mol = mol.molecule().clone();
     scheme.remove(from);
     let target = if from < arrow_index { arrow_index - 1 } else { arrow_index };
     set_scheme_arrow_structure(scheme, target, part, mol).then_some(target)
@@ -482,9 +482,9 @@ pub fn swap_line_structure_with_arrow_slot(
     let Some(SchemeItem::Structure(line_mol)) = scheme.items.get(from) else {
         return false;
     };
-    let line_mol = line_mol.clone();
+    let line_mol = line_mol.molecule().clone();
     set_scheme_arrow_structure(scheme, arrow_index, part, line_mol);
-    scheme.items[from] = SchemeItem::Structure(slot_mol);
+    scheme.items[from] = SchemeItem::Structure(slot_mol.into());
     true
 }
 
@@ -504,7 +504,7 @@ pub fn move_arrow_structure_to_line(
 ) -> Option<usize> {
     let mol = take_scheme_arrow_structure(scheme, index, part)?;
     let at = insert_at.min(scheme.items.len());
-    scheme.items.insert(at, SchemeItem::Structure(mol));
+    scheme.items.insert(at, SchemeItem::Structure(mol.into()));
     Some(at)
 }
 

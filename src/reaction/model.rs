@@ -351,7 +351,7 @@ impl Reaction {
         let Some(SchemeItem::Structure(molecule)) = self.scheme.items.get(scheme_index) else {
             return false;
         };
-        let molecule = molecule.clone();
+        let molecule = molecule.molecule().clone();
         match role {
             StructureRole::Reactant(n) => match self.analysis.reactants.get_mut(n) {
                 Some(r) => {
@@ -379,7 +379,7 @@ impl Reaction {
     pub fn set_scheme_structure(&mut self, scheme_index: usize, molecule: Molecule) -> bool {
         match self.scheme.items.get_mut(scheme_index) {
             Some(item) if matches!(item, SchemeItem::Structure(_)) => {
-                *item = SchemeItem::Structure(molecule);
+                *item = SchemeItem::Structure(molecule.into());
             }
             _ => return false,
         }
@@ -593,8 +593,8 @@ mod tests {
     fn bulk_sync_redraws_every_linked_column() {
         let mut reaction = demo::williamson_ether_synthesis();
         // Poke new structures straight into the scheme, bypassing the syncing setter …
-        reaction.scheme.items[0] = SchemeItem::Structure(demo::anisole());
-        reaction.scheme.items[2] = SchemeItem::Structure(demo::phenol());
+        reaction.scheme.items[0] = SchemeItem::Structure(demo::anisole().into());
+        reaction.scheme.items[2] = SchemeItem::Structure(demo::phenol().into());
         // … the table is stale until a resync.
         assert_eq!(reaction.analysis.compute().reactants[0].formula.plain(), "C6H6O");
 
@@ -790,7 +790,7 @@ mod tests {
         let values = entered_values(&reaction.analysis);
 
         // A second product structure after the anisole, added through the raw scheme API.
-        reaction.scheme.add(SchemeItem::Structure(demo::benzene()));
+        reaction.scheme.add(SchemeItem::Structure(demo::benzene().into()));
         reaction.sync_structures_from_scheme();
 
         assert_eq!(reaction.analysis.reactants.len(), 3);

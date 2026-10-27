@@ -252,7 +252,7 @@ impl ReactionApp {
         // The molecule currently in the linked slot, whichever kind of slot it is.
         let current = match target {
             StructureRef::Item(i) => match self.reaction.scheme.items.get(i) {
-                Some(SchemeItem::Structure(m)) => Some(m),
+                Some(SchemeItem::Structure(m)) => Some(m.molecule()),
                 _ => None,
             },
             StructureRef::ArrowLabel { index, part } => {
@@ -332,7 +332,7 @@ impl ReactionApp {
             if ui.button("➕ To scheme").clicked()
                 && let Some(mol) = self.canvas_structure()
             {
-                self.reaction.scheme.add(SchemeItem::Structure(mol));
+                self.reaction.scheme.add(SchemeItem::Structure(mol.into()));
                 self.status = "Added the structure to the scheme.".to_string();
             }
 
@@ -646,7 +646,7 @@ impl ReactionApp {
                 let (mol, sel) = match target {
                     StructureRef::Item(i) => match self.reaction.scheme.items.get(i) {
                         Some(SchemeItem::Structure(m)) => (
-                            Some(m.clone()),
+                            Some(m.molecule().clone()),
                             Hit::Scheme { index: i, part: SchemePart::Structure },
                         ),
                         _ => (None, Hit::Scheme { index: i, part: SchemePart::Structure }),
