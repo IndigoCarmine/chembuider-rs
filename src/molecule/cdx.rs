@@ -15,7 +15,7 @@
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
-use super::{cdx_bracket, cdx_page, cdx_table};
+use super::{cdx_bracket, cdx_fonts, cdx_page, cdx_table};
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule, PageObject};
 use super::depict;
@@ -555,7 +555,9 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
     let mut ids = WrittenIds::default();
     page.children = fragments_mapped(mol, shift, &mut next, &mut ids);
     let mut owned = cdx_page::Owned::new();
-    let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next);
+    let mut fonts = cdx_fonts::FontTable::of(&doc);
+    let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts);
+    fonts.store(&mut doc);
     page.children.extend(objects);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut page.children);
     page.children.extend(brackets);
@@ -597,8 +599,9 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     // New ids start past every id the document had, so none is reused for something else.
     let mut next = cdx_table::document_max_id(&doc);
     let mut owned = cdx_page::Owned::new();
+    let mut fonts = cdx_fonts::FontTable::of(&doc);
     for page in doc.children.iter_mut().filter(|c| c.tag == OBJ_PAGE) {
-        cdx_page::take_owned(page, &mut owned);
+        cdx_page::take_owned(page, &mut owned, &fonts);
         strip_structures(page);
     }
     if !doc.children.iter().any(|c| c.tag == OBJ_PAGE) {
@@ -611,7 +614,8 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     let shift = shift_onto_page(mol, 0.0);
     let mut ids = WrittenIds::default();
     let mut new = fragments_mapped(mol, shift, &mut next, &mut ids);
-    new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next));
+    new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts));
+    fonts.store(&mut doc);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut new);
     new.extend(brackets);
     let page = doc.children.iter_mut().find(|c| c.tag == OBJ_PAGE).expect("a page");
@@ -852,6 +856,7 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     if atoms > MAX_READ_ATOMS || bonds > MAX_READ_BONDS {
         return None;
     }
+    let fonts = cdx_fonts::FontTable::of(doc);
     let mut molecule = Molecule::default();
     let mut other_objects = 0;
     let mut first_atom = HashMap::new();
@@ -859,7 +864,7 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     // The object each ChemDraw id became (an arrow's `arrow` and its graphic both name it).
     let mut object_of: HashMap<u32, u32> = HashMap::new();
     for page in pages() {
-        let converted = cdx_page::convert_page(page);
+        let converted = cdx_page::convert_page(page, &fonts);
         let taken: HashSet<u32> = converted.iter().flat_map(|c| c.ids.iter().copied()).collect();
         read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom, &mut atoms_of);
         for mut c in converted {

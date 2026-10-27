@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod smiles;
 pub mod cdx;
 pub mod cdx_codec;
+pub(crate) mod cdx_fonts;
 pub(crate) mod cdx_page;
 pub(crate) mod cdx_table;
 pub mod reaction_table;

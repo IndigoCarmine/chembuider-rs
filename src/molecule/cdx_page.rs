@@ -22,11 +22,11 @@ use std::collections::{HashMap, HashSet};
 use super::cdx::{self, OBJ_GROUP, OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT, SCALE};
 use super::cdx_bracket::{self, OBJ_BRACKETED_GROUP};
 use super::cdx_codec::CdxObject;
+use super::cdx_fonts::{self, FontTable};
 use super::cdx_table::{self, OBJ_STOICHIOMETRY_GRID};
 use super::page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TextAlign};
 use super::Molecule;
-use crate::reaction::cdxml::{text_of, utf8_string};
-use crate::widget::rich_text::{RichText, Script};
+use crate::widget::rich_text::RichText;
 use crate::widget::scene::{
     arrow_primitives, ARROW_HEAD_CENTER, ARROW_HEAD_HALF_WIDTH, ARROW_HEAD_LENGTH, ARROW_SHAFT_SPACING, TEXT_LINE_HEIGHT,
 };
@@ -167,8 +167,8 @@ fn justification(t: &CdxObject) -> TextAlign {
 }
 
 /// A ChemDraw text as page text: its markup (lines joined by `\n`), alignment and anchor.
-fn read_text(t: &CdxObject) -> Option<PageText> {
-    let rich = text_of(t)?;
+fn read_text(t: &CdxObject, fonts: &FontTable) -> Option<PageText> {
+    let rich = cdx_fonts::text_of(t, fonts)?;
     let markup = markup_lines(&rich);
     if markup.trim().is_empty() {
         return None;
@@ -195,8 +195,9 @@ fn markup_lines(rich: &RichText) -> String {
 }
 
 /// The arrows and texts on `page` that become page objects, in document order (an arrow where
-/// its `arrow` object, or its lone graphic, stands).
-pub(crate) fn convert_page(page: &CdxObject) -> Vec<Converted> {
+/// its `arrow` object, or its lone graphic, stands). `fonts` is the document's font table, which
+/// names the texts' fonts.
+pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable) -> Vec<Converted> {
     let mut objects = Vec::new();
     page_level(page, &mut objects);
     // Arrow objects the editor draws, and the graphics superseded by them.
@@ -233,7 +234,7 @@ pub(crate) fn convert_page(page: &CdxObject) -> Vec<Converted> {
                 out.push(Converted { object: PageObject::Arrow(arrow), ids: vec![obj.id] });
             }
             OBJ_TEXT => {
-                if let Some(text) = read_text(obj) {
+                if let Some(text) = read_text(obj, fonts) {
                     out.push(Converted { object: PageObject::Text(text), ids: vec![obj.id] });
                 }
             }
@@ -409,8 +410,9 @@ fn new_arrow(arrow: &PageArrow, shift: (f64, f64), next: &mut u32) -> Vec<CdxObj
     vec![g, a]
 }
 
-/// A text's characters (lines joined by ChemDraw's `\r`) with their style runs.
-fn text_runs(text: &PageText) -> (Vec<(u16, u16)>, String) {
+/// A text's characters (lines joined by ChemDraw's `\r`) with their style runs, its fonts
+/// given ids in `fonts`.
+fn text_runs(text: &PageText, fonts: &mut FontTable) -> (Vec<cdx_fonts::StyleRun>, String) {
     let mut rich = RichText::new();
     for (k, line) in text.lines().into_iter().enumerate() {
         if k > 0 {
@@ -420,7 +422,7 @@ fn text_runs(text: &PageText) -> (Vec<(u16, u16)>, String) {
             rich = rich.span(span.text, span.style);
         }
     }
-    cdx::runs_of(&rich)
+    cdx_fonts::runs_of(&rich, fonts)
 }
 
 /// Where ChemDraw will draw `text` anchored at `at` (CDX units): an estimate from Arial's
@@ -428,15 +430,7 @@ fn text_runs(text: &PageText) -> (Vec<(u16, u16)>, String) {
 fn text_bbox(text: &PageText, at: (f64, f64)) -> [f64; 4] {
     let lines = text.lines();
     let scale = TEXT_PT / 10.0;
-    let width = |line: &RichText| -> f64 {
-        line.spans
-            .iter()
-            .map(|s| {
-                let k = if s.style.script == Script::Normal { 1.0 } else { 0.7 };
-                s.text.chars().map(cdx::arial_width).sum::<f64>() * k * scale
-            })
-            .sum()
-    };
+    let width = |line: &RichText| -> f64 { cdx_fonts::estimated_width(line) * scale };
     let widest = lines.iter().map(width).fold(0.0, f64::max);
     let left = match text.align {
         TextAlign::Left => at.0,
@@ -458,8 +452,8 @@ fn justification_value(align: TextAlign) -> Option<Vec<u8>> {
 }
 
 /// Write `text`'s characters, alignment and box into `t`, anchored at `at` (CDX units).
-fn set_text_content(t: &mut CdxObject, text: &PageText, at: (f64, f64)) {
-    let (runs, chars) = text_runs(text);
+fn set_text_content(t: &mut CdxObject, text: &PageText, at: (f64, f64), fonts: &mut FontTable) {
+    let (runs, chars) = text_runs(text, fonts);
     t.set(PROP_2D_POSITION, cdx::point(at.0, at.1));
     t.set(PROP_BOUNDING_BOX, cdx::rect(text_bbox(text, at)));
     match justification_value(text.align) {
@@ -467,18 +461,18 @@ fn set_text_content(t: &mut CdxObject, text: &PageText, at: (f64, f64)) {
         None => t.props.retain(|(tag, _)| *tag != PROP_JUSTIFICATION),
     }
     t.props.retain(|(tag, _)| *tag != PROP_CAPTION_JUSTIFICATION);
-    t.set(PROP_TEXT, cdx::cdx_string(&runs, &chars));
+    t.set(PROP_TEXT, cdx_fonts::string_of(&runs, &chars, false));
     if chars.chars().any(|c| c as u32 >= 0x100) {
-        t.set(PROP_UTF8_TEXT, utf8_string(&runs, &chars));
+        t.set(PROP_UTF8_TEXT, cdx_fonts::string_of(&runs, &chars, true));
     } else {
         t.props.retain(|(tag, _)| *tag != PROP_UTF8_TEXT);
     }
 }
 
-fn new_text(text: &PageText, shift: (f64, f64), next: &mut u32) -> CdxObject {
+fn new_text(text: &PageText, shift: (f64, f64), next: &mut u32, fonts: &mut FontTable) -> CdxObject {
     *next += 1;
     let mut t = CdxObject::new(OBJ_TEXT, *next);
-    set_text_content(&mut t, text, cdx_point(text.pos, shift));
+    set_text_content(&mut t, text, cdx_point(text.pos, shift), fonts);
     t
 }
 
@@ -488,8 +482,8 @@ fn new_text(text: &PageText, shift: (f64, f64), next: &mut u32) -> CdxObject {
 pub(crate) type Owned = HashMap<u32, (PageObject, Vec<CdxObject>)>;
 
 /// Take the objects reading converts ([`convert_page`]) off `page` (and out of its groups).
-pub(crate) fn take_owned(page: &mut CdxObject, owned: &mut Owned) {
-    let converted = convert_page(page);
+pub(crate) fn take_owned(page: &mut CdxObject, owned: &mut Owned, fonts: &FontTable) {
+    let converted = convert_page(page, fonts);
     let mut source_of: HashMap<u32, u32> = HashMap::new();
     for c in &converted {
         let source = c.object.source().expect("read objects have a source");
@@ -535,13 +529,15 @@ fn same_point(a: (f64, f64), b: (f64, f64)) -> bool {
 /// The ChemDraw objects for `mol`'s page objects, moved by `shift` (CDX units), with new ids
 /// from `next`. An object whose source is in `owned` is written as its original objects with
 /// what changed rewritten; any other is written new. `fragment_of` is the fragment each atom
-/// was written in (a table names the fragments of its columns).
+/// was written in (a table names the fragments of its columns). Texts name their fonts in
+/// `fonts`, the document's font table, which gains the fonts it lacked.
 pub(crate) fn write_objects(
     mol: &Molecule,
     fragment_of: &HashMap<u32, u32>,
     owned: &mut Owned,
     shift: (f64, f64),
     next: &mut u32,
+    fonts: &mut FontTable,
 ) -> Vec<CdxObject> {
     let mut out = Vec::new();
     for object in &mol.objects {
@@ -562,7 +558,7 @@ pub(crate) fn write_objects(
                 let was = cdx_point(read.pos, (0.0, 0.0));
                 let obj = &mut cdx_objects[0];
                 if t.text != read.text || t.align != read.align {
-                    set_text_content(obj, t, at);
+                    set_text_content(obj, t, at, fonts);
                 } else if !same_point(at, was) {
                     // Only moved: keep ChemDraw's own text (fonts, colours) and shift its box.
                     let (dx, dy) = (at.0 - was.0, at.1 - was.1);
@@ -598,7 +594,7 @@ pub(crate) fn write_objects(
             }
             (PageObject::Text(t), _) => {
                 if !t.is_blank() {
-                    out.push(new_text(t, shift, next));
+                    out.push(new_text(t, shift, next, fonts));
                 }
             }
             // Written with the fragments they enclose (`cdx_bracket::write_brackets`); what
@@ -870,6 +866,88 @@ mod tests {
         for o in [curved, hollow, resonance] {
             assert_eq!(find(&saved, o.id, o.tag), Some(o));
         }
+    }
+
+    /// The ChemDraw 25 reaction with one more text, made after the CDX specification (no
+    /// ChemDraw file with Symbol text was at hand): text 900, "60 μL, Δ, cat.", where μ and Δ
+    /// are `m` and `D` in the Symbol font (id 4, character set Symbol) and ", cat." is 12 pt
+    /// italic Times New Roman (id 5).
+    fn symbol_cdx() -> Vec<u8> {
+        let xml = String::from_utf8(fixture("chemdraw_symbol_text.cdxml")).unwrap();
+        cdx_codec::write(&crate::molecule::cdx::cdxml_document(&xml).unwrap())
+    }
+
+    const SYMBOL_MARKUP: &str = "60 {@Symbol:m}L, {@Symbol:D}{@Times New Roman,12://, cat.}//";
+
+    fn symbol_text(m: &Molecule) -> &PageText {
+        texts(m).into_iter().find(|t| t.source == Some(900)).expect("text 900")
+    }
+
+    #[test]
+    fn symbol_and_other_fonts_read_into_markup() {
+        let xml = String::from_utf8(fixture("chemdraw_symbol_text.cdxml")).unwrap();
+        for (what, import) in [("CDXML", read_cdxml(&xml).unwrap()), ("CDX", read_cdx(&symbol_cdx()).unwrap())] {
+            let t = symbol_text(&import.molecule);
+            assert_eq!(t.text, SYMBOL_MARKUP, "{what}");
+            // Shown as Greek; kept as ChemDraw's ASCII.
+            let shown: String = t.lines()[0].spans.iter().map(|s| crate::widget::fonts::display_text(s.style.font, &s.text)).collect();
+            assert_eq!(shown, "60 μL, Δ, cat.", "{what}");
+            // ChemDraw's 10 pt Arial is no font of its own.
+            assert!(texts(&import.molecule).iter().any(|t| t.text == "(I)"), "{what}");
+        }
+    }
+
+    #[test]
+    fn saving_keeps_symbol_text_and_the_font_table_as_they_were() {
+        let original = symbol_cdx();
+        let import = read_cdx(&original).unwrap();
+        let saved = merge_into_cdx(&original, &import.molecule);
+        let (before, after) = (cdx_codec::parse(&original).unwrap(), cdx_codec::parse(&saved).unwrap());
+        assert_eq!(find(&after, 900, OBJ_TEXT), find(&before, 900, OBJ_TEXT), "untouched text, byte for byte");
+        assert_eq!(after.prop(cdx_fonts::PROP_FONT_TABLE), before.prop(cdx_fonts::PROP_FONT_TABLE));
+        assert_eq!(symbol_text(&read_cdx(&saved).unwrap().molecule).text, SYMBOL_MARKUP);
+    }
+
+    #[test]
+    fn edited_and_new_symbol_text_is_written_in_the_symbol_font() {
+        let original = symbol_cdx();
+        let mut m = read_cdx(&original).unwrap().molecule;
+        if let Some(PageObject::Text(t)) = m.objects.iter_mut().find(|o| o.source() == Some(85)) {
+            t.text = "{@Symbol:p}-(I)".into();
+        }
+        m.add_text([20.0, 9.0], "{@Georgia:x} {@Symbol:a}");
+        let saved = merge_into_cdx(&original, &m);
+        let doc = cdx_codec::parse(&saved).unwrap();
+        let table = FontTable::of(&doc);
+        // Symbol is reused (id 4); Georgia is new, after the fonts the file had.
+        assert_eq!(table.name(4), Some("Symbol"));
+        assert_eq!(table.name(6), Some("Georgia"));
+        let (runs, chars) = cdx_fonts::parse_string(find(&doc, 85, OBJ_TEXT).unwrap().prop(PROP_TEXT).unwrap()).unwrap();
+        assert_eq!(chars, "p-(I)", "Symbol text is stored as ChemDraw's ASCII");
+        assert_eq!((runs[0].font, runs[1].font), (4, 3));
+        let again = read_cdx(&saved).unwrap().molecule;
+        let t: Vec<&str> = texts(&again).iter().map(|t| t.text.as_str()).collect();
+        assert!(t.contains(&"{@Symbol:p}-(I)") && t.contains(&"{@Georgia:x} {@Symbol:a}"), "{t:?}");
+        // And as CDXML, the Symbol font with its character set.
+        let xml = crate::molecule::cdx::cdxml_of_document(&doc);
+        assert!(xml.contains("<font id=\"4\" charset=\"Symbol\" name=\"Symbol\"/>"), "{xml}");
+        assert!(xml.contains("<s font=\"4\" size=\"10\" face=\"0\" color=\"0\">p</s>"), "{xml}");
+    }
+
+    #[test]
+    fn a_new_document_lists_the_fonts_its_texts_use() {
+        let mut m = drawn();
+        m.add_text([7.0, 10.0], "{@Symbol:b}-{@Times New Roman,14:x}");
+        let xml = molecule_to_cdxml(&m);
+        assert!(xml.contains("charset=\"Symbol\" name=\"Symbol\""), "{xml}");
+        assert!(xml.contains("name=\"Times New Roman\""), "{xml}");
+        let read = cdx_file_rs::cdxml::parse_cdxml_with_warnings(&xml).unwrap();
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        same_objects(&m, &read_cdxml(&xml).unwrap().molecule);
+        same_objects(&m, &read_cdx(&molecule_to_cdx_document(&m)).unwrap().molecule);
+        // Text in the default font adds nothing to ChemDraw's table.
+        let plain = molecule_to_cdx_document(&drawn());
+        assert_eq!(FontTable::of(&cdx_codec::parse(&plain).unwrap()).name(4), None);
     }
 
     #[test]
