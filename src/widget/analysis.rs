@@ -1,6 +1,6 @@
 //! An "Analysis" panel in the manner of ChemDraw's: chemical formula, exact mass, molecular
-//! weight, the m/z pattern of a chosen ESI ion and the elemental analysis of the structure
-//! being drawn.
+//! weight, the m/z pattern of a chosen ESI ion, the elemental analysis and the IUPAC name
+//! ([`crate::naming`]) of the structure being drawn.
 //!
 //! [`AnalysisPanel`] holds only the ion choice (and a cache); the host passes the molecule
 //! and selection in every frame:
@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 
 use crate::molecule::Molecule;
+use crate::naming::{has_stereo_marks, iupac_name, NameResult};
 use crate::reaction::ion::{Adduct, Ion, IonError};
 use crate::reaction::{FormulaAnalysis, MolecularFormula};
 use crate::widget::rich_text::RichLabel;
@@ -48,6 +49,8 @@ pub struct AnalysisPanel {
     /// Show the labels in Japanese (the numbers and notation are the same either way).
     pub ja: bool,
     cache: Option<(MolecularFormula, Option<Ion>, FormulaAnalysis)>,
+    /// The structures last named, and their name (naming is too slow to redo every frame).
+    name_cache: Option<(Molecule, NameResult)>,
 }
 
 /// `en`, or `ja` when the panel is in Japanese.
@@ -66,6 +69,7 @@ impl Default for AnalysisPanel {
             custom_charge: 1,
             ja: false,
             cache: None,
+            name_cache: None,
         }
     }
 }
@@ -97,6 +101,18 @@ impl AnalysisPanel {
         Ok(&self.cache.as_ref().unwrap().2)
     }
 
+    /// The IUPAC name of `mol` (or of the selected structures). Recomputed only when they
+    /// changed.
+    pub fn iupac_name(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &NameResult {
+        let target = analysis_target(mol, selection);
+        let fresh = matches!(&self.name_cache, Some((m, _)) if *m == target);
+        if !fresh {
+            let name = iupac_name(&target);
+            self.name_cache = Some((target, name));
+        }
+        &self.name_cache.as_ref().unwrap().1
+    }
+
     /// Draw the panel. Returns `true` when the user copied the report to the clipboard.
     pub fn ui(&mut self, ui: &mut egui::Ui, mol: &Molecule, selection: &HashSet<u32>) -> bool {
         let ja = self.ja;
@@ -119,13 +135,18 @@ impl AnalysisPanel {
                 ui.weak(t(ja, "Nothing drawn yet.", "まだ何も描かれていません"));
             }
             Ok(a) => {
-                show_values(ui, &a, ja);
+                let name = self.iupac_name(mol, selection).clone();
+                let stereo = has_stereo_marks(&analysis_target(mol, selection));
+                if show_values(ui, &a, &name, stereo, ja) {
+                    copied = true;
+                }
                 ui.add_space(4.0);
                 let copy = ui
                     .button(t(ja, "📋 Copy", "📋 コピー"))
                     .on_hover_text(t(ja, "Copy the analysis as text", "解析結果をテキストでコピー"));
                 if copy.clicked() {
-                    ui.ctx().copy_text(a.report());
+                    ui.ctx().copy_text(format!("{}
+IUPAC name: {}", a.report(), name_text(&name)));
                     copied = true;
                 }
             }
@@ -196,8 +217,18 @@ impl AnalysisPanel {
     }
 }
 
-/// Formula, masses, m/z and elemental analysis as a two-column grid.
-fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis, ja: bool) {
+/// The name, or why there is none, as one line of text.
+fn name_text(name: &NameResult) -> String {
+    match name {
+        NameResult::Ok(n) => n.clone(),
+        NameResult::Unsupported(reason) => format!("— (unsupported: {reason})"),
+    }
+}
+
+/// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid. Returns
+/// `true` when the user copied the name.
+fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis, name: &NameResult, stereo: bool, ja: bool) -> bool {
+    let mut copied = false;
     let unknown = || {
         format!("— ({}: {})", t(ja, "unknown", "不明"), a.formula.unknown_elements().join(", "))
     };
@@ -247,7 +278,31 @@ fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis, ja: bool) {
             }
         }
         ui.end_row();
+
+        ui.label(t(ja, "IUPAC name", "IUPAC 名"));
+        ui.vertical(|ui| match name {
+            NameResult::Ok(n) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(n);
+                    let copy = ui
+                        .small_button("📋")
+                        .on_hover_text(t(ja, "Copy the name", "名前をコピー"));
+                    if copy.clicked() {
+                        ui.ctx().copy_text(n.clone());
+                        copied = true;
+                    }
+                });
+                if stereo {
+                    ui.weak(t(ja, "(stereodescriptors not included)", "（立体表記は含まれません）"));
+                }
+            }
+            NameResult::Unsupported(reason) => {
+                ui.weak(format!("— ({}: {reason})", t(ja, "unsupported", "未対応")));
+            }
+        });
+        ui.end_row();
     });
+    copied
 }
 
 /// `H⁺`, `Cl⁻`, `e⁻` — the species with its charge sign, for the adduct list.
@@ -383,6 +438,15 @@ mod tests {
         let a = p.analysis(&m, &sel).unwrap();
         assert_eq!(a.ion.as_ref().unwrap().notation(), "[M+H]+");
         assert_eq!(format!("{:.4}", a.isotope_pattern.as_ref().unwrap()[0].mz), "29.0386");
+    }
+
+    #[test]
+    fn name_follows_the_selection() {
+        let (m, c1, o) = two_structures();
+        let mut p = AnalysisPanel::default();
+        assert_eq!(p.iupac_name(&m, &HashSet::new()), &NameResult::Ok("ethene; methanol".into()));
+        assert_eq!(p.iupac_name(&m, &[c1].into()), &NameResult::Ok("ethene".into()));
+        assert_eq!(p.iupac_name(&m, &[o].into()), &NameResult::Ok("methanol".into()));
     }
 
     /// The panel draws for an empty canvas, a structure, a group label and a bad ion choice.

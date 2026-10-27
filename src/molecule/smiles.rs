@@ -704,7 +704,7 @@ fn push_ring_number(out: &mut String, n: u8) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
-mod parser;
+pub(crate) mod parser;
 
 #[cfg(test)]
 mod tests {

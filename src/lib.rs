@@ -21,6 +21,7 @@
 pub mod config;
 pub mod label_chain;
 pub mod molecule;
+pub mod naming;
 pub mod reaction;
 pub mod widget;
 
