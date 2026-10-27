@@ -10,6 +10,7 @@
 //! with egui's own bundled font, so the label placement is pixel-faithful to the widget.
 
 use super::Molecule;
+use super::lookup::MolIndex;
 use crate::config::StyleConfig;
 use crate::widget::scene::{MoleculeScene, RenderTransform};
 use crate::widget::{SCALE_FACTOR, draw};
@@ -357,13 +358,14 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
 
         // Shown labels, centered on their atoms (the anchor point of the on-screen label).
         let r = (style.label_size * 0.75).round() as i32;
+        let index = MolIndex::new(mol);
         let labels: Vec<(i32, i32, String)> = mol
             .atoms
             .iter()
-            .filter(|atom| draw::should_show_label(mol, atom.id))
+            .filter(|atom| draw::should_show_label(&index, atom.id))
             .map(|atom| {
                 let c = egui::pos2(atom.pos[0] * SCALE_FACTOR, atom.pos[1] * SCALE_FACTOR);
-                (tx(c.x), ty(c.y), flatten_label(mol, atom))
+                (tx(c.x), ty(c.y), flatten_label(&index, atom))
             })
             .collect();
 
@@ -427,7 +429,7 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
 
 /// The plain-text form of an atom's on-screen label (rich spans flattened, scripts inlined). Used
 /// by the GDI/EMF path, which has no sub/superscript support.
-fn flatten_label(mol: &Molecule, atom: &super::Atom) -> String {
+fn flatten_label(mol: &MolIndex, atom: &super::Atom) -> String {
     draw::atom_label(mol, atom)
         .rich
         .spans
@@ -483,6 +485,31 @@ mod tests {
             "picture size and placement: {}",
             &svg[..120]
         );
+    }
+
+    /// Pins the whole SVG (FNV-1a of its elements, sorted: labels come out of a `HashMap`, so
+    /// their order varies run to run) of a structure with folded group hydrogens, a charge,
+    /// placed double bonds, a wedge and a ring fill, so the lookups behind the scene can change
+    /// without changing a single drawn coordinate.
+    #[test]
+    fn svg_output_is_pinned() {
+        let mut mol = bounds_sample();
+        let n = mol.atoms[4].id;
+        for (i, y) in [(0, 0.9), (1, -0.1)] {
+            let h = mol.add_atom("H".to_string(), [3.4 + i as f32 * 0.1, y], 0);
+            mol.atom_by_id_mut(h).unwrap().group_h = true;
+            mol.add_bond(n, h, BondOrder::Single);
+        }
+        let c4 = mol.add_atom("C".to_string(), [0.75, 2.8], 0);
+        mol.add_bond(mol.atoms[2].id, c4, BondOrder::Double);
+        let s = mol.add_atom("S".to_string(), [-0.5, 3.5], -1);
+        mol.add_bond(c4, s, BondOrder::Single);
+        let svg = molecule_to_svg(&mol).unwrap();
+        assert!(!svg.contains(">H</text><text x=\"3"), "the group hydrogens fold into NH2");
+        let mut elements: Vec<&str> = svg.split('<').collect();
+        elements.sort_unstable();
+        let fnv = elements.concat().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        assert_eq!((svg.len(), fnv), (2386, 9854542963868085436), "{svg}");
     }
 
     #[test]
@@ -581,6 +608,39 @@ mod tests {
         assert_eq!(u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]), 40, "BITMAPINFOHEADER");
         let h = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
         assert!(h > 0, "bottom-up DIB (positive height)");
+    }
+
+    /// Timing of `preview_png` on long chains (every 10th atom an O, so labels are laid out
+    /// too). Run in release: `cargo test --release --lib preview_scales -- --ignored --nocapture`.
+    /// The time per atom should stay flat as the chain grows.
+    #[test]
+    #[ignore = "timing; run explicitly in release"]
+    fn preview_scales_linearly_with_chain_length() {
+        for n in [25_000u32, 50_000, 100_000] {
+            let mut mol = Molecule::default();
+            let mut prev = None;
+            for i in 0..n {
+                let element = if i % 10 == 5 { "O" } else { "C" };
+                let y = if i % 2 == 0 { 0.0 } else { 0.75 };
+                let id = mol.add_atom(element.to_string(), [i as f32 * 1.3, y], 0);
+                if let Some(p) = prev {
+                    mol.add_bond(p, id, BondOrder::Single);
+                }
+                prev = Some(id);
+            }
+            let start = std::time::Instant::now();
+            let mut fonts = egui::epaint::text::Fonts::new(
+                egui::epaint::text::TextOptions::default(),
+                egui::FontDefinitions::default(),
+            );
+            let mut view = fonts.with_pixels_per_point(1.0);
+            build_scene(&mol, &StyleConfig::chemdraw(), |job| view.layout_job(job)).unwrap();
+            let scene = start.elapsed();
+            let start = std::time::Instant::now();
+            preview_png(&mol, 2400).unwrap();
+            let total = start.elapsed();
+            eprintln!("{n} atoms: scene {scene:?}, preview_png {total:?}");
+        }
     }
 
     #[test]
