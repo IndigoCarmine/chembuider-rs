@@ -300,8 +300,13 @@ impl ReactionApp {
                 }
             }
             if ui.button("🗑 Clear").clicked() {
-                self.canvas.molecule = Molecule::default();
-                self.canvas.selected_atoms.clear();
+                // An empty canvas has nothing to clear: an undo step there would only wipe
+                // the redo history. Otherwise snapshot first so Ctrl+Z brings it back.
+                if !self.canvas.molecule.atoms.is_empty() {
+                    self.canvas.push_undo();
+                    self.canvas.molecule = Molecule::default();
+                    self.canvas.selected_atoms.clear();
+                }
             }
             if ui.button("📋 Paste").clicked() {
                 self.canvas.paste_clipboard();
