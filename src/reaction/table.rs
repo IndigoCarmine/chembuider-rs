@@ -124,11 +124,11 @@ pub fn reactant_cells(r: &ReactantAnalysis) -> Vec<Cell> {
             unit: String::new(),
         },
         cell(r.mw.map(Quantity::computed), format_number),
-        // Being the limiting reagent is the user's declaration, so it is styled as entered.
-        text_cell(
-            if r.limiting { "Yes" } else { "No" },
-            if r.limiting { Origin::Entered } else { Origin::Computed },
-        ),
+        // A declared limiting reagent is the user's entry; one the fallback picked is computed.
+        match r.limiting_origin {
+            Some(origin) => text_cell("Yes", origin),
+            None => text_cell("No", Origin::Computed),
+        },
         cell(r.equivalents, format_number),
         cell(r.sample_mass, format_mass),
         cell(r.percent_weight, format_percent),
@@ -494,6 +494,19 @@ mod tests {
         assert_eq!(phenol[9].text.spans[0].text, "10.63");
         assert_eq!(product[10].unit, "%");
         assert_eq!(phenol[1].unit, "", "MW is dimensionless");
+    }
+
+    /// With no reagent declared limiting, the fallback still picks one to scale from. That
+    /// pick is inferred, not entered, so it reads "Yes" in the regular weight.
+    #[test]
+    fn inferred_limiting_reagent_is_not_styled_as_entered() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        reaction.analysis.set_limiting(None);
+        let table = AnalysisTable::from_result(&reaction.analysis.compute());
+        let limiting = &table.blocks[0].columns[0][2];
+        assert_eq!(limiting.plain(), "Yes", "phenol still carries the scale");
+        assert!(!limiting.is_entered(), "an inferred limiting reagent is computed");
+        assert_eq!(table.blocks[0].columns[1][2].plain(), "No");
     }
 
     /// Rows always exist; missing values are empty cells.
