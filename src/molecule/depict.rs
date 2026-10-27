@@ -2,7 +2,7 @@
 //! get a label, what the label says (folded hydrogens, implicit-H count, charge, the side the
 //! hydrogens go on), and which atoms are over-bonded. The editor, the reaction figure and the
 //! file writers (CDX, images) all draw from these rules, so they live with the molecule model.
-//! `widget::draw` re-exports them under their old paths.
+//! The widget's `draw` module re-exports them under their old paths.
 
 use super::lookup::AtomLookup;
 use super::{charged_max_valence, charged_valence};

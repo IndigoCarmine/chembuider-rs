@@ -560,7 +560,7 @@ impl Molecule {
     ///
     /// Hydrogens go **highest id first**, i.e. most recently added first, which both makes the
     /// choice independent of iteration order and agrees with
-    /// [`is_folded_h`](crate::widget::draw::is_folded_h): that folds the *lowest* ids into the
+    /// [`is_folded_h`](crate::molecule::depict::is_folded_h): that folds the *lowest* ids into the
     /// label, so the one this removes is the one that had already stopped being folded.
     ///
     /// Returns the ids removed.

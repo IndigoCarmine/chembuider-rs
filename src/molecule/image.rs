@@ -9,11 +9,11 @@
 //! positions each label glyph at egui's own layout coordinates and (when available) rasterizes it
 //! with egui's own bundled font, so the label placement is pixel-faithful to the widget.
 
-use super::Molecule;
+use super::{Molecule, depict};
 use super::lookup::MolIndex;
 use crate::config::StyleConfig;
 use crate::widget::scene::{MoleculeScene, RenderTransform};
-use crate::widget::{SCALE_FACTOR, draw};
+use crate::widget::SCALE_FACTOR;
 use egui::Vec2;
 use resvg::usvg::fontdb;
 use std::sync::{Arc, OnceLock};
@@ -362,7 +362,7 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         let labels: Vec<(i32, i32, String)> = mol
             .atoms
             .iter()
-            .filter(|atom| draw::should_show_label(&index, atom.id))
+            .filter(|atom| depict::should_show_label(&index, atom.id))
             .map(|atom| {
                 let c = egui::pos2(atom.pos[0] * SCALE_FACTOR, atom.pos[1] * SCALE_FACTOR);
                 (tx(c.x), ty(c.y), flatten_label(&index, atom))
@@ -430,7 +430,7 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
 /// The plain-text form of an atom's on-screen label (rich spans flattened, scripts inlined). Used
 /// by the GDI/EMF path, which has no sub/superscript support.
 fn flatten_label(mol: &MolIndex, atom: &super::Atom) -> String {
-    draw::atom_label(mol, atom)
+    depict::atom_label(mol, atom)
         .rich
         .spans
         .iter()
