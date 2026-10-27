@@ -75,6 +75,11 @@ pub fn iupac_name(mol: &Molecule) -> NameResult {
 
 /// [`iupac_name`] with the abbreviations of `config`.
 pub fn iupac_name_with_config(mol: &Molecule, config: &Config) -> NameResult {
+    // Brackets (a polymer's repeat unit, a multiple group) change what the atoms stand for;
+    // naming the atoms as drawn would name the wrong compound.
+    if mol.brackets().next().is_some() {
+        return NameResult::Unsupported("brackets (polymers, multiple groups)".into());
+    }
     let names = iupac_names_with_config(mol, config);
     if names.is_empty() {
         return NameResult::Unsupported("nothing drawn".into());

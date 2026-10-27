@@ -24,7 +24,7 @@ use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
-use crate::molecule::{ArrowKind, BondOrder, BondStereo, DoublePosition, Molecule, PageObject, PageText, ReactionTable, TextAlign};
+use crate::molecule::{ArrowKind, BondOrder, Bracket, BondStereo, DoublePosition, Molecule, PageObject, PageText, ReactionTable, TextAlign};
 use crate::reaction::edit::CellRef;
 use crate::widget::rich_text::{RichText, SpanStyle};
 
@@ -173,7 +173,7 @@ impl MoleculeScene {
             r.extend_with(l.rect.min);
             r.extend_with(l.rect.max);
         }
-        for o in &self.objects {
+        for o in self.objects.iter().filter(|o| o.rect.is_finite()) {
             r.extend_with(o.rect.min);
             r.extend_with(o.rect.max);
         }
@@ -259,7 +259,51 @@ pub fn build_object(
             SceneObject { object_id: t.id, strokes: Vec::new(), fills: Vec::new(), texts, rect }
         }
         PageObject::Table(t) => build_table(t, mol, style, xf, layout).object,
+        PageObject::Bracket(b) => build_bracket(b, mol, style, xf, layout),
     }
+}
+
+/// Size of a bracket's label relative to the atom labels (ChemDraw: 7.5 pt beside 10 pt).
+pub const BRACKET_LABEL_SCALE: f32 = 0.75;
+
+/// A bracket pair as ChemDraw draws it: each mark across its crossing bond (lines as wide as
+/// bonds), the label set small at the lower right of the closing one. A bracket whose atoms are
+/// all gone draws nothing.
+pub fn build_bracket(
+    b: &Bracket,
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> SceneObject {
+    let width = style.bond_width * xf.visual_scale;
+    let mut strokes = Vec::new();
+    let mut texts = Vec::new();
+    let mut rect = Rect::NOTHING;
+    if let Some(g) = crate::molecule::bracket::geometry(mol, b) {
+        for side in &g.sides {
+            for line in crate::molecule::bracket::side_polylines(side, b.shape) {
+                for w in line.windows(2) {
+                    let (a, c) = (xf.apply(w[0]), xf.apply(w[1]));
+                    rect.extend_with(a);
+                    rect.extend_with(c);
+                    strokes.push(SceneStroke { a, b: c, width });
+                }
+            }
+        }
+        let label = b.label.trim();
+        if !label.is_empty() {
+            let text_style = RichTextStyle::new(style.label_size * BRACKET_LABEL_SCALE * xf.visual_scale, Color32::BLACK);
+            let galley = RichText::plain(label).layout_with(&text_style, &mut layout);
+            let at = xf.apply(g.label_at);
+            let r = Rect::from_min_size(Pos2::new(at.x, at.y - galley.baseline()), galley.size());
+            rect = rect.union(r);
+            texts.push(SceneText { galley, rect: r });
+        }
+    }
+    // Nothing drawn: a rect that covers nothing (see `MoleculeScene::bounds`).
+    let rect = if rect.is_finite() { rect.expand(width * 0.5) } else { Rect::NOTHING };
+    SceneObject { object_id: b.id, strokes, fills: Vec::new(), texts, rect }
 }
 
 // ─── Reaction tables ──────────────────────────────────────────────────────────

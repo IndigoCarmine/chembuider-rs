@@ -858,8 +858,76 @@ impl ChemStructEditor {
     /// Open the text box on page text `id` (as a double-click or the Text tool does). False
     /// when there is no such text.
     pub fn edit_text(&mut self, id: u32) -> bool {
-        let Some(PageObject::Text(t)) = self.molecule.object_by_id(id) else { return false };
-        self.text_edit = Some(TextEditState { id: Some(id), pos: t.pos, align: t.align, text: t.text.clone() });
+        match self.molecule.object_by_id(id) {
+            Some(PageObject::Text(t)) => {
+                self.text_edit = Some(TextEditState { id: Some(id), pos: t.pos, align: t.align, text: t.text.clone() });
+                true
+            }
+            // A bracket's label is edited in the same box.
+            Some(PageObject::Bracket(b)) => {
+                let Some(g) = crate::molecule::bracket::geometry(&self.molecule, b) else { return false };
+                self.text_edit = Some(TextEditState { id: Some(id), pos: g.label_at, align: TextAlign::Left, text: b.label.clone() });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put brackets of `usage` around the selected atoms (see [`crate::molecule::bracket`]) as one
+    /// undo step, and select them. Returns the bracket's id, or `None` when no atom is selected.
+    pub fn bracket_selection(&mut self, usage: crate::molecule::BracketUsage) -> Option<u32> {
+        if self.selected_atoms.is_empty() {
+            return None;
+        }
+        let before = self.molecule.clone();
+        let id = self.molecule.add_bracket(&self.selected_atoms, usage)?;
+        let after = std::mem::replace(&mut self.molecule, before);
+        self.push_undo();
+        self.molecule = after;
+        self.selected_objects = [id].into_iter().collect();
+        Some(id)
+    }
+
+    /// The brackets that are selected, or failing that the brackets around any selected atom.
+    pub fn selected_brackets(&self) -> Vec<u32> {
+        let chosen: Vec<u32> =
+            self.molecule.brackets().filter(|b| self.selected_objects.contains(&b.id)).map(|b| b.id).collect();
+        if !chosen.is_empty() {
+            return chosen;
+        }
+        self.molecule
+            .brackets()
+            .filter(|b| b.atoms.iter().any(|a| self.selected_atoms.contains(a)))
+            .map(|b| b.id)
+            .collect()
+    }
+
+    /// Change bracket `id`'s meaning, its label becoming that usage's default (`n`, `2`, `co`).
+    /// One undo step; false when there is no such bracket or it already means that.
+    pub fn set_bracket_usage(&mut self, id: u32, usage: crate::molecule::BracketUsage) -> bool {
+        match self.molecule.object_by_id(id) {
+            Some(PageObject::Bracket(b)) if b.usage != usage => {}
+            _ => return false,
+        }
+        self.push_undo();
+        if let Some(PageObject::Bracket(b)) = self.molecule.object_by_id_mut(id) {
+            b.usage = usage;
+            b.label = usage.default_label().to_string();
+        }
+        true
+    }
+
+    /// Change bracket `id`'s shape (square, round, curly). One undo step; false when there is
+    /// no such bracket or it already has that shape.
+    pub fn set_bracket_shape(&mut self, id: u32, shape: crate::molecule::BracketShape) -> bool {
+        match self.molecule.object_by_id(id) {
+            Some(PageObject::Bracket(b)) if b.shape != shape => {}
+            _ => return false,
+        }
+        self.push_undo();
+        if let Some(PageObject::Bracket(b)) = self.molecule.object_by_id_mut(id) {
+            b.shape = shape;
+        }
         true
     }
 
@@ -870,6 +938,19 @@ impl ChemStructEditor {
         let text = edit.text.trim_end().to_string();
         let blank = text.trim().is_empty();
         match edit.id {
+            Some(id) if matches!(self.molecule.object_by_id(id), Some(PageObject::Bracket(_))) => {
+                let Some(PageObject::Bracket(current)) = self.molecule.object_by_id(id) else { return false };
+                // A label cleared goes back to the usage's own.
+                let text = if blank { current.usage.default_label().to_string() } else { text.trim().to_string() };
+                if current.label == text {
+                    return false;
+                }
+                self.push_undo();
+                if let Some(PageObject::Bracket(b)) = self.molecule.object_by_id_mut(id) {
+                    b.label = text;
+                }
+                true
+            }
             Some(id) => {
                 let Some(PageObject::Text(current)) = self.molecule.object_by_id(id) else { return false };
                 if blank {
@@ -992,6 +1073,16 @@ impl ChemStructEditor {
                     Some(r) => r.contains(screen),
                     None => view.mol_to_screen(t.pos).distance(screen) <= NODE_HIT_RADIUS_PX,
                 },
+                // On a bracket mark, or on its label.
+                PageObject::Bracket(b) => {
+                    self.last_object_rects.get(&b.id).is_some_and(|r| r.expand(2.0).contains(screen))
+                        || crate::molecule::bracket::geometry(&self.molecule, b).is_some_and(|g| {
+                            g.sides.iter().any(|s| {
+                                let d = point_to_segment_dist(screen, view.mol_to_screen(s.start), view.mol_to_screen(s.end));
+                                d <= BOND_HIT_THRESHOLD_PX
+                            })
+                        })
+                }
             };
             hit.then(|| o.id())
         })

@@ -11,11 +11,12 @@
 //! *all* elements go alphabetically (`H2O`, `KI`). That is what ChemDraw prints — which is why
 //! potassium carbonate reads `CK2O3` and not `K2CO3`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::molecule::Molecule;
+use crate::molecule::bracket::open_ends;
 use crate::molecule::depict::{displayed_h_count, is_folded_h};
 use crate::widget::rich_text::{RichText, SpanStyle};
 
@@ -129,20 +130,14 @@ impl MolecularFormula {
     ///
     /// Folded terminal hydrogens (the `H` of an `OH` label) are counted once, through their
     /// heavy neighbour's displayed H count — never twice.
+    ///
+    /// Brackets ([`crate::molecule::bracket`]) count as they read: the atoms of a multiple group
+    /// as many times as it repeats; a polymer's repeat unit once — with no hydrogen where a bond
+    /// crosses its brackets, and without the bare carbons that only stand for the chain going on
+    /// ([`open_ends`]) — so the formula is the unit's, `C2H4` for polyethylene (see
+    /// [`PolymerFormula`] for writing it `(C2H4)n`).
     pub fn of(mol: &Molecule) -> Self {
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for atom in &mol.atoms {
-            // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
-            if is_folded_h(mol, atom.id) {
-                continue;
-            }
-            *counts.entry(atom.element.clone()).or_default() += 1;
-            let h = displayed_h_count(mol, atom.id) as usize;
-            if h > 0 {
-                *counts.entry("H".to_string()).or_default() += h;
-            }
-        }
-        Self::from_counts(counts)
+        Self::from_counts(counts_of(mol, |_| true))
     }
 
     /// A formula from per-element counts, put into Hill order. Zero counts are dropped.
@@ -241,6 +236,94 @@ impl MolecularFormula {
     }
 }
 
+/// How many times atom `id` counts: once, times the repeat count of every multiple group
+/// around it.
+fn multiplicity(mol: &Molecule, id: u32) -> usize {
+    mol.brackets()
+        .filter(|b| b.atoms.contains(&id))
+        .filter_map(|b| b.repeat_count())
+        .fold(1usize, |n, k| n.saturating_mul(k))
+}
+
+/// Element counts of the atoms of `mol` that `keep` accepts (each with its hydrogens), the
+/// brackets taken into account as [`MolecularFormula::of`] says.
+fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> BTreeMap<String, usize> {
+    let has_brackets = mol.brackets().next().is_some();
+    let ends = if has_brackets { open_ends(mol) } else { Default::default() };
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for atom in &mol.atoms {
+        // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
+        if is_folded_h(mol, atom.id) || ends.contains(&atom.id) || !keep(atom.id) {
+            continue;
+        }
+        let times = if has_brackets { multiplicity(mol, atom.id) } else { 1 };
+        *counts.entry(atom.element.clone()).or_default() += times;
+        let h = displayed_h_count(mol, atom.id) as usize;
+        if h > 0 {
+            *counts.entry("H".to_string()).or_default() += h * times;
+        }
+    }
+    counts
+}
+
+/// The formula of a drawing with polymer brackets as it is written: what lies outside the
+/// repeat units, then each unit in parentheses with its label — `(C2H4)n`, `C2H6(C2H4)n`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolymerFormula {
+    /// Everything outside the repeat units (the bare chain ends left out). Often empty.
+    pub rest: MolecularFormula,
+    /// Each repeat unit's formula and label (`n`), in page order.
+    pub units: Vec<(MolecularFormula, String)>,
+}
+
+impl PolymerFormula {
+    /// The formula of `mol` written with its repeat units, or `None` when it has no polymer
+    /// brackets (its formula is then [`MolecularFormula::of`]'s).
+    pub fn of(mol: &Molecule) -> Option<Self> {
+        let units: Vec<_> = mol.brackets().filter(|b| b.usage.is_polymer_unit()).collect();
+        if units.is_empty() {
+            return None;
+        }
+        let inside: HashSet<u32> = units.iter().flat_map(|b| b.atoms.iter().copied()).collect();
+        let rest = MolecularFormula::from_counts(counts_of(mol, |id| !inside.contains(&id)));
+        let units = units
+            .iter()
+            .map(|b| {
+                let mine: HashSet<u32> = b.atoms.iter().copied().collect();
+                (MolecularFormula::from_counts(counts_of(mol, |id| mine.contains(&id))), b.label.trim().to_string())
+            })
+            .filter(|(f, _)| !f.is_empty())
+            .collect();
+        Some(Self { rest, units })
+    }
+
+    /// Flat text: `(C2H4)n`.
+    pub fn plain(&self) -> String {
+        let mut s = self.rest.plain();
+        for (f, label) in &self.units {
+            s.push_str(&format!("({}){label}", f.plain()));
+        }
+        s
+    }
+
+    /// Styled text, the counts and the labels as subscripts: `(C₂H₄)ₙ`.
+    pub fn rich(&self) -> RichText {
+        let mut rich = self.rest.rich();
+        let sub = SpanStyle { script: crate::widget::rich_text::Script::Sub, ..SpanStyle::default() };
+        for (f, label) in &self.units {
+            rich = rich.span("(", SpanStyle::default());
+            for span in f.rich().spans {
+                rich = rich.span(span.text, span.style);
+            }
+            rich = rich.span(")", SpanStyle::default());
+            if !label.is_empty() {
+                rich = rich.span(label.clone(), sub);
+            }
+        }
+        rich
+    }
+}
+
 /// One level of [`MolecularFormula::parse`]: element symbols with counts, and `( … )n`
 /// groups, until the end of the text or (when `depth > 0`) the closing parenthesis.
 fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap<String, usize>> {
@@ -317,6 +400,54 @@ mod tests {
 
     fn plain(mol: &Molecule) -> String {
         MolecularFormula::of(mol).plain()
+    }
+
+    /// CH2–CH2 in brackets, a bond leaving each side to a bare carbon (the chain going on).
+    fn polyethylene() -> (Molecule, Vec<u32>) {
+        let mut m = Molecule::default();
+        let ids: Vec<u32> =
+            (0..4).map(|k| m.add_atom("C".into(), [k as f32 * 1.3, if k % 2 == 0 { 0.0 } else { -0.75 }], 0)).collect();
+        for w in ids.windows(2) {
+            m.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        m.add_bracket(&[ids[1], ids[2]].into(), crate::molecule::BracketUsage::Sru);
+        (m, ids)
+    }
+
+    #[test]
+    fn a_repeat_unit_counts_once_with_no_hydrogen_at_its_crossings() {
+        let (m, _) = polyethylene();
+        assert_eq!(plain(&m), "C2H4");
+        let p = PolymerFormula::of(&m).unwrap();
+        assert_eq!(p.plain(), "(C2H4)n");
+        let rich = p.rich();
+        assert_eq!(rich.spans.last().map(|s| (s.text.as_str(), s.style.script)), Some(("n", Script::Sub)));
+        assert!(PolymerFormula::of(&demo::phenol()).is_none());
+    }
+
+    #[test]
+    fn end_groups_stay_outside_the_unit() {
+        // ClCH2–[CH2–CH2]n–: the chloromethyl is an end group, the other end stays open.
+        let (mut m, ids) = polyethylene();
+        let cl = m.add_atom("Cl".into(), [-1.3, -0.75], 0);
+        m.add_bond(cl, ids[0], BondOrder::Single);
+        assert_eq!(PolymerFormula::of(&m).unwrap().plain(), "CH2Cl(C2H4)n");
+        assert_eq!(plain(&m), "C3H6Cl");
+    }
+
+    #[test]
+    fn a_multiple_group_multiplies() {
+        // H3C–[CH2]3–CH3 drawn as one CH2 in brackets ×3: pentane.
+        let mut m = Molecule::default();
+        let ids: Vec<u32> = (0..3).map(|k| m.add_atom("C".into(), [k as f32 * 1.3, 0.0], 0)).collect();
+        m.add_bond(ids[0], ids[1], BondOrder::Single);
+        m.add_bond(ids[1], ids[2], BondOrder::Single);
+        let id = m.add_bracket(&[ids[1]].into(), crate::molecule::BracketUsage::MultipleGroup).unwrap();
+        if let Some(crate::molecule::PageObject::Bracket(b)) = m.object_by_id_mut(id) {
+            b.label = "3".into();
+        }
+        assert_eq!(plain(&m), "C5H12");
+        assert!(PolymerFormula::of(&m).is_none());
     }
 
     fn mw2(mol: &Molecule) -> String {

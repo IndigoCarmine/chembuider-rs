@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use crate::molecule::Molecule;
 use crate::naming::{has_stereo_marks, iupac_name, NameResult};
 use crate::reaction::ion::{Adduct, Ion, IonError};
-use crate::reaction::{FormulaAnalysis, MolecularFormula};
+use crate::reaction::{FormulaAnalysis, MolecularFormula, PolymerFormula};
 use crate::widget::rich_text::RichLabel;
 
 /// Which adduct the m/z line is for.
@@ -130,6 +130,13 @@ impl AnalysisPanel {
 
         let mut copied = false;
         let ion_result = self.analysis(mol, selection).cloned();
+        // A polymer's formula is written with its repeat units, `(C2H4)n`; the masses are then
+        // those of one repeat unit (with the end groups).
+        let polymer = if mol.brackets().next().is_some() {
+            PolymerFormula::of(&analysis_target(mol, selection))
+        } else {
+            None
+        };
         match ion_result {
             Ok(a) if a.formula.is_empty() => {
                 ui.weak(t(ja, "Nothing drawn yet.", "まだ何も描かれていません"));
@@ -137,7 +144,7 @@ impl AnalysisPanel {
             Ok(a) => {
                 let name = self.iupac_name(mol, selection).clone();
                 let stereo = has_stereo_marks(&analysis_target(mol, selection));
-                if show_values(ui, &a, &name, stereo, ja) {
+                if show_values(ui, &a, polymer.as_ref(), &name, stereo, ja) {
                     copied = true;
                 }
                 ui.add_space(4.0);
@@ -145,8 +152,13 @@ impl AnalysisPanel {
                     .button(t(ja, "📋 Copy", "📋 コピー"))
                     .on_hover_text(t(ja, "Copy the analysis as text", "解析結果をテキストでコピー"));
                 if copy.clicked() {
+                    let mut report = a.report();
+                    if let Some(p) = &polymer {
+                        let plain = format!("Chemical formula: {}", a.formula.plain());
+                        report = report.replacen(&plain, &format!("Chemical formula: {} (per repeat unit: {})", p.plain(), a.formula.plain()), 1);
+                    }
                     ui.ctx().copy_text(format!("{}
-IUPAC name: {}", a.report(), name_text(&name)));
+IUPAC name: {}", report, name_text(&name)));
                     copied = true;
                 }
             }
@@ -225,9 +237,17 @@ fn name_text(name: &NameResult) -> String {
     }
 }
 
-/// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid. Returns
-/// `true` when the user copied the name.
-fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis, name: &NameResult, stereo: bool, ja: bool) -> bool {
+/// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid. A polymer's
+/// formula is shown with its repeat units (`polymer`), and its masses marked as per repeat
+/// unit. Returns `true` when the user copied the name.
+fn show_values(
+    ui: &mut egui::Ui,
+    a: &FormulaAnalysis,
+    polymer: Option<&PolymerFormula>,
+    name: &NameResult,
+    stereo: bool,
+    ja: bool,
+) -> bool {
     let mut copied = false;
     let unknown = || {
         format!("— ({}: {})", t(ja, "unknown", "不明"), a.formula.unknown_elements().join(", "))
@@ -235,7 +255,17 @@ fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis, name: &NameResult, stereo
     let mass = |m: Option<f64>| m.map_or_else(unknown, |m| format!("{m:.4}"));
     egui::Grid::new("analysis_values").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t(ja, "Chemical formula", "分子式"));
-        ui.add(RichLabel::new(a.formula.rich()));
+        match polymer {
+            Some(p) => {
+                ui.vertical(|ui| {
+                    ui.add(RichLabel::new(p.rich()));
+                    ui.weak(t(ja, "Masses per repeat unit", "質量は繰り返し単位あたり"));
+                });
+            }
+            None => {
+                ui.add(RichLabel::new(a.formula.rich()));
+            }
+        }
         ui.end_row();
 
         ui.label(t(ja, "Exact mass", "精密質量"));

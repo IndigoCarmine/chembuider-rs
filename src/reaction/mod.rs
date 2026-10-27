@@ -62,7 +62,7 @@ pub use edit::{
     place_scheme_arrow_structure, scheme_arrow_structure, scheme_drop_index, scheme_item_rect,
     set_scheme_arrow_structure, swap_line_structure_with_arrow_slot, take_scheme_arrow_structure,
 };
-pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
+pub use formula::{MolecularFormula, PolymerFormula, atomic_weight, formula_of, molecular_weight};
 pub use ion::{Adduct, ELECTRON_MASS, Ion, IonError};
 pub use isotopes::isotopes;
 pub use model::{

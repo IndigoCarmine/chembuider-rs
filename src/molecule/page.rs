@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::bracket::Bracket;
 use crate::widget::rich_text::RichText;
 
 /// What an arrow means, which decides how it is drawn and written to ChemDraw.
@@ -151,6 +152,9 @@ pub enum PageObject {
     Arrow(PageArrow),
     Text(PageText),
     Table(ReactionTable),
+    /// Polymer / repeating-unit brackets around some atoms ([`super::bracket`]). They have no
+    /// position of their own: they stand where their atoms are.
+    Bracket(Bracket),
 }
 
 impl PageObject {
@@ -159,6 +163,7 @@ impl PageObject {
             PageObject::Arrow(a) => a.id,
             PageObject::Text(t) => t.id,
             PageObject::Table(t) => t.id,
+            PageObject::Bracket(b) => b.id,
         }
     }
 
@@ -168,6 +173,7 @@ impl PageObject {
             PageObject::Arrow(a) => a.id = id,
             PageObject::Text(t) => t.id = id,
             PageObject::Table(t) => t.id = id,
+            PageObject::Bracket(b) => b.id = id,
         }
     }
 
@@ -177,10 +183,12 @@ impl PageObject {
             PageObject::Arrow(a) => a.source,
             PageObject::Text(t) => t.source,
             PageObject::Table(t) => t.source,
+            PageObject::Bracket(b) => b.source,
         }
     }
 
-    /// Move the whole object by `delta` (molecule units).
+    /// Move the whole object by `delta` (molecule units). Brackets go where their atoms go, so
+    /// moving them alone does nothing.
     pub fn translate(&mut self, delta: [f32; 2]) {
         let shift = |p: &mut [f32; 2]| {
             p[0] += delta[0];
@@ -193,6 +201,7 @@ impl PageObject {
             }
             PageObject::Text(t) => shift(&mut t.pos),
             PageObject::Table(t) => shift(&mut t.pos),
+            PageObject::Bracket(_) => {}
         }
     }
 
@@ -211,16 +220,19 @@ impl PageObject {
             }
             PageObject::Text(t) => rot(&mut t.pos),
             PageObject::Table(t) => rot(&mut t.pos),
+            PageObject::Bracket(_) => {}
         }
     }
 
     /// The points that stand for the object in a lasso or a bounding box: an arrow's two ends,
-    /// a text's anchor, a table's top-left corner.
+    /// a text's anchor, a table's top-left corner. Brackets have none (their atoms stand for
+    /// them).
     pub fn key_points(&self) -> Vec<[f32; 2]> {
         match self {
             PageObject::Arrow(a) => vec![a.tail, a.head],
             PageObject::Text(t) => vec![t.pos],
             PageObject::Table(t) => vec![t.pos],
+            PageObject::Bracket(_) => Vec::new(),
         }
     }
 
@@ -241,6 +253,13 @@ impl PageObject {
     pub fn as_table(&self) -> Option<&ReactionTable> {
         match self {
             PageObject::Table(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn as_bracket(&self) -> Option<&Bracket> {
+        match self {
+            PageObject::Bracket(b) => Some(b),
             _ => None,
         }
     }

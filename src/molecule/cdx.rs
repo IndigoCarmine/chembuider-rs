@@ -15,7 +15,7 @@
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
-use super::{cdx_page, cdx_table};
+use super::{cdx_bracket, cdx_page, cdx_table};
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule, PageObject};
 use super::depict;
@@ -387,15 +387,24 @@ pub(crate) fn compact_markup(rich: &RichText) -> String {
 /// The structures of `mol` as fragments (one per connected structure), with ids from `next`.
 /// Positions are moved by `shift` (CDX units).
 pub(crate) fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
-    fragments_mapped(mol, shift, next, &mut HashMap::new())
+    fragments_mapped(mol, shift, next, &mut WrittenIds::default())
 }
 
-/// [`fragments`], recording in `fragment_of` the fragment each atom went into.
+/// What the atoms and bonds of a molecule were written as: the fragment and the node of each
+/// atom, the ChemDraw bond of each bond.
+#[derive(Debug, Default)]
+pub(crate) struct WrittenIds {
+    pub fragment_of: HashMap<u32, u32>,
+    pub node_of: HashMap<u32, u32>,
+    pub bond_of: HashMap<u32, u32>,
+}
+
+/// [`fragments`], recording in `ids` what each atom and bond went into.
 pub(crate) fn fragments_mapped(
     mol: &Molecule,
     shift: (f64, f64),
     next: &mut u32,
-    fragment_of: &mut HashMap<u32, u32>,
+    ids: &mut WrittenIds,
 ) -> Vec<CdxObject> {
     let mut id = || {
         *next += 1;
@@ -446,6 +455,7 @@ pub(crate) fn fragments_mapped(
         for atom in members {
             let node_id = id();
             nodes.insert(atom.id, node_id);
+            ids.node_of.insert(atom.id, node_id);
             let at = (atom.pos[0] as f64 * SCALE + shift.0, atom.pos[1] as f64 * SCALE + shift.1);
             bbox = Some(union(bbox, [at.0, at.1, at.0, at.1]));
             let mut node = CdxObject::new(OBJ_NODE, node_id);
@@ -470,6 +480,7 @@ pub(crate) fn fragments_mapped(
         for bond in bonds {
             let (Some(&begin), Some(&end)) = (nodes.get(&bond.begin), nodes.get(&bond.end)) else { continue };
             let mut b = CdxObject::new(OBJ_BOND, id());
+            ids.bond_of.insert(bond.id, b.id);
             b.set(PROP_BOND_BEGIN, begin.to_le_bytes().to_vec());
             b.set(PROP_BOND_END, end.to_le_bytes().to_vec());
             // kCDXBondOrder flags. ChemDraw keeps a dative bond as an order of its own (0x1000),
@@ -517,7 +528,7 @@ pub(crate) fn fragments_mapped(
         out.push(frag);
     }
     for (atom, k) in structure_of {
-        fragment_of.insert(atom, fragment_ids[k]);
+        ids.fragment_of.insert(atom, fragment_ids[k]);
     }
     out
 }
@@ -580,10 +591,13 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
         next
     });
     let shift = page_shift(mol);
-    let mut fragment_of = HashMap::new();
-    page.children = fragments_mapped(mol, shift, &mut next, &mut fragment_of);
-    let objects = cdx_page::write_objects(mol, &fragment_of, &mut cdx_page::Owned::new(), shift, &mut next);
+    let mut ids = WrittenIds::default();
+    page.children = fragments_mapped(mol, shift, &mut next, &mut ids);
+    let mut owned = cdx_page::Owned::new();
+    let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next);
     page.children.extend(objects);
+    let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut page.children);
+    page.children.extend(brackets);
     if let Some(bbox) = page.children.iter().filter_map(page_extent).reduce(|a, b| union(Some(a), b)) {
         doc.props.insert(1, (PROP_BOUNDING_BOX, rect(bbox)));
     }
@@ -608,11 +622,11 @@ fn strip_structures(obj: &mut CdxObject) {
     });
 }
 
-/// `original` (a ChemDraw document) with its structures and the arrows and texts the editor
-/// reads ([`read_cdx`]) replaced by `mol`'s. An arrow or text that came from the document goes
+/// `original` (a ChemDraw document) with its structures and the arrows, texts, tables and
+/// polymer brackets the editor reads ([`read_cdx`]) replaced by `mol`'s. An arrow or text that came from the document goes
 /// back as its own ChemDraw object, under its id, with only what was edited rewritten; one
 /// deleted in the editor is gone. The document's settings and everything else on the page —
-/// shapes, brackets, curved arrows, reaction schemes — stay as they were, so editing an object
+/// shapes, curved arrows, reaction schemes — stay as they were, so editing an object
 /// made in ChemDraw loses nothing the editor cannot show. Not a CDX document: a new one, as
 /// [`molecule_to_cdx_document`].
 pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
@@ -634,9 +648,11 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     // (ChemDraw's own drawings often come within the margin a new document keeps); only one
     // dragged off the page's top or left edge is moved back onto it.
     let shift = shift_onto_page(mol, 0.0);
-    let mut fragment_of = HashMap::new();
-    let mut new = fragments_mapped(mol, shift, &mut next, &mut fragment_of);
-    new.extend(cdx_page::write_objects(mol, &fragment_of, &mut owned, shift, &mut next));
+    let mut ids = WrittenIds::default();
+    let mut new = fragments_mapped(mol, shift, &mut next, &mut ids);
+    new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next));
+    let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut new);
+    new.extend(brackets);
     let page = doc.children.iter_mut().find(|c| c.tag == OBJ_PAGE).expect("a page");
     page.children.extend(new);
     let bbox = doc
@@ -656,6 +672,12 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
 /// Read one fragment's own nodes and bonds into `mol` (not the hidden insides of an
 /// abbreviation, which ChemDraw keeps as a fragment inside its node).
 pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
+    read_fragment_mapped(frag, mol, &mut HashMap::new());
+}
+
+/// [`read_fragment`], recording in `atoms_of` the atom each node became (and, under the
+/// fragment's id, all of them): what a bracketed group's ids point at.
+fn read_fragment_mapped(frag: &CdxObject, mol: &mut Molecule, atoms_of: &mut HashMap<u32, Vec<u32>>) {
     let mut atoms: HashMap<u32, u32> = HashMap::new();
     // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own), with their position.
     let mut hydrogens: Vec<(u32, [f32; 2], usize)> = Vec::new();
@@ -708,6 +730,8 @@ pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
         let pos = [x as f32, y as f32];
         let atom = mol.add_atom(element, pos, charge);
         atoms.insert(node.id, atom);
+        atoms_of.insert(node.id, vec![atom]);
+        atoms_of.entry(frag.id).or_default().push(atom);
         if let Some(h) = hydrogen_count(node) {
             hydrogens.push((atom, pos, h));
         }
@@ -803,24 +827,26 @@ pub(crate) fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut u
 
 /// Read `obj`'s structures into `mol`, counting in `others` the objects that are neither a
 /// structure nor one of `taken` (the arrows and texts read as page objects).
-/// `first_atom` records the first atom each fragment was read into.
+/// `first_atom` records the first atom each fragment was read into, `atoms_of` the atoms each
+/// node and fragment became.
 fn read_container(
     obj: &CdxObject,
     mol: &mut Molecule,
     others: &mut usize,
     taken: &HashSet<u32>,
     first_atom: &mut HashMap<u32, u32>,
+    atoms_of: &mut HashMap<u32, Vec<u32>>,
 ) {
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => {
                 let before = mol.atoms.len();
-                read_fragment(child, mol);
+                read_fragment_mapped(child, mol, atoms_of);
                 if let Some(a) = mol.atoms.get(before) {
                     first_atom.insert(child.id, a.id);
                 }
             }
-            OBJ_GROUP => read_container(child, mol, others, taken, first_atom),
+            OBJ_GROUP => read_container(child, mol, others, taken, first_atom, atoms_of),
             _ if taken.contains(&child.id) => {}
             _ => *others += 1,
         }
@@ -868,13 +894,22 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     let mut molecule = Molecule::default();
     let mut other_objects = 0;
     let mut first_atom = HashMap::new();
+    let mut atoms_of = HashMap::new();
     // The object each ChemDraw id became (an arrow's `arrow` and its graphic both name it).
     let mut object_of: HashMap<u32, u32> = HashMap::new();
     for page in pages() {
         let converted = cdx_page::convert_page(page);
         let taken: HashSet<u32> = converted.iter().flat_map(|c| c.ids.iter().copied()).collect();
-        read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom);
-        for c in converted {
+        read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom, &mut atoms_of);
+        for mut c in converted {
+            // A bracket's ids are its nodes': it encloses the atoms they became, when there are any.
+            if let PageObject::Bracket(b) = &mut c.object {
+                cdx_bracket::link(b, &atoms_of);
+                if b.atoms.is_empty() {
+                    other_objects += 1;
+                    continue;
+                }
+            }
             let id = molecule.push_object(c.object);
             object_of.extend(c.ids.iter().map(|&cdx_id| (cdx_id, id)));
         }

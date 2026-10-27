@@ -11,6 +11,8 @@ pub mod reaction_table;
 pub mod elements;
 pub mod depict;
 pub mod page;
+pub mod bracket;
+pub(crate) mod cdx_bracket;
 pub(crate) mod lookup;
 #[cfg(windows)]
 pub mod image;
@@ -20,6 +22,7 @@ pub mod ole;
 use serde::{Deserialize, Serialize};
 
 pub use page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TableEntry, TextAlign};
+pub use bracket::{Bracket, BracketShape, BracketUsage, RepeatPattern};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum BondStereo {
@@ -394,6 +397,37 @@ impl Molecule {
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
         self.drop_broken_ring_fills();
+        self.drop_atom_from_brackets(id);
+    }
+
+    /// Take a deleted atom out of the brackets enclosing it; brackets left enclosing nothing
+    /// go too.
+    fn drop_atom_from_brackets(&mut self, id: u32) {
+        if !self.objects.iter().any(|o| matches!(o, PageObject::Bracket(_))) {
+            return;
+        }
+        self.objects.retain_mut(|o| match o {
+            PageObject::Bracket(b) => {
+                b.atoms.retain(|&a| a != id);
+                !b.atoms.is_empty()
+            }
+            _ => true,
+        });
+    }
+
+    /// Put brackets of `usage` around `atoms` (with the hydrogens folded into their labels);
+    /// returns the new object's id, or `None` when none of the atoms exists.
+    pub fn add_bracket(&mut self, atoms: &std::collections::HashSet<u32>, usage: BracketUsage) -> Option<u32> {
+        let enclosed = bracket::atoms_for_selection(self, atoms);
+        if enclosed.is_empty() {
+            return None;
+        }
+        Some(self.push_object(PageObject::Bracket(Bracket::new(enclosed, usage))))
+    }
+
+    /// The brackets on the page.
+    pub fn brackets(&self) -> impl Iterator<Item = &Bracket> {
+        self.objects.iter().filter_map(PageObject::as_bracket)
     }
 
     pub fn remove_bond(&mut self, id: u32) {

@@ -363,3 +363,108 @@ fn a_table_without_structures_is_not_inserted() {
     assert_eq!(d.editor.insert_reaction_table(), None);
     assert!(d.editor.undo_stack.is_empty());
 }
+
+/// Polyethylene's unit drawn as C–C–C–C along x (zigzag), its middle two carbons selected.
+fn chain(d: &mut Driver) -> Vec<u32> {
+    let ids: Vec<u32> = (0..4)
+        .map(|k| d.editor.molecule.add_atom("C".into(), [-2.0 + k as f32 * 1.3, if k % 2 == 0 { 0.0 } else { -0.75 }], 0))
+        .collect();
+    for w in ids.windows(2) {
+        d.editor.molecule.add_bond(w[0], w[1], BondOrder::Single);
+    }
+    d.editor.selected_atoms = [ids[1], ids[2]].into_iter().collect();
+    ids
+}
+
+#[test]
+fn bracketing_the_selection_is_one_undo_step_and_selects_the_brackets() {
+    let mut d = Driver::new(Tool::Select);
+    let ids = chain(&mut d);
+    let id = d.editor.bracket_selection(crate::molecule::BracketUsage::Sru).unwrap();
+    let b = d.editor.molecule.object_by_id(id).unwrap().as_bracket().unwrap().clone();
+    assert_eq!((b.atoms, b.label.as_str()), (vec![ids[1], ids[2]], "n"));
+    assert!(d.editor.selected_objects.contains(&id));
+    assert_eq!(d.editor.undo_stack.len(), 1);
+    assert!(d.editor.undo());
+    assert!(d.editor.molecule.objects.is_empty());
+    d.editor.selected_atoms.clear();
+    assert_eq!(d.editor.bracket_selection(crate::molecule::BracketUsage::Sru), None, "nothing selected");
+}
+
+#[test]
+fn a_bracket_is_hit_on_its_mark_dragged_with_its_atoms_and_deleted_alone() {
+    let mut d = Driver::new(Tool::Select);
+    let ids = chain(&mut d);
+    let id = d.editor.bracket_selection(crate::molecule::BracketUsage::Sru).unwrap();
+    d.editor.selected_atoms.clear();
+    d.editor.selected_objects.clear();
+    let g = crate::molecule::bracket::geometry(&d.editor.molecule, d.editor.molecule.object_by_id(id).unwrap().as_bracket().unwrap()).unwrap();
+    let mark = [g.sides[0].start[0], (g.sides[0].start[1] + g.sides[0].end[1]) / 2.0 + 0.3];
+    d.frame(Vec::new());
+    d.click(at(mark));
+    assert!(d.editor.selected_objects.contains(&id), "a click on a mark selects the bracket");
+    // Dragging the bracket moves the atoms it encloses (and so the bracket), not the others.
+    let before: Vec<[f32; 2]> = ids.iter().map(|&a| d.editor.molecule.atom_by_id(a).unwrap().pos).collect();
+    d.drag(at(mark), at([mark[0], mark[1] + 1.0]), Default::default());
+    let after: Vec<[f32; 2]> = ids.iter().map(|&a| d.editor.molecule.atom_by_id(a).unwrap().pos).collect();
+    assert!(close(before[0], after[0]) && close(before[3], after[3]), "{before:?} {after:?}");
+    assert!((after[1][1] - before[1][1] - 1.0).abs() < 0.05 && (after[2][1] - before[2][1] - 1.0).abs() < 0.05);
+    // Delete takes the brackets, not the atoms.
+    d.editor.selected_objects = [id].into_iter().collect();
+    d.key(egui::Key::Delete, Default::default());
+    assert!(d.editor.molecule.objects.is_empty());
+    assert_eq!(d.editor.molecule.atoms.len(), 4);
+}
+
+#[test]
+fn deleting_enclosed_atoms_shrinks_then_drops_the_brackets() {
+    let mut d = Driver::new(Tool::Select);
+    let ids = chain(&mut d);
+    let id = d.editor.bracket_selection(crate::molecule::BracketUsage::Sru).unwrap();
+    d.editor.molecule.remove_atom(ids[1]);
+    assert_eq!(d.editor.molecule.object_by_id(id).unwrap().as_bracket().unwrap().atoms, vec![ids[2]]);
+    d.editor.molecule.remove_atom(ids[2]);
+    assert!(d.editor.molecule.objects.is_empty(), "brackets around nothing go");
+}
+
+#[test]
+fn the_lasso_takes_a_bracket_with_all_its_atoms() {
+    let mut d = Driver::new(Tool::Select);
+    chain(&mut d);
+    let id = d.editor.bracket_selection(crate::molecule::BracketUsage::Sru).unwrap();
+    d.editor.selected_objects.clear();
+    d.editor.selected_atoms.clear();
+    let corners = [at([-3.0, -2.0]), at([3.0, -2.0]), at([3.0, 2.0]), at([-3.0, 2.0])];
+    d.frame(vec![egui::Event::PointerMoved(corners[0])]);
+    d.frame(vec![Driver::button(corners[0], true, Default::default())]);
+    let mut prev = corners[0];
+    for &p in &corners[1..] {
+        for k in 1..=4 {
+            d.frame(vec![egui::Event::PointerMoved(prev + (p - prev) * (k as f32 / 4.0))]);
+        }
+        prev = p;
+    }
+    d.frame(vec![Driver::button(corners[3], false, Default::default())]);
+    assert!(d.editor.selected_objects.contains(&id), "{:?}", d.editor.selected_objects);
+}
+
+#[test]
+fn a_brackets_label_is_edited_in_the_text_box() {
+    let mut d = Driver::new(Tool::Select);
+    chain(&mut d);
+    let id = d.editor.bracket_selection(crate::molecule::BracketUsage::Sru).unwrap();
+    assert!(d.editor.edit_text(id));
+    assert_eq!(d.editor.text_edit.as_ref().map(|e| e.text.as_str()), Some("n"));
+    d.editor.text_edit.as_mut().unwrap().text = "x".into();
+    assert!(d.editor.commit_text_edit());
+    assert_eq!(d.editor.molecule.object_by_id(id).unwrap().as_bracket().unwrap().label, "x");
+    // Cleared, it goes back to the usage's own.
+    assert!(d.editor.edit_text(id));
+    d.editor.text_edit.as_mut().unwrap().text.clear();
+    assert!(d.editor.commit_text_edit());
+    assert_eq!(d.editor.molecule.object_by_id(id).unwrap().as_bracket().unwrap().label, "n");
+    assert!(d.editor.set_bracket_usage(id, crate::molecule::BracketUsage::MultipleGroup));
+    assert_eq!(d.editor.molecule.object_by_id(id).unwrap().as_bracket().unwrap().label, "2");
+    assert!(d.editor.set_bracket_shape(id, crate::molecule::BracketShape::Round));
+    assert!(!d.editor.set_bracket_shape(id, crate::molecule::BracketShape::Round));
+}

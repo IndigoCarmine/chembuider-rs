@@ -230,6 +230,12 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
         }
         let obj = scene::build_object(object, &editor.molecule, style, xf, |job| painter.layout_job(job));
         paint(&obj, color);
+        if let PageObject::Bracket(_) = object {
+            // Its label, for hit testing (the marks are tested by their geometry).
+            if let Some(label) = obj.texts.first() {
+                rects.insert(id, label.rect);
+            }
+        }
         if matches!(object, PageObject::Text(_)) {
             rects.insert(id, obj.rect);
             if selected || hovered {

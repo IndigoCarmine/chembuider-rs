@@ -306,9 +306,13 @@ fn lasso_select(editor: &mut ChemStructEditor, center: egui::Pos2) {
         }).collect();
         editor.selected_atoms.extend(hits);
         // A page object is taken when it lies inside whole: both ends of an arrow, a text's
-        // anchor.
-        let objects: Vec<u32> = editor.molecule.objects.iter().filter(|o| {
-            o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), &lasso))
+        // anchor, all the atoms of a bracket.
+        let objects: Vec<u32> = editor.molecule.objects.iter().filter(|o| match o {
+            PageObject::Bracket(b) => {
+                let atoms: Vec<u32> = b.atoms.iter().copied().filter(|a| editor.molecule.atom_by_id(*a).is_some()).collect();
+                !atoms.is_empty() && atoms.iter().all(|a| editor.selected_atoms.contains(a))
+            }
+            _ => o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), &lasso)),
         }).map(PageObject::id).collect();
         editor.selected_objects.extend(objects);
     }
@@ -335,7 +339,8 @@ pub fn process_select_tool(
         if let Some(atom_id) = seed {
             editor.selected_atoms = editor.molecule.connected_atoms(atom_id).into_iter().collect();
         } else if let Some(id) = editor.hovered_object {
-            // Double-click a text to edit it, a table's cell to enter its value.
+            // Double-click a text (or a bracket, for its label) to edit it, a table's cell to
+            // enter its value.
             if editor.molecule.object_by_id(id).is_some_and(|o| o.as_table().is_some()) {
                 // The release that completes a double-click may carry no interaction position.
                 let at = response
@@ -432,7 +437,8 @@ pub fn process_select_tool(
                 }
             }
             if with_selection {
-                move_objects(editor, &editor.selected_objects.clone(), [dx, dy]);
+                let moved = editor.selected_atoms.clone();
+                move_objects(editor, &editor.selected_objects.clone(), [dx, dy], &moved);
             }
             modified = true;
         } else if let Some(drag) = editor.object_drag.clone() {
@@ -440,11 +446,12 @@ pub fn process_select_tool(
                 ObjectDrag::Move { id, with_selection } => {
                     let delta = editor.view(center).screen_delta_to_mol(response.drag_delta());
                     if with_selection {
-                        move_objects(editor, &editor.selected_objects.clone(), delta);
+                        let moved = editor.selected_atoms.clone();
+                        move_objects(editor, &editor.selected_objects.clone(), delta, &moved);
                         let atoms: Vec<u32> = editor.selected_atoms.iter().copied().collect();
                         move_atoms(editor, &atoms, delta);
                     } else {
-                        move_objects(editor, &[id].into_iter().collect(), delta);
+                        move_objects(editor, &[id].into_iter().collect(), delta, &Default::default());
                     }
                 }
                 ObjectDrag::ArrowEnd { id, head } => {
@@ -558,10 +565,27 @@ fn arrow_end_at(editor: &ChemStructEditor, screen: egui::Pos2, center: egui::Pos
     }
 }
 
-fn move_objects(editor: &mut ChemStructEditor, ids: &std::collections::HashSet<u32>, delta: [f32; 2]) {
+/// Move page objects `ids` by `delta`. A bracket stands where its atoms are, so moving it
+/// moves them, except those in `moved` (which the caller moves itself).
+fn move_objects(
+    editor: &mut ChemStructEditor,
+    ids: &std::collections::HashSet<u32>,
+    delta: [f32; 2],
+    moved: &std::collections::HashSet<u32>,
+) {
+    let mut atoms: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for o in &mut editor.molecule.objects {
         if ids.contains(&o.id()) {
             o.translate(delta);
+            if let PageObject::Bracket(b) = o {
+                atoms.extend(b.atoms.iter().copied().filter(|a| !moved.contains(a)));
+            }
+        }
+    }
+    for a in &mut editor.molecule.atoms {
+        if atoms.contains(&a.id) {
+            a.pos[0] += delta[0];
+            a.pos[1] += delta[1];
         }
     }
 }

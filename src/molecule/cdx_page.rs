@@ -1,5 +1,6 @@
-//! Page objects ([`PageObject`]: reaction arrows, text and reaction tables) in a ChemDraw
-//! document. Tables are ChemDraw's stoichiometry grids; [`cdx_table`] reads and writes those.
+//! Page objects ([`PageObject`]: reaction arrows, text, reaction tables and brackets) in a
+//! ChemDraw document. Tables are ChemDraw's stoichiometry grids; [`cdx_table`] reads and writes
+//! those, [`cdx_bracket`] the bracketed groups.
 //!
 //! Reading turns the arrows and texts on a document's pages into page objects, each remembering
 //! the id of the ChemDraw object it came from (`source`). An arrow is ChemDraw's `arrow` object
@@ -19,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::cdx::{self, OBJ_GROUP, OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT, SCALE};
+use super::cdx_bracket::{self, OBJ_BRACKETED_GROUP};
 use super::cdx_codec::CdxObject;
 use super::cdx_table::{self, OBJ_STOICHIOMETRY_GRID};
 use super::page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TextAlign};
@@ -207,6 +209,7 @@ pub(crate) fn convert_page(page: &CdxObject) -> Vec<Converted> {
         }
     }
     let all_ids: HashSet<u32> = objects.iter().map(|o| o.id).collect();
+    let graphics = cdx_bracket::graphics(page);
     let mut out = Vec::new();
     for obj in objects {
         match obj.tag {
@@ -237,6 +240,17 @@ pub(crate) fn convert_page(page: &CdxObject) -> Vec<Converted> {
             OBJ_STOICHIOMETRY_GRID => {
                 if let Some(table) = cdx_table::read_grid(obj) {
                     out.push(Converted { object: PageObject::Table(table), ids: vec![obj.id] });
+                }
+            }
+            OBJ_BRACKETED_GROUP => {
+                // A group and the groups nested in it (each its own bracket); the graphics
+                // they are drawn with go with them.
+                for group in std::iter::once(obj).chain(cdx_bracket::nested_groups(obj)) {
+                    if let Some((bracket, drawn)) = cdx_bracket::read_group(group, &graphics) {
+                        let mut ids = vec![group.id];
+                        ids.extend(drawn);
+                        out.push(Converted { object: PageObject::Bracket(bracket), ids });
+                    }
                 }
             }
             _ => {}
@@ -587,6 +601,13 @@ pub(crate) fn write_objects(
                     out.push(new_text(t, shift, next));
                 }
             }
+            // Written with the fragments they enclose (`cdx_bracket::write_brackets`); what
+            // reading took for it goes back to `owned` for that.
+            (PageObject::Bracket(b), original) => {
+                if let (Some(source), Some(original)) = (b.source, original) {
+                    owned.insert(source, original);
+                }
+            }
         }
     }
     out
@@ -776,6 +797,9 @@ mod tests {
                 (PageObject::Text(x), PageObject::Text(y)) => {
                     assert_eq!((&x.text, x.align), (&y.text, y.align));
                     assert!((x.pos[0] - y.pos[0]).abs() < 1e-3 && (x.pos[1] - y.pos[1]).abs() < 1e-3, "{x:?} vs {y:?}");
+                }
+                (PageObject::Bracket(x), PageObject::Bracket(y)) => {
+                    assert_eq!((x.usage, &x.label, x.atoms.len()), (y.usage, &y.label, y.atoms.len()), "{x:?} vs {y:?}");
                 }
                 (PageObject::Table(x), PageObject::Table(y)) => {
                     let same = |a: &[super::super::TableEntry], b: &[super::super::TableEntry]| {
