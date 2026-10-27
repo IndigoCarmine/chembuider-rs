@@ -162,6 +162,8 @@ impl App for FragmentEditorApp {
                 ui.separator();
 
                 if ui.button("🗑 Clear").clicked() {
+                    // A running cleanup would go on writing into the cleared canvas.
+                    self.editor.cancel_cleanup();
                     self.editor.molecule = Molecule::default();
                     self.editor.selected_atoms.clear();
                     self.editor.hotspot_atom = None;
@@ -235,6 +237,8 @@ impl FragmentEditorApp {
         if frag.attach_idx >= frag.atoms.len() {
             return Err(format!("{name}: attach_idx out of range"));
         }
+        // A running cleanup would go on writing into the loaded fragment.
+        self.editor.cancel_cleanup();
         self.editor.molecule = frag.to_molecule();
         self.editor.selected_atoms.clear();
         // `to_molecule` adds atoms in fragment order, so atoms[attach_idx] is the attach atom.

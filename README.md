@@ -115,8 +115,9 @@ While a text field has focus (the label editor or a toolbar field), the canvas i
 tools' keys, mouse gestures, and middle-button pan, as well as `Ctrl`+`C` / `Ctrl`+`V` and
 `Ctrl`+`0`; undo/redo, `Ctrl`+`K`, and `Ctrl`+`1`/`2`/`3` still act on the canvas. While a
 clean-up runs, the tools' keys and mouse gestures and the middle-button pan are off;
-`Ctrl`+`K` (stop), `Ctrl`+`0`, zoom, `Ctrl`+`1`/`2`/`3`, and copy/paste still work, and an
-undo/redo is accepted but the running clean-up keeps overwriting the restored positions. See
+`Ctrl`+`K` (stop), `Ctrl`+`0`, zoom, `Ctrl`+`1`/`2`/`3`, and copy/paste still work. An undo
+cancels the clean-up and restores the structure from before it; a redo or a paste first stops the
+clean-up where it is. See
 [docs/MANUAL.ja.md](docs/MANUAL.ja.md) §2 for the full table.
 
 Selected atoms can be nudged with `Shift`+arrows (or `Ctrl`+arrows) and rotated with

@@ -416,6 +416,8 @@ impl ChemStructEditor {
         if clip.atoms.is_empty() {
             return false;
         }
+        // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
+        self.cancel_cleanup();
         self.push_undo();
         const OFFSET: [f32; 2] = [DEFAULT_BOND_LENGTH, DEFAULT_BOND_LENGTH];
         let new_ids: Vec<u32> = clip.atoms.iter().map(|a| {
@@ -454,6 +456,8 @@ impl ChemStructEditor {
         if other.atoms.is_empty() {
             return false;
         }
+        // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
+        self.cancel_cleanup();
         self.push_undo();
         let n = other.atoms.len() as f32;
         let cx = other.atoms.iter().map(|a| a.pos[0]).sum::<f32>() / n;
@@ -547,6 +551,11 @@ impl ChemStructEditor {
     /// [`set_cleanup_engine`](Self::set_cleanup_engine)). The built-in engine relaxes a snapshot
     /// of the molecule in the background (a worker thread natively, one chunk per poll on
     /// wasm32) so the UI never freezes.
+    ///
+    /// Stopping this way only asks the run to stop: the next [`poll_cleanup`](Self::poll_cleanup)
+    /// still copies in the positions the run ended on, so the layout reached so far is kept.
+    /// To drop a run without letting it write anything more, use
+    /// [`cancel_cleanup`](Self::cancel_cleanup).
     pub fn toggle_cleanup(&mut self) {
         match &self.cleanup_job {
             Some(job) => job.cancel(),
@@ -558,6 +567,29 @@ impl ChemStructEditor {
                 self.cleanup_job = Some(self.cleanup_engine.start(&self.molecule));
             }
         }
+    }
+
+    /// Stop a running cleanup at once and discard it: the run is cancelled and dropped, and no
+    /// more of its positions are written, so the molecule keeps whatever it holds now (the
+    /// last preview).  Returns whether a cleanup was running.
+    ///
+    /// Call this before replacing or restructuring the molecule (undo/redo, paste, a host's
+    /// Clear or load): the run works on a snapshot of the old molecule and would otherwise go
+    /// on writing its positions, by atom id, into the new one.
+    ///
+    /// A run that has already finished is joined.  One still going is dropped instead
+    /// (dropping must stop its background work, see
+    /// [`CleanupRun`](crate::molecule::cleanup::CleanupRun)): the built-in worker only sees the
+    /// cancel at its next chunk boundary, which for a few hundred atoms or more is a second
+    /// or more away, and joining would freeze the UI that long.  The worker then stops on its
+    /// own, writing only to its own buffer.
+    pub fn cancel_cleanup(&mut self) -> bool {
+        let Some(job) = self.cleanup_job.take() else { return false };
+        job.cancel();
+        if job.is_done() {
+            job.join();
+        }
+        true
     }
 
     /// Replace the engine that [`toggle_cleanup`](Self::toggle_cleanup) starts runs from.
@@ -591,12 +623,23 @@ impl ChemStructEditor {
     }
 
     /// Restore the previous molecule state, pushing the current one onto the redo stack.
+    ///
+    /// While a cleanup runs, undo cancels it instead: the run is discarded
+    /// ([`cancel_cleanup`](Self::cancel_cleanup)) and the molecule goes back to the snapshot
+    /// Cleanup took when it started (the top of the undo stack).  The half-relaxed preview is
+    /// dropped rather than pushed onto the redo stack, so the redo history stays the one from
+    /// before Cleanup started.
     pub fn undo(&mut self) -> bool {
+        let cancelled_cleanup = self.cancel_cleanup();
         if let Some(prev) = self.undo_stack.pop_back() {
-            if self.redo_stack.len() >= 50 {
-                self.redo_stack.pop_front();
+            if cancelled_cleanup {
+                self.molecule = prev;
+            } else {
+                if self.redo_stack.len() >= 50 {
+                    self.redo_stack.pop_front();
+                }
+                self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
             }
-            self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
             self.selected_atoms.clear();
             self.hotspot_atom = None;
             self.label_edit = None;
@@ -607,7 +650,11 @@ impl ChemStructEditor {
     }
 
     /// Re-apply a state previously undone, pushing the current one back onto the undo stack.
+    ///
+    /// A running cleanup is stopped first ([`cancel_cleanup`](Self::cancel_cleanup)), keeping
+    /// the layout it reached as a Ctrl+K stop would, so it cannot overwrite the redone state.
     pub fn redo(&mut self) -> bool {
+        self.cancel_cleanup();
         if let Some(next) = self.redo_stack.pop_back() {
             if self.undo_stack.len() >= 50 {
                 self.undo_stack.pop_front();

@@ -300,6 +300,8 @@ impl ReactionApp {
                 }
             }
             if ui.button("🗑 Clear").clicked() {
+                // A running cleanup would go on writing into the cleared canvas.
+                self.canvas.cancel_cleanup();
                 // An empty canvas has nothing to clear: an undo step there would only wipe
                 // the redo history. Otherwise snapshot first so Ctrl+Z brings it back.
                 if !self.canvas.molecule.atoms.is_empty() {
@@ -655,6 +657,8 @@ impl ReactionApp {
                     ),
                 };
                 if let Some(mol) = mol {
+                    // A running cleanup would go on writing into the loaded structure.
+                    self.canvas.cancel_cleanup();
                     self.canvas.push_undo();
                     self.canvas.molecule = mol;
                     self.canvas.selected_atoms.clear();
