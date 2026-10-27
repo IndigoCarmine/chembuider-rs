@@ -6,6 +6,9 @@ mod keyboard_solver;
 mod keyboard_tests;
 pub mod rich_text;
 pub mod scene;
+pub mod view;
+
+pub use view::ViewTransform;
 
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};
@@ -595,19 +598,17 @@ impl ChemStructEditor {
         }
     }
 
+    /// The current camera (zoom, pan) placed on a canvas centered at `center`.
+    pub fn view(&self, center: egui::Pos2) -> ViewTransform {
+        ViewTransform::new(self.zoom, self.pan, center)
+    }
+
     pub fn mol_to_screen(&self, pos: [f32; 2], center: egui::Pos2) -> egui::Pos2 {
-        egui::Pos2 {
-            x: center.x + pos[0] * self.zoom * SCALE_FACTOR + self.pan.x,
-            y: center.y + pos[1] * self.zoom * SCALE_FACTOR + self.pan.y,
-        }
+        self.view(center).mol_to_screen(pos)
     }
 
     pub fn screen_to_mol(&self, screen: egui::Pos2, center: egui::Pos2) -> [f32; 2] {
-        let inv = 1.0 / (self.zoom * SCALE_FACTOR);
-        [
-            (screen.x - center.x - self.pan.x) * inv,
-            (screen.y - center.y - self.pan.y) * inv,
-        ]
+        self.view(center).screen_to_mol(screen)
     }
 
     /// Screen rects of the atom labels painted last frame (atom id → rect). Empty until
