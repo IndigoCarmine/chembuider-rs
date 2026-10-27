@@ -43,6 +43,38 @@ fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Primary-button drags
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The phases of a drag made with the primary button, for the tools' drag gestures.
+///
+/// egui's `drag_started()` / `dragged()` / `drag_stopped()` fire for a drag by *any* button,
+/// but the middle button belongs to the camera (`ChemStructEditor::ui` pans with it), so the
+/// tools read their drags through this instead.
+struct PrimaryDrag {
+    started: bool,
+    dragged: bool,
+    stopped: bool,
+}
+
+impl PrimaryDrag {
+    fn of(response: &egui::Response, ui: &egui::Ui) -> Self {
+        let (held, released) = ui.input(|i| {
+            (i.pointer.button_down(egui::PointerButton::Primary),
+             i.pointer.button_released(egui::PointerButton::Primary))
+        });
+        Self {
+            started: response.drag_started() && held,
+            dragged: response.dragged() && held,
+            // A primary drag ends by releasing the button, or is aborted (Escape) while it is
+            // still held. `drag_stopped_by(Primary)` would only see the release, leaving the
+            // gesture's state behind after an abort.
+            stopped: response.drag_stopped() && (released || held),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Public tool handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -54,6 +86,7 @@ pub fn process_bond_tool(
 ) -> bool {
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
+    let drag = PrimaryDrag::of(response, ui);
 
     // ── Drag tracking ────────────────────────────────────────────────────────
     // Dragging *from an atom* always draws a bond, never moves it — the Bond tool's own
@@ -63,7 +96,7 @@ pub fn process_bond_tool(
     // Dragging *from empty canvas* (no atom and no bond under the press) instead runs the same
     // rubber-band selection the Select tool offers, so a user can marquee-select without
     // leaving the Bond tool. A drag that begins on a bond keeps the Bond tool's old no-op.
-    if response.drag_started() {
+    if drag.started {
         // `drag_started()` only fires once the pointer has moved past egui's drag threshold,
         // so by now `mouse` (the *current* position) may already be well past the atom the
         // drag actually started on. Hit-test at the press origin instead, or a fast drag off
@@ -81,7 +114,7 @@ pub fn process_bond_tool(
         }
     }
 
-    if response.dragged() {
+    if drag.dragged {
         if editor.bond_start.is_some() {
             editor.preview_end_screen = Some(mouse);
         } else if editor.drag_origin_screen.is_some() {
@@ -90,7 +123,7 @@ pub fn process_bond_tool(
         }
     }
 
-    if response.drag_stopped() {
+    if drag.stopped {
         if editor.bond_start.is_none() && editor.drag_origin_screen.is_some() {
             // Empty-space drag: commit the rubber-band selection and tear its state down.
             lasso_select(editor, center);
@@ -267,6 +300,7 @@ pub fn process_select_tool(
 ) -> bool {
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
+    let drag = PrimaryDrag::of(response, ui);
 
     // Double-click an atom or bond → select that whole connected molecule.
     if response.double_clicked() {
@@ -292,7 +326,7 @@ pub fn process_select_tool(
         }
     }
 
-    if response.drag_started() {
+    if drag.started {
         lasso_begin(editor, mouse);
         // Alt+drag with a selection rotates the molecule around its centroid.
         if ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty() {
@@ -307,7 +341,7 @@ pub fn process_select_tool(
         }
     }
 
-    if response.dragged() {
+    if drag.dragged {
         if let Some(last) = editor.rotate_last_angle {
             // Rotate the selection by the change in cursor angle about its centroid.
             let c = selection_centroid(editor);
@@ -336,7 +370,7 @@ pub fn process_select_tool(
         }
     }
 
-    if response.drag_stopped() {
+    if drag.stopped {
         if editor.rotate_last_angle.take().is_some() {
             // rotation finished
         } else if editor.dragging_atom.is_some() {
