@@ -7,7 +7,9 @@
 //! * every other reactant — `moles = equivalents × limiting moles`, `mass = moles × MW`
 //! * product — `expected moles = limiting moles × coefficient`, `expected mass = … × MW`
 //! * product — `product moles = measured mass / MW`, `%yield = product moles / expected × 100`
-//! * liquids — `volume = mass / density`; solutions — `moles = molarity × volume`
+//! * %Weight — `reactant mass = sample mass × %Weight`, so a back-filled sample mass is
+//!   `mass / %Weight`
+//! * liquids — `volume = sample mass / density`; solutions — `moles = molarity × volume`
 //!
 //! Each number remembers whether it was [`Origin::Entered`] by the user or [`Origin::Computed`]
 //! from the rest, because the table draws entered values in **bold italic**.
@@ -53,8 +55,8 @@ pub struct ReactantAnalysis {
     pub mw: Option<f64>,
     pub limiting: bool,
     pub equivalents: Option<Quantity>,
-    /// `Sample Mass`, g — entered when the reagent was weighed out, otherwise the mass its
-    /// equivalents call for (same value as [`mass`](Self::mass), computed).
+    /// `Sample Mass`, g — entered when the reagent was weighed out, otherwise the mass of
+    /// material its equivalents call for ([`mass`](Self::mass) ÷ %Weight, computed).
     pub sample_mass: Option<Quantity>,
     pub percent_weight: Option<Quantity>,
     /// mol/L.
@@ -189,13 +191,18 @@ fn analyse_reactant(
         _ => None,
     };
 
+    // Reactant Mass is the pure reagent; Reactant Mass = Sample Mass × %Weight, so the
+    // material to weigh out or measure is the pure mass divided by the assay — the inverse of
+    // the conversion in `entered_moles`. A 0 % assay supplies no reagent at any amount.
     let mass = match (moles, mw) {
         (Some(n), Some(mw)) => Some(Quantity::computed(n.value * mw)),
         _ => None,
     };
+    let assay = r.percent_weight.unwrap_or(100.0) / 100.0;
+    let material_mass = mass.filter(|_| assay > 0.0).map(|m| Quantity::computed(m.value / assay));
 
     // Volume: entered wins; else derive it from a density (neat liquid) or a molarity (stock).
-    let volume = match (r.volume, r.density, r.molarity, mass, moles) {
+    let volume = match (r.volume, r.density, r.molarity, material_mass, moles) {
         (Some(v), ..) => Some(Quantity::entered(v)),
         (None, Some(d), _, Some(m), _) if d > 0.0 => Some(Quantity::computed(m.value / d)),
         (None, None, Some(c), _, Some(n)) if c > 0.0 => {
@@ -214,7 +221,7 @@ fn analyse_reactant(
         // its equivalents — the mass you *would* weigh out, back-filled like ChemDraw does.
         sample_mass: match r.sample_mass {
             Some(m) => Some(Quantity::entered(m.as_grams())),
-            None => mass,
+            None => material_mass,
         },
         percent_weight: r.percent_weight.map(Quantity::entered),
         molarity: r.molarity.map(Quantity::entered),
@@ -505,6 +512,61 @@ mod tests {
         assert_eq!(
             format_moles(a.reactants[0].moles.unwrap().value).joined(),
             "10.63mmol"
+        );
+    }
+
+    /// %Weight on a reagent measured by equivalents: Reactant Mass stays the pure reagent,
+    /// while the back-filled Sample Mass and the density-derived Volume are of the impure
+    /// material — the inverse of how an entered sample is turned into moles.
+    #[test]
+    fn assay_scales_back_filled_sample_mass_and_volume() {
+        use crate::reaction::model::{Analysis, Reactant};
+
+        let a = Analysis::new()
+            .reactant(
+                Reactant::new(demo::phenol())
+                    .limiting()
+                    .sample_mass(Mass::grams(1.0)),
+            )
+            .reactant(Reactant::new(demo::methyl_iodide()).equivalents(1.0).percent_weight(50.0))
+            .reactant(
+                Reactant::new(demo::methyl_iodide())
+                    .equivalents(1.0)
+                    .percent_weight(50.0)
+                    .density(2.28),
+            )
+            .compute();
+
+        for r in &a.reactants[1..] {
+            let pure = r.mass.unwrap().value;
+            let sample = r.sample_mass.unwrap();
+            assert!(!sample.is_entered());
+            // 1.00 eq of MeI is 1.51 g of MeI, so 3.02 g of 50 % material is weighed out.
+            assert_eq!(format_mass(pure).joined(), "1.51g");
+            assert!((sample.value - 2.0 * pure).abs() < 1e-9, "sample mass = mass / assay");
+        }
+
+        // Feeding the derived volume back through `density × volume × assay / MW` gives the
+        // same moles.
+        let mei = &a.reactants[2];
+        let volume = mei.volume.unwrap();
+        assert!(!volume.is_entered());
+        let moles = 2.28 * volume.value * 0.5 / mei.mw.unwrap();
+        assert!((moles - mei.moles.unwrap().value).abs() < 1e-12);
+        assert_eq!(format_volume(volume.value).joined(), "1.32mL");
+
+        // And the round trip holds the other way: entering the back-filled sample mass as a
+        // weighed amount reproduces the same moles.
+        let back = Analysis::new()
+            .reactant(
+                Reactant::new(demo::methyl_iodide())
+                    .sample_mass(Mass::grams(a.reactants[1].sample_mass.unwrap().value))
+                    .percent_weight(50.0),
+            )
+            .compute();
+        assert!(
+            (back.reactants[0].moles.unwrap().value - a.reactants[1].moles.unwrap().value).abs()
+                < 1e-12
         );
     }
 
