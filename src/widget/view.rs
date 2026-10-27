@@ -8,6 +8,11 @@
 use super::scene::RenderTransform;
 use super::SCALE_FACTOR;
 
+/// Smallest editor zoom reachable by scroll or pinch.
+pub const MIN_ZOOM: f32 = 0.1;
+/// Largest editor zoom reachable by scroll or pinch.
+pub const MAX_ZOOM: f32 = 20.0;
+
 /// A snapshot of the editor camera (zoom, pan) placed on a canvas whose center is `center`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewTransform {
@@ -45,6 +50,22 @@ impl ViewTransform {
         ]
     }
 
+    /// A screen-pixel displacement (e.g. a drag delta) expressed in molecule units.
+    pub fn screen_delta_to_mol(&self, delta: egui::Vec2) -> [f32; 2] {
+        let inv = 1.0 / self.scale();
+        [delta.x * inv, delta.y * inv]
+    }
+
+    /// This camera zoomed by `factor` (clamped to [`MIN_ZOOM`]..=[`MAX_ZOOM`]), with the pan
+    /// adjusted so the molecule point under the screen position `anchor` stays under it.
+    pub fn zoomed_about(&self, factor: f32, anchor: egui::Pos2) -> Self {
+        let before = self.screen_to_mol(anchor);
+        let mut zoomed = Self { zoom: (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM), ..*self };
+        let after = zoomed.mol_to_screen(before);
+        zoomed.pan += anchor - after;
+        zoomed
+    }
+
     /// The backend-neutral render mapping for this camera. Positions scale by
     /// `zoom * SCALE_FACTOR`; visual sizes (widths, font) scale by `zoom` alone — so at zoom = 1
     /// the editor and the image exporter (`SCALE_FACTOR`, `visual_scale = 1`) agree exactly.
@@ -71,6 +92,26 @@ mod tests {
             egui::pos2(310.0 + 2.0 * SCALE_FACTOR, 195.0 - 2.0 * SCALE_FACTOR)
         );
         assert_eq!(v.screen_to_mol(egui::pos2(310.0, 195.0)), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn screen_delta_to_mol_divides_by_the_scale() {
+        let v = ViewTransform::new(1.7, egui::vec2(3.0, 4.0), egui::pos2(50.0, 60.0));
+        let d = v.screen_delta_to_mol(egui::vec2(17.0, -34.0));
+        assert_eq!(d, [17.0 / v.scale(), -34.0 / v.scale()]);
+    }
+
+    #[test]
+    fn zoomed_about_keeps_the_anchor_fixed_and_clamps() {
+        let v = ViewTransform::new(1.3, egui::vec2(25.0, -15.0), egui::pos2(320.0, 240.0));
+        let anchor = egui::pos2(500.0, 120.0);
+        let z = v.zoomed_about(1.5, anchor);
+        assert!((z.zoom - 1.95).abs() <= 1e-6);
+        assert_eq!(z.center, v.center);
+        let (a, b) = (z.screen_to_mol(anchor), v.screen_to_mol(anchor));
+        assert!((a[0] - b[0]).abs() <= 1e-4 && (a[1] - b[1]).abs() <= 1e-4, "{a:?} != {b:?}");
+        assert_eq!(v.zoomed_about(1.0e4, anchor).zoom, MAX_ZOOM);
+        assert_eq!(v.zoomed_about(1.0e-4, anchor).zoom, MIN_ZOOM);
     }
 
     #[test]

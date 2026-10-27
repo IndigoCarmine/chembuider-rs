@@ -325,9 +325,7 @@ pub fn process_select_tool(
             editor.rotate_last_angle = Some(angle);
             modified = true;
         } else if let Some(atom_id) = editor.dragging_atom {
-            let drag_delta = response.drag_delta();
-            let inv = 1.0 / (editor.zoom * super::SCALE_FACTOR);
-            let (dx, dy) = (drag_delta.x * inv, drag_delta.y * inv);
+            let [dx, dy] = editor.view(center).screen_delta_to_mol(response.drag_delta());
             let atoms_to_move: Vec<u32> = if editor.selected_atoms.contains(&atom_id) {
                 editor.selected_atoms.iter().cloned().collect()
             } else {

@@ -11,8 +11,9 @@
 //!
 //! Coordinate model: primitives are in *target pixels*. [`RenderTransform`] maps molecule
 //! coordinates to pixels (`coord_scale`, `offset`) and scales visual sizes — bond widths, label
-//! font size, offsets — by `visual_scale`. The editor passes `coord_scale = zoom * SCALE_FACTOR`,
-//! `visual_scale = zoom`; the exporter passes `coord_scale = SCALE_FACTOR`, `visual_scale = 1`.
+//! font size, offsets — by `visual_scale`. The editor passes `coord_scale` = its zoom times
+//! `SCALE_FACTOR` (see `ViewTransform::render_transform`), `visual_scale = zoom`; the exporter
+//! passes `coord_scale = SCALE_FACTOR`, `visual_scale = 1`.
 //! Both therefore agree exactly at the editor's zoom = 1 baseline.
 
 use std::collections::HashMap;
