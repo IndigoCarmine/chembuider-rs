@@ -156,6 +156,29 @@ fn write_object(out: &mut Vec<u8>, obj: &CdxObject) {
     out.extend_from_slice(&0u16.to_le_bytes());
 }
 
+/// The same tree in [`cdx_file_rs`]'s raw form, which its CDXML codec reads and writes.
+impl From<cdx_file_rs::cdx_parse_impl::raw_nodes::RawCdxObject> for CdxObject {
+    fn from(raw: cdx_file_rs::cdx_parse_impl::raw_nodes::RawCdxObject) -> Self {
+        Self {
+            tag: raw.tag,
+            id: raw.id,
+            props: raw.properties.into_iter().map(|p| (p.tag, p.value)).collect(),
+            children: raw.children.into_iter().map(Self::from).collect(),
+        }
+    }
+}
+
+impl From<CdxObject> for cdx_file_rs::cdx_parse_impl::raw_nodes::RawCdxObject {
+    fn from(obj: CdxObject) -> Self {
+        let mut raw = Self::new(obj.tag, obj.id);
+        for (tag, value) in obj.props {
+            raw.add_property(tag, value);
+        }
+        raw.children = obj.children.into_iter().map(Self::from).collect();
+        raw
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

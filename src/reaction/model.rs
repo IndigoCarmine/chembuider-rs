@@ -323,8 +323,20 @@ impl Reaction {
         reaction
     }
 
+    /// A scheme of two or more steps (arrows). Its table is not drawn, and the columns are
+    /// left as they are while it stays one: a column follows a compound across *the* arrow,
+    /// and a multi-step scheme has no single arrow to split its structures at. Once it is back
+    /// to one arrow, [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme)
+    /// lines the table up with it again.
+    pub fn is_multi_step(&self) -> bool {
+        self.scheme.arrow_count() >= 2
+    }
+
     /// Link every unlinked column to the structure at its position; see [`Reaction::new`].
     fn link_columns_by_position(&mut self) {
+        if self.is_multi_step() {
+            return;
+        }
         let mut links: Vec<(StructureRole, StructureId)> = Vec::new();
         for (i, item) in self.scheme.items.iter().enumerate() {
             match item {
@@ -511,8 +523,12 @@ impl Reaction {
     ///   among the linked columns like any other. Unlinked columns keep their relative order.
     ///
     /// A structure added straight to the scheme gets no column, and an unchanged figure is
-    /// left exactly as it was.
+    /// left exactly as it was. A [multi-step](Reaction::is_multi_step) scheme leaves the table
+    /// untouched.
     pub fn sync_structures_from_scheme(&mut self) {
+        if self.is_multi_step() {
+            return;
+        }
         // Every drawn structure, in scheme order, with the side it is drawn on. A cloned
         // structure keeps its id, so one id can be drawn twice; its first appearance decides
         // where its column goes.
@@ -1553,5 +1569,43 @@ mod tests {
         assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "CH3I", "C7H8O", "C12H10"]);
         assert_eq!(product_formulas(&reaction), ["C6H6"]);
         assert_eq!(reaction.analysis.limiting(), Some(0));
+    }
+
+    /// A second arrow makes the scheme multi-step: the table is left alone, whatever moves,
+    /// until the scheme is back to one arrow, when the columns line up with it again.
+    #[test]
+    fn a_multi_step_scheme_leaves_the_table_alone() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        assert!(!reaction.is_multi_step());
+        let (reactants, products) = (reactant_formulas(&reaction), product_formulas(&reaction));
+
+        let second = reaction.scheme.add(SchemeItem::Arrow(Arrow::new()));
+        assert!(reaction.is_multi_step());
+        // Phenol to the far end: across both arrows. Nothing changes in the table.
+        reaction.scheme.move_item(0, 10);
+        reaction.sync_structures_from_scheme();
+        assert_eq!((reactant_formulas(&reaction), product_formulas(&reaction)), (reactants.clone(), products.clone()));
+
+        // Back to one arrow (the original one, now first): phenol is after it, a product.
+        reaction.scheme.remove(second - 1);
+        assert!(!reaction.is_multi_step());
+        reaction.sync_structures_from_scheme();
+        assert!(product_formulas(&reaction).contains(&"C6H6O".to_string()));
+    }
+
+    /// Columns are not linked by position across a multi-step scheme: there is no one arrow to
+    /// tell reactants from products.
+    #[test]
+    fn a_multi_step_scheme_links_no_columns() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new())
+            .structure(demo::anisole())
+            .arrow(Arrow::new())
+            .structure(demo::benzene());
+        let analysis = Analysis::new().reactant(Reactant::new(demo::phenol())).product(Product::new(demo::benzene()));
+        let reaction = Reaction::new(scheme, analysis);
+        assert!(reaction.analysis.reactants[0].structure.is_none());
+        assert!(reaction.analysis.products[0].structure.is_none());
     }
 }

@@ -1,5 +1,8 @@
-//! The reaction scheme: structures, `+` separators and an arrow with text above and below,
-//! laid out on one horizontal reaction line.
+//! The reaction scheme: structures, `+` separators and arrows with text above and below,
+//! laid out left to right on a reaction line. A multi-step scheme runs on over several rows:
+//! a [`SchemeItem::LineBreak`] starts a new one, and so does an item that would make a row
+//! wider than [`ReactionStyle::max_row_width`]. A structure can carry a compound label
+//! (`(I)`, **4**) centred under it.
 //!
 //! Structures are drawn by the *editor's own* renderer ([`crate::widget::draw`]) so a
 //! structure in a scheme looks exactly like the same structure in the editor: same label
@@ -46,12 +49,20 @@ impl StructureId {
 pub struct SchemeStructure {
     id: StructureId,
     molecule: Molecule,
+    /// The compound label drawn under the structure (`(I)`, **4**); empty for none.
+    label: RichText,
 }
 
 impl SchemeStructure {
     /// Wrap `molecule` with a fresh [`StructureId`].
     pub fn new(molecule: Molecule) -> Self {
-        Self { id: StructureId::fresh(), molecule }
+        Self { id: StructureId::fresh(), molecule, label: RichText::new() }
+    }
+
+    /// This structure with a compound label under it.
+    pub fn with_label(mut self, label: impl Into<RichText>) -> Self {
+        self.label = label.into();
+        self
     }
 
     /// This structure's id.
@@ -67,6 +78,16 @@ impl SchemeStructure {
     /// The molecule, mutably. The id stays the same.
     pub fn molecule_mut(&mut self) -> &mut Molecule {
         &mut self.molecule
+    }
+
+    /// The compound label under the structure (empty for none).
+    pub fn label(&self) -> &RichText {
+        &self.label
+    }
+
+    /// Replace the compound label; empty text removes it.
+    pub fn set_label(&mut self, label: RichText) {
+        self.label = label;
     }
 
     /// Unwrap the molecule, dropping the id.
@@ -112,6 +133,8 @@ pub enum SchemeItem {
     Arrow(Arrow),
     /// Free-standing text on the reaction line (a reagent written out, `Δ`, a label …).
     Text(RichText),
+    /// The end of a row: the next item starts a new row under this one.
+    LineBreak,
 }
 
 /// A label riding above or below a reaction arrow: nothing, some text, or a drawn structure.
@@ -261,6 +284,21 @@ impl ReactionScheme {
         self.item(SchemeItem::Text(text.into()))
     }
 
+    /// A structure with a compound label (`"(I)"`, `"**4**\n(V)"`) under it.
+    pub fn labeled_structure(self, molecule: Molecule, label: impl Into<RichText>) -> Self {
+        self.item(SchemeItem::Structure(SchemeStructure::new(molecule).with_label(label)))
+    }
+
+    /// End the row: what follows starts a new row.
+    pub fn line_break(self) -> Self {
+        self.item(SchemeItem::LineBreak)
+    }
+
+    /// How many arrows (reaction steps) the scheme has.
+    pub fn arrow_count(&self) -> usize {
+        self.items.iter().filter(|i| matches!(i, SchemeItem::Arrow(_))).count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -298,23 +336,66 @@ impl ReactionScheme {
 pub struct SchemeLayout {
     /// One entry per item of the scheme, in order.
     pub items: Vec<PlacedItem>,
+    /// The rows the items run on, top to bottom. A scheme without items has none.
+    pub rows: Vec<SchemeRow>,
     /// Tight size of the whole scheme.
     pub size: Vec2,
-    /// Distance from the top to the reaction line (the arrow shaft).
+    /// Distance from the top to the first row's reaction line (the arrow shaft).
     pub center_line: f32,
+}
+
+impl SchemeLayout {
+    /// The reaction line of the row item `index` sits on, from the scheme's top.
+    pub fn line_of(&self, index: usize) -> f32 {
+        self.items
+            .get(index)
+            .and_then(|item| self.rows.get(item.row))
+            .map_or(self.center_line, |row| row.center_line)
+    }
+
+    /// The row whose band (from its top to its bottom, gaps split between neighbours) holds `y`,
+    /// measured from the scheme's top. Above the first row is the first, below the last the last.
+    pub fn row_at(&self, y: f32) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        Some(
+            self.rows
+                .windows(2)
+                .position(|pair| y < (pair[0].bottom + pair[1].top) * 0.5)
+                .unwrap_or(self.rows.len() - 1),
+        )
+    }
+}
+
+/// One row of a scheme.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchemeRow {
+    /// Top of the row, from the scheme's top.
+    pub top: f32,
+    /// The row's reaction line, from the scheme's top.
+    pub center_line: f32,
+    /// Bottom of the row, from the scheme's top.
+    pub bottom: f32,
+    /// The items on the row: indices into [`SchemeLayout::items`].
+    pub items: std::ops::Range<usize>,
 }
 
 /// One measured item: its box, plus whatever the paint pass needs to draw it.
 pub struct PlacedItem {
-    /// Box of this item, relative to the scheme's top-left.
+    /// Box of this item, relative to the scheme's top-left. A structure's box takes in its
+    /// compound label.
     pub rect: Rect,
+    /// The row it sits on: an index into [`SchemeLayout::rows`].
+    pub row: usize,
     pub kind: PlacedKind,
 }
 
 /// Paint-ready form of a measured item.
 pub enum PlacedKind {
-    /// Where the molecule's coordinate origin lands, relative to the scheme's top-left.
-    Structure { origin: Vec2 },
+    /// Where the molecule's coordinate origin lands, relative to the scheme's top-left, and its
+    /// compound label, if it has one.
+    Structure { origin: Vec2, label: Option<PlacedLabel> },
     /// Pre-laid-out text (`+`, a free text item).
     Text(RunLayout),
     /// Arrow shaft length plus the pre-laid-out label above and below it.
@@ -323,6 +404,28 @@ pub enum PlacedKind {
         above: PlacedArrowLabel,
         below: PlacedArrowLabel,
     },
+    /// The end of a row: nothing to draw.
+    LineBreak,
+}
+
+/// A compound label, laid out and placed under its structure.
+pub struct PlacedLabel {
+    /// Its lines, top to bottom, each centred in [`rect`](Self::rect).
+    pub lines: Vec<RunLayout>,
+    /// The label's box, relative to the scheme's top-left.
+    pub rect: Rect,
+}
+
+impl PlacedLabel {
+    /// Paint the label with the scheme's top-left at `top_left`.
+    pub fn paint(&self, painter: &Painter, top_left: Pos2) {
+        let rect = self.rect.translate(top_left.to_vec2());
+        let mut y = rect.min.y;
+        for line in &self.lines {
+            line.paint(painter, Pos2::new(rect.center().x - line.size.x * 0.5, y));
+            y += line.size.y;
+        }
+    }
 }
 
 /// Paint-ready form of one of an arrow's two labels.
@@ -350,15 +453,30 @@ enum ArrowLabelMeasure {
     Structure { bounds: Rect },
 }
 
-/// A measured scheme item, before the placement pass fixes structure origins to scheme
-/// coordinates.
+/// A measured scheme item, before the placement pass fixes it to scheme coordinates.
 enum Measured {
     Ready(PlacedKind),
+    Structure {
+        /// The molecule origin inside the item box.
+        origin: Vec2,
+        /// Width and height of the structure itself (the box above the label).
+        size: Vec2,
+        /// The label's lines and the size they take together.
+        label: Option<(Vec<RunLayout>, Vec2)>,
+    },
     Arrow {
         length: f32,
         above: ArrowLabelMeasure,
         below: ArrowLabelMeasure,
     },
+}
+
+/// One item's extent: its width, how far it reaches above and below the reaction line.
+struct Extent {
+    width: f32,
+    above: f32,
+    below: f32,
+    measured: Measured,
 }
 
 /// Measure a scheme. `scratch` is a drawing context for structures; its molecule and
@@ -370,122 +488,183 @@ pub fn measure_scheme(
     structure_style: &StyleConfig,
     scratch: &mut ChemStructEditor,
 ) -> SchemeLayout {
-    // (width, extent above the line, extent below the line, paint data)
-    let mut measured: Vec<(f32, f32, f32, Measured)> = Vec::with_capacity(scheme.items.len());
     // Half the arrow head is the shaft's own extent; a label stacks on top of that.
     let half_shaft = (style.arrow_width * 0.5).max(style.arrow_head_half_width);
-
-    for item in &scheme.items {
-        match item {
-            SchemeItem::Structure(mol) => {
-                let bounds = structure_bounds(mol, painter, style, structure_style, scratch);
-                let half = bounds.height() * 0.5;
-                // Origin offset inside the item box: the box starts at the bounds' top-left.
-                let origin = Vec2::new(-bounds.min.x, -bounds.min.y);
-                measured.push((
-                    bounds.width(),
-                    half,
-                    half,
-                    Measured::Ready(PlacedKind::Structure { origin }),
-                ));
-            }
-            SchemeItem::Plus => {
-                let layout = text_layout(&RichText::plain("+"), style.plus_font_size, painter);
-                let half = layout.size.y * 0.5;
-                measured.push((layout.size.x, half, half, Measured::Ready(PlacedKind::Text(layout))));
-            }
-            SchemeItem::Text(text) => {
-                let layout = text_layout(text, style.scheme_font_size, painter);
-                let half = layout.size.y * 0.5;
-                measured.push((layout.size.x, half, half, Measured::Ready(PlacedKind::Text(layout))));
-            }
-            SchemeItem::Arrow(arrow) => {
-                let above =
-                    measure_arrow_label(&arrow.above, painter, style, structure_style, scratch);
-                let below =
-                    measure_arrow_label(&arrow.below, painter, style, structure_style, scratch);
-                let width = |m: &ArrowLabelMeasure| match m {
-                    ArrowLabelMeasure::Empty => 0.0,
-                    ArrowLabelMeasure::Text(t) => t.size.x,
-                    ArrowLabelMeasure::Structure { bounds } => bounds.width(),
-                };
-                let label_width = width(&above).max(width(&below));
-                let length = arrow
-                    .length
-                    .unwrap_or_else(|| style.arrow_length.max(label_width + 2.0 * style.item_gap));
-                let extent = |m: &ArrowLabelMeasure| match m {
-                    ArrowLabelMeasure::Empty => half_shaft,
-                    ArrowLabelMeasure::Text(t) => half_shaft + style.arrow_text_gap + t.size.y,
-                    ArrowLabelMeasure::Structure { bounds } => {
-                        half_shaft + style.arrow_text_gap + bounds.height()
-                    }
-                };
-                measured.push((
-                    length,
-                    extent(&above),
-                    extent(&below),
-                    Measured::Arrow { length, above, below },
-                ));
-            }
-        }
-    }
-
+    let measured: Vec<Extent> = scheme
+        .items
+        .iter()
+        .map(|item| measure_item(item, painter, style, structure_style, scratch, half_shaft))
+        .collect();
     if measured.is_empty() {
-        return SchemeLayout { items: Vec::new(), size: Vec2::ZERO, center_line: 0.0 };
+        return SchemeLayout { items: Vec::new(), rows: Vec::new(), size: Vec2::ZERO, center_line: 0.0 };
     }
 
-    let center_line = measured.iter().map(|m| m.1).fold(0.0_f32, f32::max);
-    let below = measured.iter().map(|m| m.2).fold(0.0_f32, f32::max);
-    let mut items = Vec::with_capacity(measured.len());
-    let mut pen_x = 0.0_f32;
-    for (i, (width, above, item_below, kind)) in measured.into_iter().enumerate() {
-        if i > 0 {
-            pen_x += style.item_gap;
+    // Break the items into rows: after a line break, and before an item that would make the
+    // row wider than the style allows (a row always takes at least one item).
+    let mut row_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut start, mut pen_x) = (0usize, 0.0_f32);
+    for (i, m) in measured.iter().enumerate() {
+        let right = if i == start { m.width } else { pen_x + style.item_gap + m.width };
+        let too_wide = style.max_row_width.is_some_and(|max| right > max);
+        if i > start && too_wide && !matches!(m.measured, Measured::Ready(PlacedKind::LineBreak)) {
+            row_ranges.push(start..i);
+            start = i;
+            pen_x = m.width;
+        } else {
+            pen_x = right;
         }
-        let rect = Rect::from_min_size(
-            Pos2::new(pen_x, center_line - above),
-            Vec2::new(width, above + item_below),
-        );
-        let kind = match kind {
-            // Shift the structure's origin from item-box-relative to scheme-relative.
-            Measured::Ready(PlacedKind::Structure { origin }) => PlacedKind::Structure {
-                origin: origin + rect.min.to_vec2(),
-            },
-            Measured::Ready(other) => other,
-            // Place each arrow-label structure so it is centred over the shaft and sits its
-            // own height clear of it, above or below the reaction line.
-            Measured::Arrow { length, above, below } => {
-                let shaft_center_x = rect.min.x + length * 0.5;
-                let place = |m: ArrowLabelMeasure, is_above: bool| -> PlacedArrowLabel {
-                    match m {
-                        ArrowLabelMeasure::Empty => PlacedArrowLabel::Empty,
-                        ArrowLabelMeasure::Text(t) => PlacedArrowLabel::Text(t),
-                        ArrowLabelMeasure::Structure { bounds } => {
-                            let ox = shaft_center_x - bounds.center().x;
-                            let oy = if is_above {
-                                (center_line - half_shaft - style.arrow_text_gap) - bounds.max.y
-                            } else {
-                                (center_line + half_shaft + style.arrow_text_gap) - bounds.min.y
-                            };
-                            PlacedArrowLabel::Structure { origin: Vec2::new(ox, oy) }
-                        }
-                    }
-                };
-                PlacedKind::Arrow {
-                    length,
-                    above: place(above, true),
-                    below: place(below, false),
-                }
-            }
-        };
-        items.push(PlacedItem { rect, kind });
-        pen_x += width;
+        if matches!(m.measured, Measured::Ready(PlacedKind::LineBreak)) {
+            row_ranges.push(start..i + 1);
+            start = i + 1;
+            pen_x = 0.0;
+        }
+    }
+    if start < measured.len() {
+        row_ranges.push(start..measured.len());
     }
 
-    SchemeLayout {
-        items,
-        size: Vec2::new(pen_x, center_line + below),
-        center_line,
+    let mut items = Vec::with_capacity(measured.len());
+    let mut rows = Vec::with_capacity(row_ranges.len());
+    let mut measured = measured.into_iter();
+    let (mut top, mut width) = (0.0_f32, 0.0_f32);
+    for (row, range) in row_ranges.into_iter().enumerate() {
+        let row_items: Vec<Extent> = measured.by_ref().take(range.len()).collect();
+        if row > 0 {
+            top += style.row_gap;
+        }
+        let center_line = top + row_items.iter().map(|m| m.above).fold(0.0_f32, f32::max);
+        let bottom = center_line + row_items.iter().map(|m| m.below).fold(0.0_f32, f32::max);
+        let mut pen_x = 0.0_f32;
+        let mut placed_any = false;
+        for m in row_items {
+            // A line break takes no room: it sits at the end of its row.
+            if !matches!(m.measured, Measured::Ready(PlacedKind::LineBreak)) {
+                if placed_any {
+                    pen_x += style.item_gap;
+                }
+                placed_any = true;
+            }
+            let rect = Rect::from_min_size(
+                Pos2::new(pen_x, center_line - m.above),
+                Vec2::new(m.width, m.above + m.below),
+            );
+            let kind = place(m.measured, rect, center_line, half_shaft, style);
+            items.push(PlacedItem { rect, row, kind });
+            pen_x += m.width;
+        }
+        width = width.max(pen_x);
+        rows.push(SchemeRow { top, center_line, bottom, items: range });
+        top = bottom;
+    }
+
+    SchemeLayout { size: Vec2::new(width, top), center_line: rows[0].center_line, items, rows }
+}
+
+fn measure_item(
+    item: &SchemeItem,
+    painter: &Painter,
+    style: &ReactionStyle,
+    structure_style: &StyleConfig,
+    scratch: &mut ChemStructEditor,
+    half_shaft: f32,
+) -> Extent {
+    match item {
+        SchemeItem::Structure(mol) => {
+            let bounds = structure_bounds(mol, painter, style, structure_style, scratch);
+            let half = bounds.height() * 0.5;
+            // Origin offset inside the item box: the box starts at the bounds' top-left.
+            let origin = Vec2::new(-bounds.min.x, -bounds.min.y);
+            let lines: Vec<RunLayout> = split_lines(mol.label())
+                .iter()
+                .map(|line| text_layout(line, style.compound_label_font_size, painter))
+                .collect();
+            let label_size = lines.iter().fold(Vec2::ZERO, |acc, l| Vec2::new(acc.x.max(l.size.x), acc.y + l.size.y));
+            let (label, width, below) = if mol.label().is_empty() {
+                (None, bounds.width(), half)
+            } else {
+                let width = bounds.width().max(label_size.x);
+                (Some((lines, label_size)), width, half + style.compound_label_gap + label_size.y)
+            };
+            Extent {
+                width,
+                above: half,
+                below,
+                measured: Measured::Structure { origin, size: bounds.size(), label },
+            }
+        }
+        SchemeItem::Plus => {
+            let layout = text_layout(&RichText::plain("+"), style.plus_font_size, painter);
+            let half = layout.size.y * 0.5;
+            Extent { width: layout.size.x, above: half, below: half, measured: Measured::Ready(PlacedKind::Text(layout)) }
+        }
+        SchemeItem::Text(text) => {
+            let layout = text_layout(text, style.scheme_font_size, painter);
+            let half = layout.size.y * 0.5;
+            Extent { width: layout.size.x, above: half, below: half, measured: Measured::Ready(PlacedKind::Text(layout)) }
+        }
+        SchemeItem::LineBreak => {
+            Extent { width: 0.0, above: 0.0, below: 0.0, measured: Measured::Ready(PlacedKind::LineBreak) }
+        }
+        SchemeItem::Arrow(arrow) => {
+            let above = measure_arrow_label(&arrow.above, painter, style, structure_style, scratch);
+            let below = measure_arrow_label(&arrow.below, painter, style, structure_style, scratch);
+            let width = |m: &ArrowLabelMeasure| match m {
+                ArrowLabelMeasure::Empty => 0.0,
+                ArrowLabelMeasure::Text(t) => t.size.x,
+                ArrowLabelMeasure::Structure { bounds } => bounds.width(),
+            };
+            let label_width = width(&above).max(width(&below));
+            let length =
+                arrow.length.unwrap_or_else(|| style.arrow_length.max(label_width + 2.0 * style.item_gap));
+            let extent = |m: &ArrowLabelMeasure| match m {
+                ArrowLabelMeasure::Empty => half_shaft,
+                ArrowLabelMeasure::Text(t) => half_shaft + style.arrow_text_gap + t.size.y,
+                ArrowLabelMeasure::Structure { bounds } => half_shaft + style.arrow_text_gap + bounds.height(),
+            };
+            Extent {
+                width: length,
+                above: extent(&above),
+                below: extent(&below),
+                measured: Measured::Arrow { length, above, below },
+            }
+        }
+    }
+}
+
+/// Fix a measured item to its box on a row whose reaction line is at `center_line`.
+fn place(measured: Measured, rect: Rect, center_line: f32, half_shaft: f32, style: &ReactionStyle) -> PlacedKind {
+    match measured {
+        Measured::Ready(kind) => kind,
+        // The structure is centred in its box (which a wider label widens), the label under it.
+        Measured::Structure { origin, size, label } => {
+            let left = rect.center().x - size.x * 0.5;
+            let label = label.map(|(lines, label_size)| {
+                let min = Pos2::new(rect.center().x - label_size.x * 0.5, rect.min.y + size.y + style.compound_label_gap);
+                PlacedLabel { rect: Rect::from_min_size(min, label_size), lines }
+            });
+            PlacedKind::Structure { origin: origin + Vec2::new(left, rect.min.y), label }
+        }
+        // Place each arrow-label structure so it is centred over the shaft and sits its own
+        // height clear of it, above or below the reaction line.
+        Measured::Arrow { length, above, below } => {
+            let shaft_center_x = rect.min.x + length * 0.5;
+            let place = |m: ArrowLabelMeasure, is_above: bool| -> PlacedArrowLabel {
+                match m {
+                    ArrowLabelMeasure::Empty => PlacedArrowLabel::Empty,
+                    ArrowLabelMeasure::Text(t) => PlacedArrowLabel::Text(t),
+                    ArrowLabelMeasure::Structure { bounds } => {
+                        let ox = shaft_center_x - bounds.center().x;
+                        let oy = if is_above {
+                            (center_line - half_shaft - style.arrow_text_gap) - bounds.max.y
+                        } else {
+                            (center_line + half_shaft + style.arrow_text_gap) - bounds.min.y
+                        };
+                        PlacedArrowLabel::Structure { origin: Vec2::new(ox, oy) }
+                    }
+                }
+            };
+            PlacedKind::Arrow { length, above: place(above, true), below: place(below, false) }
+        }
     }
 }
 
@@ -499,19 +678,15 @@ pub fn paint_scheme(
     structure_style: &StyleConfig,
     scratch: &mut ChemStructEditor,
 ) {
-    let line_y = top_left.y + layout.center_line;
     for (item, placed) in scheme.items.iter().zip(&layout.items) {
         let rect = placed.rect.translate(top_left.to_vec2());
+        let line_y = top_left.y + layout.rows.get(placed.row).map_or(layout.center_line, |r| r.center_line);
         match (&placed.kind, item) {
-            (PlacedKind::Structure { origin }, SchemeItem::Structure(mol)) => {
-                draw_structure(
-                    mol,
-                    painter,
-                    top_left + *origin,
-                    style,
-                    structure_style,
-                    scratch,
-                );
+            (PlacedKind::Structure { origin, label }, SchemeItem::Structure(mol)) => {
+                draw_structure(mol, painter, top_left + *origin, style, structure_style, scratch);
+                if let Some(label) = label {
+                    label.paint(painter, top_left);
+                }
             }
             (PlacedKind::Text(text), _) => {
                 text.paint(painter, Pos2::new(rect.min.x, line_y - text.size.y * 0.5));
@@ -664,6 +839,22 @@ fn measure_arrow_label(
             ArrowLabelMeasure::Structure { bounds }
         }
     }
+}
+
+/// Rich text cut at its line breaks, each line keeping its spans' styles. An empty line (two
+/// breaks in a row) stays, as a blank line.
+fn split_lines(text: &RichText) -> Vec<RichText> {
+    let mut lines = vec![RichText::new()];
+    for span in &text.spans {
+        for (k, part) in span.text.split('\n').enumerate() {
+            if k > 0 {
+                lines.push(RichText::new());
+            }
+            let last = lines.last_mut().expect("starts with one line");
+            *last = std::mem::take(last).span(part, span.style);
+        }
+    }
+    lines
 }
 
 fn text_layout(text: &RichText, size: f32, painter: &Painter) -> RunLayout {
@@ -1012,5 +1203,106 @@ mod tests {
         *s.molecule_mut() = demo::anisole();
         assert_eq!(s.id(), id);
         assert!(s == demo::anisole());
+    }
+
+    fn measure(scheme: &ReactionScheme, style: &ReactionStyle) -> SchemeLayout {
+        let mut out = None;
+        with_painter(|painter| {
+            out = Some(measure_scheme(scheme, painter, style, &StyleConfig::default(), &mut scratch()));
+        });
+        out.unwrap()
+    }
+
+    /// The rows of a layout, as the items each holds.
+    fn row_items(layout: &SchemeLayout) -> Vec<std::ops::Range<usize>> {
+        layout.rows.iter().map(|r| r.items.clone()).collect()
+    }
+
+    #[test]
+    fn a_line_break_starts_a_new_row_under_the_first() {
+        let scheme = demo::multi_step_scheme().scheme;
+        let layout = measure(&scheme, &ReactionStyle::default());
+        assert_eq!(row_items(&layout), [0..6, 6..11], "the break ends the first row");
+        let [first, second] = &layout.rows[..] else { panic!("two rows") };
+        assert!(second.top >= first.bottom + ReactionStyle::default().row_gap - 0.01);
+        assert_eq!(layout.center_line, first.center_line);
+        assert!((layout.size.y - second.bottom).abs() < 0.01);
+        for (i, item) in layout.items.iter().enumerate() {
+            let row = &layout.rows[item.row];
+            assert!(row.items.contains(&i));
+            assert_eq!(layout.line_of(i), row.center_line);
+            if !matches!(item.kind, PlacedKind::LineBreak) {
+                assert!(item.rect.min.y <= row.center_line && item.rect.max.y >= row.center_line);
+                assert!(item.rect.min.y >= row.top - 0.01 && item.rect.max.y <= row.bottom + 0.01);
+            }
+        }
+        // Both rows start at the left edge.
+        assert_eq!(layout.items[0].rect.min.x, 0.0);
+        assert_eq!(layout.items[6].rect.min.x, 0.0);
+        // The break sits at the end of its row, taking no room.
+        let brk = &layout.items[5];
+        assert_eq!(brk.rect.width(), 0.0);
+        assert_eq!(brk.rect.min.x, layout.items[4].rect.max.x);
+    }
+
+    #[test]
+    fn rows_wrap_at_the_widest_a_row_may_be() {
+        let scheme = demo::williamson_ether_synthesis().scheme;
+        let wide = measure(&scheme, &ReactionStyle::default());
+        assert_eq!(wide.rows.len(), 1, "no limit, one row");
+        // Room for the phenol and the arrow, not the anisole too.
+        let limit = wide.items[1].rect.max.x + 1.0;
+        let narrow = measure(&scheme, &ReactionStyle { max_row_width: Some(limit), ..Default::default() });
+        assert_eq!(row_items(&narrow), [0..2, 2..3]);
+        assert!(narrow.size.x <= limit);
+        assert_eq!(narrow.items[2].rect.min.x, 0.0, "the wrapped item starts its row");
+        // A limit narrower than any item still puts one item on each row.
+        let tiny = measure(&scheme, &ReactionStyle { max_row_width: Some(1.0), ..Default::default() });
+        assert_eq!(row_items(&tiny), [0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn a_compound_label_is_centred_under_its_structure() {
+        let plain = ReactionScheme::new().structure(demo::phenol());
+        let labeled = ReactionScheme::new().labeled_structure(demo::phenol(), "(I)");
+        let two_lines = ReactionScheme::new().labeled_structure(demo::phenol(), "**4**\n(V)");
+        let style = ReactionStyle::default();
+        let (plain, labeled, two_lines) = (measure(&plain, &style), measure(&labeled, &style), measure(&two_lines, &style));
+
+        let PlacedKind::Structure { origin, label: None } = &plain.items[0].kind else { panic!("no label") };
+        let PlacedKind::Structure { origin: o1, label: Some(l1) } = &labeled.items[0].kind else { panic!("a label") };
+        let PlacedKind::Structure { label: Some(l2), .. } = &two_lines.items[0].kind else { panic!("a label") };
+        // Same structure, same place on the line; the label hangs below it.
+        assert_eq!(origin, o1);
+        assert_eq!(plain.center_line, labeled.center_line);
+        assert!(l1.rect.min.y >= plain.items[0].rect.max.y + style.compound_label_gap - 0.01);
+        assert!((l1.rect.center().x - plain.items[0].rect.center().x).abs() < 0.5);
+        assert!((labeled.items[0].rect.max.y - l1.rect.max.y).abs() < 0.01, "the item box takes the label in");
+        // Two lines: one per line, stacked.
+        assert_eq!(l2.lines.len(), 2);
+        assert_eq!(l2.lines[0].text(), "4");
+        assert_eq!(l2.lines[1].text(), "(V)");
+        assert!(l2.rect.height() > l1.rect.height() * 1.5);
+    }
+
+    #[test]
+    fn a_label_wider_than_its_structure_widens_the_item() {
+        let scheme = ReactionScheme::new().labeled_structure(demo::methyl_iodide(), "a very long compound name");
+        let layout = measure(&scheme, &ReactionStyle::default());
+        let PlacedKind::Structure { label: Some(l), .. } = &layout.items[0].kind else { panic!("a label") };
+        assert!((layout.items[0].rect.width() - l.rect.width()).abs() < 0.01);
+        assert!(l.rect.min.x >= -0.01);
+    }
+
+    #[test]
+    fn row_at_splits_the_gap_between_rows() {
+        let layout = measure(&demo::multi_step_scheme().scheme, &ReactionStyle::default());
+        let [first, second] = &layout.rows[..] else { panic!("two rows") };
+        let mid = (first.bottom + second.top) * 0.5;
+        assert_eq!(layout.row_at(-100.0), Some(0));
+        assert_eq!(layout.row_at(mid - 1.0), Some(0));
+        assert_eq!(layout.row_at(mid + 1.0), Some(1));
+        assert_eq!(layout.row_at(1e6), Some(1));
+        assert_eq!(measure(&ReactionScheme::new(), &ReactionStyle::default()).row_at(0.0), None);
     }
 }

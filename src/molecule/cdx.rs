@@ -22,25 +22,25 @@ use crate::widget::rich_text::{RichSpan, RichText, Script, SpanStyle};
 use std::collections::{HashMap, HashSet};
 
 // Objects (kCDXObj_*).
-const OBJ_DOCUMENT: u16 = 0x8000;
-const OBJ_PAGE: u16 = 0x8001;
-const OBJ_GROUP: u16 = 0x8002;
-const OBJ_FRAGMENT: u16 = 0x8003;
-const OBJ_NODE: u16 = 0x8004;
-const OBJ_BOND: u16 = 0x8005;
-const OBJ_TEXT: u16 = 0x8006;
+pub(crate) const OBJ_DOCUMENT: u16 = 0x8000;
+pub(crate) const OBJ_PAGE: u16 = 0x8001;
+pub(crate) const OBJ_GROUP: u16 = 0x8002;
+pub(crate) const OBJ_FRAGMENT: u16 = 0x8003;
+pub(crate) const OBJ_NODE: u16 = 0x8004;
+pub(crate) const OBJ_BOND: u16 = 0x8005;
+pub(crate) const OBJ_TEXT: u16 = 0x8006;
 
 // Properties (kCDXProp_*).
-const PROP_CREATION_PROGRAM: u16 = 0x0003;
-const PROP_2D_POSITION: u16 = 0x0200;
-const PROP_BOUNDING_BOX: u16 = 0x0204;
+pub(crate) const PROP_CREATION_PROGRAM: u16 = 0x0003;
+pub(crate) const PROP_2D_POSITION: u16 = 0x0200;
+pub(crate) const PROP_BOUNDING_BOX: u16 = 0x0204;
 const PROP_NODE_TYPE: u16 = 0x0400;
 const PROP_NODE_ELEMENT: u16 = 0x0402;
 const PROP_ATOM_CHARGE: u16 = 0x0421;
 const PROP_ATOM_NUM_HYDROGENS: u16 = 0x042B;
-const PROP_TEXT: u16 = 0x0700;
+pub(crate) const PROP_TEXT: u16 = 0x0700;
 const PROP_LABEL_ALIGNMENT: u16 = 0x0705;
-const PROP_UTF8_TEXT: u16 = 0x0709;
+pub(crate) const PROP_UTF8_TEXT: u16 = 0x0709;
 const PROP_BOND_ORDER: u16 = 0x0600;
 const PROP_BOND_DISPLAY: u16 = 0x0601;
 const PROP_BOND_BEGIN: u16 = 0x0604;
@@ -64,9 +64,9 @@ const ALIGN_RIGHT: u8 = 3;
 /// bond take about 30 bytes, so a pipe frame of 256 MiB could hold millions), and the editor's
 /// own work on a molecule (drawing, looking atoms and bonds up) is not made for such sizes
 /// either.
-const MAX_READ_ATOMS: usize = 100_000;
+pub(crate) const MAX_READ_ATOMS: usize = 100_000;
 /// See [`MAX_READ_ATOMS`].
-const MAX_READ_BONDS: usize = 100_000;
+pub(crate) const MAX_READ_BONDS: usize = 100_000;
 
 /// ChemDraw's document style, as ChemDraw 26 writes it: bond length (14.4 pt), spacing and line
 /// widths, the label and caption styles (Arial 10 pt, formula face), the colour and font tables.
@@ -89,7 +89,7 @@ const DOCUMENT_STYLE: [(u16, &str); 14] = [
 ];
 
 /// Font id of Arial in [`DOCUMENT_STYLE`]'s font table.
-pub(super) const LABEL_FONT: u16 = 3;
+pub(crate) const LABEL_FONT: u16 = 3;
 /// Label size in 1/20 pt (10 pt).
 pub(super) const LABEL_SIZE: u16 = 200;
 /// Formula face: digits become subscripts and a trailing charge a superscript.
@@ -103,7 +103,7 @@ const FACE_SUPERSCRIPT: u16 = 0x40;
 pub const SCALE: f64 = 14.4 / 1.5 * 65536.0;
 
 /// One point in CDX units.
-pub(super) const PT: f64 = 65536.0;
+pub(crate) const PT: f64 = 65536.0;
 /// A structure starting above or left of the page edge is moved to this margin.
 const PAGE_MARGIN: f64 = 36.0 * PT;
 /// From an atom to its label's baseline, as ChemDraw places it (half the cap height of 10 pt Arial).
@@ -123,7 +123,7 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 /// A CDXString: its style runs (start, font, face, size, colour), then the characters.
-fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
+pub(crate) fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(runs.len() as u16).to_le_bytes());
     for &(start, face) in runs {
@@ -136,7 +136,7 @@ fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
 }
 
 /// The text and style runs (start, face) of a CDXString.
-fn parse_cdx_string(v: &[u8]) -> Option<(Vec<(usize, u16)>, String)> {
+pub(crate) fn parse_cdx_string(v: &[u8]) -> Option<(Vec<(usize, u16)>, String)> {
     let n = u16::from_le_bytes([*v.first()?, *v.get(1)?]) as usize;
     let mut runs = Vec::with_capacity(n);
     for i in 0..n {
@@ -148,7 +148,7 @@ fn parse_cdx_string(v: &[u8]) -> Option<(Vec<(usize, u16)>, String)> {
     Some((runs, text))
 }
 
-fn point(x: f64, y: f64) -> Vec<u8> {
+pub(crate) fn point(x: f64, y: f64) -> Vec<u8> {
     let mut v = Vec::with_capacity(8);
     v.extend_from_slice(&(y.round() as i32).to_le_bytes());
     v.extend_from_slice(&(x.round() as i32).to_le_bytes());
@@ -156,12 +156,12 @@ fn point(x: f64, y: f64) -> Vec<u8> {
 }
 
 /// A CDXRectangle: top, left, bottom, right.
-fn rect(r: [f64; 4]) -> Vec<u8> {
+pub(crate) fn rect(r: [f64; 4]) -> Vec<u8> {
     let [left, top, right, bottom] = r;
     [top, left, bottom, right].iter().flat_map(|v| (v.round() as i32).to_le_bytes()).collect()
 }
 
-fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> [f64; 4] {
+pub(crate) fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> [f64; 4] {
     match a {
         None => b,
         Some(a) => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
@@ -276,7 +276,7 @@ pub(super) fn node_rules(mol: &impl AtomLookup, atom: &super::Atom) -> NodeRules
 }
 
 /// Style runs (start char, face) for rich text, and its characters.
-fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
+pub(crate) fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
     let mut runs: Vec<(u16, u16)> = Vec::new();
     let mut text = String::new();
     for span in &rich.spans {
@@ -301,7 +301,7 @@ fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
 
 /// Rich text from a CDXString's runs: formula face turns digits into subscripts and the
 /// trailing charge into a superscript, as ChemDraw draws it.
-fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
+pub(crate) fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
     let chars: Vec<char> = text.chars().collect();
     let mut rich = RichText::new();
     let runs: Vec<(usize, u16)> = if runs.is_empty() { vec![(0, 0)] } else { runs.to_vec() };
@@ -380,7 +380,7 @@ fn compact_markup(rich: &RichText) -> String {
 
 /// The structures of `mol` as fragments (one per connected structure), with ids from `next`.
 /// Positions are moved by `shift` (CDX units).
-fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
+pub(crate) fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
     let mut id = || {
         *next += 1;
         *next
@@ -487,19 +487,26 @@ fn page_shift(mol: &Molecule) -> (f64, f64) {
     (fix(min(0)), fix(min(1)))
 }
 
-fn bounding_box(obj: &CdxObject) -> Option<[f64; 4]> {
+pub(crate) fn bounding_box(obj: &CdxObject) -> Option<[f64; 4]> {
     let v = obj.prop(PROP_BOUNDING_BOX).filter(|v| v.len() >= 16)?;
     let n = |i: usize| i32::from_le_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]) as f64;
     Some([n(4), n(0), n(12), n(8)])
 }
 
-/// A new ChemDraw document holding `mol` (an empty page when it has no atoms).
-pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
+/// An empty ChemDraw document in ChemDraw's own style ([`DOCUMENT_STYLE`]), naming this
+/// program as its creator.
+pub(crate) fn new_document() -> CdxObject {
     let mut doc = CdxObject::new(OBJ_DOCUMENT, 0);
     doc.set(PROP_CREATION_PROGRAM, cdx_string(&[], &format!("ChemBuilder {}", env!("CARGO_PKG_VERSION"))));
     for (tag, value) in DOCUMENT_STYLE {
         doc.set(tag, hex(value));
     }
+    doc
+}
+
+/// A new ChemDraw document holding `mol` (an empty page when it has no atoms).
+pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
+    let mut doc = new_document();
     let mut next = 0;
     let mut page = CdxObject::new(OBJ_PAGE, {
         next += 1;
@@ -565,7 +572,7 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
 
 /// Read one fragment's own nodes and bonds into `mol` (not the hidden insides of an
 /// abbreviation, which ChemDraw keeps as a fragment inside its node).
-fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
+pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
     let mut atoms: HashMap<u32, u32> = HashMap::new();
     // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own), with their position.
     let mut hydrogens: Vec<(u32, [f32; 2], usize)> = Vec::new();
@@ -674,7 +681,7 @@ fn hydrogen_count(node: &CdxObject) -> Option<usize> {
 /// Add up the most atoms and bonds [`read_container`] can make of `obj`'s structures: a node
 /// and a bond each, and each node's hydrogens with their bonds, whether or not the node ends up
 /// with bonds of its own (which would leave its hydrogens out).
-fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut usize) {
+pub(crate) fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut usize) {
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => {
@@ -709,7 +716,31 @@ fn read_container(obj: &CdxObject, mol: &mut Molecule, others: &mut usize) {
 /// The structures of a CDX document (empty when it has none), or `None` when the bytes are
 /// not CDX, or its structures are larger than [`MAX_READ_ATOMS`] / [`MAX_READ_BONDS`] allow.
 pub fn read_cdx(bytes: &[u8]) -> Option<CdxImport> {
-    let doc = cdx_codec::parse(bytes).filter(|d| d.tag == OBJ_DOCUMENT)?;
+    read_document(&cdx_codec::parse(bytes)?)
+}
+
+/// The structures of a CDXML document, read as [`read_cdx`] reads CDX: both are the same
+/// object tree, written as XML. `None` when the text is not CDXML, or its structures are too
+/// large.
+pub fn read_cdxml(xml: &str) -> Option<CdxImport> {
+    read_document(&cdxml_document(xml)?)
+}
+
+/// A CDXML document as the object tree a CDX file holds.
+pub fn cdxml_document(xml: &str) -> Option<CdxObject> {
+    cdx_file_rs::cdxml::parse_cdxml(xml).ok().map(CdxObject::from)
+}
+
+/// A CDX object tree written as CDXML.
+pub fn cdxml_of_document(doc: &CdxObject) -> String {
+    cdx_file_rs::cdxml::write_cdxml(&doc.clone().into())
+}
+
+/// The structures of a document object tree; see [`read_cdx`].
+fn read_document(doc: &CdxObject) -> Option<CdxImport> {
+    if doc.tag != OBJ_DOCUMENT {
+        return None;
+    }
     let pages = || doc.children.iter().filter(|c| c.tag == OBJ_PAGE);
     let (mut atoms, mut bonds) = (0, 0);
     for page in pages() {

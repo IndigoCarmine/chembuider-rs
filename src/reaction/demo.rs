@@ -146,3 +146,26 @@ pub fn williamson_ether_synthesis() -> crate::reaction::Reaction {
 
     Reaction::new(scheme, analysis)
 }
+
+/// A four-step scheme on two rows, in the style of a synthesis route: each structure carries a
+/// compound label, each arrow its step number above it, and the last product is compound
+/// **4**. The intermediate (III) ends the first row and starts the second. The molecules are
+/// stand-ins (this module's small structures); the figure, not the chemistry, is the point.
+pub fn multi_step_scheme() -> crate::reaction::Reaction {
+    use crate::reaction::{Analysis, Arrow, Reaction, ReactionScheme};
+
+    let scheme = ReactionScheme::new()
+        .labeled_structure(benzene(), "(I)")
+        .arrow(Arrow::new().above("i)"))
+        .labeled_structure(phenol(), "(II)")
+        .arrow(Arrow::new().above("ii)"))
+        .labeled_structure(anisole(), "(III)")
+        .line_break()
+        .labeled_structure(anisole(), "(III)")
+        .arrow(Arrow::new().above("iii)"))
+        .labeled_structure(biphenyl(), "(IV)")
+        .arrow(Arrow::new().above("iv)"))
+        .labeled_structure(phenol(), "**4**\n(V)");
+
+    Reaction::new(scheme, Analysis::new())
+}

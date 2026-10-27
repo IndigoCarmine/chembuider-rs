@@ -73,12 +73,16 @@ pub enum SchemePart {
     Text,
     /// A `+` separator — selectable (so it can be deleted) but not editable.
     Plus,
+    /// The compound label under a structure (`(I)`), or where one would go.
+    CompoundLabel,
+    /// A row break — selectable (so it can be deleted) but not editable.
+    LineBreak,
 }
 
 impl SchemePart {
     /// True for the parts that carry a [`RichText`] the user can type into.
     pub const fn is_text(self) -> bool {
-        matches!(self, Self::ArrowAbove | Self::ArrowBelow | Self::Text)
+        matches!(self, Self::ArrowAbove | Self::ArrowBelow | Self::Text | Self::CompoundLabel)
     }
 }
 
@@ -95,6 +99,12 @@ pub enum Hit {
 /// pixels tall, and an *empty* label still needs a target — that is how text gets added to a
 /// bare arrow in the first place.
 pub const ARROW_HIT_HALF_HEIGHT: f32 = 11.0;
+
+/// Where a line break's marker sits after the last item of its row, and how wide it is: the
+/// break takes no room in the figure, so the editor gives it a target of its own.
+pub const LINE_BREAK_GAP: f32 = 6.0;
+/// See [`LINE_BREAK_GAP`].
+pub const LINE_BREAK_WIDTH: f32 = 14.0;
 
 // ─── Editable fields ─────────────────────────────────────────────────────────
 
@@ -374,6 +384,7 @@ pub fn scheme_text(scheme: &ReactionScheme, index: usize, part: SchemePart) -> S
         (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => text_markup(&a.above),
         (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => text_markup(&a.below),
         (Some(SchemeItem::Text(t)), SchemePart::Text) => t.to_markup(),
+        (Some(SchemeItem::Structure(s)), SchemePart::CompoundLabel) => s.label().to_markup(),
         _ => String::new(),
     }
 }
@@ -582,6 +593,7 @@ pub fn set_scheme_text(
             a.below = ArrowLabel::from(RichText::parse(markup))
         }
         (Some(SchemeItem::Text(t)), SchemePart::Text) => *t = RichText::parse(markup),
+        (Some(SchemeItem::Structure(s)), SchemePart::CompoundLabel) => s.set_label(RichText::parse(markup)),
         _ => return false,
     }
     true
@@ -629,8 +641,11 @@ pub fn cell_rect(layout: &FigureLayout, top_left: Pos2, cell: CellRef) -> Option
 /// Screen rect of one part of a scheme item, for a figure whose top-left corner is at
 /// `top_left`.
 ///
-/// An arrow's two text bands are the halves of its box split at the reaction line, each grown
-/// to at least [`ARROW_HIT_HALF_HEIGHT`]; every other part is the item's own box.
+/// An arrow's two text bands are the halves of its box split at its row's reaction line, each
+/// grown to at least [`ARROW_HIT_HALF_HEIGHT`]. A structure's box stops at its compound label,
+/// which is a part of its own — or, with no label yet, a band under the structure where one
+/// would go. A line break is a narrow band at the end of its row. Every other part is the
+/// item's own box.
 pub fn scheme_item_rect(
     layout: &FigureLayout,
     top_left: Pos2,
@@ -640,8 +655,33 @@ pub fn scheme_item_rect(
     let origin = top_left + layout.scheme_offset;
     let placed = layout.scheme.items.get(index)?;
     let rect = placed.rect.translate(origin.to_vec2());
-    let line_y = origin.y + layout.scheme.center_line;
+    let line_y = origin.y + layout.scheme.line_of(index);
+    let label = match &placed.kind {
+        PlacedKind::Structure { label, .. } => label.as_ref().map(|l| l.rect.translate(origin.to_vec2())),
+        _ => None,
+    };
     Some(match part {
+        SchemePart::Structure => match label {
+            Some(l) => Rect::from_min_max(rect.min, Pos2::new(rect.max.x, l.min.y)),
+            None => rect,
+        },
+        SchemePart::CompoundLabel => match label {
+            Some(l) => Rect::from_min_max(
+                Pos2::new(rect.min.x.min(l.min.x), l.min.y),
+                Pos2::new(rect.max.x.max(l.max.x), l.max.y),
+            ),
+            None => Rect::from_min_max(
+                Pos2::new(rect.min.x, rect.max.y),
+                Pos2::new(rect.max.x, rect.max.y + 2.0 * ARROW_HIT_HALF_HEIGHT),
+            ),
+        },
+        SchemePart::LineBreak => {
+            let row = layout.scheme.rows.get(placed.row)?;
+            Rect::from_min_max(
+                Pos2::new(rect.min.x + LINE_BREAK_GAP, origin.y + row.top),
+                Pos2::new(rect.min.x + LINE_BREAK_GAP + LINE_BREAK_WIDTH, origin.y + row.bottom),
+            )
+        }
         SchemePart::ArrowAbove => Rect::from_min_max(
             Pos2::new(rect.min.x, rect.min.y.min(line_y - ARROW_HIT_HALF_HEIGHT)),
             Pos2::new(rect.max.x, line_y),
@@ -654,17 +694,23 @@ pub fn scheme_item_rect(
     })
 }
 
-/// Where a scheme item dragged to `pointer` would drop: the number of items whose horizontal
-/// centre sits left of the pointer, i.e. an insertion slot in `0..=items.len()`. Independent
-/// of which item is being dragged, so the caller converts it to a final index itself.
+/// Where a scheme item dragged to `pointer` would drop: an insertion slot in
+/// `0..=items.len()`. The pointer picks a row; the slot is after every item of the rows above
+/// and after the items of its row whose horizontal centre sits left of the pointer — before
+/// the row's line break, so a drop at the end of a row stays on it. Independent of which item
+/// is being dragged, so the caller converts it to a final index itself.
 pub fn scheme_drop_index(layout: &FigureLayout, top_left: Pos2, pointer: Pos2) -> usize {
     let origin = top_left + layout.scheme_offset;
-    layout
-        .scheme
-        .items
-        .iter()
-        .filter(|placed| placed.rect.translate(origin.to_vec2()).center().x < pointer.x)
-        .count()
+    let scheme = &layout.scheme;
+    let Some(row) = scheme.row_at(pointer.y - origin.y).and_then(|r| scheme.rows.get(r)) else {
+        return 0;
+    };
+    row.items.start
+        + scheme.items[row.items.clone()]
+            .iter()
+            .filter(|placed| !matches!(placed.kind, PlacedKind::LineBreak))
+            .filter(|placed| placed.rect.translate(origin.to_vec2()).center().x < pointer.x)
+            .count()
 }
 
 /// The arrow above/below band under `pointer`, if any — a drop slot for a dragged structure.
@@ -684,7 +730,7 @@ pub fn arrow_slot_at(
     }
 }
 
-/// A vertical caret marking where a dragged item will drop, spanning the scheme band.
+/// A vertical caret marking where a dragged item will drop, spanning the row it drops on.
 fn draw_drop_caret(
     painter: &egui::Painter,
     layout: &FigureLayout,
@@ -694,13 +740,19 @@ fn draw_drop_caret(
 ) {
     let origin = top_left + layout.scheme_offset;
     let scheme = &layout.scheme;
-    let Some(last) = scheme.items.last() else { return };
-    let x = match scheme.items.get(insert_at) {
-        Some(placed) => placed.rect.translate(origin.to_vec2()).min.x,
-        None => last.rect.translate(origin.to_vec2()).max.x,
+    // Before the item at the slot when it starts something on its row; otherwise after the
+    // item before the slot (the end of a row, where a line break or the scheme's end follows).
+    let starts_row = |i: usize| i == 0 || matches!(scheme.items[i - 1].kind, PlacedKind::LineBreak);
+    let (placed, x) = match scheme.items.get(insert_at) {
+        Some(p) if !matches!(p.kind, PlacedKind::LineBreak) || starts_row(insert_at) => (p, p.rect.min.x),
+        _ => match insert_at.checked_sub(1).and_then(|i| scheme.items.get(i)) {
+            Some(p) => (p, p.rect.max.x),
+            None => return,
+        },
     };
+    let Some(row) = scheme.rows.get(placed.row) else { return };
     painter.line_segment(
-        [Pos2::new(x, origin.y), Pos2::new(x, origin.y + scheme.size.y)],
+        [Pos2::new(origin.x + x, origin.y + row.top), Pos2::new(origin.x + x, origin.y + row.bottom)],
         Stroke::new(2.5, color),
     );
 }
@@ -709,10 +761,11 @@ fn draw_drop_caret(
 /// The first one is what selecting the item as a whole names.
 fn scheme_item_parts(item: &SchemeItem) -> &'static [SchemePart] {
     match item {
-        SchemeItem::Structure(_) => &[SchemePart::Structure],
+        SchemeItem::Structure(_) => &[SchemePart::Structure, SchemePart::CompoundLabel],
         SchemeItem::Plus => &[SchemePart::Plus],
         SchemeItem::Arrow(_) => &[SchemePart::ArrowAbove, SchemePart::ArrowBelow],
         SchemeItem::Text(_) => &[SchemePart::Text],
+        SchemeItem::LineBreak => &[SchemePart::LineBreak],
     }
 }
 
@@ -1130,8 +1183,23 @@ impl ReactionEditor {
         }
 
         // Outlines over the finished figure. Nothing is drawn when the pointer is elsewhere
-        // and nothing is selected, so an idle figure is byte-for-byte the plain rendering.
+        // and nothing is selected, so an idle figure is byte-for-byte the plain rendering —
+        // except for a line break, which takes no room in the figure and gets a faint marker
+        // so it can be found, selected and deleted.
         let painter = ui.painter().clone();
+        for (index, item) in reaction.scheme.items.iter().enumerate() {
+            if let (SchemeItem::LineBreak, Some(r)) =
+                (item, scheme_item_rect(&layout, rect.min, index, SchemePart::LineBreak))
+            {
+                painter.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "↵",
+                    egui::FontId::proportional(14.0),
+                    Color32::from_gray(160),
+                );
+            }
+        }
         let outline = |hit: Hit, stroke: Stroke| {
             let r = match hit {
                 Hit::Cell(cell) => cell_rect(&layout, rect.min, cell),
@@ -1425,6 +1493,7 @@ impl ReactionEditor {
         };
 
         let width = anchor.width().max(88.0);
+        let multiline = matches!(target, EditTarget::SchemeText { part: SchemePart::CompoundLabel, .. });
         let box_id = Self::edit_box_id(ui);
         let area = egui::Area::new(ui.id().with("reaction_cell_edit"))
             .order(egui::Order::Foreground)
@@ -1437,7 +1506,16 @@ impl ReactionEditor {
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style())
                     .show(ui, |ui| {
-                        let mut output = egui::TextEdit::singleline(&mut text)
+                        // A compound label can run over lines ("4" over "(V)"): Shift+Enter
+                        // breaks the line, Enter still commits.
+                        let edit = if multiline {
+                            egui::TextEdit::multiline(&mut text)
+                                .desired_rows(2)
+                                .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
+                        } else {
+                            egui::TextEdit::singleline(&mut text)
+                        };
+                        let mut output = edit
                             .id(box_id)
                             .desired_width(width)
                             .hint_text(hint)
@@ -1465,7 +1543,7 @@ impl ReactionEditor {
             e.text = text;
         }
 
-        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !(multiline && i.modifiers.shift));
         let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
         let lost = response.lost_focus() && !enter;
 
@@ -3487,5 +3565,86 @@ mod tests {
         let reaction = drag(true, center(3, BELOW), left, front);
         assert!(line_draws(&reaction, 0, demo::methyl_iodide()));
         assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    // ── Multi-step schemes ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_multi_step_figure_has_no_table() {
+        let reaction = demo::multi_step_scheme();
+        with_figure(&reaction, |layout, _| {
+            assert!(layout.table.is_empty());
+            let m = crate::reaction::ReactionStyle::default().margin;
+            assert!((layout.size.y - (layout.scheme.size.y + 2.0 * m)).abs() < 0.01);
+        });
+    }
+
+    /// Every part of every item on either row answers for itself at its own centre.
+    #[test]
+    fn both_rows_hit_test_by_part() {
+        let reaction = demo::multi_step_scheme();
+        with_figure(&reaction, |layout, top_left| {
+            for (index, item) in reaction.scheme.items.iter().enumerate() {
+                for &part in scheme_item_parts(item) {
+                    let rect = scheme_item_rect(layout, top_left, index, part).unwrap();
+                    assert_eq!(
+                        hit_test(&reaction.scheme, layout, top_left, rect.center()),
+                        Some(Hit::Scheme { index, part }),
+                        "item {index} {part:?}"
+                    );
+                }
+            }
+            // The arrow on the second row splits at that row's line, not the first's.
+            let origin = top_left + layout.scheme_offset;
+            let line = origin.y + layout.scheme.line_of(7);
+            assert!(line > origin.y + layout.scheme.center_line);
+            let above = scheme_item_rect(layout, top_left, 7, SchemePart::ArrowAbove).unwrap();
+            let below = scheme_item_rect(layout, top_left, 7, SchemePart::ArrowBelow).unwrap();
+            assert_eq!((above.max.y, below.min.y), (line, line));
+            // A structure stops where its label starts.
+            let structure = scheme_item_rect(layout, top_left, 8, SchemePart::Structure).unwrap();
+            let label = scheme_item_rect(layout, top_left, 8, SchemePart::CompoundLabel).unwrap();
+            assert_eq!(structure.max.y, label.min.y);
+        });
+    }
+
+    #[test]
+    fn an_unlabelled_structure_offers_a_band_for_a_label() {
+        let reaction = demo::williamson_ether_synthesis();
+        with_figure(&reaction, |layout, top_left| {
+            let structure = scheme_item_rect(layout, top_left, 0, SchemePart::Structure).unwrap();
+            let band = scheme_item_rect(layout, top_left, 0, SchemePart::CompoundLabel).unwrap();
+            assert_eq!(band.min.y, structure.max.y);
+            assert_eq!(
+                hit_test(&reaction.scheme, layout, top_left, band.center()),
+                Some(Hit::Scheme { index: 0, part: SchemePart::CompoundLabel })
+            );
+        });
+    }
+
+    #[test]
+    fn a_drop_lands_on_the_row_under_the_pointer() {
+        let reaction = demo::multi_step_scheme();
+        with_figure(&reaction, |layout, top_left| {
+            let origin = top_left + layout.scheme_offset;
+            let rows = &layout.scheme.rows;
+            let y = |row: usize| origin.y + rows[row].center_line;
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(origin.x - 50.0, y(0))), 0);
+            // Past the end of the first row: before its line break, still on it.
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(origin.x + 5000.0, y(0))), 5);
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(origin.x - 50.0, y(1))), 6);
+            assert_eq!(scheme_drop_index(layout, top_left, Pos2::new(origin.x + 5000.0, y(1))), 11);
+        });
+    }
+
+    #[test]
+    fn a_compound_label_is_edited_as_markup() {
+        let mut scheme = demo::multi_step_scheme().scheme;
+        assert_eq!(scheme_text(&scheme, 10, SchemePart::CompoundLabel), "**4**
+(V)");
+        assert!(set_scheme_text(&mut scheme, 0, SchemePart::CompoundLabel, "**1**"));
+        let SchemeItem::Structure(s) = &scheme.items[0] else { panic!("a structure") };
+        assert_eq!(s.label(), &RichText::parse("**1**"));
+        assert!(!set_scheme_text(&mut scheme, 5, SchemePart::CompoundLabel, "x"), "a line break has no label");
     }
 }

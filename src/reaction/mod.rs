@@ -37,6 +37,7 @@
 //!
 //! See `examples/reaction_scheme.rs` for a complete host application.
 
+pub mod cdxml;
 pub mod demo;
 pub mod edit;
 pub mod formula;

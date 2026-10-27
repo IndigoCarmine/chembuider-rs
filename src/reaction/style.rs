@@ -39,6 +39,19 @@ pub struct ReactionStyle {
     /// Font size of a free-standing text item in the scheme.
     #[serde(default = "def_scheme_font_size")]
     pub scheme_font_size: f32,
+    /// Font size of a compound label under a structure (`(I)`, **4**).
+    #[serde(default = "def_compound_label_font_size")]
+    pub compound_label_font_size: f32,
+    /// Gap between a structure and its compound label.
+    #[serde(default = "def_compound_label_gap")]
+    pub compound_label_gap: f32,
+    /// Vertical gap between two rows of a scheme.
+    #[serde(default = "def_row_gap")]
+    pub row_gap: f32,
+    /// Widest a scheme row may grow before the next item starts a new row. `None` wraps only
+    /// at the scheme's line breaks.
+    #[serde(default)]
+    pub max_row_width: Option<f32>,
 
     // ── Table ────────────────────────────────────────────────────────────────
     /// Font size of the table cells.
@@ -102,6 +115,9 @@ fn def_arrow_text_gap() -> f32 { 5.0 }
 fn def_arrow_font_size() -> f32 { 13.0 }
 fn def_plus_font_size() -> f32 { 17.0 }
 fn def_scheme_font_size() -> f32 { 13.0 }
+fn def_compound_label_font_size() -> f32 { 13.0 }
+fn def_compound_label_gap() -> f32 { 6.0 }
+fn def_row_gap() -> f32 { 24.0 }
 fn def_table_font_size() -> f32 { 12.0 }
 fn def_unit_scale() -> f32 { 0.75 }
 fn def_cell_pad_x() -> f32 { 6.0 }
@@ -129,6 +145,10 @@ impl Default for ReactionStyle {
             arrow_font_size: def_arrow_font_size(),
             plus_font_size: def_plus_font_size(),
             scheme_font_size: def_scheme_font_size(),
+            compound_label_font_size: def_compound_label_font_size(),
+            compound_label_gap: def_compound_label_gap(),
+            row_gap: def_row_gap(),
+            max_row_width: None,
             table_font_size: def_table_font_size(),
             unit_scale: def_unit_scale(),
             cell_pad_x: def_cell_pad_x(),

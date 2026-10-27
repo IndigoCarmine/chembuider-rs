@@ -3,6 +3,9 @@
 //! ```text
 //! cargo run --example reaction_scheme                       # open a window
 //! cargo run --example reaction_scheme -- --render out.png   # headless render to a PNG
+//! cargo run --example reaction_scheme -- --multi-step       # start on the four-step scheme
+//! cargo run --example reaction_scheme -- --open scheme.cdxml   # start on a ChemDraw scheme
+//! cargo run --example reaction_scheme -- --open a.cdxml --render out.png --save b.cdxml
 //! ```
 //!
 //! The window starts on the ChemDraw *Analysis* figure it has always drawn (phenol + MeI /
@@ -23,6 +26,11 @@
 //!   rich-text markup (`K_2CO_3`) applies.
 //! * **the panel on the right** mirrors those actions for columns and scheme items, but is no
 //!   longer required for the scheme — every scheme action has a direct gesture above.
+//! * **multi-step schemes**: add arrows and structures in a row, and a *line break* to go on
+//!   on a new row (or set a row width to wrap at). Click under a structure to give it a
+//!   compound label (`(I)`, `**4**`; Shift+Enter starts a second line). A scheme of two or more
+//!   steps is a drawing only — its table is not shown.
+//! * **open and save ChemDraw schemes** (CDXML or CDX) from the toolbar.
 //!
 //! `--render` is unaffected by any of this: it runs the plain [`ReactionView`] paint path.
 //! See [`chembuider_rs::reaction::edit`] for the editing API this app is a host for.
@@ -31,6 +39,7 @@ use chembuider_rs::egui;
 use chembuider_rs::reaction::edit::{
     EditTarget, Hit, SchemePart, StructureRef, cleanup_scheme_structure, scheme_arrow_structure,
 };
+use chembuider_rs::reaction::cdxml::{scheme_from_cdx, scheme_from_cdxml};
 use chembuider_rs::reaction::{
     Analysis, Arrow, Mass, MolecularFormula, Product, Reactant, Reaction, ReactionEditor,
     ReactionScheme, SchemeItem, demo,
@@ -82,12 +91,26 @@ fn reference_reaction() -> Reaction {
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(i) = args.iter().position(|a| a == "--render") {
-        let path = args
-            .get(i + 1)
-            .cloned()
-            .unwrap_or_else(|| "target/reaction_scheme.png".to_string());
-        headless::render(&path, &reference_reaction());
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let reaction = match value("--open") {
+        Some(path) => match open_scheme(std::path::Path::new(&path)) {
+            Ok(reaction) => reaction,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+        None if args.iter().any(|a| a == "--multi-step") => demo::multi_step_scheme(),
+        None => reference_reaction(),
+    };
+    if let Some(path) = value("--save") {
+        headless::save(&path, &reaction);
+    }
+    if args.iter().any(|a| a == "--render") {
+        let path = value("--render").unwrap_or_else(|| "target/reaction_scheme.png".to_string());
+        headless::render(&path, &reaction);
+    }
+    if args.iter().any(|a| a == "--render" || a == "--save") {
         return Ok(());
     }
 
@@ -103,13 +126,27 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // The figure is drawn on white paper; a light theme keeps the page around it light.
             cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(ReactionApp::default()))
+            Ok(Box::new(ReactionApp { reaction, ..Default::default() }))
         }),
     )
 }
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
+
+/// A ChemDraw scheme (CDXML, or binary CDX) from a file, as a reaction with an empty table.
+#[cfg(not(target_arch = "wasm32"))]
+fn open_scheme(path: &std::path::Path) -> Result<Reaction, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let scheme = if bytes.starts_with(b"VjCD") {
+        scheme_from_cdx(&bytes)
+    } else {
+        scheme_from_cdxml(&String::from_utf8_lossy(&bytes))
+    };
+    scheme
+        .map(|scheme| Reaction::new(scheme, Analysis::new()))
+        .ok_or_else(|| format!("{}: no reaction scheme could be read", path.display()))
+}
 
 struct ReactionApp {
     reaction: Reaction,
@@ -225,6 +262,58 @@ impl eframe::App for ReactionApp {
 }
 
 impl ReactionApp {
+    /// Start over on `reaction`: nothing selected, nothing linked to the canvas.
+    fn load(&mut self, reaction: Reaction, status: &str) {
+        self.editor.select(None);
+        self.editor.cancel_edit();
+        self.linked_structure = None;
+        self.reaction = reaction;
+        self.status = status.to_string();
+    }
+
+    fn open_file(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = rfd::FileDialog::new().add_filter("ChemDraw", &["cdxml", "cdx"]).pick_file() {
+            match open_scheme(&path) {
+                Ok(reaction) => self.load(reaction, &format!("Opened {}.", path.display())),
+                Err(e) => self.status = e,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status = "Opening files needs the desktop build.".to_string();
+        }
+    }
+
+    /// Save the scheme as CDXML (or binary CDX). The table is not part of a ChemDraw scheme.
+    fn save_file(&mut self, painter: &egui::Painter, binary: bool) {
+        if self.reaction.scheme.is_empty() {
+            self.status = "The scheme is empty — nothing to save.".to_string();
+            return;
+        }
+        let (bytes, ext) = if binary {
+            (self.editor.view.scheme_cdx(painter, &self.reaction.scheme), "cdx")
+        } else {
+            (self.editor.view.scheme_cdxml(painter, &self.reaction.scheme).into_bytes(), "cdxml")
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("ChemDraw", &[ext])
+            .set_file_name(format!("scheme.{ext}"))
+            .save_file()
+        {
+            self.status = match std::fs::write(&path, bytes) {
+                Ok(()) => format!("Saved {}.", path.display()),
+                Err(e) => format!("Save failed: {e}"),
+            };
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (bytes, ext);
+            self.status = "Saving files needs the desktop build.".to_string();
+        }
+    }
+
     /// The structure currently on the canvas, or `None` (with a complaint in the status bar)
     /// when there is nothing drawn.
     fn canvas_structure(&mut self) -> Option<Molecule> {
@@ -313,6 +402,33 @@ impl ReactionApp {
             if ui.button("📋 Paste").clicked() {
                 self.canvas.paste_clipboard();
             }
+
+            ui.separator();
+
+            ui.label("Scheme:");
+            if ui.button("📂 Open CDXML/CDX…").clicked() {
+                self.open_file();
+            }
+            if ui.button("💾 Save CDXML…").clicked() {
+                self.save_file(ui.painter(), false);
+            }
+            if ui.button("💾 Save CDX…").clicked() {
+                self.save_file(ui.painter(), true);
+            }
+            if ui.button("Analysis demo").clicked() {
+                self.load(reference_reaction(), "The Analysis figure.");
+            }
+            if ui.button("Multi-step demo").clicked() {
+                self.load(demo::multi_step_scheme(), "A four-step scheme on two rows.");
+            }
+            let style = &mut self.editor.view.style;
+            let mut wrap = style.max_row_width.is_some();
+            if ui.checkbox(&mut wrap, "Wrap rows at").changed() {
+                style.max_row_width = wrap.then_some(700.0);
+            }
+            if let Some(width) = style.max_row_width.as_mut() {
+                ui.add(egui::DragValue::new(width).range(100.0..=4000.0).suffix(" px"));
+            }
         });
 
         ui.horizontal_wrapped(|ui| {
@@ -354,6 +470,10 @@ impl ReactionApp {
                 let i = self.reaction.scheme.add(SchemeItem::Text("text".into()));
                 self.editor
                     .begin_edit(EditTarget::SchemeText { index: i, part: SchemePart::Text }, &self.reaction);
+            }
+            if ui.button("➕ line break").clicked() {
+                self.reaction.scheme.add(SchemeItem::LineBreak);
+                self.status = "Added a line break — what follows goes on a new row.".to_string();
             }
 
             ui.separator();
@@ -442,6 +562,9 @@ impl ReactionApp {
                             if ui.small_button("⟳").on_hover_text("Replace with the canvas").clicked() {
                                 action = Some(Action::ReplaceSchemeStructure(i));
                             }
+                            if ui.small_button("label").on_hover_text("Edit the compound label").clicked() {
+                                action = Some(Action::EditSchemeText(i, SchemePart::CompoundLabel));
+                            }
                         }
                         SchemeItem::Arrow(_) => {
                             if ui.small_button("below").clicked() {
@@ -456,7 +579,7 @@ impl ReactionApp {
                                 action = Some(Action::EditSchemeText(i, SchemePart::Text));
                             }
                         }
-                        SchemeItem::Plus => {}
+                        SchemeItem::Plus | SchemeItem::LineBreak => {}
                     }
                 });
             });
@@ -550,6 +673,10 @@ impl ReactionApp {
                 }
                 if ui.button("⟳ Replace with canvas").clicked() {
                     action = Some(Action::ReplaceSchemeStructure(index));
+                    ui.close();
+                }
+                if ui.button("✎ Edit label").clicked() {
+                    action = Some(Action::EditSchemeText(index, SchemePart::CompoundLabel));
                     ui.close();
                 }
                 ui.separator();
@@ -749,6 +876,7 @@ fn describe(hit: Hit, reaction: &Reaction) -> String {
             match part {
                 SchemePart::ArrowAbove => format!("scheme item {index} — arrow, above"),
                 SchemePart::ArrowBelow => format!("scheme item {index} — arrow, below"),
+                SchemePart::CompoundLabel => format!("scheme item {index} — {what}, label"),
                 _ => format!("scheme item {index} — {what}"),
             }
         }
@@ -766,6 +894,7 @@ fn item_label(item: &SchemeItem) -> String {
             let flat: String = t.spans.iter().map(|s| s.text.as_str()).collect();
             format!("text \"{flat}\"")
         }
+        SchemeItem::LineBreak => "line break".to_string(),
     }
 }
 
@@ -781,6 +910,26 @@ mod headless {
     use std::collections::HashMap;
 
     type Atlas = HashMap<u64, (usize, usize, Vec<egui::Color32>)>;
+
+    /// Write the scheme as CDXML (or CDX, by the extension) without a window.
+    pub fn save(path: &str, reaction: &Reaction) {
+        let ctx = egui::Context::default();
+        let mut view = ReactionView::new();
+        let mut bytes = Vec::new();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            bytes = if path.ends_with(".cdx") {
+                view.scheme_cdx(ui.painter(), &reaction.scheme)
+            } else {
+                view.scheme_cdxml(ui.painter(), &reaction.scheme).into_bytes()
+            };
+        });
+        std::fs::write(path, bytes).expect("write the scheme");
+        println!("wrote {path}");
+    }
 
     pub fn render(path: &str, reaction: &Reaction) {
         let ctx = egui::Context::default();
