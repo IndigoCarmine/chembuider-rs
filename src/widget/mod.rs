@@ -1334,3 +1334,175 @@ mod undo_redo_tests {
         assert_eq!(editor.molecule.atoms.len(), 1, "Ctrl+Z should undo the second atom placement");
     }
 }
+
+/// Characterization tests for the editor's view (camera): the mol <-> screen mapping, scroll
+/// zoom and middle-button pan. They pin today's behavior so the view code can be consolidated
+/// without changing what the user sees.
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    use crate::testkit::run_frame;
+
+    /// Several non-trivial cameras, including the zoom clamp bounds.
+    fn cameras() -> Vec<(f32, egui::Vec2)> {
+        vec![
+            (1.0, egui::Vec2::ZERO),
+            (0.1, egui::vec2(-40.0, 12.5)),
+            (2.75, egui::vec2(130.0, -77.0)),
+            (20.0, egui::vec2(3.0, 9000.0)),
+        ]
+    }
+
+    fn assert_close(a: egui::Pos2, b: egui::Pos2, what: &str) {
+        assert!(
+            (a.x - b.x).abs() <= 1e-3 && (a.y - b.y).abs() <= 1e-3,
+            "{what}: {a:?} != {b:?}"
+        );
+    }
+
+    #[test]
+    fn mol_to_screen_and_screen_to_mol_round_trip() {
+        let center = egui::pos2(321.0, 245.0);
+        for (zoom, pan) in cameras() {
+            let e = ChemStructEditor { zoom, pan, ..Default::default() };
+            for p in [[0.0, 0.0], [1.5, -2.25], [-7.0, 3.0]] {
+                let back = e.screen_to_mol(e.mol_to_screen(p, center), center);
+                assert!(
+                    (back[0] - p[0]).abs() <= 1e-4 && (back[1] - p[1]).abs() <= 1e-4,
+                    "zoom {zoom} pan {pan:?}: {p:?} round-tripped to {back:?}"
+                );
+            }
+            for s in [center, egui::pos2(0.0, 0.0), egui::pos2(800.0, 13.0)] {
+                let back = e.mol_to_screen(e.screen_to_mol(s, center), center);
+                assert_close(back, s, &format!("zoom {zoom} pan {pan:?}: screen round trip"));
+            }
+        }
+    }
+
+    #[test]
+    fn mol_to_screen_places_the_origin_at_center_plus_pan_and_scales_by_zoom() {
+        let center = egui::pos2(321.0, 245.0);
+        let e = ChemStructEditor { zoom: 2.0, pan: egui::vec2(10.0, -5.0), ..Default::default() };
+        assert_close(e.mol_to_screen([0.0, 0.0], center), center + e.pan, "origin");
+        assert_close(
+            e.mol_to_screen([1.0, 1.0], center),
+            center + e.pan + egui::vec2(2.0 * SCALE_FACTOR, 2.0 * SCALE_FACTOR),
+            "unit offset",
+        );
+    }
+
+    #[test]
+    fn draw_transform_agrees_with_mol_to_screen() {
+        let center = egui::pos2(321.0, 245.0);
+        for (zoom, pan) in cameras() {
+            let e = ChemStructEditor { zoom, pan, ..Default::default() };
+            let t = draw::editor_transform_for_tests(&e, center);
+            assert_eq!(t.visual_scale, zoom, "visual sizes scale by zoom alone");
+            for p in [[0.0, 0.0], [1.5, -2.25], [-7.0, 3.0]] {
+                assert_close(
+                    t.apply(p),
+                    e.mol_to_screen(p, center),
+                    &format!("zoom {zoom} pan {pan:?} point {p:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_zoom_keeps_the_point_under_the_cursor_fixed() {
+        let ctx = egui::Context::default();
+        let mut editor =
+            ChemStructEditor { zoom: 1.3, pan: egui::vec2(25.0, -15.0), ..Default::default() };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        // Off-center, so a zoom about the canvas center (rather than the cursor) would move it.
+        let cursor = egui::pos2(500.0, 120.0);
+
+        // Two frames: the canvas only reports hover once egui has laid it out a frame earlier.
+        for _ in 0..2 {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+        }
+        assert!(editor.pointer_active, "the cursor must be over the canvas");
+        // `last_mouse_mol` is `screen_to_mol(cursor, center)` taken at the start of each frame.
+        let before = editor.last_mouse_mol;
+        let zoom_before = editor.zoom;
+
+        for (i, dy) in [120.0_f32, -40.0].into_iter().enumerate() {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            }]);
+            // egui spreads one wheel event over several frames; let it play out.
+            for _ in 0..30 {
+                run_frame(&ctx, screen_rect, &mut editor, vec![]);
+            }
+            // One more frame so `last_mouse_mol` is re-sampled under the final camera.
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+            let after = editor.last_mouse_mol;
+            assert!(
+                (after[0] - before[0]).abs() <= 1e-3 && (after[1] - before[1]).abs() <= 1e-3,
+                "scroll #{i}: the molecule point under the cursor moved from {before:?} to {after:?}"
+            );
+        }
+        assert!(
+            (editor.zoom - zoom_before).abs() > 1e-3,
+            "the scroll must actually have zoomed (zoom stayed {})",
+            editor.zoom
+        );
+    }
+
+    #[test]
+    fn scroll_up_zooms_in_and_zoom_is_clamped_to_0_1_through_20() {
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let cursor = egui::pos2(320.0, 240.0);
+        for (dy, bound) in [(1.0e5_f32, 20.0_f32), (-1.0e5, 0.1)] {
+            let mut editor = ChemStructEditor::default();
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            }]);
+            for _ in 0..60 {
+                run_frame(&ctx, screen_rect, &mut editor, vec![]);
+            }
+            assert_eq!(editor.zoom, bound, "scroll delta {dy} should end at the clamp bound");
+        }
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_bond_tool() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, Tool::Bond);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p0 = egui::pos2(300.0, 200.0);
+        let p1 = egui::pos2(340.0, 170.0);
+        let p2 = egui::pos2(360.0, 230.0);
+
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p0,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        let pan_start = editor.pan;
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p1)]);
+        assert_eq!(editor.pan, pan_start + (p1 - p0), "pan follows the middle-drag delta");
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p2)]);
+        assert_eq!(editor.pan, pan_start + (p2 - p0), "pan accumulates over the drag");
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p2,
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        let pan_end = editor.pan;
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        assert_eq!(editor.pan, pan_end, "moving after the release does not pan");
+    }
+}

@@ -27,6 +27,16 @@ fn editor_transform(editor: &ChemStructEditor, center: egui::Pos2) -> RenderTran
     }
 }
 
+/// Test-only window onto [`editor_transform`], so `widget::view_tests` can check that the
+/// draw-side transform agrees with `ChemStructEditor::mol_to_screen`.
+#[cfg(test)]
+pub(super) fn editor_transform_for_tests(
+    editor: &ChemStructEditor,
+    center: egui::Pos2,
+) -> RenderTransform {
+    editor_transform(editor, center)
+}
+
 // ─── Per-frame label layout pass ─────────────────────────────────────────────
 
 /// Lay out every visible atom label once per frame, via the shared [`scene::build_labels`]. The
