@@ -11,7 +11,7 @@
 
 use super::Molecule;
 use crate::config::StyleConfig;
-use crate::widget::scene::{self, RenderTransform};
+use crate::widget::scene::{MoleculeScene, RenderTransform};
 use crate::widget::{SCALE_FACTOR, draw};
 use egui::Vec2;
 use resvg::usvg::fontdb;
@@ -56,7 +56,7 @@ fn render_pixmap(mol: &Molecule, background: Option<resvg::tiny_skia::Color>) ->
     if mol.atoms.is_empty() {
         return None;
     }
-    let svg = molecule_to_svg(mol);
+    let svg = molecule_to_svg(mol)?;
     let mut opt = resvg::usvg::Options::default();
     opt.fontdb = egui_font().0;
     let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
@@ -85,7 +85,7 @@ pub fn preview_png(mol: &Molecule, max_side: u32) -> Option<(Vec<u8>, [f32; 2])>
     if mol.atoms.is_empty() {
         return None;
     }
-    let svg = molecule_to_svg_styled(mol, &StyleConfig::chemdraw());
+    let svg = molecule_to_svg_styled(mol, &StyleConfig::chemdraw())?;
     let mut opt = resvg::usvg::Options::default();
     opt.fontdb = egui_font().0;
     let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
@@ -149,50 +149,17 @@ pub fn molecule_to_dib(mol: &Molecule) -> Option<Vec<u8>> {
 // ─── Shared scene bounds ───────────────────────────────────────────────────────
 
 /// Build the shared scene at `SCALE_FACTOR` px/unit (offset 0), plus the pixel bounding rect of
-/// everything in it (ring fills, bonds, labels, bare atoms). Returned so both the SVG and EMF
-/// paths lay the structure out identically. `layout` is the galley source.
+/// everything in it ([`MoleculeScene::bounds`]). Returned so both the SVG and EMF paths lay the
+/// structure out identically. `layout` is the galley source. `None` when nothing is drawn.
 fn build_scene(
     mol: &Molecule,
     style: &StyleConfig,
     layout: impl FnMut(egui::text::LayoutJob) -> Arc<egui::Galley>,
-) -> (scene::MoleculeScene, egui::Rect) {
+) -> Option<(MoleculeScene, egui::Rect)> {
     let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
-    let labels = scene::build_labels(mol, style, xf, layout);
-    let bonds = scene::build_bonds(mol, style, xf, &labels);
-    let ring_fills = scene::build_ring_fills(mol, xf);
-
-    let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
-    let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
-    let mut grow = |p: egui::Pos2| {
-        min.x = min.x.min(p.x);
-        min.y = min.y.min(p.y);
-        max.x = max.x.max(p.x);
-        max.y = max.y.max(p.y);
-    };
-    for a in &mol.atoms {
-        grow(xf.apply(a.pos));
-    }
-    for poly in &ring_fills {
-        poly.points.iter().for_each(|p| grow(*p));
-    }
-    for b in &bonds {
-        for s in &b.strokes {
-            grow(s.a);
-            grow(s.b);
-        }
-        for f in &b.fills {
-            f.iter().for_each(|p| grow(*p));
-        }
-    }
-    for l in labels.values() {
-        grow(l.rect.min);
-        grow(l.rect.max);
-    }
-    let bounds = egui::Rect::from_min_max(min, max);
-    (
-        scene::MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad },
-        bounds,
-    )
+    let scene = MoleculeScene::build(mol, style, xf, layout);
+    let bounds = scene.bounds(mol, xf)?;
+    Some((scene, bounds))
 }
 
 // ─── SVG (raster) path ─────────────────────────────────────────────────────────
@@ -211,12 +178,13 @@ fn xml_escape(c: char) -> String {
 /// Render the molecule to an SVG string from the shared scene: ring-fill polygons, then bond
 /// strokes / wedge fills (with a hole cut under each label), then each label glyph placed at
 /// egui's exact layout position. The background stays transparent. `x`/`y` translate the scene so its bounding box sits at `MARGIN_PX`.
-fn molecule_to_svg(mol: &Molecule) -> String {
+/// `None` when there is nothing to draw.
+fn molecule_to_svg(mol: &Molecule) -> Option<String> {
     molecule_to_svg_styled(mol, &StyleConfig::default())
 }
 
 /// [`molecule_to_svg`] in `style`.
-fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> String {
+fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String> {
     let family = egui_font().1;
 
     // Standalone egui font stack: the same layout egui does on-screen, so label geometry matches.
@@ -225,7 +193,7 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> String {
         egui::FontDefinitions::default(),
     );
     let mut view = fonts.with_pixels_per_point(1.0);
-    let (scene, bounds) = build_scene(mol, style, |job| view.layout_job(job));
+    let (scene, bounds) = build_scene(mol, style, |job| view.layout_job(job))?;
 
     let w = bounds.width() + 2.0 * MARGIN_PX;
     let h = bounds.height() + 2.0 * MARGIN_PX;
@@ -311,7 +279,7 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> String {
     }
 
     s.push_str("</g></svg>");
-    s
+    Some(s)
 }
 
 // ─── EMF (GDI vector) path ─────────────────────────────────────────────────────
@@ -360,7 +328,7 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         egui::FontDefinitions::default(),
     );
     let mut view = fonts.with_pixels_per_point(1.0);
-    let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job));
+    let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job))?;
 
     let dx = MARGIN_PX - bounds.min.x;
     let dy = MARGIN_PX - bounds.min.y;
@@ -473,6 +441,50 @@ mod tests {
     use super::*;
     use crate::molecule::{BondOrder, BondStereo};
 
+    /// Labeled heteroatoms (O, N with H), a placed double bond, a solid wedge and a ring fill.
+    fn bounds_sample() -> Molecule {
+        let mut m = Molecule::default();
+        let c1 = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c2 = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c3 = m.add_atom("C".to_string(), [0.75, 1.3], 0);
+        let o = m.add_atom("O".to_string(), [-1.0, -0.8], 0);
+        let n = m.add_atom("N".to_string(), [2.6, 0.9], 0);
+        m.add_bond(c1, c2, BondOrder::Double);
+        m.add_bond(c2, c3, BondOrder::Single);
+        m.add_bond(c3, c1, BondOrder::Single);
+        let w = m.add_bond(c1, o, BondOrder::Single);
+        m.bond_by_id_mut(w).unwrap().stereo = BondStereo::WedgeUp;
+        m.add_bond(c2, n, BondOrder::Single);
+        m.set_ring_fill(vec![c1, c2, c3], [0, 200, 0, 128]);
+        m
+    }
+
+    /// Pins the exported picture's bounds (atoms ∪ ring fills ∪ bonds ∪ labels) to fixed numbers,
+    /// so moving the bounds computation cannot shift the picture's size or placement.
+    #[test]
+    fn scene_bounds_are_pinned() {
+        let mol = bounds_sample();
+        let style = StyleConfig::default();
+        let mut fonts = egui::epaint::text::Fonts::new(
+            egui::epaint::text::TextOptions::default(),
+            egui::FontDefinitions::default(),
+        );
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let (_, b) = build_scene(&mol, &style, |job| view.layout_job(job)).unwrap();
+        let expected = [-64.031, -47.5, 148.735, 65.0];
+        for (got, want) in [b.min.x, b.min.y, b.max.x, b.max.y].into_iter().zip(expected) {
+            assert!((got - want).abs() < 1e-3, "bounds {b:?}, expected {expected:?}");
+        }
+        let svg = molecule_to_svg(&mol).unwrap();
+        assert!(
+            svg.starts_with(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="237" height="136" viewBox="0 0 237 136"><g transform="translate(76.031,59.500)">"#
+            ),
+            "picture size and placement: {}",
+            &svg[..120]
+        );
+    }
+
     #[test]
     fn preview_is_drawn_at_chemdraws_scale() {
         let mut mol = Molecule::default();
@@ -497,7 +509,7 @@ mod tests {
         let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
         let o = mol.add_atom("O".to_string(), [1.5, 0.0], 0);
         mol.add_bond(c, o, BondOrder::Double);
-        let svg = molecule_to_svg(&mol);
+        let svg = molecule_to_svg(&mol).unwrap();
         assert!(svg.starts_with("<svg"));
         assert!(svg.ends_with("</svg>"));
         assert_eq!(svg.matches("<line").count(), 2, "double bond renders two lines");
@@ -511,7 +523,7 @@ mod tests {
         let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
         let o = mol.add_atom("O".to_string(), [1.5, 0.0], 0);
         mol.add_bond(c, o, BondOrder::Single);
-        let svg = molecule_to_svg(&mol);
+        let svg = molecule_to_svg(&mol).unwrap();
         assert!(svg.contains(r#"<mask id="labels""#), "labels mask the drawing");
         assert!(svg.contains(r#"mask="url(#labels)""#));
         assert_eq!(svg.matches(r#"fill="white""#).count(), 1, "the only white is the mask's own");
@@ -521,7 +533,7 @@ mod tests {
         let a = bare.add_atom("C".to_string(), [0.0, 0.0], 0);
         let b = bare.add_atom("C".to_string(), [1.5, 0.0], 0);
         bare.add_bond(a, b, BondOrder::Single);
-        assert!(!molecule_to_svg(&bare).contains("mask"));
+        assert!(!molecule_to_svg(&bare).unwrap().contains("mask"));
 
         // The preview has a transparent background and no white box behind the label.
         let (png, _) = preview_png(&mol, 2400).unwrap();
@@ -538,7 +550,7 @@ mod tests {
         let b = mol.add_atom("C".to_string(), [1.5, 0.0], 0);
         let bond = mol.add_bond(a, b, BondOrder::Single);
         mol.bond_by_id_mut(bond).unwrap().stereo = BondStereo::WedgeUp;
-        let svg = molecule_to_svg(&mol);
+        let svg = molecule_to_svg(&mol).unwrap();
         assert!(svg.contains(r#"fill="black""#), "solid wedge is a black polygon");
 
         // A triangle ring, filled green.
@@ -550,7 +562,7 @@ mod tests {
         ring.add_bond(r2, r3, BondOrder::Single);
         ring.add_bond(r3, r1, BondOrder::Single);
         ring.set_ring_fill(vec![r1, r2, r3], [0, 200, 0, 128]);
-        let svg = molecule_to_svg(&ring);
+        let svg = molecule_to_svg(&ring).unwrap();
         assert!(svg.contains("fill-opacity"), "ring fill is a translucent polygon");
         assert!(svg.contains("rgb(0,200,0)"), "ring fill keeps its color");
     }

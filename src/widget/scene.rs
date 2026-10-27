@@ -95,6 +95,49 @@ pub struct MoleculeScene {
     pub label_bg_pad: f32,
 }
 
+impl MoleculeScene {
+    /// Lay out labels, then build the bonds (trimmed at those labels) and ring fills of `mol`
+    /// under `xf`. `layout` is the galley source, as for [`build_labels`].
+    pub fn build(
+        mol: &Molecule,
+        style: &StyleConfig,
+        xf: RenderTransform,
+        layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+    ) -> Self {
+        let labels = build_labels(mol, style, xf, layout);
+        let bonds = build_bonds(mol, style, xf, &labels);
+        let ring_fills = build_ring_fills(mol, xf);
+        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale }
+    }
+
+    /// The pixel rect covering everything drawn: every atom position of `mol` (under `xf`, the
+    /// transform this scene was built with — bare atoms have no primitive of their own), the ring
+    /// fills, bond strokes / wedge fills and label rects. `None` when there is nothing to cover.
+    pub fn bounds(&self, mol: &Molecule, xf: RenderTransform) -> Option<Rect> {
+        let mut r = Rect::NOTHING;
+        for a in &mol.atoms {
+            r.extend_with(xf.apply(a.pos));
+        }
+        for poly in &self.ring_fills {
+            poly.points.iter().for_each(|p| r.extend_with(*p));
+        }
+        for b in &self.bonds {
+            for s in &b.strokes {
+                r.extend_with(s.a);
+                r.extend_with(s.b);
+            }
+            for f in &b.fills {
+                f.iter().for_each(|p| r.extend_with(*p));
+            }
+        }
+        for l in self.labels.values() {
+            r.extend_with(l.rect.min);
+            r.extend_with(l.rect.max);
+        }
+        (r.min.x <= r.max.x && r.min.y <= r.max.y).then_some(r)
+    }
+}
+
 // ─── Label layout ─────────────────────────────────────────────────────────────
 
 /// Lay out every visible atom label. Shared by the bond pass (endpoint trimming), the white
@@ -561,6 +604,36 @@ mod tests {
         assert!((strokes[0].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[1].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[0].width - style.bond_width * 2.0).abs() < 1e-4);
+    }
+
+    /// `bounds` covers the atoms, the bonds and the label rects, follows the transform's offset,
+    /// and is `None` for an empty molecule.
+    #[test]
+    fn scene_bounds_cover_labels_and_follow_offset() {
+        let m = sample();
+        let style = StyleConfig::default();
+        let mut fonts = fonts();
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 2.0 };
+        let scene = MoleculeScene::build(&m, &style, xf, |j| view.layout_job(j));
+        assert!((scene.label_bg_pad - style.label_bg_pad * 2.0).abs() < 1e-6);
+        let b = scene.bounds(&m, xf).expect("non-empty");
+        for a in &m.atoms {
+            assert!(b.contains(xf.apply(a.pos)));
+        }
+        let label = scene.labels.values().next().expect("the O label").rect;
+        assert!(b.contains_rect(label), "label rect {label:?} inside {b:?}");
+        assert!(b.min.x < xf.apply(m.atoms[3].pos).x, "the O label extends past its atom");
+
+        let pan = Vec2::new(30.0, -12.0);
+        let moved = RenderTransform { offset: pan, ..xf };
+        let moved_scene = MoleculeScene::build(&m, &style, moved, |j| view.layout_job(j));
+        let mb = moved_scene.bounds(&m, moved).unwrap();
+        assert!((mb.min - b.min - pan).length() < 1e-3 && (mb.max - b.max - pan).length() < 1e-3);
+
+        let empty = Molecule::default();
+        let es = MoleculeScene::build(&empty, &style, xf, |j| view.layout_job(j));
+        assert!(es.bounds(&empty, xf).is_none());
     }
 
     #[test]
