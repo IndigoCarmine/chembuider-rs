@@ -221,6 +221,8 @@ impl App for EditorApp {
                 ui.separator();
 
                 if ui.button("🗑 Clear").clicked() {
+                    // Snapshot first so Ctrl+Z brings the cleared structure back.
+                    self.editor.push_undo();
                     self.editor.molecule = Molecule::default();
                     self.editor.selected_atoms.clear();
                     self.status = "Canvas cleared.".to_string();

@@ -300,6 +300,8 @@ impl ReactionApp {
                 }
             }
             if ui.button("🗑 Clear").clicked() {
+                // Snapshot first so Ctrl+Z brings the cleared structure back.
+                self.canvas.push_undo();
                 self.canvas.molecule = Molecule::default();
                 self.canvas.selected_atoms.clear();
             }
