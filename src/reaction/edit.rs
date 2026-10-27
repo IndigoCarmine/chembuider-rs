@@ -804,6 +804,9 @@ pub struct ReactionEditor {
     context_target: Option<Hit>,
     /// A scheme item being dragged to reorder, live for the duration of the drag.
     drag: Option<DragReorder>,
+    /// Set when a drag moved scheme structures to other positions; read and cleared by the host
+    /// with [`take_scheme_rearranged`](Self::take_scheme_rearranged).
+    scheme_rearranged: bool,
 }
 
 impl Default for ReactionEditor {
@@ -823,6 +826,7 @@ impl ReactionEditor {
             edit_request: None,
             context_target: None,
             drag: None,
+            scheme_rearranged: false,
         }
     }
 
@@ -860,6 +864,15 @@ impl ReactionEditor {
     /// True while a scheme item is being dragged to reorder it.
     pub fn is_dragging(&self) -> bool {
         self.drag.is_some()
+    }
+
+    /// Take whether [`show`](Self::show) has moved scheme structures to other positions since
+    /// the last call: a drag that reordered the line, moved a structure onto or off an arrow
+    /// slot, or swapped two of them. The host must re-check anything it holds by scheme
+    /// position — a [`StructureRef`] from [`take_edit_request`](Self::take_edit_request) kept
+    /// as a canvas link, say — since it may now name a different structure.
+    pub fn take_scheme_rearranged(&mut self) -> bool {
+        std::mem::take(&mut self.scheme_rearranged)
     }
 
     /// Run the automatic 2-D layout cleanup on the *selected* scheme structure, if the current
@@ -1123,6 +1136,8 @@ impl ReactionEditor {
                                 // Re-derive every table column from whatever structure now sits
                                 // at its position.
                                 reaction.sync_structures_from_scheme();
+                                // Dropped back in place moves nothing; any other landing does.
+                                self.scheme_rearranged |= landed != from;
                                 self.selection =
                                     Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
                             }
@@ -1210,6 +1225,7 @@ impl ReactionEditor {
                     // Occupied by a structure: trade places rather than refuse (課題A).
                     if swap_line_structure_with_arrow_slot(&mut reaction.scheme, from, ti, tp) {
                         reaction.sync_structures_from_scheme();
+                        self.scheme_rearranged = true;
                         self.selection =
                             Some(Hit::Scheme { index: from, part: SchemePart::Structure });
                     }
@@ -1217,6 +1233,7 @@ impl ReactionEditor {
                     move_line_structure_to_arrow_slot(&mut reaction.scheme, from, ti, tp)
                 {
                     reaction.sync_structures_from_scheme();
+                    self.scheme_rearranged = true;
                     self.selection = Some(Hit::Scheme { index: landed, part: tp });
                 }
             }
@@ -1241,6 +1258,7 @@ impl ReactionEditor {
                 // Arrow-label structures feed reactant columns, and a swap can move which slot
                 // holds which — re-derive so the columns follow.
                 reaction.sync_structures_from_scheme();
+                self.scheme_rearranged = true;
                 self.selection = Some(Hit::Scheme { index: ti, part: tp });
             }
         }
@@ -1258,6 +1276,7 @@ impl ReactionEditor {
         if let Some(at) = move_arrow_structure_to_line(&mut reaction.scheme, index, part, insert_at)
         {
             reaction.sync_structures_from_scheme();
+            self.scheme_rearranged = true;
             self.selection = Some(Hit::Scheme { index: at, part: SchemePart::Structure });
         }
     }
@@ -2422,6 +2441,73 @@ mod tests {
         );
         assert_eq!(editor.selection(), Some(Hit::Cell(moles)));
         assert!(editor.editing().is_none(), "Reactant Moles is computed");
+    }
+
+    /// Through the widget, with a real pointer: a drag that reorders the scheme is reported to
+    /// the host exactly once, so a host holding a positional [`StructureRef`] (e.g. a canvas
+    /// link) can tell its index went stale. A plain click reports nothing.
+    #[test]
+    fn a_drag_reorder_is_reported_to_the_host() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
+        let last = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+
+        // A click on a structure selects it but leaves the scheme as it was.
+        let start = last.center();
+        frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start)]);
+        frame(&ctx, &mut editor, &mut reaction, vec![button(start, true), button(start, false)]);
+        assert!(!editor.take_scheme_rearranged(), "a click does not rearrange the scheme");
+
+        // Drag the product (anisole) to the far left, ahead of phenol.
+        let end = Pos2::new(first.min.x + 2.0, first.center().y);
+        // egui picks the item up at wherever the pointer is when it first crosses the drag
+        // threshold, so nudge it off the press point while still over the product.
+        let nudge = start + Vec2::new(-12.0, 0.0);
+        frame(&ctx, &mut editor, &mut reaction, vec![button(start, true)]);
+        frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(nudge)]);
+        frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(end)]);
+        assert!(editor.is_dragging(), "the press-and-move picked the product up");
+        frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+
+        assert!(!editor.is_dragging());
+        assert!(
+            matches!(&reaction.scheme.items[0], SchemeItem::Structure(m) if *m == demo::anisole()),
+            "the drag moved anisole to the front"
+        );
+        assert!(editor.take_scheme_rearranged(), "the reorder is reported");
+        assert!(!editor.take_scheme_rearranged(), "and only once");
     }
 
     /// Through the widget: the interactive path allocates and paints exactly what the plain
