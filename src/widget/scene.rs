@@ -26,7 +26,7 @@ use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
 use crate::molecule::{BondOrder, BondStereo, Molecule};
 
-use super::draw::{atom_label, folded_h, should_show_label};
+use crate::molecule::depict::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
 
 // Fixed internal detail (not user-tunable): hash-wedge line count and wavy-bond resolution.
