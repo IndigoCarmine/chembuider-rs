@@ -3187,4 +3187,305 @@ mod tests {
             "an idle editor must draw exactly the plain figure"
         );
     }
+
+    // ── Entered values stay with their compound through every move ──────────
+    //
+    // Each compound below carries values of its own, so a column that ends up beside the wrong
+    // structure (or a column left in place while its structure moved) shows up as a mismatch
+    // between the column's name, its molecule, its values and the structure its id points at.
+    // None of these moves crosses the arrow: every reactant stays a reactant.
+
+    /// One reactant column as it was entered, keyed by its name.
+    struct Entered {
+        name: &'static str,
+        molecule: fn() -> Molecule,
+        limiting: bool,
+        sample_mass: Option<f64>,
+        equivalents: Option<f64>,
+        /// Whether a scheme structure draws it (K₂CO₃ is only a table column).
+        drawn: bool,
+    }
+
+    const ENTERED: [Entered; 5] = [
+        Entered {
+            name: "phenol",
+            molecule: demo::phenol,
+            limiting: true,
+            sample_mass: Some(1.0),
+            equivalents: None,
+            drawn: true,
+        },
+        Entered {
+            name: "benzene",
+            molecule: demo::benzene,
+            limiting: false,
+            sample_mass: Some(3.0),
+            equivalents: Some(2.0),
+            drawn: true,
+        },
+        Entered {
+            name: "biphenyl",
+            molecule: demo::biphenyl,
+            limiting: false,
+            sample_mass: None,
+            equivalents: Some(0.1),
+            drawn: true,
+        },
+        Entered {
+            name: "MeI",
+            molecule: demo::methyl_iodide,
+            limiting: false,
+            sample_mass: None,
+            equivalents: Some(1.5),
+            drawn: true,
+        },
+        Entered {
+            name: "K2CO3",
+            molecule: demo::potassium_carbonate,
+            limiting: false,
+            sample_mass: None,
+            equivalents: Some(3.0),
+            drawn: false,
+        },
+    ];
+
+    /// `phenol + benzene →(above: biphenyl, below: MeI or nothing) anisole`, with a column for
+    /// each structure (linked by [`Reaction::new`]) plus an undrawn K₂CO₃ column at the end.
+    fn valued_reaction(mei_below: bool) -> Reaction {
+        let mut arrow = Arrow::new().above_structure(demo::biphenyl());
+        if mei_below {
+            arrow = arrow.below_structure(demo::methyl_iodide());
+        }
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::benzene())
+            .arrow(arrow)
+            .structure(demo::anisole());
+        let mut analysis = Analysis::new();
+        for e in ENTERED.iter().filter(|e| mei_below || e.name != "MeI") {
+            let mut r = Reactant::new((e.molecule)()).name(e.name);
+            r.limiting = e.limiting;
+            r.sample_mass = e.sample_mass.map(Mass::grams);
+            r.equivalents = e.equivalents;
+            analysis.add_reactant(r);
+        }
+        analysis.add_product(
+            Product::new(demo::anisole()).name("anisole").measured_mass(Mass::grams(0.7)),
+        );
+        Reaction::new(scheme, analysis)
+    }
+
+    /// The molecule the scheme draws for `id`, on the line or on an arrow band.
+    fn drawn_molecule(scheme: &ReactionScheme, id: StructureId) -> Option<&Molecule> {
+        match find_scheme_structure(scheme, id)? {
+            Hit::Scheme { index, part: SchemePart::Structure } => match &scheme.items[index] {
+                SchemeItem::Structure(s) => Some(s.molecule()),
+                _ => None,
+            },
+            Hit::Scheme { index, part } => scheme_arrow_structure(scheme, index, part),
+            Hit::Cell(_) => None,
+        }
+    }
+
+    /// The reactant columns read `order` (by name), and every column still holds its own
+    /// compound's molecule and entered values, linked to the structure that draws it.
+    fn assert_values_follow(reaction: &Reaction, order: &[&str]) {
+        let names: Vec<_> =
+            reaction.analysis.reactants.iter().map(|r| r.name.as_deref().unwrap_or("?")).collect();
+        assert_eq!(names, order, "the reactant columns are in scheme order");
+        for r in &reaction.analysis.reactants {
+            let name = r.name.as_deref().unwrap();
+            let e = ENTERED.iter().find(|e| e.name == name).unwrap();
+            assert!(r.molecule == (e.molecule)(), "{name}: the column kept its molecule");
+            assert_eq!(r.limiting, e.limiting, "{name}: limiting stayed with the compound");
+            assert_eq!(
+                r.sample_mass.map(Mass::as_grams),
+                e.sample_mass,
+                "{name}: sample mass stayed with the compound"
+            );
+            assert_eq!(r.equivalents, e.equivalents, "{name}: equivalents stayed with the compound");
+            match r.structure {
+                Some(id) => {
+                    assert!(e.drawn, "{name}: an undrawn column was never linked");
+                    assert!(
+                        drawn_molecule(&reaction.scheme, id) == Some(&r.molecule),
+                        "{name}: the column is linked to the structure that draws it"
+                    );
+                }
+                None => assert!(!e.drawn, "{name}: the column lost its structure"),
+            }
+        }
+        let [p] = reaction.analysis.products.as_slice() else { panic!("one product column") };
+        assert_eq!(p.name.as_deref(), Some("anisole"));
+        assert!(p.molecule == demo::anisole());
+        assert_eq!(p.measured_mass.map(Mass::as_grams), Some(0.7));
+        let id = p.structure.expect("the product stays linked");
+        assert!(drawn_molecule(&reaction.scheme, id) == Some(&demo::anisole()));
+    }
+
+    /// The fixture itself: [`Reaction::new`] links by position, in scheme order.
+    #[test]
+    fn valued_reaction_starts_linked_in_scheme_order() {
+        assert_values_follow(
+            &valued_reaction(true),
+            &["phenol", "benzene", "biphenyl", "MeI", "K2CO3"],
+        );
+        assert_values_follow(&valued_reaction(false), &["phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    /// The edit-layer moves, followed by the resync the widget does after each of them.
+    #[test]
+    fn values_follow_their_compound_through_the_edit_layer_moves() {
+        // Along the line: benzene to the front.
+        let mut reaction = valued_reaction(true);
+        assert_eq!(reaction.scheme.move_item(2, -2), Some(0));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["benzene", "phenol", "biphenyl", "MeI", "K2CO3"]);
+
+        // Line → empty slot: phenol onto the empty below band (the arrow shifts to index 2).
+        let mut reaction = valued_reaction(false);
+        assert_eq!(move_line_structure_to_arrow_slot(&mut reaction.scheme, 0, 3, BELOW), Some(2));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["benzene", "biphenyl", "phenol", "K2CO3"]);
+
+        // Line ↔ occupied slot: phenol and biphenyl trade places.
+        let mut reaction = valued_reaction(true);
+        assert!(swap_line_structure_with_arrow_slot(&mut reaction.scheme, 0, 3, ABOVE));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["biphenyl", "benzene", "phenol", "MeI", "K2CO3"]);
+
+        // Slot → line: MeI to the front of the line.
+        let mut reaction = valued_reaction(true);
+        assert_eq!(move_arrow_structure_to_line(&mut reaction.scheme, 3, BELOW, 0), Some(0));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    /// The drop handler's own paths: line onto an empty slot, line swapped with an occupied
+    /// slot, slot swapped with slot, slot onto an empty slot, and slot back onto the line.
+    #[test]
+    fn values_follow_their_compound_through_drop_into_arrow_slot() {
+        let mut editor = ReactionEditor::new();
+
+        let mut reaction = valued_reaction(false);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(0), 3, BELOW);
+        assert_values_follow(&reaction, &["benzene", "biphenyl", "phenol", "K2CO3"]);
+
+        let mut reaction = valued_reaction(true);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(2), 3, ABOVE);
+        assert_values_follow(&reaction, &["phenol", "biphenyl", "benzene", "MeI", "K2CO3"]);
+
+        let mut reaction = valued_reaction(true);
+        let above = DragSource::ArrowLabel { index: 3, part: ABOVE };
+        editor.drop_into_arrow_slot(&mut reaction, above, 3, BELOW);
+        assert_values_follow(&reaction, &["phenol", "benzene", "MeI", "biphenyl", "K2CO3"]);
+
+        let mut reaction = valued_reaction(false);
+        editor.drop_into_arrow_slot(&mut reaction, above, 3, BELOW);
+        assert!(arrow_label(&reaction.scheme, 3, ABOVE).unwrap().is_empty());
+        assert_values_follow(&reaction, &["phenol", "benzene", "biphenyl", "K2CO3"]);
+
+        let mut reaction = valued_reaction(true);
+        editor.drop_arrow_structure_onto_line(&mut reaction, 3, BELOW, 0);
+        assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    /// Through the widget, with a real pointer: every kind of drag — a reorder along the line,
+    /// a line structure onto an empty or an occupied arrow slot, slot to slot, and slot back
+    /// onto the line — leaves limiting, sample mass and equivalents with the same compound.
+    #[test]
+    fn values_follow_their_compound_through_a_widget_drag() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        /// On a fresh [`valued_reaction`]: press where `from` says, cross the drag threshold
+        /// `nudge` away, let go where `to` says, and hand back the reaction.
+        fn drag(
+            mei_below: bool,
+            from: impl Fn(&FigureLayout, Pos2) -> Pos2,
+            nudge: Vec2,
+            to: impl Fn(&FigureLayout, Pos2) -> Pos2,
+        ) -> Reaction {
+            let mut reaction = valued_reaction(mei_below);
+            let mut editor = ReactionEditor::new();
+            let ctx = egui::Context::default();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+            let (start, end) = (from(&layout, origin), to(&layout, origin));
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![button(start, true)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start + nudge)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the item up");
+            frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+            assert!(!editor.is_dragging());
+            assert!(editor.take_scheme_rearranged(), "the drag changed the scheme");
+            reaction
+        }
+        let center = |index, part| {
+            move |l: &FigureLayout, o: Pos2| scheme_item_rect(l, o, index, part).unwrap().center()
+        };
+        // The front of the line, over phenol (not over an arrow band).
+        let front = |l: &FigureLayout, o: Pos2| {
+            let first = scheme_item_rect(l, o, 0, SchemePart::Structure).unwrap();
+            Pos2::new(first.min.x + 2.0, first.center().y)
+        };
+        let line_draws = |r: &Reaction, index: usize, m: Molecule| {
+            matches!(&r.scheme.items[index], SchemeItem::Structure(s) if *s == m)
+        };
+        let band_draws = |r: &Reaction, index: usize, part: SchemePart, m: Molecule| {
+            scheme_arrow_structure(&r.scheme, index, part) == Some(&m)
+        };
+        let left = Vec2::new(-12.0, 0.0);
+        let right = Vec2::new(12.0, 0.0);
+
+        // Reorder along the line: benzene to the front.
+        let reaction = drag(true, center(2, SchemePart::Structure), left, front);
+        assert!(line_draws(&reaction, 0, demo::benzene()));
+        assert_values_follow(&reaction, &["benzene", "phenol", "biphenyl", "MeI", "K2CO3"]);
+
+        // Line → empty slot: phenol onto the arrow's empty below band.
+        let reaction = drag(false, center(0, SchemePart::Structure), right, center(3, BELOW));
+        assert!(band_draws(&reaction, 2, BELOW, demo::phenol()));
+        assert_values_follow(&reaction, &["benzene", "biphenyl", "phenol", "K2CO3"]);
+
+        // Line ↔ occupied slot: phenol onto biphenyl's band, biphenyl back onto the line.
+        let reaction = drag(true, center(0, SchemePart::Structure), right, center(3, ABOVE));
+        assert!(band_draws(&reaction, 3, ABOVE, demo::phenol()));
+        assert_values_follow(&reaction, &["biphenyl", "benzene", "phenol", "MeI", "K2CO3"]);
+
+        // Slot ↔ slot: biphenyl (above) dropped on MeI (below); the two trade bands.
+        let reaction = drag(true, center(3, ABOVE), left, center(3, BELOW));
+        assert!(band_draws(&reaction, 3, ABOVE, demo::methyl_iodide()));
+        assert_values_follow(&reaction, &["phenol", "benzene", "MeI", "biphenyl", "K2CO3"]);
+
+        // Slot → line: MeI off its band to the front of the line.
+        let reaction = drag(true, center(3, BELOW), left, front);
+        assert!(line_draws(&reaction, 0, demo::methyl_iodide()));
+        assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
 }
