@@ -396,10 +396,11 @@ fn collate(s: &str) -> Vec<u8> {
 
 /// Backtracking enumeration of every depth-first traversal of one component.
 ///
-/// The depth-first stack is explicit, so one call to [`Search::search`] performs exactly one
-/// *step* — choose a child, or finish an atom and hand control back to its parent — and
-/// backtracking is then ordinary recursion with an undo on the way out. A traversal is complete
-/// when the stack empties; its string is rendered and kept if it is the smallest so far.
+/// The depth-first stack is explicit, and so is the backtracking: a [`Step`] performs exactly
+/// one *step* — choose a child, or finish an atom and hand control back to its parent — and
+/// [`Search::search`] keeps the steps in progress on a stack of its own, undoing each one's
+/// choices on the way out. A traversal is complete when the depth-first stack empties; its
+/// string is rendered and kept if it is the smallest so far.
 struct Search<'a> {
     sk: &'a Skeleton,
     visited: Vec<bool>,
@@ -416,6 +417,20 @@ struct Search<'a> {
     best: Option<(Vec<u8>, String)>,
     traversals: usize,
     exhausted: bool,
+}
+
+/// One step of [`Search::search`] whose continuations are still being enumerated.
+struct Step {
+    /// The atom on top of the depth-first stack when the step began.
+    i: usize,
+    /// The ring closures the step classified, undone when it ends.
+    closed: Vec<(usize, usize)>,
+    /// `(bond, atom)` for every unvisited neighbour `i` can descend to, in the order they are
+    /// tried. Empty when `i` is finished.
+    candidates: Vec<(usize, usize)>,
+    /// How many of `candidates` have been descended into; for a finished atom, whether it has
+    /// been taken off the depth-first stack yet (0 or 1).
+    taken: usize,
 }
 
 impl<'a> Search<'a> {
@@ -469,10 +484,71 @@ impl<'a> Search<'a> {
         token[..k] > best[..k]
     }
 
+    /// Enumerate every traversal that continues from the current depth-first stack.
+    ///
+    /// Each [`Step`] is one level of what would naturally be a recursion — begin a step, try
+    /// each of its choices with the next step nested inside, undo on the way out — but the
+    /// levels live in `steps` on the heap. A traversal takes about two steps per atom, so as
+    /// call frames they would exhaust the thread's stack on a structure of a few thousand atoms.
     fn search(&mut self) {
+        let mut steps: Vec<Step> = Vec::new();
+        // Whether the next step, nested inside the innermost one in `steps`, is due to begin.
+        let mut descend = true;
+        loop {
+            if descend {
+                descend = false;
+                if let Some(step) = self.begin_step() {
+                    steps.push(step);
+                }
+            }
+            let Some(step) = steps.last_mut() else { return };
+            let i = step.i;
+
+            if step.candidates.is_empty() {
+                if step.taken == 0 {
+                    // `i` is finished: every one of its bonds is classified, so no later ring
+                    // closure can appear on it and it is safe to leave the stack for good.
+                    step.taken = 1;
+                    self.stack.pop();
+                    descend = true;
+                    continue;
+                }
+                self.stack.push(i);
+            } else {
+                if step.taken > 0 {
+                    let (b, j) = step.candidates[step.taken - 1];
+                    self.stack.pop();
+                    self.children[i].pop();
+                    self.visited[j] = false;
+                    self.used[b] = false;
+                }
+                if let Some(&(b, j)) = step.candidates.get(step.taken) {
+                    step.taken += 1;
+                    self.used[b] = true;
+                    self.visited[j] = true;
+                    self.children[i].push(b);
+                    self.stack.push(j);
+                    descend = true;
+                    continue;
+                }
+            }
+
+            for &(b, j) in step.closed.iter().rev() {
+                self.rings[j].pop();
+                self.rings[i].pop();
+                self.used[b] = false;
+            }
+            steps.pop();
+        }
+    }
+
+    /// Begin one step: stop if the budget is spent, record the traversal if the stack has
+    /// emptied, and otherwise classify the ring closures on the atom on top of the stack and
+    /// list the children it could descend to. `None` means the step is already over.
+    fn begin_step(&mut self) -> Option<Step> {
         if self.traversals >= TRAVERSAL_BUDGET {
             self.exhausted = true;
-            return;
+            return None;
         }
         let Some(&i) = self.stack.last() else {
             self.traversals += 1;
@@ -481,7 +557,7 @@ impl<'a> Search<'a> {
             if self.best.as_ref().is_none_or(|(b, _)| key < *b) {
                 self.best = Some((key, s));
             }
-            return;
+            return None;
         };
 
         let sk = self.sk;
@@ -513,31 +589,7 @@ impl<'a> Search<'a> {
             })
             .collect();
 
-        if candidates.is_empty() {
-            // `i` is finished: every one of its bonds is classified, so no later ring closure
-            // can appear on it and it is safe to leave the stack for good.
-            self.stack.pop();
-            self.search();
-            self.stack.push(i);
-        } else {
-            for (b, j) in candidates {
-                self.used[b] = true;
-                self.visited[j] = true;
-                self.children[i].push(b);
-                self.stack.push(j);
-                self.search();
-                self.stack.pop();
-                self.children[i].pop();
-                self.visited[j] = false;
-                self.used[b] = false;
-            }
-        }
-
-        for &(b, j) in closed.iter().rev() {
-            self.rings[j].pop();
-            self.rings[i].pop();
-            self.used[b] = false;
-        }
+        Some(Step { i, closed, candidates, taken: 0 })
     }
 
     fn render(&self) -> String {
@@ -546,26 +598,54 @@ impl<'a> Search<'a> {
         // order the bonds happen to sit in `Molecule::bonds` — a ring-fusion carbon carries two
         // of them, and without this the same molecule built two ways writes `C2=CC=CC=C21` one
         // time and `C2=CC=CC=C12` the next.
-        let mut pos = vec![usize::MAX; self.sk.len()];
-        let mut next = 0usize;
-        self.number(self.root, &mut pos, &mut next);
+        let pos = self.number();
 
+        // Atoms are written in the same depth-first order they were numbered in, with the
+        // tree walked through an explicit stack (the tree can be as deep as the component is
+        // large). Each atom's work is pushed in reverse so that it pops in writing order:
+        // a branch is `(` bond atom-and-subtree `)`, and the last child is written unbranched.
         let mut out = String::new();
         let mut open: HashMap<usize, u8> = HashMap::new();
         let mut free = [true; 100];
-        self.write(self.root, &pos, &mut out, &mut open, &mut free);
+        let mut todo = vec![Write::Atom(self.root)];
+        while let Some(w) = todo.pop() {
+            match w {
+                Write::Text(t) => out.push_str(t),
+                Write::Atom(i) => {
+                    self.write_atom(i, &pos, &mut out, &mut open, &mut free);
+                    let kids = &self.children[i];
+                    for (k, &b) in kids.iter().enumerate().rev() {
+                        let last = k + 1 == kids.len();
+                        if !last {
+                            todo.push(Write::Text(")"));
+                        }
+                        todo.push(Write::Atom(self.sk.other(b, i)));
+                        todo.push(Write::Text(bond_symbol(self.sk.order(b))));
+                        if !last {
+                            todo.push(Write::Text("("));
+                        }
+                    }
+                }
+            }
+        }
         out
     }
 
-    fn number(&self, i: usize, pos: &mut Vec<usize>, next: &mut usize) {
-        pos[i] = *next;
-        *next += 1;
-        for &b in &self.children[i] {
-            self.number(self.sk.other(b, i), pos, next);
+    /// Each atom's position in depth-first preorder, children in the order they are written.
+    fn number(&self) -> Vec<usize> {
+        let mut pos = vec![usize::MAX; self.sk.len()];
+        let mut next = 0usize;
+        let mut todo = vec![self.root];
+        while let Some(i) = todo.pop() {
+            pos[i] = next;
+            next += 1;
+            todo.extend(self.children[i].iter().rev().map(|&b| self.sk.other(b, i)));
         }
+        pos
     }
 
-    fn write(
+    /// An atom's token followed by its ring-closure digits.
+    fn write_atom(
         &self,
         i: usize,
         pos: &[usize],
@@ -594,20 +674,15 @@ impl<'a> Search<'a> {
                 }
             }
         }
-
-        let kids = &self.children[i];
-        for (k, &b) in kids.iter().enumerate() {
-            let last = k + 1 == kids.len();
-            if !last {
-                out.push('(');
-            }
-            out.push_str(bond_symbol(self.sk.order(b)));
-            self.write(self.sk.other(b, i), pos, out, open, free);
-            if !last {
-                out.push(')');
-            }
-        }
     }
+}
+
+/// One pending piece of [`Search::render`]'s output.
+enum Write {
+    /// An atom, its ring digits and then everything below it in the tree.
+    Atom(usize),
+    /// A bond symbol or a branch parenthesis.
+    Text(&'static str),
 }
 
 /// Ring-closure numbers past 9 need the `%nn` escape, single digits must not use it.
@@ -1059,6 +1134,201 @@ mod tests {
         for (name, m) in all_fixtures() {
             let g = generate(&m);
             println!("{name:24} {:>7} traversals  {}", g.traversals, g.smiles);
+        }
+    }
+
+    // ── characterization ───────────────────────────────────────────────────────
+
+    /// A deterministic pseudo-random structure: a random forest of up to two dozen atoms with a
+    /// few extra bonds closing rings, mixed elements, charges, bond orders, drawn and isotopic
+    /// hydrogens, unknown labels and stereo marks. Same LCG as [`shuffled_indices`], so a case
+    /// is reproducible from its seed alone.
+    fn random_molecule(seed: u64) -> Molecule {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut rand = move |n: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        const ELEMENTS: [&str; 20] = [
+            "C", "C", "C", "C", "C", "C", "N", "N", "O", "O", "S", "P", "F", "Cl", "Br", "Si",
+            "B", "H", "D", "Xx",
+        ];
+        const STEREO: [BondStereo; 6] = [
+            BondStereo::None,
+            BondStereo::WedgeUp,
+            BondStereo::WedgeDown,
+            BondStereo::Bold,
+            BondStereo::Dashed,
+            BondStereo::Wavy,
+        ];
+
+        let mut m = Molecule::default();
+        let n = 1 + rand(24) as usize;
+        let ids: Vec<u32> = (0..n)
+            .map(|k| {
+                let element = ELEMENTS[rand(ELEMENTS.len() as u64) as usize].to_string();
+                let charge = match rand(20) {
+                    0 => 1,
+                    1 => -1,
+                    2 => 2,
+                    _ => 0,
+                };
+                let id = m.add_atom(element, [k as f32, 0.0], charge);
+                if rand(2) == 0 {
+                    m.atom_by_id_mut(id).expect("just added").group_h = true;
+                }
+                id
+            })
+            .collect();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for k in 1..n {
+            if rand(12) != 0 {
+                pairs.push((k, rand(k as u64) as usize));
+            }
+        }
+        for _ in 0..rand(5) {
+            pairs.push((rand(n as u64) as usize, rand(n as u64) as usize));
+        }
+        for (i, j) in pairs {
+            if i == j {
+                continue;
+            }
+            let order = match rand(10) {
+                0..=6 => BondOrder::Single,
+                7 | 8 => BondOrder::Double,
+                _ => BondOrder::Triple,
+            };
+            let b = m.add_bond(ids[i], ids[j], order);
+            if let Some(bond) = m.bond_by_id_mut(b) {
+                bond.stereo = STEREO[rand(STEREO.len() as u64) as usize].clone();
+            }
+        }
+        m
+    }
+
+    /// `n` carbons, bonded `i`–`i+1`, and back to the first when `ring`.
+    fn carbon_path(n: usize, ring: bool) -> Molecule {
+        let mut bonds: Vec<(usize, usize, BondOrder)> =
+            (1..n).map(|k| (k - 1, k, BondOrder::Single)).collect();
+        if ring && n > 2 {
+            bonds.push((n - 1, 0, BondOrder::Single));
+        }
+        mol(&vec![("C", 0); n], &bonds)
+    }
+
+    /// Every structure whose output [`output_is_pinned`] holds fixed.
+    fn characterization_cases() -> Vec<(String, Molecule)> {
+        let mut cases: Vec<(String, Molecule)> = all_fixtures()
+            .into_iter()
+            .map(|(name, m)| (format!("fixture:{name}"), m))
+            .collect();
+        for n in [1, 2, 3, 5, 8, 13, 40, 200] {
+            cases.push((format!("chain:{n}"), carbon_path(n, false)));
+        }
+        for n in [3, 4, 5, 6, 7, 12, 30, 100] {
+            cases.push((format!("ring:{n}"), carbon_path(n, true)));
+        }
+        for k in 0..=4 {
+            let atoms = [("N", 0), ("C", 0), ("O", 0), ("Cl", 0), ("C", 0)];
+            let bonds: Vec<_> = (1..=k).map(|j| (0, j, BondOrder::Single)).collect();
+            cases.push((format!("star:{k}"), mol(&atoms[..=k], &bonds)));
+        }
+        // Complete graphs: every DFS is a Hamiltonian path, so K_n costs n! traversals, and K7
+        // and K8 keep more than nine rings open at once. Where the budget cuts the search off
+        // is pinned by `random:81`, which runs out of it.
+        for n in 4..=8 {
+            let bonds: Vec<_> = (0..n)
+                .flat_map(|i| ((i + 1)..n).map(move |j| (i, j, BondOrder::Single)))
+                .collect();
+            cases.push((format!("complete:{n}"), mol(&vec![("C", 0); n], &bonds)));
+        }
+        for seed in 0..150u64 {
+            cases.push((format!("random:{seed}"), random_molecule(seed)));
+        }
+        cases
+    }
+
+    fn characterization_line(name: &str, m: &Molecule) -> String {
+        let g = generate(m);
+        format!("{name}\t{}\t{}\t{}", g.traversals, g.exhausted, g.smiles)
+    }
+
+    /// How many tests [`output_is_pinned`] is split across, so the cases run in parallel.
+    const CHARACTERIZATION_SHARES: usize = 4;
+
+    /// The exact output — and the traversal count and budget flag, which pin the search order
+    /// and its pruning — for every fixture, a set of chains, rings, stars and complete graphs,
+    /// and a seeded batch of random structures. The expected lines were produced by the
+    /// recursive writer before it was made iterative; regenerate them with
+    /// `cargo test --lib smiles::tests::dump_characterization -- --ignored --nocapture` only
+    /// when the canonical form is meant to change.
+    ///
+    /// Checks the cases whose index is `share` modulo [`CHARACTERIZATION_SHARES`].
+    fn output_is_pinned(share: usize) {
+        let expected = include_str!("smiles/characterization.txt");
+        let cases = characterization_cases();
+        let want: Vec<&str> = expected.lines().collect();
+        assert_eq!(want.len(), cases.len(), "characterization.txt is out of step with the cases");
+        for ((name, m), want) in cases.iter().zip(want).skip(share).step_by(CHARACTERIZATION_SHARES) {
+            assert_eq!(characterization_line(name, m), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_0() {
+        output_is_pinned(0);
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_1() {
+        output_is_pinned(1);
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_2() {
+        output_is_pinned(2);
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_3() {
+        output_is_pinned(3);
+    }
+
+    /// [`to_smiles`] runs on the UI thread, on whatever came in off the clipboard, so the depth
+    /// of the structure must never become the depth of the call stack: an overflow there is not
+    /// a panic but an abort that takes every unsaved drawing with it. A 256 KiB stack is a
+    /// quarter of the smallest main-thread stack a desktop platform gives (Windows, 1 MiB); the
+    /// recursive writer already overflowed it at three hundred atoms, so a thousand leaves a
+    /// wide margin. (Exhaustive search is quadratic on a chain, which is what keeps N modest.)
+    #[test]
+    fn a_long_chain_or_ring_does_not_exhaust_a_small_stack() {
+        const N: usize = 1000;
+        for ring in [false, true] {
+            let m = carbon_path(N, ring);
+            let s = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || to_smiles(&m))
+                .expect("spawn a thread with a small stack")
+                .join()
+                .expect("to_smiles panicked");
+
+            let want = if ring {
+                format!("C1{}C1", "C".repeat(N - 2))
+            } else {
+                "C".repeat(N)
+            };
+            assert_eq!(s, want, "ring: {ring}");
+            let (parsed, _) = parse(&s);
+            assert_eq!(parsed.atoms.len(), N, "ring: {ring}");
+            assert_eq!(parsed.bonds.len(), if ring { N } else { N - 1 }, "ring: {ring}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_characterization() {
+        for (name, m) in characterization_cases() {
+            println!("{}", characterization_line(&name, &m));
         }
     }
 
