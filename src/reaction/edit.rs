@@ -1668,6 +1668,34 @@ mod tests {
         assert_eq!(reaction.analysis.limiting(), None, "clicking it again clears it");
     }
 
+    /// Clearing the declaration on phenol lets the fallback pick phenol again. The cell must
+    /// still show that the click did something: the declared bold-italic "Yes" becomes an
+    /// inferred regular "Yes", matching the "No" that the entered state now holds.
+    #[test]
+    fn clearing_a_declared_limiting_reagent_shows_the_inferred_one() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let mut editor = ReactionEditor::new();
+        let cell = CellRef::new(BlockKind::Reactants, 0, 2);
+        let limiting_cell = |reaction: &Reaction| {
+            AnalysisTable::from_result(&reaction.analysis.compute()).blocks[0].columns[0][2].clone()
+        };
+
+        let before = limiting_cell(&reaction);
+        assert_eq!((before.plain(), before.is_entered()), ("Yes".to_string(), true));
+        assert_eq!(field_text(&reaction.analysis, cell), "Yes");
+
+        editor.click(Hit::Cell(cell), &mut reaction);
+        assert_eq!(reaction.analysis.limiting(), None);
+        let after = limiting_cell(&reaction);
+        assert_eq!((after.plain(), after.is_entered()), ("Yes".to_string(), false));
+        assert_eq!(field_text(&reaction.analysis, cell), "No");
+
+        // Clicking the inferred "Yes" declares it again.
+        editor.click(Hit::Cell(cell), &mut reaction);
+        assert_eq!(reaction.analysis.limiting(), Some(0));
+        assert!(limiting_cell(&reaction).is_entered());
+    }
+
     /// Deleting the limiting reagent leaves the reaction without one; the derived amounts go
     /// blank instead of quietly rescaling to a reagent that has no amount of its own.
     #[test]

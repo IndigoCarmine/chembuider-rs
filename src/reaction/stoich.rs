@@ -53,7 +53,12 @@ pub struct ReactantAnalysis {
     pub formula: MolecularFormula,
     /// g/mol; `None` when the structure carries a group label with no atomic weight.
     pub mw: Option<f64>,
+    /// Whether this reagent sets the scale — declared, or picked by the fallback.
     pub limiting: bool,
+    /// How it became limiting: [`Origin::Entered`] when the user declared it,
+    /// [`Origin::Computed`] when no reagent is declared and the fallback picked this one.
+    /// `None` exactly when [`limiting`](Self::limiting) is `false`.
+    pub limiting_origin: Option<Origin>,
     pub equivalents: Option<Quantity>,
     /// `Sample Mass`, g — entered when the reagent was weighed out, otherwise the mass of
     /// material its equivalents call for ([`mass`](Self::mass) ÷ %Weight, computed).
@@ -116,13 +121,15 @@ impl Analysis {
 
         // The limiting reagent: the one flagged, else the first whose amount is known
         // outright (a sample mass, or a concentration × volume).
-        let limiting_index = self
-            .reactants
-            .iter()
-            .position(|r| r.limiting)
-            .or_else(|| {
-                (0..self.reactants.len()).find(|&i| entered_moles(&self.reactants[i], mws[i]).is_some())
-            });
+        let declared = self.reactants.iter().position(|r| r.limiting);
+        let limiting_index = declared.or_else(|| {
+            (0..self.reactants.len()).find(|&i| entered_moles(&self.reactants[i], mws[i]).is_some())
+        });
+        let limiting_origin = |i: usize| match (Some(i) == limiting_index, declared.is_some()) {
+            (false, _) => None,
+            (true, true) => Some(Origin::Entered),
+            (true, false) => Some(Origin::Computed),
+        };
         let limiting_moles =
             limiting_index.and_then(|i| entered_moles(&self.reactants[i], mws[i]));
 
@@ -131,7 +138,7 @@ impl Analysis {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                analyse_reactant(r, mws[i], limiting_moles, Some(i) == limiting_index)
+                analyse_reactant(r, mws[i], limiting_moles, limiting_origin(i))
             })
             .collect();
 
@@ -169,8 +176,9 @@ fn analyse_reactant(
     r: &Reactant,
     mw: Option<f64>,
     limiting_moles: Option<f64>,
-    is_limiting: bool,
+    limiting_origin: Option<Origin>,
 ) -> ReactantAnalysis {
+    let is_limiting = limiting_origin.is_some();
     let own = entered_moles(r, mw);
 
     // Moles: what this reagent's own entries say, otherwise equivalents × the limiting scale.
@@ -216,6 +224,7 @@ fn analyse_reactant(
         formula: MolecularFormula::of(&r.molecule),
         mw,
         limiting: is_limiting,
+        limiting_origin,
         equivalents,
         // What you weigh out: the entered mass, or — for a reagent whose amount follows from
         // its equivalents — the mass you *would* weigh out, back-filled like ChemDraw does.
