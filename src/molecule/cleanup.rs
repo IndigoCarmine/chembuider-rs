@@ -1406,6 +1406,215 @@ mod tests {
         }
     }
 
+    // ─── Characterization: today's cleanup result, pinned bit for bit ─────────
+    //
+    // A safety net for restructuring how the two-phase schedule (relax → ring rescue) is
+    // driven: `cleanup_2d` and the native `CleanupJob` must keep producing exactly the
+    // coordinates they produce now.  The fingerprints below were recorded from the code as it
+    // stood, not derived from any expectation of what a "good" layout is.  The f32 trig calls
+    // (`atan2`) come from the platform's libm and 100k relaxation steps amplify a 1-ulp
+    // difference, so they were recorded on x86_64-pc-windows-msvc; if they disagree on another
+    // platform without any code change, that is the libm, not a regression.
+
+    /// What phase 2 (`ring_rescue`) ended up doing for a fixture.
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum Rescue {
+        /// Phase 1 left no crossed ring, so `apply_ring_fix` was never called.
+        NotNeeded,
+        /// The first rescue pass did not help and was rolled back to the phase-1 result.
+        Rejected,
+        /// The first pass reduced the crossing count and was kept; nothing further was kept.
+        KeptOnePass,
+        /// The repeat loop kept a second (or later) pass as well.
+        KeptSeveralPasses,
+    }
+
+    struct Fixture {
+        name: &'static str,
+        mol: Molecule,
+        rescue: Rescue,
+        /// `fingerprint` of the coordinates `cleanup_2d` produces today.
+        fingerprint: u64,
+    }
+
+    /// Exact coordinates (as f32 bit patterns) in `mol.atoms` order.
+    fn coord_bits(mol: &Molecule) -> Vec<(u32, [u32; 2])> {
+        mol.atoms.iter().map(|a| (a.id, [a.pos[0].to_bits(), a.pos[1].to_bits()])).collect()
+    }
+
+    fn position_bits(positions: &[(u32, [f32; 2])]) -> Vec<(u32, [u32; 2])> {
+        positions.iter().map(|&(id, p)| (id, [p[0].to_bits(), p[1].to_bits()])).collect()
+    }
+
+    /// FNV-1a over every atom's id and coordinate bits, in order.
+    fn fingerprint(bits: &[(u32, [u32; 2])]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &(id, [x, y]) in bits {
+            for word in [id, x, y] {
+                for byte in word.to_le_bytes() {
+                    h ^= u64::from(byte);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    /// Molecules `convergence_50_random` draws (same seed and recipe), picked by trial index.
+    fn random_trials(picks: &[usize]) -> Vec<Molecule> {
+        let last = *picks.iter().max().unwrap();
+        let mut rng = Lcg(0xDEAD_BEEF_CAFE_1234);
+        let mut out = Vec::new();
+        for trial in 0..=last {
+            let n_atoms = rng.usize_range(2, 21);
+            let extra_bonds = rng.usize_range(0, n_atoms / 2 + 1);
+            let range = rng.f32_range(5.0, 15.0);
+            let mol = random_molecule(&mut rng, n_atoms, extra_bonds, range);
+            if picks.contains(&trial) {
+                out.push(mol);
+            }
+        }
+        out
+    }
+
+    fn characterization_fixtures() -> Vec<Fixture> {
+        let empty = Molecule::default();
+
+        let mut single = Molecule::default();
+        single.add_atom("C".to_string(), [0.7, -0.3], 0);
+
+        // C0–C1≡C2 bent to ~90° at the sp carbon (exercises the linear-centre term).
+        let mut propyne = Molecule::default();
+        let c0 = propyne.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c1 = propyne.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c2 = propyne.add_atom("C".to_string(), [1.5, 1.5], 0);
+        propyne.add_bond(c0, c1, BondOrder::Single);
+        propyne.add_bond(c1, c2, BondOrder::Triple);
+
+        // A badly drawn but uncrossed benzene ring with a methyl group.
+        let mut toluene = Molecule::default();
+        let ring: Vec<u32> = [[0.0, 1.2], [1.4, 0.9], [1.1, -0.6], [0.1, -1.7], [-1.3, -0.4], [-1.0, 0.5]]
+            .iter()
+            .map(|&p| toluene.add_atom("C".to_string(), p, 0))
+            .collect();
+        for i in 0..6 {
+            let order = if i % 2 == 0 { BondOrder::Double } else { BondOrder::Single };
+            toluene.add_bond(ring[i], ring[(i + 1) % 6], order);
+        }
+        let methyl = toluene.add_atom("C".to_string(), [0.3, 2.0], 0);
+        toluene.add_bond(ring[0], methyl, BondOrder::Single);
+
+        let mut random = random_trials(&[1, 2, 5, 10, 22, 42]).into_iter();
+        let mut next = || random.next().unwrap();
+
+        vec![
+            Fixture { name: "empty", mol: empty, rescue: Rescue::NotNeeded, fingerprint: 0xcbf2_9ce4_8422_2325 },
+            Fixture { name: "single_atom", mol: single, rescue: Rescue::NotNeeded, fingerprint: 0x5f24_2d39_c242_2be4 },
+            Fixture { name: "propyne_bent", mol: propyne, rescue: Rescue::NotNeeded, fingerprint: 0x0dcf_aa10_fc30_b7e9 },
+            Fixture { name: "toluene_distorted", mol: toluene, rescue: Rescue::NotNeeded, fingerprint: 0x1d45_d142_bb29_38ca },
+            // Random trials, chosen to cover every route through phase 2 (see `Rescue`).
+            Fixture { name: "random_trial_01", mol: next(), rescue: Rescue::NotNeeded, fingerprint: 0x7c68_05f3_d142_0581 },
+            Fixture { name: "random_trial_02", mol: next(), rescue: Rescue::NotNeeded, fingerprint: 0xf609_5d14_1c2e_9375 },
+            Fixture { name: "random_trial_05", mol: next(), rescue: Rescue::KeptOnePass, fingerprint: 0xa05e_aa4f_57dd_f0dd },
+            Fixture { name: "random_trial_10", mol: next(), rescue: Rescue::KeptSeveralPasses, fingerprint: 0xf461_4345_0557_b563 },
+            Fixture { name: "random_trial_22", mol: next(), rescue: Rescue::Rejected, fingerprint: 0x88b0_afef_6dfb_28b9 },
+            Fixture { name: "random_trial_42", mol: next(), rescue: Rescue::KeptOnePass, fingerprint: 0x2f8b_bd1c_9ab9_256a },
+        ]
+    }
+
+    /// Run the native background job to completion the way `poll_cleanup` consumes it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_native_job(mol: &Molecule) -> Vec<(u32, [f32; 2])> {
+        let job = CleanupJob::start(mol);
+        while !job.is_done() {
+            std::thread::yield_now();
+        }
+        let positions = job.latest();
+        job.join();
+        positions
+    }
+
+    /// Which route through phase 2 `cleanup_2d` took to produce `got`, found by replaying
+    /// phase 1 and a single rescue pass by hand and comparing.
+    fn observed_rescue(name: &str, mol: &Molecule, got: &[(u32, [u32; 2])], cleaned: &Molecule) -> Rescue {
+        if mol.atoms.is_empty() {
+            return Rescue::NotNeeded;
+        }
+        let mut st = CleanupState::new(mol);
+        st.step(JOB_PHASE_BUDGET);
+        let after_phase1 = position_bits(&st.positions());
+        let crossings_after_phase1 = st.ring_crossing_count();
+        if crossings_after_phase1 == 0 {
+            assert_eq!(got, after_phase1, "{name}: no crossed ring, yet the result is not phase 1's");
+            return Rescue::NotNeeded;
+        }
+        if got == after_phase1 {
+            return Rescue::Rejected;
+        }
+
+        st.apply_ring_fix();
+        st.step(JOB_PHASE_BUDGET);
+        let after_one_pass = position_bits(&st.positions());
+        let crossings_after_one_pass = st.ring_crossing_count();
+        assert!(
+            crossings_after_one_pass < crossings_after_phase1,
+            "{name}: a rescue pass was kept although it did not reduce crossings \
+             ({crossings_after_phase1} → {crossings_after_one_pass})"
+        );
+        let crossings_final = CleanupState::new(cleaned).ring_crossing_count();
+        if crossings_final < crossings_after_one_pass {
+            Rescue::KeptSeveralPasses
+        } else {
+            // Any later pass was rolled back, which restores the one-pass result exactly.
+            assert_eq!(got, after_one_pass, "{name}: later passes were rejected, yet the result moved");
+            Rescue::KeptOnePass
+        }
+    }
+
+    /// `cleanup_2d` still produces exactly the recorded coordinates, and each fixture still
+    /// takes the recorded route through phase 2 — so every branch of `ring_rescue` (skipped,
+    /// rolled back, one pass kept, repeated passes kept) is pinned.
+    #[test]
+    fn cleanup_2d_matches_recorded_coordinates() {
+        let fixtures = characterization_fixtures();
+        for route in [Rescue::NotNeeded, Rescue::Rejected, Rescue::KeptOnePass, Rescue::KeptSeveralPasses] {
+            assert!(fixtures.iter().any(|f| f.rescue == route), "no fixture covers {route:?}");
+        }
+
+        let mut mismatches = Vec::new();
+        for fx in &fixtures {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            let got = coord_bits(&mol);
+
+            let rescue = observed_rescue(fx.name, &fx.mol, &got, &mol);
+            assert_eq!(rescue, fx.rescue, "{}: route through ring_rescue changed", fx.name);
+
+            let fp = fingerprint(&got);
+            if fp != fx.fingerprint {
+                mismatches.push(format!(
+                    "{}: fingerprint 0x{fp:016x} (recorded 0x{:016x}), coordinates {:?}",
+                    fx.name,
+                    fx.fingerprint,
+                    mol.atoms.iter().map(|a| (a.id, a.pos)).collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "cleanup_2d output changed:\n{}", mismatches.join("\n"));
+    }
+
+    /// The native background job and the synchronous `cleanup_2d` agree bit for bit.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_job_matches_cleanup_2d() {
+        for fx in characterization_fixtures() {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            let from_job = position_bits(&run_native_job(&fx.mol));
+            assert_eq!(from_job, coord_bits(&mol), "{}: CleanupJob differs from cleanup_2d", fx.name);
+        }
+    }
+
     /// Maintenance script (not a real test — `#[ignore]`d so it never runs in CI):
     /// read every fragment JSON under `assets/fragments/` and `fragments/`, relax its
     /// geometry with `cleanup_2d`, re-center on the attach atom, and write it back.
