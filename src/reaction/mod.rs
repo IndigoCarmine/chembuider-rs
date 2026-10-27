@@ -57,7 +57,9 @@ pub use edit::{
 };
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
 pub use model::{Analysis, Mass, Product, Reactant, Reaction, StructureRole};
-pub use scheme::{Arrow, ArrowLabel, ReactionScheme, SchemeItem, SchemeLayout};
+pub use scheme::{
+    Arrow, ArrowLabel, ReactionScheme, SchemeItem, SchemeLayout, SchemeStructure, StructureId,
+};
 pub use stoich::{
     AnalysisResult, Formatted, Origin, ProductAnalysis, Quantity, ReactantAnalysis, format_mass,
     format_moles, format_number, format_percent,

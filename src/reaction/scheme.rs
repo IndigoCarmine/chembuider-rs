@@ -8,6 +8,9 @@
 //! molecule is scaled into it instead of zooming, which keeps line widths and label sizes
 //! absolute (see [`ReactionStyle::structure_scale`]).
 
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::config::StyleConfig;
@@ -18,11 +21,91 @@ use crate::widget::{ChemStructEditor, draw as structure_draw};
 use super::style::ReactionStyle;
 use super::text::{Run, RunLayout, layout_runs};
 
+/// A stable identity for a structure in a [`ReactionScheme`].
+///
+/// Every [`SchemeStructure`] gets a fresh, process-unique id when it is created, so a structure
+/// can be told apart from another one carrying an identical molecule, and followed while it
+/// moves around the scheme. Cloning a [`SchemeStructure`] keeps its id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StructureId(u64);
+
+impl StructureId {
+    /// A new id, distinct from every id handed out before in this process.
+    pub fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// A structure placed in a [`ReactionScheme`]: a [`Molecule`] plus its [`StructureId`].
+///
+/// It dereferences to the molecule, so it can be drawn and inspected wherever a `&Molecule`
+/// is expected, and compares equal to a bare [`Molecule`] with the same contents (the id is
+/// ignored in that comparison).
+#[derive(Clone, Debug)]
+pub struct SchemeStructure {
+    id: StructureId,
+    molecule: Molecule,
+}
+
+impl SchemeStructure {
+    /// Wrap `molecule` with a fresh [`StructureId`].
+    pub fn new(molecule: Molecule) -> Self {
+        Self { id: StructureId::fresh(), molecule }
+    }
+
+    /// This structure's id.
+    pub fn id(&self) -> StructureId {
+        self.id
+    }
+
+    /// The molecule.
+    pub fn molecule(&self) -> &Molecule {
+        &self.molecule
+    }
+
+    /// The molecule, mutably. The id stays the same.
+    pub fn molecule_mut(&mut self) -> &mut Molecule {
+        &mut self.molecule
+    }
+
+    /// Unwrap the molecule, dropping the id.
+    pub fn into_molecule(self) -> Molecule {
+        self.molecule
+    }
+}
+
+impl From<Molecule> for SchemeStructure {
+    fn from(molecule: Molecule) -> Self {
+        Self::new(molecule)
+    }
+}
+
+impl Deref for SchemeStructure {
+    type Target = Molecule;
+
+    fn deref(&self) -> &Molecule {
+        &self.molecule
+    }
+}
+
+impl DerefMut for SchemeStructure {
+    fn deref_mut(&mut self) -> &mut Molecule {
+        &mut self.molecule
+    }
+}
+
+impl PartialEq<Molecule> for SchemeStructure {
+    fn eq(&self, other: &Molecule) -> bool {
+        self.molecule == *other
+    }
+}
+
 /// One element of a reaction scheme, drawn left to right.
 #[derive(Clone, Debug)]
 pub enum SchemeItem {
     /// A drawn structure, centred on the reaction line.
-    Structure(Molecule),
+    Structure(SchemeStructure),
     /// A `+` between two reagents.
     Plus,
     /// The reaction arrow, with its conditions above and below.
@@ -44,7 +127,7 @@ pub enum ArrowLabel {
     /// Rich text (reagents, a base, a solvent, a temperature).
     Text(RichText),
     /// A drawn structure.
-    Structure(Molecule),
+    Structure(SchemeStructure),
 }
 
 impl ArrowLabel {
@@ -64,7 +147,7 @@ impl ArrowLabel {
     /// The drawn structure, when this label is one.
     pub fn as_structure(&self) -> Option<&Molecule> {
         match self {
-            Self::Structure(m) => Some(m),
+            Self::Structure(m) => Some(m.molecule()),
             _ => None,
         }
     }
@@ -72,7 +155,7 @@ impl ArrowLabel {
     /// The drawn structure, mutably, when this label is one.
     pub fn as_structure_mut(&mut self) -> Option<&mut Molecule> {
         match self {
-            Self::Structure(m) => Some(m),
+            Self::Structure(m) => Some(m.molecule_mut()),
             _ => None,
         }
     }
@@ -122,13 +205,13 @@ impl Arrow {
 
     /// A structure above the shaft, drawn like a main-line scheme structure.
     pub fn above_structure(mut self, molecule: Molecule) -> Self {
-        self.above = ArrowLabel::Structure(molecule);
+        self.above = ArrowLabel::Structure(molecule.into());
         self
     }
 
     /// A structure below the shaft, drawn like a main-line scheme structure.
     pub fn below_structure(mut self, molecule: Molecule) -> Self {
-        self.below = ArrowLabel::Structure(molecule);
+        self.below = ArrowLabel::Structure(molecule.into());
         self
     }
 
@@ -163,7 +246,7 @@ impl ReactionScheme {
     }
 
     pub fn structure(self, molecule: Molecule) -> Self {
-        self.item(SchemeItem::Structure(molecule))
+        self.item(SchemeItem::Structure(molecule.into()))
     }
 
     pub fn plus(self) -> Self {
@@ -869,5 +952,65 @@ mod tests {
             assert!(layout.items.is_empty());
             assert_eq!(layout.size, Vec2::ZERO);
         });
+    }
+
+    fn structure_ids(scheme: &ReactionScheme) -> Vec<StructureId> {
+        let mut ids = Vec::new();
+        for item in &scheme.items {
+            match item {
+                SchemeItem::Structure(s) => ids.push(s.id()),
+                SchemeItem::Arrow(a) => {
+                    for label in [&a.above, &a.below] {
+                        if let ArrowLabel::Structure(s) = label {
+                            ids.push(s.id());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn builder_gives_every_structure_its_own_id() {
+        // The same molecule twice still gets two ids: identity is not the molecule's content.
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::phenol())
+            .arrow(
+                Arrow::new()
+                    .above_structure(demo::phenol())
+                    .below_structure(demo::anisole()),
+            )
+            .structure(demo::anisole());
+        let ids = structure_ids(&scheme);
+        assert_eq!(ids.len(), 5);
+        let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "ids must be distinct: {ids:?}");
+    }
+
+    #[test]
+    fn scheme_structure_derefs_to_and_compares_with_its_molecule() {
+        let s = SchemeStructure::new(demo::phenol());
+        let as_ref: &Molecule = &s;
+        assert_eq!(*as_ref, demo::phenol());
+        assert_eq!(s.molecule(), &demo::phenol());
+        assert!(s == demo::phenol());
+        assert!(s != demo::anisole());
+        // A clone is the same structure (same id); a new wrapper is a different one.
+        assert_eq!(s.clone().id(), s.id());
+        assert_ne!(SchemeStructure::from(demo::phenol()).id(), s.id());
+        assert_eq!(s.into_molecule(), demo::phenol());
+    }
+
+    #[test]
+    fn editing_through_deref_mut_keeps_the_id() {
+        let mut s = SchemeStructure::new(demo::phenol());
+        let id = s.id();
+        *s.molecule_mut() = demo::anisole();
+        assert_eq!(s.id(), id);
+        assert!(s == demo::anisole());
     }
 }
