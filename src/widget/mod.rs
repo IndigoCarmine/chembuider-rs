@@ -4,6 +4,8 @@ pub mod interact;
 mod keyboard_solver;
 #[cfg(test)]
 mod keyboard_tests;
+#[cfg(test)]
+mod render_tests;
 pub mod rich_text;
 pub mod scene;
 pub mod view;
