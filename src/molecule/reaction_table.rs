@@ -23,6 +23,10 @@ const SIDE_REACH: f32 = 1.5;
 const REAGENT_REACH: f32 = 3.0;
 /// Gap between a reaction and a table inserted under it.
 const INSERT_GAP: f32 = 1.5;
+/// A caption's line spacing and the depth below its last baseline, in molecule units (generous
+/// for the editor's label sizes).
+const CAPTION_LINE: f32 = 0.5;
+const CAPTION_DESCENT: f32 = 0.2;
 
 /// The structures a table's columns stand for, each as its atom ids (sorted), in column order.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -391,7 +395,17 @@ pub fn new_table(mol: &Molecule, arrow: Option<u32>) -> Option<ReactionTable> {
         points.extend([a.tail, a.head]);
     }
     let left = points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
-    let bottom = points.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+    let right = points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+    let top = points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+    let mut bottom = points.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+    // Captions just under the structures (compound numbers, conditions) stay above the table.
+    for t in mol.objects.iter().filter_map(PageObject::as_text) {
+        let [x, y] = t.pos;
+        if x >= left - 1.0 && x <= right + 1.0 && y >= top && y <= bottom + 2.0 * INSERT_GAP {
+            let lines = t.text.split('\n').count() as f32;
+            bottom = bottom.max(y + (lines - 1.0) * CAPTION_LINE + CAPTION_DESCENT);
+        }
+    }
     let mut reactants = match_entries(mol, &[], &columns.reactants);
     if let Some(first) = reactants.first_mut() {
         first.limiting = true;
@@ -480,6 +494,18 @@ mod tests {
         // Toggling the limiting reagent moves it.
         let t = edit_cell(&m, &t, CellRef::new(BlockKind::Reactants, 0, 2), "").unwrap().unwrap();
         assert!(t.reactants[0].limiting && !t.reactants[1].limiting);
+    }
+
+    #[test]
+    fn a_new_table_goes_under_the_captions_too() {
+        let (mut m, _) = scheme();
+        let without = new_table(&m, None).unwrap().pos[1];
+        m.add_text([0.5, 1.0], "(1)");
+        let with = new_table(&m, None).unwrap().pos[1];
+        assert!(with > without && with >= 1.0 + INSERT_GAP, "{without} → {with}");
+        // A text far away does not push it down.
+        m.add_text([0.0, 30.0], "far");
+        assert_eq!(new_table(&m, None).unwrap().pos[1], with);
     }
 
     #[test]

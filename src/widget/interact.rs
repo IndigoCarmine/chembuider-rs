@@ -337,7 +337,12 @@ pub fn process_select_tool(
         } else if let Some(id) = editor.hovered_object {
             // Double-click a text to edit it, a table's cell to enter its value.
             if editor.molecule.object_by_id(id).is_some_and(|o| o.as_table().is_some()) {
-                if let Some(cell) = editor.table_cell_at(id, mouse) {
+                // The release that completes a double-click may carry no interaction position.
+                let at = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                    .unwrap_or(mouse);
+                if let Some(cell) = editor.table_cell_at(id, at) {
                     modified |= editor.edit_table_cell(id, cell);
                 }
             } else {
