@@ -33,7 +33,9 @@ enum Source {
     Office { sender: Sender, original: OleContent },
     /// `original` is the file's CDX as it was opened (`None` for a new file): each save merges
     /// the drawing into it, as for ibisOffice, so what the editor cannot show stays in the file.
-    File { path: PathBuf, original: Option<Vec<u8>> },
+    /// `on_disk` is what the file held when it was last read or written here (`None`: not
+    /// there), to tell whether another program changed it since.
+    File { path: PathBuf, original: Option<Vec<u8>>, on_disk: Option<Vec<u8>> },
 }
 
 struct Tab {
@@ -48,6 +50,9 @@ struct Tab {
     /// Not a drawing the editor can read: shown, never sent back.
     unreadable: Option<String>,
     note: Option<String>,
+    /// The file was changed by another program since it was opened or last saved here: it is
+    /// no longer written, so that change is not lost.
+    changed_outside: bool,
     /// The window pans to the drawing on its first frame.
     fit: bool,
 }
@@ -72,20 +77,20 @@ impl Tab {
             None => {}
         }
         let sent = editor.molecule.clone();
-        Tab { object, title, source, editor, sent, changed: None, unreadable, note, fit: true }
+        Tab { object, title, source, editor, sent, changed: None, unreadable, note, changed_outside: false, fit: true }
     }
 
     /// A CDX file opened by hand.
     fn open_file(path: PathBuf, ja: bool) -> Tab {
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match std::fs::read(&path) {
-            Ok(bytes) => Tab::new(0, title, Source::File { path, original: Some(bytes.clone()) }, Some(&bytes), ja),
+            Ok(bytes) => Tab::new(0, title, Source::File { path, original: Some(bytes.clone()), on_disk: Some(bytes.clone()) }, Some(&bytes), ja),
             // Nothing there yet: a new drawing, written on the first edit.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tab::new(0, title, Source::File { path, original: None }, None, ja),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tab::new(0, title, Source::File { path, original: None, on_disk: None }, None, ja),
             // There but not readable (locked, no access, …): shown as such and never written
             // over, or the first edit would replace the file with a drawing that is not it.
             Err(e) => {
-                let mut tab = Tab::new(0, title, Source::File { path, original: None }, None, ja);
+                let mut tab = Tab::new(0, title, Source::File { path, original: None, on_disk: None }, None, ja);
                 tab.unreadable = Some(if ja { format!("ファイルを読めません: {e}") } else { format!("Cannot read the file: {e}") });
                 tab
             }
@@ -107,13 +112,15 @@ impl Tab {
 
     /// What becomes of an edit, for the status bar.
     fn edits_status(&self, ja: bool) -> &'static str {
-        edits_status(matches!(self.source, Source::Office { .. }), self.unreadable.is_some(), ja)
+        edits_status(matches!(self.source, Source::Office { .. }), self.unreadable.is_some() || self.changed_outside, ja)
     }
 
-    /// The drawing as it is now, sent back (to ibisOffice, or written to its file).
+    /// The drawing as it is now, sent back (to ibisOffice, or written to its file). A file
+    /// another program changed since it was read or written here is left as it is, and no
+    /// longer written: its content is compared, as a modification time may not change.
     fn flush(&mut self) -> Result<(), String> {
         self.changed = None;
-        if self.unreadable.is_some() || self.editor.molecule == self.sent {
+        if self.unreadable.is_some() || self.changed_outside || self.editor.molecule == self.sent {
             return Ok(());
         }
         let mol = self.editor.molecule.clone();
@@ -127,7 +134,31 @@ impl Tab {
                 let content = content::with_cdx(original, cdx_bytes);
                 sender.send(&EditorMsg::Update { content, preview, size_emu: Some(size) }).map_err(|e| e.to_string())?;
             }
-            Source::File { path, .. } => std::fs::write(path, cdx_bytes).map_err(|e| e.to_string())?,
+            Source::File { path, on_disk, .. } => {
+                let now = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.to_string()),
+                };
+                if now != *on_disk {
+                    self.changed_outside = true;
+                    return Ok(());
+                }
+                if let Err(e) = std::fs::write(&path, &cdx_bytes) {
+                    // A write that fails after truncating (disk full, a network drive gone)
+                    // leaves the file empty or half written. That is ours, not another
+                    // program's change, so it is what the next try compares against and
+                    // writes over in full. If it cannot be read either, `on_disk` is left
+                    // alone: the next try fails to read it too and reports that instead.
+                    match std::fs::read(&path) {
+                        Ok(bytes) => *on_disk = Some(bytes),
+                        Err(r) if r.kind() == std::io::ErrorKind::NotFound => *on_disk = None,
+                        Err(_) => {}
+                    }
+                    return Err(e.to_string());
+                }
+                *on_disk = Some(cdx_bytes);
+            }
         }
         self.sent = mol;
         Ok(())
@@ -314,8 +345,9 @@ impl OfficeApp {
 }
 
 /// What the status bar says becomes of an edit to an object from ibisOffice (`to_office`) or
-/// to a file. An unreadable drawing can still be drawn on, but its edits are never sent or
-/// written (see [`Tab::flush`]) and are lost with the tab, so it must not say they are kept.
+/// to a file. An unreadable drawing (or a file another program changed) can still be drawn
+/// on, but its edits are never sent or written (see [`Tab::flush`]) and are lost with the tab,
+/// so it must not say they are kept.
 fn edits_status(to_office: bool, unreadable: bool, ja: bool) -> &'static str {
     match (to_office, unreadable, ja) {
         (true, false, true) => "編集は自動的に反映されます",
@@ -398,7 +430,11 @@ impl eframe::App for OfficeApp {
                 return;
             };
             let what = tab.edits_status(self.ja);
-            let text = [tab.unreadable.as_deref(), tab.note.as_deref(), Some(what), Some(self.status.as_str())]
+            let outside = tab.changed_outside.then_some(self.t(
+                "ファイルが別のアプリで変更されたため上書きしません",
+                "The file was changed by another program and is not written over",
+            ));
+            let text = [tab.unreadable.as_deref(), outside, tab.note.as_deref(), Some(what), Some(self.status.as_str())]
                 .into_iter()
                 .flatten()
                 .filter(|s| !s.is_empty())
@@ -569,6 +605,38 @@ mod tests {
         add_oxygen(&mut tab);
         tab.flush().unwrap();
         assert_eq!(cdx::read_cdx(&std::fs::read(&path).unwrap()).unwrap().molecule.atoms.len(), 1, "written on the first edit");
+    }
+
+    #[test]
+    fn a_file_changed_by_another_program_is_not_written_over() {
+        let dir = TempDir::new("changed-outside");
+        let path = dir.0.join("drawing.cdx");
+        std::fs::write(&path, include_bytes!("../../tests/fixtures/chemdraw26_benzene.cdx")).unwrap();
+        let mut tab = Tab::open_file(path.clone(), false);
+        add_oxygen(&mut tab);
+        tab.flush().unwrap();
+        assert!(!tab.changed_outside, "its own save is not taken for another program's");
+
+        // ChemDraw saves the same file while it is open here.
+        let theirs = cdx::molecule_to_cdx_document(&Molecule::default());
+        std::fs::write(&path, &theirs).unwrap();
+        add_oxygen(&mut tab);
+        assert_eq!(tab.flush(), Ok(()));
+        assert!(std::fs::read(&path).unwrap() == theirs, "their save is kept");
+        assert!(tab.changed_outside, "the change is noticed");
+        assert_eq!(tab.edits_status(false), "Edits are not saved");
+        add_oxygen(&mut tab);
+        tab.flush().unwrap();
+        assert!(std::fs::read(&path).unwrap() == theirs, "nor written over later");
+
+        // A new drawing whose file another program created in the meantime.
+        let new = dir.0.join("new.cdx");
+        let mut tab = Tab::open_file(new.clone(), false);
+        std::fs::write(&new, &theirs).unwrap();
+        add_oxygen(&mut tab);
+        tab.flush().unwrap();
+        assert!(std::fs::read(&new).unwrap() == theirs, "the file another program made is kept");
+        assert!(tab.changed_outside);
     }
 
     #[test]
