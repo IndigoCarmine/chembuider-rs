@@ -854,7 +854,7 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 240.0))),
             ..Default::default()
         };
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             let response = ui.add(RichLabel::new("SO_4^{2-}"));
             assert!(response.rect.width() > 0.0 && response.rect.height() > 0.0);
         });

@@ -1230,7 +1230,7 @@ impl ChemStructEditor {
         if let (Some((edit_id, screen_pos)), Some((_, text))) =
             (label_state, self.label_edit.as_mut())
         {
-            let area_resp = egui::Area::new(egui::Id::new("label_edit_area"))
+            let area_resp = egui::Area::new(egui::Id::unique("label_edit_area"))
                 .fixed_pos(screen_pos + egui::vec2(12.0, -12.0))
                 .show(ui.ctx(), |ui| {
                     let mut output = egui::TextEdit::singleline(text)
@@ -1751,6 +1751,7 @@ mod view_tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, dy),
                 phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
                 modifiers: Default::default(),
             }]);
             // egui spreads one wheel event over several frames; let it play out.
@@ -1860,6 +1861,7 @@ mod view_tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, dy),
                 phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
                 modifiers: Default::default(),
             }]);
             for _ in 0..60 {
@@ -1893,7 +1895,7 @@ mod view_tests {
             let ctx = egui::Context::default();
             let mut editor = ChemStructEditor { tool: tool.clone(), ..Default::default() };
             let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
-            let field = egui::Id::new("some_text_field");
+            let field = egui::Id::unique("some_text_field");
             let p0 = egui::pos2(300.0, 200.0);
             let p1 = egui::pos2(340.0, 170.0);
             let frame = |editor: &mut ChemStructEditor, events: Vec<egui::Event>| {
@@ -1903,7 +1905,7 @@ mod view_tests {
                     focused: true,
                     ..Default::default()
                 };
-                let _ = ctx.run_ui(raw, |ui| {
+                let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                     ui.memory_mut(|m| m.request_focus(field));
                     editor.ui(ui);
                 });
@@ -1970,7 +1972,7 @@ mod view_tests {
                 ..Default::default()
             };
             let mut modified = false;
-            let _ = ctx.run_ui(raw, |ui| modified = editor.ui(ui));
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| modified = editor.ui(ui));
             modified
         };
         let button = |pos, pressed| egui::Event::PointerButton {
@@ -2115,7 +2117,7 @@ mod fit_tests {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
         let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
         let mut canvas = egui::Rect::NOTHING;
-        let _ = ctx.run_ui(raw, |ui| {
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
             canvas = ui.available_rect_before_wrap();
             editor.ui(ui);
         });
@@ -2190,15 +2192,15 @@ mod fit_tests {
     ) -> egui::Rect {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
         let (events, modifiers) = crate::testkit::chord(spec);
+        let events = std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect();
         let raw = egui::RawInput {
             screen_rect: Some(screen),
-            modifiers,
             events,
             focused: true,
             ..Default::default()
         };
         let mut canvas = egui::Rect::NOTHING;
-        let _ = ctx.run_ui(raw, |ui| {
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
             if let Some(text) = text_field.as_deref_mut() {
                 ui.add(egui::TextEdit::singleline(text)).request_focus();
             }

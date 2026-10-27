@@ -678,7 +678,7 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
         let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
         let mut canvas = egui::Rect::NOTHING;
-        let _ = ctx.run_ui(raw, |ui| {
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
             canvas = ui.available_rect_before_wrap();
             tab.editor.ui(ui);
         });

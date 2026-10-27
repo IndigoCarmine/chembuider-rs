@@ -48,7 +48,7 @@ cargo run --example editor
 ```toml
 [dependencies]
 chembuider-rs = { git = "https://github.com/IndigoCarmine/chembuider-rs" }
-eframe = "0.34"
+eframe = "0.37"
 ```
 
 ウィジェットは `egui` のみに依存します（`chembuider_rs::egui` として再エクスポートしているので、

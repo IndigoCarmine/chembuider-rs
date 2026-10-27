@@ -33,11 +33,26 @@ pub(crate) fn run_frame(
     run_frame_with_modifiers(ctx, screen_rect, editor, events, egui::Modifiers::default());
 }
 
-/// As [`run_frame`], but also sets `RawInput::modifiers`.
+/// Run one headless frame.
+///
+/// egui (0.37+) debug-asserts that a frame's texture uploads were applied before its output is
+/// dropped. Tests have no renderer to apply them to, so they are discarded here.
+pub(crate) fn run_ui(
+    ctx: &egui::Context,
+    raw: egui::RawInput,
+    f: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut output = ctx.run_ui(raw, f);
+    output.textures_delta.clear();
+    output
+}
+
+/// As [`run_frame`], but also sets the frame-level modifier state.
 ///
 /// Some handlers read the *frame-level* modifier state rather than the per-event copy —
 /// `ChemStructEditor::ui`'s Ctrl+Z/Ctrl+Y path does exactly that — so a chord carrying
-/// modifiers has to set both or it will be seen as unmodified.
+/// modifiers has to set both or it will be seen as unmodified. egui keeps that state across
+/// frames and only changes it on `Event::ModifiersChanged`, so every frame starts with one.
 pub(crate) fn run_frame_with_modifiers(
     ctx: &egui::Context,
     screen_rect: egui::Rect,
@@ -45,14 +60,14 @@ pub(crate) fn run_frame_with_modifiers(
     events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
 ) {
+    let events = std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect();
     let raw = egui::RawInput {
         screen_rect: Some(screen_rect),
-        modifiers,
         events,
         focused: true,
         ..Default::default()
     };
-    let _ = ctx.run_ui(raw, |ui| {
+    let _ = run_ui(ctx, raw, |ui| {
         editor.ui(ui);
     });
 }
@@ -511,6 +526,7 @@ fn fp_shape(shape: &egui::Shape, out: &mut Vec<FpLine>) {
             let pts: Vec<String> = b.points.iter().map(|q| fp_pos(*q)).collect();
             format!("cbezier [{}] fill={}", pts.join(" "), fp_color(b.fill))
         }
+        Shape::Band(b) => format!("band points={} fill={} stroke={}", b.points.len(), fp_color(b.fill), fp_stroke(b.stroke)),
         Shape::Callback(_) => "callback".to_string(),
     };
     out.push(FpLine::new(text));

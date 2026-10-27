@@ -383,7 +383,7 @@ mod tests {
         ] {
             p.adduct = adduct;
             p.charge = charge;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
                 p.ui(ui, &mol, &HashSet::new());
             });
         }

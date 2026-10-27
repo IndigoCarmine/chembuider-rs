@@ -239,7 +239,7 @@ mod tests {
         let (editor, bond) = hydrazine();
         let bond = editor.molecule.bond_by_id(bond).unwrap().clone();
         for ja in [false, true] {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
                 assert_eq!(bond_menu(ui, &bond, ja), None);
             });
         }

@@ -50,7 +50,7 @@ Add the crate and a matching egui/eframe:
 ```toml
 [dependencies]
 chembuider-rs = { git = "https://github.com/IndigoCarmine/chembuider-rs" }
-eframe = "0.34"
+eframe = "0.37"
 ```
 
 The widget depends only on `egui` (re-exported as `chembuider_rs::egui` so you always get a

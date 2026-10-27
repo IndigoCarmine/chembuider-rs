@@ -209,7 +209,7 @@ mod tests {
             ..Default::default()
         };
         let mut view = ReactionView::new();
-        let _ = ctx.run_ui(raw, |ui| {
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
             let layout = view.measure(ui.painter(), &reaction);
             let m = view.style.margin;
 
@@ -254,7 +254,7 @@ mod tests {
         let mut view = ReactionView::new();
         let mut allocated = Rect::NOTHING;
         let mut measured = Vec2::ZERO;
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             measured = view.measure(ui.painter(), &reaction).size;
             allocated = view.show(ui, &reaction).rect;
         });
@@ -390,7 +390,7 @@ mod tests {
             ..Default::default()
         };
         let mut layout_fp = String::new();
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             let painter = ui.painter().clone();
             let layout = view.measure(&painter, reaction);
             layout_fp = layout_fingerprint(&layout);

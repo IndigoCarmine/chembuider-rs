@@ -38,7 +38,7 @@ fn egui_font() -> (Arc<fontdb::Database>, String) {
         {
             if let Some(data) = defs.font_data.get(first) {
                 let before: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
-                db.load_font_data(data.font.to_vec());
+                db.load_font_data((*data.font).as_ref().to_vec());
                 if let Some(face) = db.faces().find(|f| !before.contains(&f.id)) {
                     if let Some((fam, _)) = face.families.first() {
                         family = fam.clone();

@@ -652,7 +652,7 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
             ..Default::default()
         };
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             editor.ui(ui);
         });
 
@@ -692,7 +692,7 @@ mod tests {
         editor.molecule.add_bond(o, c, BondOrder::Single); // bond from the right → "HO"
 
         let center = egui::pos2(200.0, 150.0);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
             let layouts = compute_label_layouts(&editor, ui.painter(), center);
             let layout = &layouts[&o];
             let sp = editor.mol_to_screen([0.0, 0.0], center);
@@ -725,7 +725,7 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
             ..Default::default()
         };
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             editor.ui(ui);
         });
 
@@ -763,7 +763,7 @@ mod tests {
         let a = editor.molecule.add_atom("CO2Et".to_string(), [0.0, 0.0], 0);
 
         let center = egui::pos2(200.0, 150.0);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
             let layouts = compute_label_layouts(&editor, ui.painter(), center);
             editor.last_label_rects =
                 layouts.iter().map(|(id, l)| (*id, l.rect)).collect();

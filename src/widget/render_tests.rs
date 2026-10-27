@@ -23,7 +23,7 @@ fn frame(ctx: &egui::Context, editor: &mut ChemStructEditor, events: Vec<egui::E
         focused: true,
         ..Default::default()
     };
-    let output = ctx.run_ui(raw, |ui| {
+    let output = crate::testkit::run_ui(&ctx, raw, |ui| {
         editor.ui(ui);
     });
     shape_fingerprint(&output.shapes)

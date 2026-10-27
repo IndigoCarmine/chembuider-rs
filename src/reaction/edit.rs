@@ -1491,7 +1491,7 @@ impl ReactionEditor {
     /// The edit box's widget id, fixed (rather than left to egui) so its keyboard focus can be
     /// handed back from outside the overlay — see [`leave_edit`](Self::leave_edit).
     fn edit_box_id(ui: &egui::Ui) -> egui::Id {
-        ui.id().with("reaction_cell_edit_text")
+        ui.scope_id().with("reaction_cell_edit_text")
     }
 
     /// The user moved on from the open box — clicked away from it, or picked up a scheme item
@@ -1563,7 +1563,7 @@ impl ReactionEditor {
         let width = anchor.width().max(88.0);
         let multiline = matches!(target, EditTarget::SchemeText { part: SchemePart::CompoundLabel, .. });
         let box_id = Self::edit_box_id(ui);
-        let area = egui::Area::new(ui.id().with("reaction_cell_edit"))
+        let area = egui::Area::new(ui.scope_id().with("reaction_cell_edit"))
             .order(egui::Order::Foreground)
             // egui sizes a new Area with `spacing.default_area_size` (600 x 400) for its
             // first, invisible pass, and that oversized rect is what decides hit-testing on
@@ -1652,7 +1652,7 @@ mod tests {
             ..Default::default()
         };
         let mut view = ReactionView::new();
-        let _ = ctx.run_ui(raw, |ui| {
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
             let layout = view.measure(ui.painter(), reaction);
             f(&layout, TOP_LEFT);
         });
@@ -2851,15 +2851,15 @@ mod tests {
         );
         let mut editor = ReactionEditor::new();
         let ctx = egui::Context::default();
-        let mut run = |editor: &mut ReactionEditor, reaction: &mut Reaction, events: Vec<egui::Event>| {
+        let run = |editor: &mut ReactionEditor, reaction: &mut Reaction, events: Vec<egui::Event>| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
                 events,
                 ..Default::default()
             };
             let mut layout = None;
-            let _ = ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let top_left = ui.next_widget_position();
                     layout = Some((editor.view.measure(ui.painter(), reaction), top_left));
                     editor.show(ui, reaction);
@@ -2945,7 +2945,7 @@ mod tests {
             };
             let mut view = ReactionView::new();
             let mut figure = None;
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                 // Measure the same figure the editor is about to draw, with the same fonts.
                 let layout = view.measure(ui.painter(), reaction);
                 let origin = editor.show(ui, reaction).rect.min;
@@ -3023,7 +3023,7 @@ mod tests {
             };
             let mut view = ReactionView::new();
             let mut figure = None;
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                 let layout = view.measure(ui.painter(), reaction);
                 let origin = editor.show(ui, reaction).rect.min;
                 figure = Some((layout, origin));
@@ -3091,7 +3091,7 @@ mod tests {
             };
             let mut view = ReactionView::new();
             let mut figure = None;
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                 let layout = view.measure(ui.painter(), reaction);
                 let origin = editor.show(ui, reaction).rect.min;
                 figure = Some((layout, origin));
@@ -3224,7 +3224,7 @@ mod tests {
             };
             let mut view = ReactionView::new();
             let mut figure = None;
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                 let layout = view.measure(ui.painter(), reaction);
                 let origin = editor.show(ui, reaction).rect.min;
                 figure = Some((layout, origin));
@@ -3350,7 +3350,7 @@ mod tests {
             };
             let mut view = ReactionView::new();
             let mut figure = None;
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                 let layout = view.measure(ui.painter(), reaction);
                 let origin = editor.show(ui, reaction).rect.min;
                 figure = Some((layout, origin));
@@ -3449,13 +3449,13 @@ mod tests {
         let ctx = egui::Context::default();
         let mut view = ReactionView::new();
         let mut plain_rect = Rect::NOTHING;
-        let plain = ctx.run_ui(raw(), |ui| plain_rect = view.show(ui, &reaction).rect);
+        let plain = crate::testkit::run_ui(&ctx, raw(), |ui| plain_rect = view.show(ui, &reaction).rect);
 
         let mut reaction = reaction;
         let ctx = egui::Context::default();
         let mut editor = ReactionEditor::new();
         let mut edit_rect = Rect::NOTHING;
-        let edited = ctx.run_ui(raw(), |ui| {
+        let edited = crate::testkit::run_ui(&ctx, raw(), |ui| {
             edit_rect = editor.show(ui, &mut reaction).rect;
         });
 
@@ -3689,7 +3689,7 @@ mod tests {
             };
             let mut view = ReactionView::new();
             let mut figure = None;
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
                 let layout = view.measure(ui.painter(), reaction);
                 let origin = editor.show(ui, reaction).rect.min;
                 figure = Some((layout, origin));

@@ -814,13 +814,15 @@ mod headless {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
             ..Default::default()
         };
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             bytes = if path.ends_with(".cdx") {
                 view.scheme_cdx(ui.painter(), &reaction.scheme)
             } else {
                 view.scheme_cdxml(ui.painter(), &reaction.scheme).into_bytes()
             };
-        });
+        })
+        .textures_delta
+        .clear();
         std::fs::write(path, bytes).expect("write the scheme");
         println!("wrote {path}");
     }
@@ -838,17 +840,17 @@ mod headless {
 
         // Pass 1: a frame just to measure — the fonts have to exist before text can be laid out.
         let mut size = egui::vec2(1400.0, 900.0);
-        let warm = ctx.run_ui(input(size), |ui| {
+        let mut warm = ctx.run_ui(input(size), |ui| {
             size = view.measure(ui.painter(), reaction).size;
         });
-        fold_textures(&warm.textures_delta, &mut atlas);
+        fold_textures(&mut warm.textures_delta, &mut atlas);
 
         // Pass 2: paint the figure at its own size, over the whole (unclipped) layer.
-        let output = ctx.run_ui(input(size), |ui| {
+        let mut output = ctx.run_ui(input(size), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             view.paint(&painter, egui::Pos2::ZERO, reaction);
         });
-        fold_textures(&output.textures_delta, &mut atlas);
+        fold_textures(&mut output.textures_delta, &mut atlas);
 
         let (w, h) = (size.x.ceil() as usize, size.y.ceil() as usize);
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -861,25 +863,28 @@ mod headless {
     }
 
     /// Fold a frame's texture uploads (full images and sub-rect patches) into the atlas.
-    fn fold_textures(deltas: &egui::TexturesDelta, atlas: &mut Atlas) {
-        for (id, delta) in &deltas.set {
+    fn fold_textures(deltas: &mut egui::TexturesDelta, atlas: &mut Atlas) {
+        for (id, id_deltas) in &deltas.set {
             let egui::TextureId::Managed(mid) = id else { continue };
-            let egui::epaint::image::ImageData::Color(img) = &delta.image;
-            match delta.pos {
-                None => {
-                    atlas.insert(*mid, (img.size[0], img.size[1], img.pixels.clone()));
-                }
-                Some([px, py]) => {
-                    if let Some((w, _h, pixels)) = atlas.get_mut(mid) {
-                        for y in 0..img.size[1] {
-                            for x in 0..img.size[0] {
-                                pixels[(py + y) * *w + px + x] = img.pixels[y * img.size[0] + x];
+            for delta in id_deltas {
+                let egui::epaint::image::ImageData::Color(img) = &delta.image;
+                match delta.pos {
+                    None => {
+                        atlas.insert(*mid, (img.size[0], img.size[1], img.pixels.clone()));
+                    }
+                    Some([px, py]) => {
+                        if let Some((w, _h, pixels)) = atlas.get_mut(mid) {
+                            for y in 0..img.size[1] {
+                                for x in 0..img.size[0] {
+                                    pixels[(py + y) * *w + px + x] = img.pixels[y * img.size[0] + x];
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        deltas.clear();
     }
 
     /// CPU-rasterize tessellated meshes onto a white page; returns an RGB buffer.
