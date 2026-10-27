@@ -2,7 +2,7 @@ use super::ChemStructEditor;
 use super::rich_text::RichText;
 use super::scene::{self, RenderTransform};
 use crate::molecule::lookup::AtomLookup;
-use crate::molecule::{max_valence, normal_valence};
+use crate::molecule::max_valence;
 use std::collections::HashMap;
 
 // Geometry helpers moved to `scene.rs` (the backend-neutral primitive builder). Re-exported so
@@ -330,7 +330,8 @@ pub(crate) fn folded_h(mol: &impl AtomLookup, atom_id: u32) -> bool {
     let other = if b.begin == atom_id { b.end } else { b.begin };
     let Some(heavy) = mol.atom_by_id(other) else { return false };
     if heavy.element == "H" { return false; }
-    let Some(valence) = normal_valence(&heavy.element) else { return false };
+    // The same valence `displayed_h_count` fills, so "room" means room in the label.
+    let Some(valence) = charged_valence(&heavy.element, heavy.charge) else { return false };
 
     // Room left on the neighbour: its valence, minus every bond that is not a group hydrogen,
     // minus the group hydrogens folded ahead of this one. Ordering those by id makes the
@@ -343,7 +344,7 @@ pub(crate) fn folded_h(mol: &impl AtomLookup, atom_id: u32) -> bool {
             _ => nb.order.valence(),
         }
     }).sum();
-    used < valence as i16 + heavy.charge as i16
+    used < valence
 }
 
 pub(crate) fn should_show_label(mol: &impl AtomLookup, atom_id: u32) -> bool {
@@ -388,12 +389,69 @@ fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, 
     }
 }
 
+/// Valence electrons of the neutral atom, for the elements [`normal_valence`] knows.
+///
+/// [`normal_valence`]: crate::molecule::normal_valence
+fn valence_electrons(element: &str) -> Option<i16> {
+    match element {
+        "H" => Some(1),
+        "B" => Some(3),
+        "C" | "Si" => Some(4),
+        "N" | "P" => Some(5),
+        "O" | "S" => Some(6),
+        "F" | "Cl" | "Br" | "I" => Some(7),
+        _ => None,
+    }
+}
+
+/// The valence a charged atom fills with hydrogen: the number of bonds it makes once its
+/// charge has added or removed electrons — i.e. the valence of the element it is then
+/// isoelectronic with. `None` exactly where [`normal_valence`] is `None`.
+///
+/// With `e` = valence electrons − charge, the atom makes `min(e, 8 − e)` bonds (`min(e, 2 − e)`
+/// for hydrogen, whose shell holds two): up to four electrons each one pairs with a bond
+/// partner; past four the extra ones stay as lone pairs. Simply adding the charge to the
+/// valence is the same thing only while `e ≥ 4` on the far side of carbon, which is why it
+/// held for the onium ions and went wrong for carbon, silicon, boron and hydrogen:
+///
+/// | atom | e | like | valence | as ion      | `valence + charge` |
+/// |------|---|------|---------|-------------|--------------------|
+/// | C⁺   | 3 | B    | 3       | CH₃⁺        | 5 (wrong)          |
+/// | C⁻   | 5 | N    | 3       | CH₃⁻        | 3                  |
+/// | C²⁺  | 2 | Be   | 2       | CH₂²⁺       | 6 (wrong)          |
+/// | Si⁺  | 3 | Al   | 3       | SiH₃⁺       | 5 (wrong)          |
+/// | Si⁻  | 5 | P    | 3       | SiH₃⁻       | 3                  |
+/// | N⁺   | 4 | C    | 4       | NH₄⁺        | 4                  |
+/// | N⁻   | 6 | O    | 2       | NH₂⁻        | 2                  |
+/// | P⁺   | 4 | Si   | 4       | PH₄⁺        | 4                  |
+/// | O⁺   | 5 | N    | 3       | H₃O⁺        | 3                  |
+/// | O⁻   | 7 | F    | 1       | HO⁻         | 1                  |
+/// | S⁺   | 5 | P    | 3       | H₃S⁺        | 3                  |
+/// | F⁻   | 8 | Ne   | 0       | F⁻          | 0                  |
+/// | B⁻   | 4 | C    | 4       | BH₄⁻        | 2 (wrong)          |
+/// | B⁺   | 2 | Be   | 2       | BH₂⁺        | 4 (wrong)          |
+/// | H⁺   | 0 | —    | 0       | H⁺          | 2 (wrong)          |
+/// | H⁻   | 2 | He   | 0       | H⁻          | 0                  |
+///
+/// ChemDraw counts a charged atom's implicit hydrogens this way (a "+" on the end carbon
+/// of ethane gives CH₂⁺, on the nitrogen of methylamine NH₃⁺), as do RDKit and the
+/// OpenSMILES/MDL readers. It leaves out radicals and the expanded valences of S and P, as
+/// `normal_valence` does for the neutral atom. Charges that strip every valence electron or
+/// overfill the shell give 0, never a negative valence.
+///
+/// [`normal_valence`]: crate::molecule::normal_valence
+pub(crate) fn charged_valence(element: &str, charge: i8) -> Option<i16> {
+    let e = valence_electrons(element)? - charge as i16;
+    let shell = if element == "H" { 2 } else { 8 };
+    Some(e.min(shell - e).max(0))
+}
+
 /// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
-/// implicit H needed to satisfy valence. Computed as `valence + charge` minus the
+/// implicit H needed to satisfy valence. Computed as the [`charged_valence`] minus the
 /// bond-order sum to *non-folded* neighbors, which naturally includes both.
 pub(crate) fn displayed_h_count(mol: &impl AtomLookup, atom_id: u32) -> u8 {
     let Some(atom) = mol.atom_by_id(atom_id) else { return 0 };
-    let Some(valence) = normal_valence(&atom.element) else { return 0 };
+    let Some(effective) = charged_valence(&atom.element, atom.charge) else { return 0 };
     // A lone atom (no bonds yet) shows just its symbol — placing "O"/"N"/"S" at the cursor
     // should read as O/N/S, not OH2/NH3/SH2. Implicit H appears once it gets a bond.
     if mol.bonds_for_atom(atom_id).is_empty() {
@@ -406,8 +464,6 @@ pub(crate) fn displayed_h_count(mol: &impl AtomLookup, atom_id: u32) -> u8 {
         })
         .map(|b| b.order.valence())
         .sum();
-    // Positive charge raises effective valence (e.g. N+ = 4), negative lowers it
-    let effective = valence as i16 + atom.charge as i16;
     (effective - bond_sum_heavy).max(0) as u8
 }
 
@@ -439,7 +495,7 @@ fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::molecule::{BondOrder, Molecule};
+    use crate::molecule::{normal_valence, BondOrder, Molecule};
 
     fn label(mol: &Molecule, id: u32) -> String {
         atom_label_text(mol, mol.atom_by_id(id).unwrap())
@@ -480,6 +536,60 @@ mod tests {
         let o = m.add_atom("O".to_string(), [1.0, 0.0], 0);
         m.add_bond(c, o, BondOrder::Double);
         assert_eq!(label(&m, o), "O", "C=O oxygen should render as 'O'");
+    }
+
+    /// A charge changes how many hydrogens an atom takes by what it does to the atom's valence
+    /// electrons, not by adding itself to the valence: N⁺ and O⁺ gain a bond (onium), but C⁺
+    /// loses one (carbocation), C⁻ loses one too (carbanion, a lone pair), and B⁻ gains one
+    /// (borate). Each is drawn with one bond to a methyl carbon, so the label shows all the
+    /// hydrogens of the named ion but one.
+    #[test]
+    fn charge_changes_valence_by_the_atoms_electron_count() {
+        for (el, charge, want) in [
+            ("C", 1, "CH2+"),  // ethyl cation: CH3+ with one H traded for the bond
+            ("C", -1, "CH2-"), // CH3- carbanion
+            ("N", 1, "NH3+"),  // NH4+
+            ("N", -1, "NH-"),  // NH2- amide
+            ("O", 1, "OH2+"),  // H3O+
+            ("O", -1, "O-"),   // alkoxide
+            ("B", -1, "BH3-"), // BH4- borate
+            ("B", 1, "BH+"),   // BH2+ borinium
+            ("Si", 1, "SiH2+"),
+            ("P", 1, "PH3+"),  // PH4+ phosphonium
+            ("S", 1, "SH2+"),  // H3S+ sulfonium
+        ] {
+            let mut m = Molecule::default();
+            let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+            let x = m.add_atom(el.to_string(), [1.0, 0.0], charge);
+            m.add_bond(c, x, BondOrder::Single);
+            assert_eq!(label(&m, x), want, "C-{el}({charge:+}) should render as '{want}'");
+        }
+    }
+
+    /// The valence a charged atom fills with hydrogen, for the elements the table in
+    /// [`charged_valence`] covers — including the doubly charged and the hydrogen ions.
+    #[test]
+    fn charged_valence_follows_the_isoelectronic_element() {
+        for (el, charge, want) in [
+            ("C", 0, Some(4)), ("C", 1, Some(3)), ("C", -1, Some(3)), ("C", 2, Some(2)),
+            ("N", 0, Some(3)), ("N", 1, Some(4)), ("N", -1, Some(2)), ("N", 2, Some(3)),
+            ("O", 0, Some(2)), ("O", 1, Some(3)), ("O", -1, Some(1)), ("O", 2, Some(4)),
+            ("B", 0, Some(3)), ("B", -1, Some(4)), ("B", 1, Some(2)),
+            ("F", 0, Some(1)), ("F", -1, Some(0)), ("Cl", 1, Some(2)),
+            ("H", 0, Some(1)), ("H", 1, Some(0)), ("H", -1, Some(0)),
+            ("Si", -1, Some(3)), ("S", -1, Some(1)), ("P", 1, Some(4)),
+            ("Fe", 2, None), ("Xx", 0, None),
+        ] {
+            assert_eq!(charged_valence(el, charge), want, "{el} with charge {charge:+}");
+        }
+        // Neutral, the table agrees with `normal_valence` element for element.
+        for el in ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Si", "H"] {
+            assert_eq!(
+                charged_valence(el, 0),
+                normal_valence(el).map(i16::from),
+                "{el}: the electron table disagrees with normal_valence",
+            );
+        }
     }
 
     #[test]

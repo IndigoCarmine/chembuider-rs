@@ -806,6 +806,24 @@ mod tests {
         }
     }
 
+    /// The ethyl cation CH3–CH2+: ChemDraw reads NumHydrogens as the cation's own count, so it
+    /// must be the carbocation's two, not the four a "valence + charge" count would give.
+    #[test]
+    fn writes_a_carbocations_hydrogen_count() {
+        let mut mol = Molecule::default();
+        let c1 = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c2 = mol.add_atom("C".to_string(), [1.3, 0.0], 1);
+        mol.add_bond(c1, c2, BondOrder::Single);
+
+        let doc = cdx_codec::parse(&molecule_to_cdx_document(&mol)).unwrap();
+        let mut nodes = Vec::new();
+        find(&doc, OBJ_NODE, &mut nodes);
+        let cation = nodes.iter().find(|n| n.prop_int(PROP_ATOM_CHARGE) == Some(1)).unwrap();
+        assert_eq!(cation.prop_i16(PROP_ATOM_NUM_HYDROGENS), Some(2));
+        let (_, label) = parse_cdx_string(cation.children[0].prop(PROP_TEXT).unwrap()).unwrap();
+        assert_eq!(label, "CH2+");
+    }
+
     #[test]
     fn writes_labels_charges_and_folded_hydrogens_like_chemdraw() {
         // H2N–CH2–C(=O)–O(-)

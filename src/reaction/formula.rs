@@ -327,6 +327,13 @@ mod tests {
         m.add_bond(c, n, BondOrder::Single);
         assert_eq!(plain(&m), "CH6N", "CH3-NH3+ (charge is not shown in the formula)");
 
+        // ...but a cationic carbon loses one: the ethyl cation CH3-CH2+ is C2H5, not C2H7.
+        let mut m = Molecule::default();
+        let c1 = m.add_atom("C".into(), [0.0, 0.0], 0);
+        let c2 = m.add_atom("C".into(), [1.5, 0.0], 1);
+        m.add_bond(c1, c2, BondOrder::Single);
+        assert_eq!(plain(&m), "C2H5", "CH3-CH2+ (a carbocation has valence 3)");
+
         // Elements with no standard valence take no implicit H (K in the carbonate).
         let mut m = Molecule::default();
         let k = m.add_atom("K".into(), [0.0, 0.0], 0);
