@@ -45,7 +45,14 @@ pub struct AnalysisPanel {
     pub custom_name: String,
     pub custom_formula: String,
     pub custom_charge: i32,
+    /// Show the labels in Japanese (the numbers and notation are the same either way).
+    pub ja: bool,
     cache: Option<(MolecularFormula, Option<Ion>, FormulaAnalysis)>,
+}
+
+/// `en`, or `ja` when the panel is in Japanese.
+fn t<'a>(ja: bool, en: &'a str, ja_text: &'a str) -> &'a str {
+    if ja { ja_text } else { en }
 }
 
 impl Default for AnalysisPanel {
@@ -57,6 +64,7 @@ impl Default for AnalysisPanel {
             custom_name: "ACN+H".into(),
             custom_formula: "C2H4N".into(),
             custom_charge: 1,
+            ja: false,
             cache: None,
         }
     }
@@ -91,8 +99,13 @@ impl AnalysisPanel {
 
     /// Draw the panel. Returns `true` when the user copied the report to the clipboard.
     pub fn ui(&mut self, ui: &mut egui::Ui, mol: &Molecule, selection: &HashSet<u32>) -> bool {
-        let scope = if selection.is_empty() { "Whole drawing" } else { "Selected structures" };
-        ui.heading("Analysis");
+        let ja = self.ja;
+        let scope = if selection.is_empty() {
+            t(ja, "Whole drawing", "図全体")
+        } else {
+            t(ja, "Selected structures", "選択した構造")
+        };
+        ui.heading(t(ja, "Analysis", "解析"));
         ui.weak(scope);
         ui.separator();
 
@@ -103,32 +116,36 @@ impl AnalysisPanel {
         let ion_result = self.analysis(mol, selection).cloned();
         match ion_result {
             Ok(a) if a.formula.is_empty() => {
-                ui.weak("Nothing drawn yet.");
+                ui.weak(t(ja, "Nothing drawn yet.", "まだ何も描かれていません"));
             }
             Ok(a) => {
-                show_values(ui, &a);
+                show_values(ui, &a, ja);
                 ui.add_space(4.0);
-                if ui.button("📋 Copy").on_hover_text("Copy the analysis as text").clicked() {
+                let copy = ui
+                    .button(t(ja, "📋 Copy", "📋 コピー"))
+                    .on_hover_text(t(ja, "Copy the analysis as text", "解析結果をテキストでコピー"));
+                if copy.clicked() {
                     ui.ctx().copy_text(a.report());
                     copied = true;
                 }
             }
             Err(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, format!("Ion: {e}"));
+                ui.colored_label(ui.visuals().error_fg_color, format!("{}: {e}", t(ja, "Ion", "イオン")));
             }
         }
         copied
     }
 
     fn ion_controls(&mut self, ui: &mut egui::Ui) {
+        let ja = self.ja;
         let presets = Adduct::presets();
         let label = |choice: &AdductChoice| match choice {
-            AdductChoice::Neutral => "Neutral (M)".to_string(),
+            AdductChoice::Neutral => t(ja, "Neutral (M)", "中性 (M)").to_string(),
             AdductChoice::Preset(i) => adduct_label(&presets[*i]),
-            AdductChoice::Custom => "Custom…".to_string(),
+            AdductChoice::Custom => t(ja, "Custom…", "カスタム…").to_string(),
         };
         egui::Grid::new("analysis_ion").num_columns(2).show(ui, |ui| {
-            ui.label("Adduct");
+            ui.label(t(ja, "Adduct", "付加イオン"));
             let before = self.adduct.clone();
             egui::ComboBox::from_id_salt("analysis_adduct")
                 .selected_text(label(&self.adduct))
@@ -147,27 +164,27 @@ impl AnalysisPanel {
             ui.end_row();
 
             if self.adduct == AdductChoice::Custom {
-                ui.label("Name");
+                ui.label(t(ja, "Name", "名前"));
                 ui.add(egui::TextEdit::singleline(&mut self.custom_name).desired_width(80.0));
                 ui.end_row();
-                ui.label("Formula");
+                ui.label(t(ja, "Formula", "組成式"));
                 ui.add(egui::TextEdit::singleline(&mut self.custom_formula).desired_width(80.0));
                 ui.end_row();
-                ui.label("Charge / unit");
+                ui.label(t(ja, "Charge / unit", "1 単位の電荷"));
                 ui.add(egui::DragValue::new(&mut self.custom_charge).range(-3..=3));
                 ui.end_row();
             }
 
             if self.adduct != AdductChoice::Neutral {
-                ui.label("Charge");
+                ui.label(t(ja, "Charge", "電荷"));
                 ui.add(egui::DragValue::new(&mut self.charge).range(-10..=10).custom_formatter(
                     |z, _| if z > 0.0 { format!("+{z}") } else { format!("{z}") },
                 ));
                 ui.end_row();
-                ui.label("Molecules");
+                ui.label(t(ja, "Molecules", "分子数"));
                 ui.add(egui::DragValue::new(&mut self.multimer).range(1..=10).prefix("n = "));
                 ui.end_row();
-                ui.label("Ion");
+                ui.label(t(ja, "Ion", "イオン"));
                 match self.ion() {
                     Ok(Some(ion)) => ui.strong(ion.notation()),
                     Ok(None) => ui.label("—"),
@@ -180,19 +197,21 @@ impl AnalysisPanel {
 }
 
 /// Formula, masses, m/z and elemental analysis as a two-column grid.
-fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis) {
-    let unknown = || format!("— (unknown: {})", a.formula.unknown_elements().join(", "));
+fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis, ja: bool) {
+    let unknown = || {
+        format!("— ({}: {})", t(ja, "unknown", "不明"), a.formula.unknown_elements().join(", "))
+    };
     let mass = |m: Option<f64>| m.map_or_else(unknown, |m| format!("{m:.4}"));
     egui::Grid::new("analysis_values").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Chemical formula");
+        ui.label(t(ja, "Chemical formula", "分子式"));
         ui.add(RichLabel::new(a.formula.rich()));
         ui.end_row();
 
-        ui.label("Exact mass");
+        ui.label(t(ja, "Exact mass", "精密質量"));
         ui.label(mass(a.exact_mass));
         ui.end_row();
 
-        ui.label("Molecular weight");
+        ui.label(t(ja, "Molecular weight", "分子量"));
         ui.label(mass(a.molecular_weight));
         ui.end_row();
 
@@ -214,7 +233,7 @@ fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis) {
         }
         ui.end_row();
 
-        ui.label("Elemental analysis");
+        ui.label(t(ja, "Elemental analysis", "元素分析"));
         match &a.elemental_analysis {
             Some(ea) => {
                 ui.vertical(|ui| {
