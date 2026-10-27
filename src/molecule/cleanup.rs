@@ -1869,6 +1869,85 @@ mod tests {
         assert_eq!(editor.undo_stack.len(), 1);
     }
 
+    /// A run that finishes between two calls of the editor's poll: its first `latest()` returns
+    /// the preview and, as a worker publishing its last chunk and setting `done` would, makes
+    /// `is_done()` true from then on; every later `latest()` returns the final positions (e.g.
+    /// the restore after a rejected rescue pass, or after a cancel mid-rescue).
+    struct FinishesAfterFirstLatestRun {
+        preview: Vec<(u32, [f32; 2])>,
+        finished: Vec<(u32, [f32; 2])>,
+        done: std::sync::atomic::AtomicBool,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupRun for FinishesAfterFirstLatestRun {
+        fn cancel(&self) {}
+        fn is_done(&self) -> bool {
+            self.done.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            if self.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.finished.clone()
+            } else {
+                self.preview.clone()
+            }
+        }
+        fn join(self: Box<Self>) {
+            self.joined.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct FinishesAfterFirstLatestEngine {
+        preview: Vec<(u32, [f32; 2])>,
+        finished: Vec<(u32, [f32; 2])>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupEngine for FinishesAfterFirstLatestEngine {
+        fn start(&self, _mol: &Molecule) -> CleanupJob {
+            CleanupJob::from_run(FinishesAfterFirstLatestRun {
+                preview: self.preview.clone(),
+                finished: self.finished.clone(),
+                done: Default::default(),
+                joined: self.joined.clone(),
+            })
+        }
+    }
+
+    /// A run that becomes done right after `poll_cleanup` read its preview must still end on
+    /// the final positions: the editor may only treat what `latest()` returns as final when
+    /// `is_done()` was already true before that `latest()` call.
+    #[test]
+    fn run_finishing_after_the_preview_read_ends_on_the_final_positions() {
+        use std::sync::atomic::Ordering;
+        let mut editor = crate::widget::ChemStructEditor::default();
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [5.0, 5.0], 0);
+        let before = editor.molecule.clone();
+        let preview = vec![(a, [1.25, -0.5]), (b, [2.5, 0.75])];
+        let finished = vec![(a, [-3.0, 1.0]), (b, [4.0, -2.0])];
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        editor.set_cleanup_engine(FinishesAfterFirstLatestEngine {
+            preview: preview.clone(),
+            finished: finished.clone(),
+            joined: joined.clone(),
+        });
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup(), "the run was not done before the preview was read");
+        assert_eq!(atom_positions(&editor.molecule), preview);
+        assert!(editor.cleanup_job.is_some());
+        assert!(!joined.load(Ordering::Relaxed));
+
+        assert!(!editor.poll_cleanup(), "a finished run ends the cleanup");
+        assert_eq!(atom_positions(&editor.molecule), finished);
+        assert!(editor.cleanup_job.is_none());
+        assert!(joined.load(Ordering::Relaxed));
+        assert_eq!(editor.undo_stack.len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+    }
+
     /// Wrapping the run in a trait object must not cost `CleanupJob` (and so the editor that
     /// holds one) the `Send + Sync` it had as a concrete threaded job.
     #[test]

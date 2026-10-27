@@ -574,12 +574,16 @@ impl ChemStructEditor {
     /// preview, and finalize (join the worker) once it reports done. Returns true while active.
     pub fn poll_cleanup(&mut self) -> bool {
         let Some(job) = &self.cleanup_job else { return false };
+        // Read `is_done` before `latest`: only positions read after `is_done` returned true are
+        // guaranteed final.  Checked the other way round, a run finishing between the two
+        // calls would end the cleanup on the preview read just before its final positions.
+        let done = job.is_done();
         for (id, pos) in job.latest() {
             if let Some(atom) = self.molecule.atom_by_id_mut(id) {
                 atom.pos = pos;
             }
         }
-        if job.is_done() {
+        if done {
             self.cleanup_job.take().unwrap().join();
             false
         } else {
