@@ -697,7 +697,8 @@ const JOB_PHASE_BUDGET: usize = 100_000;
 ///   * Once `is_done` returns `true`, `latest` returns the final positions.
 ///   * After `cancel`, the run must still reach `is_done` (soon), so the editor can finish.
 ///   * The run may be dropped without `join` (e.g. when the editor holding it is dropped, or
-///     its `cleanup_job` is replaced); dropping it must stop any background work.
+///     `ChemStructEditor::cancel_cleanup` discards it, possibly before `is_done`); dropping it
+///     must stop any background work.
 ///
 /// Methods take `&self` because the editor holds the job behind a shared reference while it
 /// polls; a run that needs to mutate uses interior mutability.
@@ -1790,6 +1791,7 @@ mod tests {
     struct FakeEngine {
         positions: Vec<(u32, [f32; 2])>,
         done: bool,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -1798,7 +1800,7 @@ mod tests {
             CleanupJob::from_run(FakeRun {
                 positions: self.positions.clone(),
                 done: self.done,
-                cancelled: Default::default(),
+                cancelled: self.cancelled.clone(),
                 joined: self.joined.clone(),
             })
         }
@@ -1811,6 +1813,8 @@ mod tests {
         before: Molecule,
         /// The positions the fake engine's runs report.
         positions: Vec<(u32, [f32; 2])>,
+        /// Set once the run is cancelled.
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// Set once the run is joined.
         joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
@@ -1822,9 +1826,15 @@ mod tests {
         let b = editor.molecule.add_atom("C".to_string(), [5.0, 5.0], 0);
         let before = editor.molecule.clone();
         let positions = vec![(a, [1.25, -0.5]), (b, [2.5, 0.75])];
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        editor.set_cleanup_engine(FakeEngine { positions: positions.clone(), done, joined: joined.clone() });
-        FakeEngineFixture { editor, before, positions, joined }
+        editor.set_cleanup_engine(FakeEngine {
+            positions: positions.clone(),
+            done,
+            cancelled: cancelled.clone(),
+            joined: joined.clone(),
+        });
+        FakeEngineFixture { editor, before, positions, cancelled, joined }
     }
 
     fn atom_positions(mol: &Molecule) -> Vec<(u32, [f32; 2])> {
@@ -1837,7 +1847,7 @@ mod tests {
     #[test]
     fn set_cleanup_engine_drives_toggle_and_poll() {
         use std::sync::atomic::Ordering;
-        let FakeEngineFixture { mut editor, before, positions, joined } = editor_with_fake_engine(true);
+        let FakeEngineFixture { mut editor, before, positions, joined, .. } = editor_with_fake_engine(true);
 
         editor.toggle_cleanup();
         assert!(editor.cleanup_job.is_some());
@@ -1867,6 +1877,152 @@ mod tests {
         assert!(editor.cleanup_job.is_some());
         assert!(!joined.load(Ordering::Relaxed));
         assert_eq!(editor.undo_stack.len(), 1);
+    }
+
+    /// Undo while a cleanup runs cancels it: the run is cancelled and dropped, the molecule is
+    /// back to its pre-cleanup structure, a later poll writes nothing over it, and neither
+    /// stack keeps the half-relaxed preview (the redo history is the one from before Cleanup).
+    #[test]
+    fn undo_during_cleanup_cancels_it_and_restores_the_pre_cleanup_molecule() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, positions, cancelled, joined } =
+            editor_with_fake_engine(false);
+
+        editor.toggle_cleanup();
+        let redo_at_start = editor.redo_stack.clone();
+        assert!(editor.poll_cleanup());
+        assert_eq!(atom_positions(&editor.molecule), positions, "preview applied");
+
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+        assert!(editor.cleanup_job.is_none());
+        assert!(!editor.is_cleaning());
+        assert!(cancelled.load(Ordering::Relaxed), "the run was cancelled");
+        assert!(!joined.load(Ordering::Relaxed), "the run was dropped, not joined");
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        assert!(editor.undo_stack.is_empty(), "the pre-cleanup snapshot was consumed");
+        assert_eq!(editor.redo_stack, redo_at_start, "no half-relaxed state on the redo stack");
+
+        assert!(!editor.poll_cleanup());
+        assert_eq!(editor.molecule, before, "nothing overwrites the restored molecule");
+        assert!(!editor.redo(), "nothing to redo: the cleanup was cancelled, not undone");
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// The redo history from before Cleanup survives an undo that cancels the cleanup.
+    #[test]
+    fn undo_during_cleanup_keeps_the_redo_history_from_before_it() {
+        let FakeEngineFixture { mut editor, before, .. } = editor_with_fake_engine(false);
+        // An undo entry equal to the current molecule makes Cleanup's own snapshot a
+        // duplicate, so `push_undo` skips it and leaves the redo stack alone.
+        let mut later = before.clone();
+        later.add_atom("O".to_string(), [9.0, 9.0], 0);
+        editor.undo_stack.push_back(before.clone());
+        editor.redo_stack.push_back(later.clone());
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup());
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+        assert_eq!(editor.redo_stack, std::collections::VecDeque::from(vec![later.clone()]));
+        assert!(editor.redo());
+        assert_eq!(editor.molecule, later);
+    }
+
+    /// Redo while a cleanup runs stops it at once: the run is cancelled and dropped and a later
+    /// poll writes nothing more.  With nothing to redo the stopped layout stays (as a Ctrl+K
+    /// stop would leave it) and Undo still returns to the pre-cleanup molecule.
+    #[test]
+    fn redo_during_cleanup_stops_it() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, positions, cancelled, joined } =
+            editor_with_fake_engine(false);
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup());
+        assert!(!editor.redo(), "nothing to redo");
+        assert!(editor.cleanup_job.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        assert_eq!(atom_positions(&editor.molecule), positions);
+
+        assert!(!editor.poll_cleanup());
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// Pasting while a cleanup runs stops it, so the run can no longer move atoms.
+    #[test]
+    fn paste_during_cleanup_stops_it() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, cancelled, joined, .. } = editor_with_fake_engine(false);
+        let mut source = crate::widget::ChemStructEditor::default();
+        let id = source.molecule.add_atom("N".to_string(), [0.0, 0.0], 0);
+        source.selected_atoms.insert(id);
+        let clip = source.copy_to_string().expect("one selected atom copies");
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup());
+        assert!(editor.paste_from_string(&clip));
+        assert!(editor.cleanup_job.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        let after_paste = editor.molecule.clone();
+        assert!(!editor.poll_cleanup());
+        assert_eq!(editor.molecule, after_paste);
+    }
+
+    /// `cancel_cleanup` stops a running cleanup without writing any more positions, and
+    /// reports whether there was one.
+    #[test]
+    fn cancel_cleanup_stops_the_run_without_writing() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, cancelled, joined, .. } =
+            editor_with_fake_engine(false);
+
+        assert!(!editor.cancel_cleanup(), "nothing to cancel while idle");
+        editor.toggle_cleanup();
+        assert!(editor.cancel_cleanup());
+        assert!(editor.cleanup_job.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        assert_eq!(editor.molecule, before, "no preview was polled, so nothing moved");
+        // A host replacing the molecule after cancelling keeps what it put there.
+        editor.molecule = Molecule::default();
+        assert!(!editor.poll_cleanup());
+        assert!(editor.molecule.atoms.is_empty());
+    }
+
+    /// A run that already reports done when `cancel_cleanup` comes is joined, not just dropped,
+    /// and its final positions are not written either.
+    #[test]
+    fn cancel_cleanup_joins_a_finished_run() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, joined, .. } = editor_with_fake_engine(true);
+
+        editor.toggle_cleanup();
+        assert!(editor.cancel_cleanup());
+        assert!(editor.cleanup_job.is_none());
+        assert!(joined.load(Ordering::Relaxed), "a finished run is joined");
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// `cancel_cleanup` discards a running built-in (native, threaded) run without writing its
+    /// positions and without waiting for the worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cancel_cleanup_discards_a_running_native_job() {
+        let mut rng = Lcg(0x1053);
+        let mol = random_molecule(&mut rng, 120, 30, 40.0);
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.toggle_cleanup();
+        assert!(editor.cancel_cleanup());
+        assert!(editor.cleanup_job.is_none());
+        assert_eq!(editor.molecule, mol);
     }
 
     /// A run that finishes between two calls of the editor's poll: its first `latest()` returns
