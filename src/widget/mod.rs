@@ -1050,15 +1050,23 @@ impl ChemStructEditor {
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let tool_modified = if label_editing || cleaning || ui.ctx().egui_wants_keyboard_input() {
-            false
-        } else {
+        let canvas_input = !(label_editing || cleaning || ui.ctx().egui_wants_keyboard_input());
+        let tool_modified = if canvas_input {
             match self.tool.clone() {
                 Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
                 Tool::Select => interact::process_select_tool(self, &response, center, ui),
                 Tool::Eraser => interact::process_eraser_tool(self, &response, center),
             }
+        } else {
+            false
         };
+
+        // Middle-button drag pans the camera, whatever the tool. It runs after the tool
+        // handler so the tool still sees this frame's pre-pan view, as the Bond tool did when
+        // the pan lived inside it.
+        if canvas_input && ui.input(|i| i.pointer.middle_down()) {
+            self.pan += ui.input(|i| i.pointer.delta());
+        }
         let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
@@ -1552,9 +1560,59 @@ mod view_tests {
 
     #[test]
     fn middle_drag_pans_by_the_pointer_delta_in_the_bond_tool() {
-        let ctx = egui::Context::default();
-        let mut editor = ChemStructEditor::default();
+        let editor = ChemStructEditor::default();
         assert_eq!(editor.tool, Tool::Bond);
+        assert_middle_drag_pans(editor);
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_select_tool() {
+        assert_middle_drag_pans(ChemStructEditor { tool: Tool::Select, ..Default::default() });
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_eraser_tool() {
+        assert_middle_drag_pans(ChemStructEditor { tool: Tool::Eraser, ..Default::default() });
+    }
+
+    /// A focused text field keeps the canvas from reacting to input, the camera included.
+    #[test]
+    fn middle_drag_does_not_pan_while_a_text_field_has_focus() {
+        for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
+            let ctx = egui::Context::default();
+            let mut editor = ChemStructEditor { tool: tool.clone(), ..Default::default() };
+            let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+            let field = egui::Id::new("some_text_field");
+            let p0 = egui::pos2(300.0, 200.0);
+            let p1 = egui::pos2(340.0, 170.0);
+            let frame = |editor: &mut ChemStructEditor, events: Vec<egui::Event>| {
+                let raw = egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(raw, |ui| {
+                    ui.memory_mut(|m| m.request_focus(field));
+                    editor.ui(ui);
+                });
+            };
+            frame(&mut editor, vec![egui::Event::PointerMoved(p0)]);
+            frame(&mut editor, vec![egui::Event::PointerButton {
+                pos: p0,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: Default::default(),
+            }]);
+            let pan_start = editor.pan;
+            frame(&mut editor, vec![egui::Event::PointerMoved(p1)]);
+            assert_eq!(editor.pan, pan_start, "{tool:?}: no pan while a text field has focus");
+        }
+    }
+
+    fn assert_middle_drag_pans(mut editor: ChemStructEditor) {
+        let ctx = egui::Context::default();
+        let tool = editor.tool.clone();
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
         let p0 = egui::pos2(300.0, 200.0);
         let p1 = egui::pos2(340.0, 170.0);
@@ -1569,9 +1627,9 @@ mod view_tests {
         }]);
         let pan_start = editor.pan;
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p1)]);
-        assert_eq!(editor.pan, pan_start + (p1 - p0), "pan follows the middle-drag delta");
+        assert_eq!(editor.pan, pan_start + (p1 - p0), "{tool:?}: pan follows the middle-drag delta");
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p2)]);
-        assert_eq!(editor.pan, pan_start + (p2 - p0), "pan accumulates over the drag");
+        assert_eq!(editor.pan, pan_start + (p2 - p0), "{tool:?}: pan accumulates over the drag");
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
             pos: p2,
             button: egui::PointerButton::Middle,
@@ -1580,6 +1638,142 @@ mod view_tests {
         }]);
         let pan_end = editor.pan;
         run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
-        assert_eq!(editor.pan, pan_end, "moving after the release does not pan");
+        assert_eq!(editor.pan, pan_end, "{tool:?}: moving after the release does not pan");
+    }
+
+    /// Middle-drag along `path` (press at the first point, release at the last), calling
+    /// `during` after every frame the button is held. Returns whether any frame's `ui()`
+    /// reported a modification.
+    fn middle_drag_along(
+        editor: &mut ChemStructEditor,
+        path: &[egui::Pos2],
+        mut during: impl FnMut(&ChemStructEditor),
+    ) -> bool {
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let frame = |editor: &mut ChemStructEditor, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut modified = false;
+            let _ = ctx.run_ui(raw, |ui| modified = editor.ui(ui));
+            modified
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let (first, last) = (path[0], path[path.len() - 1]);
+        let mut modified = frame(editor, vec![egui::Event::PointerMoved(first)]);
+        modified |= frame(editor, vec![button(first, true)]);
+        during(editor);
+        for &p in &path[1..] {
+            modified |= frame(editor, vec![egui::Event::PointerMoved(p)]);
+            during(editor);
+        }
+        modified |= frame(editor, vec![button(last, false)]);
+        modified
+    }
+
+    /// The canvas center of the 640x480 test screen, where mol (0, 0) sits at the default view.
+    const MID: egui::Pos2 = egui::pos2(320.0, 240.0);
+
+    #[test]
+    fn select_middle_drag_from_an_atom_only_pans() {
+        let mut editor = ChemStructEditor { tool: Tool::Select, ..Default::default() };
+        let atom = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let undo_len = editor.undo_stack.len();
+        let pan_start = editor.pan;
+
+        // Small first steps so the drag starts while the pointer is still over the atom (the
+        // Select tool picks the dragged atom from the hover at drag start).
+        let path = [
+            MID,
+            MID + egui::vec2(4.0, 2.0),
+            MID + egui::vec2(8.0, 4.0),
+            MID + egui::vec2(60.0, 30.0),
+            MID + egui::vec2(100.0, 50.0),
+        ];
+        let modified = middle_drag_along(&mut editor, &path, |_| {});
+
+        assert_ne!(editor.pan, pan_start, "the middle drag pans");
+        assert_eq!(editor.molecule.atom_by_id(atom).unwrap().pos, [0.0, 0.0], "atom not moved");
+        assert!(editor.selected_atoms.is_empty(), "selection unchanged");
+        assert_eq!(editor.undo_stack.len(), undo_len, "no undo snapshot");
+        assert!(!modified, "ui() reports no modification");
+    }
+
+    #[test]
+    fn select_middle_drag_around_an_atom_does_not_lasso() {
+        let mut editor = ChemStructEditor { tool: Tool::Select, ..Default::default() };
+        editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let pan_start = editor.pan;
+
+        // Starts in empty space and circles the atom at MID.
+        let path = [
+            MID + egui::vec2(-150.0, 0.0),
+            MID + egui::vec2(0.0, -150.0),
+            MID + egui::vec2(150.0, 0.0),
+            MID + egui::vec2(0.0, 150.0),
+            MID + egui::vec2(-150.0, 0.0),
+        ];
+        // The path is closed, so the pan ends where it began; check it moved along the way.
+        let mut panned = false;
+        middle_drag_along(&mut editor, &path, |e| {
+            assert!(e.lasso_path.is_empty(), "no lasso path during a middle drag");
+            panned |= e.pan != pan_start;
+        });
+
+        assert!(panned, "the middle drag pans");
+        assert!(editor.selected_atoms.is_empty(), "nothing lasso-selected");
+    }
+
+    /// Escape aborts an egui drag while the primary button is still held; the tool must still
+    /// see that as the end of its primary drag and tear the lasso down.
+    #[test]
+    fn select_primary_lasso_aborted_by_escape_is_torn_down() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor { tool: Tool::Select, ..Default::default() };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p0 = MID + egui::vec2(-150.0, 0.0);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p0,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        for p in [p0 + egui::vec2(40.0, -40.0), p0 + egui::vec2(80.0, -60.0)] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+        }
+        assert!(!editor.lasso_path.is_empty(), "the primary drag draws a lasso");
+        assert!(editor.drag_origin_screen.is_some());
+
+        let (events, modifiers) = crate::testkit::chord("Escape");
+        crate::testkit::run_frame_with_modifiers(&ctx, screen_rect, &mut editor, events, modifiers);
+        assert!(editor.lasso_path.is_empty(), "the aborted lasso is cleared");
+        assert!(editor.drag_origin_screen.is_none(), "the aborted lasso is torn down");
+    }
+
+    #[test]
+    fn bond_middle_drag_from_an_atom_does_not_draw_a_bond() {
+        let mut editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, Tool::Bond);
+        editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let undo_len = editor.undo_stack.len();
+
+        let path = [MID, MID + egui::vec2(80.0, 40.0), MID + egui::vec2(150.0, 90.0)];
+        middle_drag_along(&mut editor, &path, |e| {
+            assert!(e.bond_start.is_none(), "no bond preview during a middle drag");
+        });
+
+        assert_eq!(editor.molecule.atoms.len(), 1, "no atom added");
+        assert!(editor.molecule.bonds.is_empty(), "no bond added");
+        assert_eq!(editor.undo_stack.len(), undo_len, "no undo snapshot");
     }
 }
