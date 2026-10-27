@@ -120,6 +120,16 @@ impl App for EditorApp {
                     self.editor.tool = Tool::Eraser;
                     self.status = tool_status(Tool::Eraser);
                 }
+                for (tool, label) in [
+                    (Tool::Arrow(chembuider_rs::molecule::ArrowKind::Reaction), "→ Arrow"),
+                    (Tool::Arrow(chembuider_rs::molecule::ArrowKind::Equilibrium), "⇌ Equilibrium"),
+                    (Tool::Text, "T Text"),
+                ] {
+                    if ui.selectable_label(self.editor.tool == tool, label).clicked() {
+                        self.editor.tool = tool.clone();
+                        self.status = tool_status(tool);
+                    }
+                }
 
                 ui.separator();
 
@@ -315,7 +325,9 @@ fn tool_status(tool: Tool) -> String {
     match tool {
         Tool::Select => "Select: click/lasso to select, double-click for whole molecule, Alt+drag to rotate, Delete to remove.".to_string(),
         Tool::Bond => "Bond: click atom to extend chain, drag atom→atom to draw bond, click bond to cycle order.".to_string(),
-        Tool::Eraser => "Eraser: click an atom or bond to remove it.".to_string(),
+        Tool::Eraser => "Eraser: click an atom, bond, arrow or text to remove it.".to_string(),
+        Tool::Arrow(_) => "Arrow: drag from tail to head (Shift: any angle), or click for a default arrow.".to_string(),
+        Tool::Text => "Text: click to type (Enter commits, Shift+Enter new line), click a text to edit it.".to_string(),
     }
 }
 

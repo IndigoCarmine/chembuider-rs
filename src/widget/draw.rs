@@ -176,6 +176,64 @@ pub fn draw_atom_labels(
     }
 }
 
+// ─── Layer 2b: page objects (arrows, texts) ──────────────────────────────────
+
+const SELECTED: egui::Color32 = egui::Color32::from_rgb(80, 130, 255);
+const HOVERED: egui::Color32 = egui::Color32::from_rgb(50, 180, 50);
+
+/// Paint the page objects from the shared scene (the geometry the image export draws), tinted
+/// when hovered or selected, with the end handles of a lone selected arrow and the arrow being
+/// drawn. Returns the screen rect of every text painted, for next frame's hit testing.
+pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) -> HashMap<u32, egui::Rect> {
+    use crate::molecule::PageObject;
+    let xf = editor_transform(editor, center);
+    let style = &editor.config.style;
+    let editing = editor.text_edit.as_ref().and_then(|e| e.id);
+    let mut rects = HashMap::new();
+    let paint = |obj: &scene::SceneObject, color: egui::Color32| {
+        for s in &obj.strokes {
+            painter.line_segment([s.a, s.b], egui::Stroke::new(s.width, color));
+        }
+        for fill in &obj.fills {
+            painter.add(egui::Shape::convex_polygon(fill.clone(), color, egui::Stroke::NONE));
+        }
+        for line in &obj.texts {
+            line.galley.paint(painter, line.rect.min);
+        }
+    };
+    for object in &editor.molecule.objects {
+        let id = object.id();
+        if editing == Some(id) {
+            continue;
+        }
+        let obj = scene::build_object(object, style, xf, |job| painter.layout_job(job));
+        let selected = editor.selected_objects.contains(&id);
+        let hovered = editor.hovered_object == Some(id);
+        let color = if selected { SELECTED } else if hovered { HOVERED } else { egui::Color32::BLACK };
+        paint(&obj, color);
+        if matches!(object, PageObject::Text(_)) {
+            rects.insert(id, obj.rect);
+            if selected || hovered {
+                painter.rect_stroke(obj.rect.expand(2.0), 2.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Outside);
+            }
+        }
+    }
+    // The ends of a lone selected arrow can be dragged: mark them.
+    if let Some(a) = super::interact::lone_selected_arrow(editor) {
+        for p in [a.tail, a.head] {
+            let sp = xf.apply(p);
+            painter.circle(sp, 4.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
+        }
+    }
+    // The arrow being drawn with the Arrow tool.
+    if let Some(super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag {
+        let preview = PageObject::Arrow(crate::molecule::PageArrow { id: 0, tail, head, kind, source: None });
+        let obj = scene::build_object(&preview, style, xf, |job| painter.layout_job(job));
+        paint(&obj, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
+    }
+    rects
+}
+
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────
 
 pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {

@@ -7,6 +7,8 @@ mod keyboard_solver;
 #[cfg(test)]
 mod keyboard_tests;
 #[cfg(test)]
+mod page_tests;
+#[cfg(test)]
 mod render_tests;
 pub mod rich_text;
 pub mod scene;
@@ -15,7 +17,7 @@ pub mod view;
 pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
-use crate::molecule::{BondOrder, BondStereo, DoublePosition, Molecule};
+use crate::molecule::{ArrowKind, BondOrder, BondStereo, DoublePosition, Molecule, PageObject, TextAlign};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
@@ -76,6 +78,13 @@ pub enum Tool {
     Select,
     Bond,
     Eraser,
+    /// Draw a reaction or equilibrium arrow: drag from tail to head (the direction snaps to
+    /// 15° steps; hold Shift for any angle), or click to place one of the default length.
+    Arrow(ArrowKind),
+    /// Place or edit a text (reaction conditions, captions): click empty canvas to start one,
+    /// click a text to edit it. Enter or a click elsewhere commits, Shift+Enter starts a new
+    /// line, Escape cancels; a text left empty is removed.
+    Text,
 }
 
 impl std::fmt::Display for Tool {
@@ -84,8 +93,23 @@ impl std::fmt::Display for Tool {
             Tool::Select => write!(f, "Select"),
             Tool::Bond => write!(f, "Bond"),
             Tool::Eraser => write!(f, "Eraser"),
+            Tool::Arrow(ArrowKind::Reaction) => write!(f, "Reaction Arrow"),
+            Tool::Arrow(ArrowKind::Equilibrium) => write!(f, "Equilibrium Arrow"),
+            Tool::Text => write!(f, "Text"),
         }
     }
+}
+
+/// A page text being typed or edited ([`ChemStructEditor::text_edit`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextEditState {
+    /// The text being edited, or `None` for a new one, added when committed.
+    pub id: Option<u32>,
+    /// Where the text is anchored (see [`PageText::pos`](crate::molecule::PageText::pos)).
+    pub pos: [f32; 2],
+    pub align: TextAlign,
+    /// The markup typed so far, lines separated by `\n`.
+    pub text: String,
 }
 
 pub struct ChemStructEditor {
@@ -175,6 +199,22 @@ pub struct ChemStructEditor {
     /// The bond under the pointer when the canvas was last right-clicked: what the host's
     /// context menu acts on. Kept until [`clear_context_bond`](Self::clear_context_bond).
     context_bond: Option<u32>,
+
+    /// Selected page objects (arrows, texts), by id: moved, deleted and rotated with the
+    /// selected atoms.
+    pub selected_objects: HashSet<u32>,
+
+    /// The page object under the pointer (when no atom is).
+    pub hovered_object: Option<u32>,
+
+    /// The page text being typed, while the text box is open. Keyboard input goes to it.
+    pub text_edit: Option<TextEditState>,
+
+    /// A drag on page objects in progress (drawing an arrow, moving objects, an arrow's end).
+    pub(crate) object_drag: Option<interact::ObjectDrag>,
+
+    /// Screen rects of the page texts painted last frame, for hit testing, as for labels.
+    last_object_rects: std::collections::HashMap<u32, egui::Rect>,
 }
 
 /// What [`ChemStructEditor::show`] hands back: the canvas response, for a host to attach a
@@ -218,6 +258,11 @@ impl Default for ChemStructEditor {
             last_label_rects: std::collections::HashMap::new(),
             fit_requested: false,
             context_bond: None,
+            selected_objects: HashSet::new(),
+            hovered_object: None,
+            text_edit: None,
+            object_drag: None,
+            last_object_rects: std::collections::HashMap::new(),
         }
     }
 }
@@ -738,9 +783,7 @@ impl ChemStructEditor {
                 }
                 self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
             }
-            self.selected_atoms.clear();
-            self.hotspot_atom = None;
-            self.label_edit = None;
+            self.clear_transient_state();
             true
         } else {
             false
@@ -758,13 +801,107 @@ impl ChemStructEditor {
                 self.undo_stack.pop_front();
             }
             self.undo_stack.push_back(std::mem::replace(&mut self.molecule, next));
-            self.selected_atoms.clear();
-            self.hotspot_atom = None;
-            self.label_edit = None;
+            self.clear_transient_state();
             true
         } else {
             false
         }
+    }
+
+    /// Forget selections and in-progress edits, which may point at things the molecule just
+    /// lost (undo, redo).
+    fn clear_transient_state(&mut self) {
+        self.selected_atoms.clear();
+        self.selected_objects.clear();
+        self.hotspot_atom = None;
+        self.label_edit = None;
+        self.text_edit = None;
+        self.object_drag = None;
+    }
+
+    /// Delete everything selected, atoms and page objects, in one undo step. Returns false
+    /// when nothing is selected.
+    pub fn delete_selection(&mut self) -> bool {
+        if self.selected_atoms.is_empty() && self.selected_objects.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        for id in std::mem::take(&mut self.selected_atoms) {
+            self.molecule.remove_atom(id);
+        }
+        for id in std::mem::take(&mut self.selected_objects) {
+            self.molecule.remove_object(id);
+        }
+        true
+    }
+
+    /// Open the text box on page text `id` (as a double-click or the Text tool does). False
+    /// when there is no such text.
+    pub fn edit_text(&mut self, id: u32) -> bool {
+        let Some(PageObject::Text(t)) = self.molecule.object_by_id(id) else { return false };
+        self.text_edit = Some(TextEditState { id: Some(id), pos: t.pos, align: t.align, text: t.text.clone() });
+        true
+    }
+
+    /// Close the text box, keeping what was typed: a new text is added, an edited one changed,
+    /// and one left blank removed, each as one undo step. Returns whether the molecule changed.
+    pub fn commit_text_edit(&mut self) -> bool {
+        let Some(edit) = self.text_edit.take() else { return false };
+        let text = edit.text.trim_end().to_string();
+        let blank = text.trim().is_empty();
+        match edit.id {
+            Some(id) => {
+                let Some(PageObject::Text(current)) = self.molecule.object_by_id(id) else { return false };
+                if blank {
+                    self.push_undo();
+                    self.molecule.remove_object(id);
+                    self.selected_objects.remove(&id);
+                    true
+                } else if current.text != text {
+                    self.push_undo();
+                    if let Some(PageObject::Text(t)) = self.molecule.object_by_id_mut(id) {
+                        t.text = text;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            None if blank => false,
+            None => {
+                self.push_undo();
+                let id = self.molecule.add_text(edit.pos, text);
+                if let Some(PageObject::Text(t)) = self.molecule.object_by_id_mut(id) {
+                    t.align = edit.align;
+                }
+                true
+            }
+        }
+    }
+
+    /// The page object under screen point `screen`: an arrow near its shaft, a text over the
+    /// rect it was painted in last frame. The topmost (last drawn) wins.
+    pub fn hit_test_object(&self, screen: egui::Pos2, center: egui::Pos2) -> Option<u32> {
+        let view = self.view(center);
+        self.molecule.objects.iter().rev().find_map(|o| {
+            let hit = match o {
+                PageObject::Arrow(a) => {
+                    let spread = match a.kind {
+                        ArrowKind::Reaction => 0.0,
+                        ArrowKind::Equilibrium => {
+                            scene::ARROW_SHAFT_SPACING * self.config.style.bond_width * self.zoom * 0.5
+                        }
+                    };
+                    let d = point_to_segment_dist(screen, view.mol_to_screen(a.tail), view.mol_to_screen(a.head));
+                    d <= BOND_HIT_THRESHOLD_PX + spread
+                }
+                PageObject::Text(t) => match self.last_object_rects.get(&t.id) {
+                    Some(r) => r.expand(3.0).contains(screen),
+                    None => view.mol_to_screen(t.pos).distance(screen) <= NODE_HIT_RADIUS_PX,
+                },
+            };
+            hit.then(|| o.id())
+        })
     }
 
     /// The current camera (zoom, pan) placed on a canvas centered at `center`.
@@ -1051,6 +1188,52 @@ impl ChemStructEditor {
         normalize_angle(best)
     }
 
+    /// Show the page text box while [`text_edit`](Self::text_edit) is open, and close it on
+    /// Enter (commit), Escape (cancel) or a click elsewhere (commit). Returns whether a commit
+    /// changed the molecule.
+    fn show_text_edit(&mut self, ui: &mut egui::Ui, center: egui::Pos2) -> bool {
+        let Some(edit) = self.text_edit.as_ref() else { return false };
+        // An edited text that undo or a host removed has nothing left to edit.
+        if edit.id.is_some_and(|id| self.molecule.object_by_id(id).is_none()) {
+            self.text_edit = None;
+            return false;
+        }
+        let size = self.config.style.label_size * self.zoom;
+        let anchor = self.mol_to_screen(edit.pos, center);
+        let top_left = anchor - egui::vec2(4.0, size * 1.1);
+        let rows = edit.text.lines().count().max(1);
+        let Some(edit) = self.text_edit.as_mut() else { return false };
+        let area = egui::Area::new(egui::Id::unique("chembuilder_page_text_edit"))
+            .fixed_pos(top_left)
+            .show(ui.ctx(), |ui| {
+                egui::TextEdit::multiline(&mut edit.text)
+                    .desired_width((size * 12.0).max(120.0))
+                    .desired_rows(rows)
+                    .font(egui::FontId::proportional(size))
+                    .hint_text("H_2O, 25 \u{b0}C")
+                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
+                    .show(ui)
+                    .response
+            });
+        let response = area.inner;
+        response.request_focus();
+        let (enter, escape) = ui.input(|i| {
+            (i.key_pressed(egui::Key::Enter) && !i.modifiers.shift, i.key_pressed(egui::Key::Escape))
+        });
+        let clicked_elsewhere = ui.input(|i| i.pointer.any_pressed())
+            && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !area.response.rect.contains(p));
+        if escape {
+            self.text_edit = None;
+            response.surrender_focus();
+            false
+        } else if enter || clicked_elsewhere {
+            response.surrender_focus();
+            self.commit_text_edit()
+        } else {
+            false
+        }
+    }
+
     /// Main entry point called from the app each frame. Returns true if molecule was modified.
     ///
     /// A host that wants the canvas [`Response`](egui::Response) — to attach a context menu,
@@ -1072,7 +1255,7 @@ impl ChemStructEditor {
         // the fit lands in this very frame. Not while a text field (the label editor, or a host
         // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
         // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
-        let text_input = self.label_edit.is_some() || ui.ctx().egui_wants_keyboard_input();
+        let text_input = self.label_edit.is_some() || self.text_edit.is_some() || ui.ctx().egui_wants_keyboard_input();
         if !text_input && ui.input(|i| i.key_pressed(egui::Key::Num0) && i.modifiers.ctrl) {
             self.request_fit();
         }
@@ -1097,7 +1280,14 @@ impl ChemStructEditor {
         if let Some(mouse_pos) = mouse_pos {
             self.last_mouse_mol = self.screen_to_mol(mouse_pos, center);
             self.hovered_atom = self.hit_test_atom(mouse_pos, center);
-            self.hovered_bond = if self.hovered_atom.is_none() {
+            // An atom beats a page object, and a page object a bond (a label or condition
+            // text sitting over a bond is what the pointer is meant to be on).
+            self.hovered_object = if self.hovered_atom.is_none() {
+                self.hit_test_object(mouse_pos, center)
+            } else {
+                None
+            };
+            self.hovered_bond = if self.hovered_atom.is_none() && self.hovered_object.is_none() {
                 self.hit_test_bond(mouse_pos, center)
             } else {
                 None
@@ -1105,6 +1295,12 @@ impl ChemStructEditor {
         } else {
             self.hovered_atom = None;
             self.hovered_bond = None;
+            self.hovered_object = None;
+        }
+        // Selected objects that undo, redo or deletion removed are no longer selected.
+        if !self.selected_objects.is_empty() {
+            let mol = &self.molecule;
+            self.selected_objects.retain(|id| mol.object_by_id(*id).is_some());
         }
 
         // A keyboard bond target is only meaningful while that bond exists, and undo, redo,
@@ -1165,12 +1361,13 @@ impl ChemStructEditor {
 
         // Ctrl+Z: undo. Ctrl+Y or Ctrl+Shift+Z: redo.
         let undo_pressed = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
-        let did_undo = undo_pressed && self.undo();
+        // The text box keeps Ctrl+Z / Ctrl+Y for its own typing.
+        let did_undo = undo_pressed && self.text_edit.is_none() && self.undo();
         let redo_pressed = ui.input(|i| {
             (i.key_pressed(egui::Key::Y) && i.modifiers.ctrl)
                 || (i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && i.modifiers.shift)
         });
-        let did_redo = redo_pressed && self.redo();
+        let did_redo = redo_pressed && self.text_edit.is_none() && self.redo();
 
         // Copy/paste only act on the canvas when no text field has focus.
         let editing_text = ui.ctx().egui_wants_keyboard_input();
@@ -1289,16 +1486,22 @@ impl ChemStructEditor {
         if label_confirmed { self.label_edit = None; }
         let label_editing = self.label_edit.is_some();
 
+        // ── Page text box ────────────────────────────────────────────────────
+        let text_committed = self.show_text_edit(ui, center);
+        let text_editing = self.text_edit.is_some();
+
         // Suppress canvas key/mouse handling whenever a text field (our label editor or a
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let canvas_input = !(label_editing || cleaning || ui.ctx().egui_wants_keyboard_input());
+        let canvas_input = !(label_editing || text_editing || cleaning || ui.ctx().egui_wants_keyboard_input());
         let tool_modified = if canvas_input {
             match self.tool.clone() {
                 Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
                 Tool::Select => interact::process_select_tool(self, &response, center, ui),
                 Tool::Eraser => interact::process_eraser_tool(self, &response, center),
+                Tool::Arrow(kind) => interact::process_arrow_tool(self, &response, center, ui, kind),
+                Tool::Text => interact::process_text_tool(self, &response, center, ui),
             }
         } else {
             false
@@ -1310,7 +1513,7 @@ impl ChemStructEditor {
         if canvas_input && ui.input(|i| i.pointer.middle_down()) {
             self.pan += ui.input(|i| i.pointer.delta());
         }
-        let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning | did_undo | did_redo;
+        let modified = cleanup_toggle | label_confirmed | text_committed | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
         // crossing bonds, and labels paint the cached galleys. Keep the rects for next
@@ -1323,6 +1526,7 @@ impl ChemStructEditor {
         draw::draw_bonds(self, &painter, center, &label_layouts);
         draw::draw_atom_backgrounds(self, &painter, center, &label_layouts);
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
+        self.last_object_rects = draw::draw_page_objects(self, &painter, center);
         draw::draw_overlays(self, &painter, center);
 
         EditorResponse { response, modified }
