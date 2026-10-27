@@ -8,7 +8,7 @@ pub mod rich_text;
 pub mod scene;
 pub mod view;
 
-pub use view::ViewTransform;
+pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};
@@ -158,6 +158,9 @@ pub struct ChemStructEditor {
     /// like "CO2Et" should be clickable over their whole text, not just a small circle).
     /// One frame of lag is fine — hover runs before the draw pass.
     last_label_rects: std::collections::HashMap<u32, egui::Rect>,
+
+    /// Set by [`request_fit`](Self::request_fit); the next `ui()` fits the view and clears it.
+    fit_requested: bool,
 }
 
 impl Default for ChemStructEditor {
@@ -191,6 +194,7 @@ impl Default for ChemStructEditor {
             last_v_down: false,
             rotate_last_angle: None,
             last_label_rects: std::collections::HashMap::new(),
+            fit_requested: false,
         }
     }
 }
@@ -603,6 +607,48 @@ impl ChemStructEditor {
         ViewTransform::new(self.zoom, self.pan, center)
     }
 
+    /// Zoom and pan so the whole drawing — atoms, bonds, ring fills and atom labels — sits
+    /// centered on `canvas` (the rect [`ui`](Self::ui) draws into) with [`FitOptions::default`].
+    /// Does nothing when the molecule is empty. Labels are laid out with `ctx`'s fonts; before
+    /// the first frame, use [`request_fit`](Self::request_fit) instead.
+    ///
+    /// # Panics
+    ///
+    /// If `ctx` has never started a frame (egui creates its fonts then). Calling it during the
+    /// first frame, inside `run_ui`, is fine.
+    pub fn fit_view(&mut self, ctx: &egui::Context, canvas: egui::Rect) {
+        self.fit_view_with(ctx, canvas, FitOptions::default());
+    }
+
+    /// Fit the view (as [`fit_view`](Self::fit_view)) at the start of the next
+    /// [`ui`](Self::ui) call, on the canvas that frame draws into. Usable before any frame
+    /// has run and without knowing the canvas size, e.g. right after loading a drawing.
+    pub fn request_fit(&mut self) {
+        self.fit_requested = true;
+    }
+
+    /// [`fit_view`](Self::fit_view) with a chosen margin, zoom range, or zoom kept as is.
+    ///
+    /// # Panics
+    ///
+    /// If `ctx` has never started a frame, as for [`fit_view`](Self::fit_view).
+    pub fn fit_view_with(&mut self, ctx: &egui::Context, canvas: egui::Rect, opts: FitOptions) {
+        self.fit_with_layout(canvas, opts, |job| ctx.fonts_mut(|f| f.layout_job(job)));
+    }
+
+    fn fit_with_layout(
+        &mut self,
+        canvas: egui::Rect,
+        opts: FitOptions,
+        layout: impl FnMut(egui::text::LayoutJob) -> std::sync::Arc<egui::Galley>,
+    ) {
+        let style = &self.config.style;
+        if let Some(v) = view::fit_transform(&self.molecule, style, canvas, self.zoom, opts, layout) {
+            self.zoom = v.zoom;
+            self.pan = v.pan;
+        }
+    }
+
     /// Zoom by `factor` about the screen point `anchor` (see [`ViewTransform::zoomed_about`]).
     fn zoom_about(&mut self, factor: f32, anchor: egui::Pos2, center: egui::Pos2) {
         let zoomed = self.view(center).zoomed_about(factor, anchor);
@@ -848,6 +894,12 @@ impl ChemStructEditor {
         );
         let center = rect.center();
         let painter = ui.painter_at(rect);
+
+        // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
+        // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
+        if std::mem::take(&mut self.fit_requested) {
+            self.fit_with_layout(rect, FitOptions::default(), |job| painter.layout_job(job));
+        }
 
         painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
 
@@ -1775,5 +1827,97 @@ mod view_tests {
         assert_eq!(editor.molecule.atoms.len(), 1, "no atom added");
         assert!(editor.molecule.bonds.is_empty(), "no bond added");
         assert_eq!(editor.undo_stack.len(), undo_len, "no undo snapshot");
+    }
+}
+
+/// `fit_view` frames the drawing the editor then actually paints.
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    /// A drawing far from the origin whose extremes are labels: H2N on the left, CO2Et on the
+    /// right, 45 units apart.
+    fn labeled_editor() -> ChemStructEditor {
+        let mut editor = ChemStructEditor::default();
+        let m = &mut editor.molecule;
+        for [(e1, p1), (e2, p2)] in [
+            [("N", [-20.0, 3.0]), ("C", [-18.5, 3.0])],
+            [("CO2Et", [25.0, 4.0]), ("C", [23.5, 4.0])],
+        ] {
+            let a = m.add_atom(e1.to_string(), p1, 0);
+            let b = m.add_atom(e2.to_string(), p2, 0);
+            m.add_bond(a, b, BondOrder::Single);
+        }
+        editor
+    }
+
+    /// Run one frame; returns the canvas rect the editor drew into.
+    fn frame(ctx: &egui::Context, editor: &mut ChemStructEditor) -> egui::Rect {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+        let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let mut canvas = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            canvas = ui.available_rect_before_wrap();
+            editor.ui(ui);
+        });
+        canvas
+    }
+
+    /// Every atom and every label rect painted in the last frame lies inside the margin, and
+    /// the drawing's bounding rect is centered on the canvas.
+    fn assert_framed(editor: &ChemStructEditor, canvas: egui::Rect) {
+        let avail = canvas.shrink(FitOptions::default().margin).expand(0.01);
+        let center = canvas.center();
+        let mut bounds = egui::Rect::NOTHING;
+        for a in &editor.molecule.atoms {
+            let p = editor.mol_to_screen(a.pos, center);
+            assert!(avail.contains(p), "atom {p:?} outside {avail:?}");
+            bounds.extend_with(p);
+        }
+        assert_eq!(editor.label_rects().len(), 2, "both labels painted");
+        for r in editor.label_rects().values() {
+            assert!(avail.contains_rect(*r), "label {r:?} outside {avail:?}");
+            bounds = bounds.union(*r);
+        }
+        let off = bounds.center() - center;
+        assert!(off.x.abs() <= 1.0 && off.y.abs() <= 1.0, "drawing center off by {off:?}");
+    }
+
+    #[test]
+    fn fit_view_frames_the_painted_drawing() {
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        let canvas = frame(&ctx, &mut editor);
+        editor.fit_view(&ctx, canvas);
+        assert!(editor.zoom < 1.0, "45 units do not fit 600 px at zoom 1");
+        assert_eq!(frame(&ctx, &mut editor), canvas);
+        assert_framed(&editor, canvas);
+
+        let (zoom, pan) = (editor.zoom, editor.pan);
+        editor.fit_view_with(&ctx, canvas, FitOptions { keep_zoom: true, ..Default::default() });
+        assert_eq!(editor.zoom, zoom, "keep_zoom keeps the zoom");
+        assert!((editor.pan - pan).length() < 1e-3, "an already fitted view stays put");
+
+        let mut empty =
+            ChemStructEditor { zoom: 2.0, pan: egui::vec2(5.0, 6.0), ..Default::default() };
+        empty.fit_view(&ctx, canvas);
+        assert_eq!((empty.zoom, empty.pan), (2.0, egui::vec2(5.0, 6.0)), "nothing to fit");
+    }
+
+    #[test]
+    fn request_fit_applies_on_the_next_frame_with_its_canvas_once() {
+        // A fresh context: no frame has run, so `fit_view` could not lay labels out yet.
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        editor.request_fit();
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "nothing until ui()");
+        let canvas = frame(&ctx, &mut editor);
+        assert_framed(&editor, canvas);
+
+        // The request is used up: a later pan stays.
+        editor.pan += egui::vec2(40.0, -25.0);
+        let pan = editor.pan;
+        frame(&ctx, &mut editor);
+        assert_eq!(editor.pan, pan);
     }
 }
