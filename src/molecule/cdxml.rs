@@ -418,6 +418,26 @@ mod tests {
         assert_eq!(node(&xml, c).1, "");
     }
 
+    /// "Ac" (acetyl) and "Ts" (tosyl) are labels in this editor, not actinium and tennessine.
+    #[test]
+    fn acetyl_and_tosyl_are_labels_not_elements() {
+        let mut mol = Molecule::default();
+        let n = mol.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let ac = mol.add_atom("Ac".to_string(), [1.3, 0.75], 0);
+        let ts = mol.add_atom("Ts".to_string(), [-1.3, 0.75], 0);
+        mol.add_bond(n, ac, BondOrder::Single);
+        mol.add_bond(n, ts, BondOrder::Single);
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        for (id, text) in [(ac, "Ac"), (ts, "Ts")] {
+            let (tag, inner) = node(&xml, id);
+            assert!(tag.contains("NodeType=\"Unspecified\""), "{text}: {tag}");
+            assert!(!tag.contains("Element="), "{text} is no element: {tag}");
+            assert!(!tag.contains("NumHydrogens="), "{text}: {tag}");
+            assert!(inner.contains(&format!(">{text}</s></t>")), "{text}: {inner}");
+        }
+    }
+
     #[test]
     fn label_text_is_escaped() {
         let mut mol = Molecule::default();
