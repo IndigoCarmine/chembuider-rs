@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod bond_menu;
 pub mod draw;
+pub mod fonts;
 pub mod interact;
 #[cfg(test)]
 mod keyboard_solver;

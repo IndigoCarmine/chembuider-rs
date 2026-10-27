@@ -342,46 +342,7 @@ pub(crate) fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
 /// Markup for `rich` as someone would type it: a one-character script without braces
 /// (`CO_2Et`, `NH_4^+`), longer ones braced.
 pub(crate) fn compact_markup(rich: &RichText) -> String {
-    let mut out = String::new();
-    let (mut bold, mut italic) = (false, false);
-    let reserved = |c: char| matches!(c, '\\' | '*' | '/' | '^' | '_' | '{' | '}');
-    for span in rich.spans.iter().filter(|s| !s.text.is_empty()) {
-        if span.style.bold != bold {
-            out.push_str("**");
-            bold = span.style.bold;
-        }
-        if span.style.italic != italic {
-            out.push_str("//");
-            italic = span.style.italic;
-        }
-        let escaped: String = span.text.chars().flat_map(|c| if reserved(c) { vec!['\\', c] } else { vec![c] }).collect();
-        let marker = match span.style.script {
-            Script::Normal => None,
-            Script::Sub => Some('_'),
-            Script::Super => Some('^'),
-        };
-        let mut chars = span.text.chars();
-        match (marker, chars.next(), chars.next()) {
-            (None, _, _) => out.push_str(&escaped),
-            (Some(m), Some(c), None) if !c.is_whitespace() => {
-                out.push(m);
-                out.push_str(&escaped);
-            }
-            (Some(m), _, _) => {
-                out.push(m);
-                out.push('{');
-                out.push_str(&escaped);
-                out.push('}');
-            }
-        }
-    }
-    if bold {
-        out.push_str("**");
-    }
-    if italic {
-        out.push_str("//");
-    }
-    out
+    rich.to_compact_markup()
 }
 
 /// The structures of `mol` as fragments (one per connected structure), with ids from `next`.

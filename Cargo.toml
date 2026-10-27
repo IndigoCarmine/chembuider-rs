@@ -25,6 +25,10 @@ serde_json = "1"
 # ChemDraw CDXML (and the CDX object model) without its renderer/viewer.
 cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "e98de81a15c41ab4b6edb001de97956088b6f3f7", default-features = false }
 
+# System fonts for named fonts in rich text (font lists, font data for egui and the exports).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fontdb = "0.23"
+
 # Only the example host app needs a windowing backend / file dialogs.
 # Native: glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12
 # layer fails to build against current `windows` crate versions on this toolchain.

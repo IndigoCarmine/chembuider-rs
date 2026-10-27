@@ -351,6 +351,7 @@ dependencies = [
  "clipboard-win",
  "eframe",
  "egui",
+ "fontdb",
  "interprocess",
  "js-sys",
  "log",
