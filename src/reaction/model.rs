@@ -292,8 +292,9 @@ pub enum StructureRole {
 ///
 /// The [`set_scheme_structure`] / [`sync_structures_from_scheme`] methods carry the change
 /// from the scheme into the linked [`Analysis`] column so the table redraws in step; the bulk
-/// sync also unlinks columns whose structure left the scheme and puts the linked columns back
-/// in scheme order.
+/// sync also unlinks columns whose structure left the scheme, turns a column whose structure
+/// crossed the arrow into a column of the other kind (Reactant ↔ Product), and puts the linked
+/// columns back in scheme order.
 ///
 /// [`structure_role`]: Reaction::structure_role
 /// [`set_scheme_structure`]: Reaction::set_scheme_structure
@@ -487,31 +488,85 @@ impl Reaction {
     ///   scheme order (item by item, an arrow's above band before its below band), so the
     ///   table reads like the scheme again after a reorder. Unlinked columns keep their
     ///   positions. A column moves whole, so its limiting flag, masses and equivalents stay
-    ///   with its compound.
+    ///   with its compound;
+    /// * a linked column whose structure now sits on the **other side of the arrow** is
+    ///   converted, Reactant ↔ Product (see below).
+    ///
+    /// **Crossing the arrow.** A structure's side is where it is drawn now: a main-line
+    /// structure before the first arrow is a reactant, one after it a product, and a structure
+    /// on an arrow band is a reagent, so a reactant — the same split [`Reaction::new`] links by.
+    /// With no arrow at all, every structure is a reactant. Dragging a structure across the
+    /// arrow, moving the arrow past structures or removing the arrow can therefore leave a
+    /// linked column on the wrong side; it is then converted:
+    ///
+    /// * carried over: molecule, name, coefficient, equivalents and the [`StructureId`] link;
+    /// * dropped: whatever the other side has no field for — a reactant's limiting flag,
+    ///   sample mass, percent weight, molarity, density and volume, or a product's percent
+    ///   completion, measured mass and purity. A converted limiting reagent leaves the
+    ///   reaction **without** a limiting reagent (no neighbour is promoted, as with
+    ///   [`Analysis::remove_reactant`]); a product turned into a reactant is not limiting;
+    /// * dropped values are not brought back if the structure later crosses back;
+    /// * the converted column joins its new side right after that side's last linked column
+    ///   still drawn (at the front when there is none), then takes its scheme-order place
+    ///   among the linked columns like any other. Unlinked columns keep their relative order.
     ///
     /// A structure added straight to the scheme gets no column, and an unchanged figure is
     /// left exactly as it was.
     pub fn sync_structures_from_scheme(&mut self) {
-        // Every drawn structure, in scheme order. A cloned structure keeps its id, so one id
-        // can be drawn twice; its first appearance decides where its column goes.
-        let mut drawn: Vec<(StructureId, &Molecule)> = Vec::new();
+        // Every drawn structure, in scheme order, with the side it is drawn on. A cloned
+        // structure keeps its id, so one id can be drawn twice; its first appearance decides
+        // where its column goes.
+        let mut drawn: Vec<(StructureId, &Molecule, Side)> = Vec::new();
+        let mut line_side = Side::Reactant;
         for item in &self.scheme.items {
             let labels = match item {
-                SchemeItem::Structure(s) => [Some(s), None],
-                SchemeItem::Arrow(a) => [band_structure(&a.above), band_structure(&a.below)],
+                SchemeItem::Structure(s) => [Some((s, line_side)), None],
+                SchemeItem::Arrow(a) => {
+                    line_side = Side::Product;
+                    [
+                        band_structure(&a.above).map(|s| (s, Side::Reactant)),
+                        band_structure(&a.below).map(|s| (s, Side::Reactant)),
+                    ]
+                }
                 _ => [None, None],
             };
-            for s in labels.into_iter().flatten() {
-                if !drawn.iter().any(|(id, _)| *id == s.id()) {
-                    drawn.push((s.id(), s.molecule()));
+            for (s, side) in labels.into_iter().flatten() {
+                if !drawn.iter().any(|(id, _, _)| *id == s.id()) {
+                    drawn.push((s.id(), s.molecule(), side));
                 }
             }
         }
+        let side_of = |link: Option<StructureId>| {
+            let id = link?;
+            drawn.iter().find(|(d, _, _)| *d == id).map(|(_, _, side)| *side)
+        };
+
+        // Columns now on the wrong side of the arrow move across, converted.
+        let analysis = &mut self.analysis;
+        let (reactants, to_products): (Vec<_>, Vec<_>) = std::mem::take(&mut analysis.reactants)
+            .into_iter()
+            .partition(|r| side_of(r.structure) != Some(Side::Product));
+        let (products, to_reactants): (Vec<_>, Vec<_>) = std::mem::take(&mut analysis.products)
+            .into_iter()
+            .partition(|p| side_of(p.structure) != Some(Side::Reactant));
+        analysis.reactants = reactants;
+        analysis.products = products;
+        insert_after_last_linked(
+            &mut analysis.reactants,
+            |r| side_of(r.structure).is_some(),
+            to_reactants.into_iter().map(product_to_reactant),
+        );
+        insert_after_last_linked(
+            &mut analysis.products,
+            |p| side_of(p.structure).is_some(),
+            to_products.into_iter().map(reactant_to_product),
+        );
+
         // Each column's place in scheme order, re-deriving the linked ones and unlinking those
         // whose structure left the scheme.
         let rank = |link: &mut Option<StructureId>, molecule: &mut Molecule| -> Option<usize> {
             let id = (*link)?;
-            let found = drawn.iter().position(|(d, _)| *d == id);
+            let found = drawn.iter().position(|(d, _, _)| *d == id);
             match found {
                 Some(rank) => *molecule = drawn[rank].1.clone(),
                 None => *link = None,
@@ -519,11 +574,11 @@ impl Reaction {
             found
         };
         let reactant_ranks: Vec<_> =
-            self.analysis.reactants.iter_mut().map(|r| rank(&mut r.structure, &mut r.molecule)).collect();
+            analysis.reactants.iter_mut().map(|r| rank(&mut r.structure, &mut r.molecule)).collect();
         let product_ranks: Vec<_> =
-            self.analysis.products.iter_mut().map(|p| rank(&mut p.structure, &mut p.molecule)).collect();
-        reorder_linked(&mut self.analysis.reactants, &reactant_ranks);
-        reorder_linked(&mut self.analysis.products, &product_ranks);
+            analysis.products.iter_mut().map(|p| rank(&mut p.structure, &mut p.molecule)).collect();
+        reorder_linked(&mut analysis.reactants, &reactant_ranks);
+        reorder_linked(&mut analysis.products, &product_ranks);
     }
 
     // ── Arrow-label structures ↔ reactant columns ────────────────────────────
@@ -636,6 +691,50 @@ fn band_structure(label: &ArrowLabel) -> Option<&SchemeStructure> {
         ArrowLabel::Structure(s) => Some(s),
         _ => None,
     }
+}
+
+/// Which side of the arrow a drawn structure stands on; see
+/// [`Reaction::sync_structures_from_scheme`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Reactant,
+    Product,
+}
+
+/// A reactant column whose structure crossed to the product side. Keeps what a product column
+/// can hold (molecule, name, coefficient, equivalents, link); the reactant-only entries — the
+/// limiting flag among them — are dropped.
+fn reactant_to_product(r: Reactant) -> Product {
+    Product {
+        name: r.name,
+        coefficient: r.coefficient,
+        equivalents: r.equivalents,
+        structure: r.structure,
+        ..Product::new(r.molecule)
+    }
+}
+
+/// A product column whose structure crossed to the reactant side. Keeps what both column kinds
+/// share (molecule, name, coefficient, equivalents, link); it is not limiting.
+fn product_to_reactant(p: Product) -> Reactant {
+    Reactant {
+        name: p.name,
+        coefficient: p.coefficient,
+        equivalents: p.equivalents,
+        structure: p.structure,
+        ..Reactant::new(p.molecule)
+    }
+}
+
+/// Insert `incoming` right after the last column `is_linked` accepts (at the front when none
+/// does), keeping the order of both.
+fn insert_after_last_linked<T>(
+    columns: &mut Vec<T>,
+    is_linked: impl Fn(&T) -> bool,
+    incoming: impl IntoIterator<Item = T>,
+) {
+    let at = columns.iter().rposition(is_linked).map_or(0, |i| i + 1);
+    columns.splice(at..at, incoming);
 }
 
 /// Refill the positions of the linked columns (`ranks[i]` is `Some`) with those same columns
@@ -1314,5 +1413,145 @@ mod tests {
         reaction.sync_structures_from_scheme();
         assert_columns_follow_compounds(&reaction, ["C12H10", "CK2O3", "C6H6O", "CH3I"]);
         assert_links_by_id(&reaction);
+    }
+
+    // ── Crossing the arrow: Reactant ↔ Product (G-005) ───────────────────────
+
+    /// The column linked to `id`, which must exist.
+    fn linked(reaction: &Reaction, id: StructureId) -> StructureRole {
+        reaction.column_linked_to(id).expect("the structure still has a column")
+    }
+
+    /// Phenol (the limiting reagent) dragged past the arrow becomes a product column carrying
+    /// its molecule, name, coefficient, equivalents and id; the reaction is left without a
+    /// limiting reagent. Dragged back, it is a reactant again — not limiting, its weighed mass
+    /// not restored.
+    #[test]
+    fn a_structure_dragged_across_the_arrow_changes_column_kind() {
+        let mut reaction = id_fixture();
+        let phenol = line_id(&reaction, 0);
+        {
+            let r = &mut reaction.analysis.reactants[0];
+            r.name = Some("phenol".into());
+            r.coefficient = 2.0;
+            r.equivalents = Some(1.0);
+        }
+
+        // [+, MeI, →(biphenyl), anisole, phenol]
+        assert_eq!(reaction.scheme.move_item(0, 4), Some(4));
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["CK2O3", "CH3I", "C12H10"]);
+        assert_eq!(product_formulas(&reaction), ["C7H8O", "C6H6O", "C6H6"]);
+        assert_eq!(linked(&reaction, phenol), StructureRole::Product(1));
+        assert_eq!(reaction.structure_role(4), Some(StructureRole::Product(1)));
+        let p = &reaction.analysis.products[1];
+        assert_eq!(p.name.as_deref(), Some("phenol"));
+        assert_eq!((p.coefficient, p.equivalents), (2.0, Some(1.0)));
+        assert_eq!(p.measured_mass, None);
+        assert_eq!(reaction.analysis.limiting(), None, "the limiting reagent left the reactants");
+        // The other columns keep their own values.
+        assert_eq!(reaction.analysis.reactants[1].equivalents, Some(1.1));
+        assert_eq!(reaction.analysis.products[0].measured_mass, Some(Mass::grams(0.9)));
+        assert_links_by_id(&reaction);
+
+        // Back to the front: [phenol, +, MeI, →(biphenyl), anisole].
+        assert_eq!(reaction.scheme.move_item(4, -4), Some(0));
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["CK2O3", "C6H6O", "CH3I", "C12H10"]);
+        assert_eq!(product_formulas(&reaction), ["C7H8O", "C6H6"]);
+        assert_eq!(linked(&reaction, phenol), StructureRole::Reactant(1));
+        let r = &reaction.analysis.reactants[1];
+        assert_eq!(r.name.as_deref(), Some("phenol"));
+        assert_eq!((r.coefficient, r.equivalents), (2.0, Some(1.0)));
+        assert!(!r.limiting, "limiting is not restored");
+        assert_eq!(r.sample_mass, None, "the weighed mass dropped on crossing is not restored");
+        assert_eq!(reaction.analysis.limiting(), None);
+        assert_links_by_id(&reaction);
+    }
+
+    /// Moving the arrow to the front puts every main-line structure after it: phenol and MeI
+    /// become products; the biphenyl on the arrow band stays a reactant.
+    #[test]
+    fn moving_the_arrow_to_the_front_makes_line_structures_products() {
+        let mut reaction = id_fixture();
+        // [→(biphenyl), phenol, +, MeI, anisole]
+        assert_eq!(reaction.scheme.move_item(3, -3), Some(0));
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["CK2O3", "C12H10"]);
+        assert_eq!(product_formulas(&reaction), ["C6H6O", "CH3I", "C7H8O", "C6H6"]);
+        assert_eq!(reaction.analysis.limiting(), None);
+        let eq: Vec<_> = reaction.analysis.products.iter().map(|p| p.equivalents).collect();
+        assert_eq!(eq, [None, Some(1.1), None, None], "MeI's equivalents crossed with it");
+        let measured: Vec<_> = reaction.analysis.products.iter().map(|p| p.measured_mass).collect();
+        assert_eq!(measured, [None, None, Some(Mass::grams(0.9)), Some(Mass::milligrams(20.0))]);
+        let r = &reaction.analysis.reactants[1];
+        assert_eq!((r.equivalents, r.sample_mass), (Some(0.1), Some(Mass::milligrams(150.0))));
+        for i in [1, 3, 4] {
+            assert!(matches!(reaction.structure_role(i), Some(StructureRole::Product(_))));
+        }
+        assert_links_by_id(&reaction);
+    }
+
+    /// Removing the arrow leaves no product side: the anisole becomes a reactant column (its
+    /// measured mass dropped), the biphenyl that rode on the arrow is unlinked, and phenol
+    /// stays the limiting reagent.
+    #[test]
+    fn removing_the_arrow_makes_every_structure_a_reactant() {
+        let mut reaction = id_fixture();
+        let anisole = line_id(&reaction, 4);
+        // [phenol, +, MeI, anisole]
+        assert!(reaction.scheme.remove(3).is_some());
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "CH3I", "C7H8O", "C12H10"]);
+        assert_eq!(product_formulas(&reaction), ["C6H6"]);
+        assert_eq!(linked(&reaction, anisole), StructureRole::Reactant(3));
+        let a = &reaction.analysis;
+        assert!(!a.reactants[3].limiting);
+        assert_eq!(a.reactants[3].sample_mass, None);
+        assert_eq!(a.reactants[4].structure, None, "the biphenyl left with the arrow");
+        assert_eq!(a.reactants[4].sample_mass, Some(Mass::milligrams(150.0)));
+        assert_eq!(a.limiting(), Some(0));
+        assert_eq!(a.reactants[0].sample_mass, Some(Mass::grams(1.0)));
+        assert_eq!(a.products[0].measured_mass, Some(Mass::milligrams(20.0)));
+        for i in [0, 2, 3] {
+            assert!(matches!(reaction.structure_role(i), Some(StructureRole::Reactant(_))));
+        }
+    }
+
+    /// An arrow band is the reagent side: a reactant moved onto it is not converted and keeps
+    /// every value (the limiting flag too), while a product moved onto it becomes a reactant.
+    #[test]
+    fn arrow_bands_count_as_the_reactant_side() {
+        use crate::reaction::edit::move_line_structure_to_arrow_slot;
+        let mut reaction = id_fixture();
+        let phenol = line_id(&reaction, 0);
+        // [+, MeI, →(biphenyl / phenol), anisole]
+        assert_eq!(
+            move_line_structure_to_arrow_slot(&mut reaction.scheme, 0, 3, SchemePart::ArrowBelow),
+            Some(2)
+        );
+        reaction.sync_structures_from_scheme();
+        assert_eq!(linked(&reaction, phenol), StructureRole::Reactant(3));
+        let r = &reaction.analysis.reactants[3];
+        assert!(r.limiting);
+        assert_eq!(r.sample_mass, Some(Mass::grams(1.0)));
+        assert_eq!(reaction.analysis.limiting(), Some(3));
+        assert_eq!(product_formulas(&reaction), ["C7H8O", "C6H6"]);
+
+        // The anisole onto the band above, emptied by dropping the biphenyl (now unlinked).
+        let mut reaction = id_fixture();
+        let anisole = line_id(&reaction, 4);
+        let SchemeItem::Arrow(arrow) = &mut reaction.scheme.items[3] else { panic!("the arrow") };
+        arrow.above = ArrowLabel::Empty;
+        assert_eq!(
+            move_line_structure_to_arrow_slot(&mut reaction.scheme, 4, 3, SchemePart::ArrowAbove),
+            Some(3)
+        );
+        reaction.sync_structures_from_scheme();
+        assert_eq!(linked(&reaction, anisole), StructureRole::Reactant(3));
+        assert_eq!(reaction.arrow_structure_role(3, SchemePart::ArrowAbove), Some(StructureRole::Reactant(3)));
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "CH3I", "C7H8O", "C12H10"]);
+        assert_eq!(product_formulas(&reaction), ["C6H6"]);
+        assert_eq!(reaction.analysis.limiting(), Some(0));
     }
 }

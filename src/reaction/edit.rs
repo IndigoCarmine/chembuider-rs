@@ -3120,10 +3120,14 @@ mod tests {
         }
 
         // A good value is written, exactly as clicking away would write it.
+        //
+        // G-005 (I-070): the dragged anisole crosses the arrow, so its column turns into a
+        // reactant and takes the front; phenol's column — the one typed into — is reactant 1
+        // after the drag (this used to read reactant 0, when a column kept its kind).
         let sample_mass = CellRef::new(BlockKind::Reactants, 0, 4);
         let (reaction, editor, ctx) = type_then_drag(sample_mass, "2.5g");
         assert_eq!(
-            reaction.analysis.reactants[0].sample_mass.map(Mass::as_grams),
+            reaction.analysis.reactants[1].sample_mass.map(Mass::as_grams),
             Some(2.5),
             "the typed Sample Mass reached the analysis"
         );
@@ -3133,7 +3137,7 @@ mod tests {
 
         // A value that does not parse closes the box too, leaving the old value and saying why.
         let (reaction, editor, ctx) = type_then_drag(sample_mass, "two grams");
-        assert_eq!(reaction.analysis.reactants[0].sample_mass.map(Mass::as_grams), Some(1.0));
+        assert_eq!(reaction.analysis.reactants[1].sample_mass.map(Mass::as_grams), Some(1.0));
         assert!(editor.editing().is_none(), "a drag never leaves the box open behind it");
         assert_eq!(editor.error(), Some("not a number"));
         assert_eq!(ctx.memory(|m| m.focused()), None);
