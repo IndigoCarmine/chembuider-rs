@@ -28,7 +28,9 @@ pub enum Event {
 /// Where an open drawing came from and goes back to.
 enum Source {
     Office { sender: Sender, original: OleContent },
-    File(PathBuf),
+    /// `original` is the file's CDX as it was opened (`None` for a new file): each save merges
+    /// the drawing into it, as for ibisOffice, so what the editor cannot show stays in the file.
+    File { path: PathBuf, original: Option<Vec<u8>> },
 }
 
 struct Tab {
@@ -70,10 +72,17 @@ impl Tab {
         Tab { object, title, source, editor, sent, changed: None, unreadable, note, fit: true }
     }
 
+    /// A CDX file opened by hand.
+    fn open_file(path: PathBuf, ja: bool) -> Tab {
+        let bytes = std::fs::read(&path).ok();
+        let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Tab::new(0, title, Source::File { path, original: bytes.clone() }, bytes.as_deref(), ja)
+    }
+
     fn original_cdx(&self) -> Option<&[u8]> {
         match &self.source {
             Source::Office { original, .. } => original.stream(content::CONTENTS),
-            Source::File(_) => None,
+            Source::File { original, .. } => original.as_deref(),
         }
     }
 
@@ -94,7 +103,7 @@ impl Tab {
                 let content = content::with_cdx(original, cdx_bytes);
                 sender.send(&EditorMsg::Update { content, preview, size_emu: Some(size) }).map_err(|e| e.to_string())?;
             }
-            Source::File(path) => std::fs::write(path, cdx_bytes).map_err(|e| e.to_string())?,
+            Source::File { path, .. } => std::fs::write(path, cdx_bytes).map_err(|e| e.to_string())?,
         }
         self.sent = mol;
         Ok(())
@@ -187,11 +196,9 @@ impl OfficeApp {
         let ja = std::env::var("LANG").map(|l| l.starts_with("ja")).unwrap_or(false);
         let mut app = OfficeApp { tabs: Vec::new(), active: 0, events, ja, status: String::new(), office, script: std::env::var("CHEMBUILDER_OFFICE_TEST_SCRIPT").ok() };
         if let Some(path) = file {
-            let bytes = std::fs::read(&path).ok();
-            let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            app.tabs.push(Tab::new(0, title, Source::File(path), bytes.as_deref(), app.ja));
+            app.tabs.push(Tab::open_file(path, app.ja));
         } else if !office {
-            app.tabs.push(Tab::new(0, "untitled.cdx".into(), Source::File(PathBuf::from("untitled.cdx")), None, app.ja));
+            app.tabs.push(Tab::new(0, "untitled.cdx".into(), Source::File { path: PathBuf::from("untitled.cdx"), original: None }, None, app.ja));
         }
         app
     }
@@ -353,7 +360,7 @@ impl eframe::App for OfficeApp {
             };
             let what = match &tab.source {
                 Source::Office { .. } => sent_to,
-                Source::File(_) => saved_to,
+                Source::File { .. } => saved_to,
             };
             let text = [tab.unreadable.as_deref(), tab.note.as_deref(), Some(what), Some(self.status.as_str())]
                 .into_iter()
@@ -416,5 +423,43 @@ pub fn log(message: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("office.log")) {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let _ = writeln!(f, "{secs} {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::molecule::cdx_codec::{self, CdxObject};
+    use crate::BondOrder;
+
+    const OBJ_TEXT: u16 = 0x8006;
+    const PROP_CREATION_PROGRAM: u16 = 0x0003;
+
+    #[test]
+    fn saving_a_file_keeps_what_the_editor_does_not_show() {
+        // A ChemDraw drawing with a caption beside the structure.
+        let mut doc = cdx_codec::parse(include_bytes!("../../tests/fixtures/chemdraw26_benzene.cdx")).unwrap();
+        doc.children[0].children.push(CdxObject::new(OBJ_TEXT, 500));
+        assert!(doc.prop(PROP_CREATION_PROGRAM).is_some(), "ChemDraw names itself");
+        let original = cdx_codec::write(&doc);
+        let path = std::env::temp_dir().join(format!("chembuilder-office-file-{}.cdx", std::process::id()));
+        std::fs::write(&path, &original).unwrap();
+
+        let mut tab = Tab::open_file(path.clone(), false);
+        assert!(tab.note.is_some(), "the caption is announced as kept");
+        for added in 1..=2 {
+            let first = tab.editor.molecule.atoms[0].id;
+            let pos = tab.editor.molecule.atoms[0].pos;
+            let o = tab.editor.molecule.add_atom("O".to_string(), [pos[0] + added as f32, pos[1] - 1.5], 0);
+            tab.editor.molecule.add_bond(first, o, BondOrder::Single);
+            tab.flush().unwrap();
+
+            let saved = std::fs::read(&path).unwrap();
+            let import = cdx::read_cdx(&saved).unwrap();
+            assert_eq!(import.molecule.atoms.len(), 6 + added, "the structure is replaced, not doubled");
+            assert_eq!(import.other_objects, 1, "the caption stays");
+            assert_eq!(cdx_codec::parse(&saved).unwrap().prop(PROP_CREATION_PROGRAM), doc.prop(PROP_CREATION_PROGRAM));
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 }
