@@ -1062,6 +1062,146 @@ mod tests {
         }
     }
 
+    // ── characterization ───────────────────────────────────────────────────────
+
+    /// A deterministic pseudo-random structure: a random forest of up to two dozen atoms with a
+    /// few extra bonds closing rings, mixed elements, charges, bond orders, drawn and isotopic
+    /// hydrogens, unknown labels and stereo marks. Same LCG as [`shuffled_indices`], so a case
+    /// is reproducible from its seed alone.
+    fn random_molecule(seed: u64) -> Molecule {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut rand = move |n: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        const ELEMENTS: [&str; 20] = [
+            "C", "C", "C", "C", "C", "C", "N", "N", "O", "O", "S", "P", "F", "Cl", "Br", "Si",
+            "B", "H", "D", "Xx",
+        ];
+        const STEREO: [BondStereo; 6] = [
+            BondStereo::None,
+            BondStereo::WedgeUp,
+            BondStereo::WedgeDown,
+            BondStereo::Bold,
+            BondStereo::Dashed,
+            BondStereo::Wavy,
+        ];
+
+        let mut m = Molecule::default();
+        let n = 1 + rand(24) as usize;
+        let ids: Vec<u32> = (0..n)
+            .map(|k| {
+                let element = ELEMENTS[rand(ELEMENTS.len() as u64) as usize].to_string();
+                let charge = match rand(20) {
+                    0 => 1,
+                    1 => -1,
+                    2 => 2,
+                    _ => 0,
+                };
+                let id = m.add_atom(element, [k as f32, 0.0], charge);
+                if rand(2) == 0 {
+                    m.atom_by_id_mut(id).expect("just added").group_h = true;
+                }
+                id
+            })
+            .collect();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for k in 1..n {
+            if rand(12) != 0 {
+                pairs.push((k, rand(k as u64) as usize));
+            }
+        }
+        for _ in 0..rand(5) {
+            pairs.push((rand(n as u64) as usize, rand(n as u64) as usize));
+        }
+        for (i, j) in pairs {
+            if i == j {
+                continue;
+            }
+            let order = match rand(10) {
+                0..=6 => BondOrder::Single,
+                7 | 8 => BondOrder::Double,
+                _ => BondOrder::Triple,
+            };
+            let b = m.add_bond(ids[i], ids[j], order);
+            if let Some(bond) = m.bond_by_id_mut(b) {
+                bond.stereo = STEREO[rand(STEREO.len() as u64) as usize].clone();
+            }
+        }
+        m
+    }
+
+    /// `n` carbons, bonded `i`–`i+1`, and back to the first when `ring`.
+    fn carbon_path(n: usize, ring: bool) -> Molecule {
+        let mut bonds: Vec<(usize, usize, BondOrder)> =
+            (1..n).map(|k| (k - 1, k, BondOrder::Single)).collect();
+        if ring && n > 2 {
+            bonds.push((n - 1, 0, BondOrder::Single));
+        }
+        mol(&vec![("C", 0); n], &bonds)
+    }
+
+    /// Every structure whose output [`output_is_pinned_across_many_structures`] holds fixed.
+    fn characterization_cases() -> Vec<(String, Molecule)> {
+        let mut cases: Vec<(String, Molecule)> = all_fixtures()
+            .into_iter()
+            .map(|(name, m)| (format!("fixture:{name}"), m))
+            .collect();
+        for n in [1, 2, 3, 5, 8, 13, 40, 200] {
+            cases.push((format!("chain:{n}"), carbon_path(n, false)));
+        }
+        for n in [3, 4, 5, 6, 7, 12, 30, 100] {
+            cases.push((format!("ring:{n}"), carbon_path(n, true)));
+        }
+        for k in 0..=4 {
+            let atoms = [("N", 0), ("C", 0), ("O", 0), ("Cl", 0), ("C", 0)];
+            let bonds: Vec<_> = (1..=k).map(|j| (0, j, BondOrder::Single)).collect();
+            cases.push((format!("star:{k}"), mol(&atoms[..=k], &bonds)));
+        }
+        // Complete graphs: every DFS is a Hamiltonian path, so K_n costs n! traversals and K9
+        // (362 880) runs out of the budget — which pins where the budget cuts the search off.
+        for n in 4..=9 {
+            let bonds: Vec<_> = (0..n)
+                .flat_map(|i| ((i + 1)..n).map(move |j| (i, j, BondOrder::Single)))
+                .collect();
+            cases.push((format!("complete:{n}"), mol(&vec![("C", 0); n], &bonds)));
+        }
+        for seed in 0..150u64 {
+            cases.push((format!("random:{seed}"), random_molecule(seed)));
+        }
+        cases
+    }
+
+    fn characterization_line(name: &str, m: &Molecule) -> String {
+        let g = generate(m);
+        format!("{name}\t{}\t{}\t{}", g.traversals, g.exhausted, g.smiles)
+    }
+
+    /// The exact output — and the traversal count and budget flag, which pin the search order
+    /// and its pruning — for every fixture, a set of chains, rings, stars and complete graphs,
+    /// and a seeded batch of random structures. The expected lines were produced by the
+    /// recursive writer before it was made iterative; regenerate them with
+    /// `cargo test --lib smiles::tests::dump_characterization -- --ignored --nocapture` only
+    /// when the canonical form is meant to change.
+    #[test]
+    fn output_is_pinned_across_many_structures() {
+        let expected = include_str!("smiles/characterization.txt");
+        let cases = characterization_cases();
+        let want: Vec<&str> = expected.lines().collect();
+        assert_eq!(want.len(), cases.len(), "characterization.txt is out of step with the cases");
+        for ((name, m), want) in cases.iter().zip(want) {
+            assert_eq!(characterization_line(name, m), want, "{name}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_characterization() {
+        for (name, m) in characterization_cases() {
+            println!("{}", characterization_line(&name, &m));
+        }
+    }
+
     /// Representative structures, pinned exactly. Kekulé aromatics, a charge, a salt, a
     /// hypervalent sulfur and a fused bicycle — the strings a reader can check against any
     /// toolkit.
