@@ -105,6 +105,11 @@ impl Tab {
         }
     }
 
+    /// What becomes of an edit, for the status bar.
+    fn edits_status(&self, ja: bool) -> &'static str {
+        edits_status(matches!(self.source, Source::Office { .. }), self.unreadable.is_some(), ja)
+    }
+
     /// The drawing as it is now, sent back (to ibisOffice, or written to its file).
     fn flush(&mut self) -> Result<(), String> {
         self.changed = None;
@@ -308,6 +313,22 @@ impl OfficeApp {
     }
 }
 
+/// What the status bar says becomes of an edit to an object from ibisOffice (`to_office`) or
+/// to a file. An unreadable drawing can still be drawn on, but its edits are never sent or
+/// written (see [`Tab::flush`]) and are lost with the tab, so it must not say they are kept.
+fn edits_status(to_office: bool, unreadable: bool, ja: bool) -> &'static str {
+    match (to_office, unreadable, ja) {
+        (true, false, true) => "編集は自動的に反映されます",
+        (true, false, false) => "Edits are sent back automatically",
+        (true, true, true) => "編集は反映されません",
+        (true, true, false) => "Edits are not sent back",
+        (false, false, true) => "編集は自動的に保存されます",
+        (false, false, false) => "Edits are saved automatically",
+        (false, true, true) => "編集は保存されません",
+        (false, true, false) => "Edits are not saved",
+    }
+}
+
 /// Pan the view so the drawing is in the middle.
 fn fit(editor: &mut ChemStructEditor) {
     let n = editor.molecule.atoms.len() as f32;
@@ -371,17 +392,12 @@ impl eframe::App for OfficeApp {
             return;
         }
 
-        let sent_to = self.t("編集は自動的に反映されます", "Edits are sent back automatically");
-        let saved_to = self.t("編集は自動的に保存されます", "Edits are saved automatically");
         egui::Panel::bottom("status").show(ui, |ui| {
             let Some(tab) = self.tabs.get(self.active) else {
                 ui.label(&self.status);
                 return;
             };
-            let what = match &tab.source {
-                Source::Office { .. } => sent_to,
-                Source::File { .. } => saved_to,
-            };
+            let what = tab.edits_status(self.ja);
             let text = [tab.unreadable.as_deref(), tab.note.as_deref(), Some(what), Some(self.status.as_str())]
                 .into_iter()
                 .flatten()
@@ -516,6 +532,30 @@ mod tests {
         add_oxygen(&mut tab);
         assert_eq!(tab.flush(), Ok(()), "nothing is written");
         assert!(path.is_dir(), "what was there is left alone");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_says_its_edits_are_not_saved() {
+        let dir = TempDir::new("unreadable-status");
+        let path = dir.0.join("drawing.cdx");
+        std::fs::create_dir(&path).unwrap();
+
+        let tab = Tab::open_file(path, false);
+        assert!(tab.unreadable.is_some());
+        assert_eq!(tab.edits_status(false), "Edits are not saved");
+        assert_eq!(tab.edits_status(true), "編集は保存されません");
+
+        // One that can be read still says its edits are saved.
+        let readable = Tab::open_file(dir.0.join("new.cdx"), false);
+        assert_eq!(readable.edits_status(false), "Edits are saved automatically");
+    }
+
+    #[test]
+    fn an_office_object_that_cannot_be_read_says_its_edits_are_not_sent_back() {
+        // A tab for ibisOffice needs its connection, so the wording is checked on its own.
+        assert_eq!(edits_status(true, true, false), "Edits are not sent back");
+        assert_eq!(edits_status(true, true, true), "編集は反映されません");
+        assert_eq!(edits_status(true, false, false), "Edits are sent back automatically");
     }
 
     #[test]
