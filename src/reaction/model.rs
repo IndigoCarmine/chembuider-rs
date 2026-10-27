@@ -375,14 +375,13 @@ impl Reaction {
     /// when the item is not a structure.
     ///
     /// This is the structure-editing counterpart of typing into a table cell: both leave the
-    /// figure re-derivable from what is drawn.
+    /// figure re-derivable from what is drawn. The structure is redrawn, not swapped for a new
+    /// one, so it keeps its [`StructureId`](super::scheme::StructureId).
     pub fn set_scheme_structure(&mut self, scheme_index: usize, molecule: Molecule) -> bool {
-        match self.scheme.items.get_mut(scheme_index) {
-            Some(item) if matches!(item, SchemeItem::Structure(_)) => {
-                *item = SchemeItem::Structure(molecule.into());
-            }
-            _ => return false,
-        }
+        let Some(SchemeItem::Structure(structure)) = self.scheme.items.get_mut(scheme_index) else {
+            return false;
+        };
+        *structure.molecule_mut() = molecule;
         self.sync_structure_from_scheme(scheme_index);
         true
     }
@@ -481,7 +480,8 @@ impl Reaction {
 
     /// Put a structure on an arrow's above/below band and carry it into the reactant column it
     /// stands for, so the table's formula, MW and stoichiometry follow — the arrow-label
-    /// counterpart of [`set_scheme_structure`](Reaction::set_scheme_structure).
+    /// counterpart of [`set_scheme_structure`](Reaction::set_scheme_structure). A structure
+    /// already on the band is redrawn and keeps its id; see [`super::edit::set_scheme_arrow_structure`].
     ///
     /// Returns `false` (changing nothing) when the item is not an arrow or the part is not a
     /// band. Placing a structure can shift the ordinal of later arrow reagents, so this does a
