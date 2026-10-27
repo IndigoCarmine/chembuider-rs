@@ -145,6 +145,41 @@ impl Fragment {
         Ok(())
     }
 
+    /// Check that `name` can be used as is for the file `fragments/<name>.json` on every
+    /// platform, so the file lands inside `fragments/` and nowhere else.
+    ///
+    /// The name is user data (typed into the editor, or the `"name"` field of a shared fragment
+    /// JSON), and the code that saves fragments builds their path from it. Refused: the empty
+    /// name; path separators (`/`, `\`), `:` (a Windows drive or stream) and `..`; control
+    /// characters; a trailing `.` or whitespace (Windows drops them, so the file would not be
+    /// the one named); and the Windows device names `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+    /// `LPT1`–`LPT9`, also with an extension (`NUL.x`), in any case.
+    ///
+    /// Every place that writes `fragments/<name>.json` calls this first, and fragments whose
+    /// name fails it are skipped when loading.
+    pub fn validate_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("fragment name is empty".into());
+        }
+        if let Some(c) = name.chars().find(|&c| matches!(c, '/' | '\\' | ':') || c.is_control()) {
+            return Err(format!("fragment name {name:?} contains {c:?}, which is not allowed in a file name"));
+        }
+        if name.contains("..") {
+            return Err(format!("fragment name {name:?} contains \"..\""));
+        }
+        if name.ends_with(|c: char| c == '.' || c.is_whitespace()) {
+            return Err(format!("fragment name {name:?} ends with a dot or whitespace"));
+        }
+        let device = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+        let numbered = |prefix: &str| {
+            device.strip_prefix(prefix).is_some_and(|d| matches!(d.as_bytes(), [b'1'..=b'9']))
+        };
+        if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT") {
+            return Err(format!("fragment name {name:?} is a reserved device name on Windows"));
+        }
+        Ok(())
+    }
+
     /// Parse a fragment from its JSON representation (the on-disk `fragments/<name>.json` format).
     /// A fragment that parses but fails [`Fragment::validate`] is an error.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
@@ -341,5 +376,46 @@ mod tests {
             }
         }
         assert!(count > 0, "no fragments found in {dir:?}");
+    }
+
+    #[test]
+    fn validate_name_refuses_names_that_are_not_a_plain_file_name() {
+        let bad = [
+            "", "../evil", "..", "a..b", "a/b", "/abs", "a\\b", "C:x", "x:stream", "tab\there",
+            "nl\n", "nul\0", "trailing.", "trailing ", "trailing\t", "CON", "con", "Prn", "AUX",
+            "NUL", "NUL.x", "nul.tar.gz", "CON .x", "COM1", "com9", "LPT1", "lpt9.json",
+        ];
+        for name in bad {
+            assert!(Fragment::validate_name(name).is_err(), "{name:?} must be refused");
+        }
+        let good = [
+            "OH", "CO2Me", "C12H25", "benzene", "ring6", "my group", "N-Boc", "a.b", "COM",
+            "COM0", "COM10", "LPT", "CONx", "Nul2", ".hidden", "Ph",
+        ];
+        for name in good {
+            assert!(Fragment::validate_name(name).is_ok(), "{name:?} must be accepted");
+        }
+    }
+
+    /// Every fragment the crate ships (and the parametric ones it builds) has a name that the
+    /// savers accept, so saving the config never refuses a built-in.
+    #[test]
+    fn every_shipped_fragment_name_is_a_valid_file_name() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut count = 0;
+        for dir in ["assets/fragments", "fragments"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|x| x == "json") {
+                    let frag = Fragment::load(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                    Fragment::validate_name(&frag.name).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 0, "no fragments found");
+        for frag in [Fragment::ring(3), Fragment::ring(12), Fragment::benzene(), Fragment::chain(4), Fragment::zigzag(4)] {
+            Fragment::validate_name(&frag.name).unwrap_or_else(|e| panic!("{e}"));
+        }
     }
 }
