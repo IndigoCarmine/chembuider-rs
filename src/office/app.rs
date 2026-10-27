@@ -5,7 +5,6 @@ use super::content;
 use super::message::{EditorMsg, HostMsg, OleContent};
 use super::session::{self, Args, Sender};
 use crate::molecule::cdx;
-use crate::widget::SCALE_FACTOR;
 use crate::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -53,14 +52,15 @@ struct Tab {
     /// The file was changed by another program since it was opened or last saved here: it is
     /// no longer written, so that change is not lost.
     changed_outside: bool,
-    /// The window pans to the drawing on its first frame.
-    fit: bool,
 }
 
 impl Tab {
     fn new(object: u64, title: String, source: Source, cdx_bytes: Option<&[u8]>, ja: bool) -> Tab {
         let mut editor = ChemStructEditor::default();
         editor.config = Config::load();
+        // The whole drawing in view (zoomed out if it is larger than the window) on the
+        // tab's first frame, whichever way the tab was opened.
+        editor.request_fit();
         let (mut unreadable, mut note) = (None, None);
         match cdx_bytes.map(cdx::read_cdx) {
             Some(Some(import)) => {
@@ -77,7 +77,7 @@ impl Tab {
             None => {}
         }
         let sent = editor.molecule.clone();
-        Tab { object, title, source, editor, sent, changed: None, unreadable, note, changed_outside: false, fit: true }
+        Tab { object, title, source, editor, sent, changed: None, unreadable, note, changed_outside: false }
     }
 
     /// A CDX file opened by hand.
@@ -361,17 +361,6 @@ fn edits_status(to_office: bool, unreadable: bool, ja: bool) -> &'static str {
     }
 }
 
-/// Pan the view so the drawing is in the middle.
-fn fit(editor: &mut ChemStructEditor) {
-    let n = editor.molecule.atoms.len() as f32;
-    if n == 0.0 {
-        return;
-    }
-    let cx = editor.molecule.atoms.iter().map(|a| a.pos[0]).sum::<f32>() / n;
-    let cy = editor.molecule.atoms.iter().map(|a| a.pos[1]).sum::<f32>() / n;
-    editor.pan = egui::vec2(-cx * SCALE_FACTOR * editor.zoom, -cy * SCALE_FACTOR * editor.zoom);
-}
-
 /// The interop tests' edit: one carbon added beside the drawing.
 fn run_script(script: &str, tab: &mut Tab) {
     if script == "add-atom" {
@@ -446,10 +435,6 @@ impl eframe::App for OfficeApp {
         let pressed = ctx.input(|i| i.pointer.any_down());
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else { return };
-            if tab.fit {
-                fit(&mut tab.editor);
-                tab.fit = false;
-            }
             // Each edit starts the wait again, so a gesture goes back as one change.
             if tab.editor.ui(ui) {
                 tab.changed = Some(Instant::now());
@@ -652,5 +637,80 @@ mod tests {
         tab.flush().unwrap();
         let saved = cdx::read_cdx(&std::fs::read(dir.0.join(UNTITLED)).unwrap()).unwrap();
         assert_eq!(saved.molecule.atoms.len(), 7, "the edit goes onto the earlier drawing");
+    }
+
+    /// A chain far wider than the window at zoom 1, as ChemDraw CDX.
+    fn wide_cdx() -> Vec<u8> {
+        let mut mol = Molecule::default();
+        let mut prev = None;
+        for i in 0..40 {
+            let a = mol.add_atom("C".to_string(), [i as f32 * 1.5, if i % 2 == 0 { 0.0 } else { 0.75 }], 0);
+            if let Some(p) = prev {
+                mol.add_bond(p, a, BondOrder::Single);
+            }
+            prev = Some(a);
+        }
+        cdx::molecule_to_cdx_document(&mol)
+    }
+
+    /// The tab's first frame, drawn as the window's central panel draws it; the canvas it used.
+    fn first_frame(ctx: &egui::Context, tab: &mut Tab) -> egui::Rect {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+        let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let mut canvas = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            canvas = ui.available_rect_before_wrap();
+            tab.editor.ui(ui);
+        });
+        canvas
+    }
+
+    /// The whole drawing is on the canvas after the tab's first frame, zoomed out to get there.
+    fn assert_whole_drawing_shown(tab: &mut Tab) {
+        let ctx = egui::Context::default();
+        let canvas = first_frame(&ctx, tab);
+        let ed = &tab.editor;
+        assert_eq!(ed.molecule.atoms.len(), 40, "the drawing was read");
+        assert!(ed.zoom < 1.0, "a drawing wider than the window is zoomed out, not only panned");
+        for a in &ed.molecule.atoms {
+            let p = ed.mol_to_screen(a.pos, canvas.center());
+            assert!(canvas.contains(p), "atom at {p:?} outside the canvas {canvas:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_opens_with_the_whole_drawing_in_view() {
+        let dir = TempDir::new("fit-file");
+        let path = dir.0.join("wide.cdx");
+        std::fs::write(&path, wide_cdx()).unwrap();
+        assert_whole_drawing_shown(&mut Tab::open_file(path, false));
+    }
+
+    #[test]
+    fn an_earlier_untitled_drawing_opens_with_the_whole_drawing_in_view() {
+        let dir = TempDir::new("fit-untitled");
+        std::fs::write(dir.0.join(UNTITLED), wide_cdx()).unwrap();
+        assert_whole_drawing_shown(&mut Tab::untitled(&dir.0, false));
+    }
+
+    #[test]
+    fn an_object_from_ibisoffice_opens_with_the_whole_drawing_in_view() {
+        use interprocess::local_socket::prelude::*;
+        use interprocess::local_socket::ListenerOptions;
+
+        // A host end for the object's connection, as ibisOffice has.
+        let name = format!("chembuilder-app-fit-{}", std::process::id());
+        let listener = ListenerOptions::new().name(session::socket_name(&name).unwrap()).create_sync().unwrap();
+        let args = Args { socket: name.clone(), token: String::new(), mode: session::Mode::Interactive };
+        let (_receiver, sender) = session::connect(&args).unwrap();
+        let _host = listener.accept().unwrap();
+
+        let (events, rx) = mpsc::channel();
+        let mut app = OfficeApp { tabs: Vec::new(), active: 0, events: rx, ja: false, status: String::new(), office: true, script: None };
+        let content = content::new_content(wide_cdx());
+        events.send(Event::Opened { object: 1, content, title: "wide".into(), locale: "en".into(), sender }).unwrap();
+        app.take_events(&egui::Context::default());
+        assert_eq!(app.tabs.len(), 1);
+        assert_whole_drawing_shown(&mut app.tabs[0]);
     }
 }
