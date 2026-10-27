@@ -937,8 +937,8 @@ mod tests {
         assert_eq!(a.products[0].structure, Some(line_id(&reaction, 2)));
     }
 
-    /// A column that already names a structure keeps it, and a structure some column already
-    /// names is not linked to a second column.
+    /// A column that already names a structure keeps it, even when the structure at its
+    /// position is a different one.
     #[test]
     fn new_keeps_existing_links() {
         let scheme = ReactionScheme::new()
@@ -969,5 +969,36 @@ mod tests {
         let phenol = line_id(&reaction, 0);
         assert!(a.reactants.iter().all(|r| r.structure != Some(phenol)));
         assert_eq!(a.products[0].structure, Some(line_id(&reaction, 4)));
+    }
+
+    /// A structure some column already names is not linked to a second column, even when the
+    /// column at its position is free.
+    #[test]
+    fn new_does_not_link_a_structure_twice() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::methyl_iodide())
+            .arrow(Arrow::new())
+            .structure(demo::anisole());
+        let SchemeItem::Structure(mei) = &scheme.items[2] else {
+            panic!("item 2 is the MeI structure");
+        };
+        let mei = mei.id();
+        // Column 0 already names the MeI drawn at item 2; column 1 — MeI's positional column —
+        // is unlinked.
+        let mut first = Reactant::new(demo::methyl_iodide());
+        first.structure = Some(mei);
+        let analysis = Analysis::new()
+            .reactant(first)
+            .reactant(Reactant::new(demo::phenol()))
+            .product(Product::new(demo::anisole()));
+        let reaction = Reaction::new(scheme, analysis);
+        let a = &reaction.analysis;
+        assert_eq!(a.reactants[0].structure, Some(mei));
+        assert_eq!(a.reactants[1].structure, None, "MeI is already named by column 0");
+        let naming_mei = a.reactants.iter().filter(|r| r.structure == Some(mei)).count()
+            + a.products.iter().filter(|p| p.structure == Some(mei)).count();
+        assert_eq!(naming_mei, 1, "MeI's id appears in exactly one column");
     }
 }
