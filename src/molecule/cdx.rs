@@ -18,7 +18,7 @@ use super::cdx_codec::{self, CdxObject};
 use super::{elements, BondOrder, BondStereo, Molecule};
 use crate::widget::draw;
 use crate::widget::rich_text::{RichSpan, RichText, Script, SpanStyle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Objects (kCDXObj_*).
 const OBJ_DOCUMENT: u16 = 0x8000;
@@ -53,6 +53,17 @@ const NODE_EXTERNAL_CONNECTION_POINT: i16 = 12;
 /// Label alignment (kCDXLabelAlignment_*): the first character on the atom, or the last.
 const ALIGN_LEFT: u8 = 1;
 const ALIGN_RIGHT: u8 = 3;
+
+/// The most nodes a document's structures may have, and the most bonds, for [`read_cdx`] to
+/// read it. The largest real drawings (a long polymer, a big reaction scheme in ChemDraw) have a
+/// few thousand atoms and bonds; these leave a margin of more than twenty times that. A CDX
+/// beyond them is no drawing to edit but bytes that would keep the reader, and an Office host
+/// waiting on a Render or Import, busy (a bare node and bond take about 30 bytes, so a pipe
+/// frame of 256 MiB could hold millions), and the editor's own work on a molecule (drawing,
+/// looking atoms and bonds up) is not made for such sizes either.
+const MAX_READ_ATOMS: usize = 100_000;
+/// See [`MAX_READ_ATOMS`].
+const MAX_READ_BONDS: usize = 100_000;
 
 /// ChemDraw's document style, as ChemDraw 26 writes it: bond length (14.4 pt), spacing and line
 /// widths, the label and caption styles (Arial 10 pt, formula face), the colour and font tables.
@@ -463,8 +474,13 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
 /// abbreviation, which ChemDraw keeps as a fragment inside its node).
 fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
     let mut atoms: HashMap<u32, u32> = HashMap::new();
-    // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own).
-    let mut hydrogens: Vec<(u32, usize)> = Vec::new();
+    // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own), with their position.
+    let mut hydrogens: Vec<(u32, [f32; 2], usize)> = Vec::new();
+    // The fragment's bonds so far (atom pair, lower id first) and the atoms they join. The atoms
+    // are new to `mol`, so no bond read before can join them: these are all a repeated bond
+    // can repeat, and looking them up here keeps reading linear in the fragment's size.
+    let mut bonds: HashSet<(u32, u32)> = HashSet::new();
+    let mut bonded: HashSet<u32> = HashSet::new();
     for node in frag.children.iter().filter(|c| c.tag == OBJ_NODE) {
         let node_type = node.prop_i16(PROP_NODE_TYPE).unwrap_or(NODE_ELEMENT);
         if node_type == NODE_EXTERNAL_CONNECTION_POINT {
@@ -506,12 +522,13 @@ fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
                 },
             },
         };
-        let atom = mol.add_atom(element, [x as f32, y as f32], charge);
+        let pos = [x as f32, y as f32];
+        let atom = mol.add_atom(element, pos, charge);
         atoms.insert(node.id, atom);
         if node_type == NODE_ELEMENT
             && let Some(h) = node.prop_int(PROP_ATOM_NUM_HYDROGENS).filter(|&h| h > 0)
         {
-            hydrogens.push((atom, h.min(8) as usize));
+            hydrogens.push((atom, pos, h.min(8) as usize));
         }
     }
     for bond in frag.children.iter().filter(|c| c.tag == OBJ_BOND) {
@@ -533,25 +550,42 @@ fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
             8 => (BondStereo::Wavy, a, b),
             _ => (BondStereo::None, a, b),
         };
-        let id = mol.add_bond(a, b, order);
-        if let Some(bond) = mol.bond_by_id_mut(id) {
-            bond.stereo = stereo;
+        // A bond given twice is one bond, the first, as `Molecule::add_bond` has it.
+        if bonds.insert((a.min(b), a.max(b))) {
+            mol.push_bond(a, b, order, stereo);
+            bonded.extend([a, b]);
         }
     }
     // An atom on its own shows no hydrogens here unless it has them: ChemDraw's NH4+ would
     // come back as N+. They are the label's (group) hydrogens, as an `n` key's NH2 has.
-    for (atom, count) in hydrogens {
-        if !mol.bonds_for_atom(atom).is_empty() {
+    for (atom, at, count) in hydrogens {
+        if bonded.contains(&atom) {
             continue;
         }
-        let at = mol.atom_by_id(atom).map(|a| a.pos).unwrap_or_default();
         for k in 0..count {
             let angle = k as f32 * std::f32::consts::TAU / count as f32;
-            let h = mol.add_atom("H".to_string(), [at[0] + angle.cos(), at[1] + angle.sin()], 0);
-            if let Some(hydrogen) = mol.atom_by_id_mut(h) {
-                hydrogen.group_h = true;
+            // A group's hydrogen (`group_h`), new and so not bonded yet.
+            let h = mol.add_fragment_atom("H".to_string(), [at[0] + angle.cos(), at[1] + angle.sin()], 0);
+            mol.push_bond(atom, h, BondOrder::Single, BondStereo::None);
+        }
+    }
+}
+
+/// Add up the nodes and bonds of `obj`'s structures, the ones [`read_container`] reads.
+fn count_structures(obj: &CdxObject, nodes: &mut usize, bonds: &mut usize) {
+    for child in &obj.children {
+        match child.tag {
+            OBJ_FRAGMENT => {
+                for c in &child.children {
+                    match c.tag {
+                        OBJ_NODE => *nodes += 1,
+                        OBJ_BOND => *bonds += 1,
+                        _ => {}
+                    }
+                }
             }
-            mol.add_bond(atom, h, BondOrder::Single);
+            OBJ_GROUP => count_structures(child, nodes, bonds),
+            _ => {}
         }
     }
 }
@@ -567,12 +601,21 @@ fn read_container(obj: &CdxObject, mol: &mut Molecule, others: &mut usize) {
 }
 
 /// The structures of a CDX document (empty when it has none), or `None` when the bytes are
-/// not CDX.
+/// not CDX, or its structures are larger than [`MAX_READ_ATOMS`] / [`MAX_READ_BONDS`] allow.
 pub fn read_cdx(bytes: &[u8]) -> Option<CdxImport> {
     let doc = cdx_codec::parse(bytes).filter(|d| d.tag == OBJ_DOCUMENT)?;
+    let pages = || doc.children.iter().filter(|c| c.tag == OBJ_PAGE);
+    let (mut nodes, mut bonds) = (0, 0);
+    for page in pages() {
+        count_structures(page, &mut nodes, &mut bonds);
+    }
+    // Checked before anything is built. Hydrogen counts add at most 8 atoms a node.
+    if nodes > MAX_READ_ATOMS || bonds > MAX_READ_BONDS {
+        return None;
+    }
     let mut molecule = Molecule::default();
     let mut other_objects = 0;
-    for page in doc.children.iter().filter(|c| c.tag == OBJ_PAGE) {
+    for page in pages() {
         read_container(page, &mut molecule, &mut other_objects);
     }
     Some(CdxImport { molecule, other_objects })
@@ -824,6 +867,58 @@ mod tests {
         all_ids(&doc, &mut ids);
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "no id is used twice");
+    }
+
+    /// A CDX document with one fragment per entry of `chains`: a chain of that many carbons,
+    /// each bonded to the next, plus every bond of the chain `repeats` more times.
+    fn chain_document(chains: &[usize], repeats: usize) -> Vec<u8> {
+        let mut next = 1;
+        let mut id = || {
+            next += 1;
+            next
+        };
+        let mut page = CdxObject::new(OBJ_PAGE, id());
+        for &n in chains {
+            let mut frag = CdxObject::new(OBJ_FRAGMENT, id());
+            let nodes: Vec<u32> = (0..n).map(|_| id()).collect();
+            for (k, &node) in nodes.iter().enumerate() {
+                let mut obj = CdxObject::new(OBJ_NODE, node);
+                obj.set(PROP_2D_POSITION, point(0.0, k as f64 * SCALE));
+                frag.children.push(obj);
+            }
+            for _ in 0..=repeats {
+                for pair in nodes.windows(2) {
+                    let mut bond = CdxObject::new(OBJ_BOND, id());
+                    bond.set(PROP_BOND_BEGIN, pair[0].to_le_bytes().to_vec());
+                    bond.set(PROP_BOND_END, pair[1].to_le_bytes().to_vec());
+                    frag.children.push(bond);
+                }
+            }
+            page.children.push(frag);
+        }
+        let mut doc = CdxObject::new(OBJ_DOCUMENT, 1);
+        doc.children.push(page);
+        cdx_codec::write(&doc)
+    }
+
+    #[test]
+    fn reads_a_chain_as_large_as_allowed_and_drops_repeated_bonds() {
+        let import = read_cdx(&chain_document(&[MAX_READ_ATOMS / 2], 1)).expect("within the limits");
+        assert_eq!(import.molecule.atoms.len(), MAX_READ_ATOMS / 2);
+        assert_eq!(import.molecule.bonds.len(), MAX_READ_ATOMS / 2 - 1, "a bond given twice is one bond");
+        let import = read_cdx(&chain_document(&[MAX_READ_ATOMS / 2, MAX_READ_ATOMS / 2], 0)).expect("within the limits");
+        assert_eq!(import.molecule.atoms.len(), MAX_READ_ATOMS);
+        assert_eq!(import.molecule.bonds.len(), MAX_READ_ATOMS - 2);
+    }
+
+    #[test]
+    fn refuses_documents_with_more_atoms_or_bonds_than_allowed() {
+        // In one fragment, and across fragments of one document.
+        assert!(read_cdx(&chain_document(&[MAX_READ_ATOMS + 1], 0)).is_none());
+        assert!(read_cdx(&chain_document(&[MAX_READ_ATOMS / 2 + 1, MAX_READ_ATOMS / 2], 0)).is_none());
+        // Bonds over the limit, even when they repeat bonds already there.
+        assert!(read_cdx(&chain_document(&[MAX_READ_BONDS / 2 + 2], 1)).is_none());
+        assert!(cdx_bytes_to_molecule(&chain_document(&[MAX_READ_ATOMS + 1], 0)).is_none());
     }
 
     #[test]

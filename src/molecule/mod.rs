@@ -179,8 +179,14 @@ impl Molecule {
         if self.bond_between(begin, end).is_some() {
             return 0;
         }
+        self.push_bond(begin, end, order, BondStereo::None)
+    }
+
+    /// Add a bond the caller knows is not there yet (a reader that tracks its own bonds, where
+    /// [`add_bond`](Self::add_bond)'s search through every bond would make reading quadratic).
+    fn push_bond(&mut self, begin: u32, end: u32, order: BondOrder, stereo: BondStereo) -> u32 {
         let id = self.alloc_id();
-        self.bonds.push(Bond { id, begin, end, order, stereo: BondStereo::None });
+        self.bonds.push(Bond { id, begin, end, order, stereo });
         id
     }
 
