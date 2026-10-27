@@ -396,10 +396,11 @@ fn collate(s: &str) -> Vec<u8> {
 
 /// Backtracking enumeration of every depth-first traversal of one component.
 ///
-/// The depth-first stack is explicit, so one call to [`Search::search`] performs exactly one
-/// *step* — choose a child, or finish an atom and hand control back to its parent — and
-/// backtracking is then ordinary recursion with an undo on the way out. A traversal is complete
-/// when the stack empties; its string is rendered and kept if it is the smallest so far.
+/// The depth-first stack is explicit, and so is the backtracking: a [`Step`] performs exactly
+/// one *step* — choose a child, or finish an atom and hand control back to its parent — and
+/// [`Search::search`] keeps the steps in progress on a stack of its own, undoing each one's
+/// choices on the way out. A traversal is complete when the depth-first stack empties; its
+/// string is rendered and kept if it is the smallest so far.
 struct Search<'a> {
     sk: &'a Skeleton,
     visited: Vec<bool>,
@@ -416,6 +417,20 @@ struct Search<'a> {
     best: Option<(Vec<u8>, String)>,
     traversals: usize,
     exhausted: bool,
+}
+
+/// One step of [`Search::search`] whose continuations are still being enumerated.
+struct Step {
+    /// The atom on top of the depth-first stack when the step began.
+    i: usize,
+    /// The ring closures the step classified, undone when it ends.
+    closed: Vec<(usize, usize)>,
+    /// `(bond, atom)` for every unvisited neighbour `i` can descend to, in the order they are
+    /// tried. Empty when `i` is finished.
+    candidates: Vec<(usize, usize)>,
+    /// How many of `candidates` have been descended into; for a finished atom, whether it has
+    /// been taken off the depth-first stack yet (0 or 1).
+    taken: usize,
 }
 
 impl<'a> Search<'a> {
@@ -469,10 +484,71 @@ impl<'a> Search<'a> {
         token[..k] > best[..k]
     }
 
+    /// Enumerate every traversal that continues from the current depth-first stack.
+    ///
+    /// Each [`Step`] is one level of what would naturally be a recursion — begin a step, try
+    /// each of its choices with the next step nested inside, undo on the way out — but the
+    /// levels live in `steps` on the heap. A traversal takes about two steps per atom, so as
+    /// call frames they would exhaust the thread's stack on a structure of a few thousand atoms.
     fn search(&mut self) {
+        let mut steps: Vec<Step> = Vec::new();
+        // Whether the next step, nested inside the innermost one in `steps`, is due to begin.
+        let mut descend = true;
+        loop {
+            if descend {
+                descend = false;
+                if let Some(step) = self.begin_step() {
+                    steps.push(step);
+                }
+            }
+            let Some(step) = steps.last_mut() else { return };
+            let i = step.i;
+
+            if step.candidates.is_empty() {
+                if step.taken == 0 {
+                    // `i` is finished: every one of its bonds is classified, so no later ring
+                    // closure can appear on it and it is safe to leave the stack for good.
+                    step.taken = 1;
+                    self.stack.pop();
+                    descend = true;
+                    continue;
+                }
+                self.stack.push(i);
+            } else {
+                if step.taken > 0 {
+                    let (b, j) = step.candidates[step.taken - 1];
+                    self.stack.pop();
+                    self.children[i].pop();
+                    self.visited[j] = false;
+                    self.used[b] = false;
+                }
+                if let Some(&(b, j)) = step.candidates.get(step.taken) {
+                    step.taken += 1;
+                    self.used[b] = true;
+                    self.visited[j] = true;
+                    self.children[i].push(b);
+                    self.stack.push(j);
+                    descend = true;
+                    continue;
+                }
+            }
+
+            for &(b, j) in step.closed.iter().rev() {
+                self.rings[j].pop();
+                self.rings[i].pop();
+                self.used[b] = false;
+            }
+            steps.pop();
+        }
+    }
+
+    /// Begin one step: stop if the budget is spent, record the traversal if the stack has
+    /// emptied, and otherwise classify the ring closures on the atom on top of the stack and
+    /// list the children it could descend to. `None` means the step is already over.
+    fn begin_step(&mut self) -> Option<Step> {
         if self.traversals >= TRAVERSAL_BUDGET {
             self.exhausted = true;
-            return;
+            return None;
         }
         let Some(&i) = self.stack.last() else {
             self.traversals += 1;
@@ -481,7 +557,7 @@ impl<'a> Search<'a> {
             if self.best.as_ref().is_none_or(|(b, _)| key < *b) {
                 self.best = Some((key, s));
             }
-            return;
+            return None;
         };
 
         let sk = self.sk;
@@ -513,31 +589,7 @@ impl<'a> Search<'a> {
             })
             .collect();
 
-        if candidates.is_empty() {
-            // `i` is finished: every one of its bonds is classified, so no later ring closure
-            // can appear on it and it is safe to leave the stack for good.
-            self.stack.pop();
-            self.search();
-            self.stack.push(i);
-        } else {
-            for (b, j) in candidates {
-                self.used[b] = true;
-                self.visited[j] = true;
-                self.children[i].push(b);
-                self.stack.push(j);
-                self.search();
-                self.stack.pop();
-                self.children[i].pop();
-                self.visited[j] = false;
-                self.used[b] = false;
-            }
-        }
-
-        for &(b, j) in closed.iter().rev() {
-            self.rings[j].pop();
-            self.rings[i].pop();
-            self.used[b] = false;
-        }
+        Some(Step { i, closed, candidates, taken: 0 })
     }
 
     fn render(&self) -> String {
