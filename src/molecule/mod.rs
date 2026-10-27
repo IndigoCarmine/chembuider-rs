@@ -187,12 +187,27 @@ impl Molecule {
     pub fn remove_atom(&mut self, id: u32) {
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
-        // A ring fill whose cycle lost an atom no longer describes a ring — drop it.
-        self.ring_fills.retain(|rf| !rf.atoms.contains(&id));
+        self.drop_broken_ring_fills();
     }
 
     pub fn remove_bond(&mut self, id: u32) {
         self.bonds.retain(|b| b.id != id);
+        self.drop_broken_ring_fills();
+    }
+
+    /// Drop every ring fill whose cycle is no longer closed. A fill describes a ring only while
+    /// all of its atoms exist and each consecutive pair (wrapping around) is still bonded;
+    /// once an atom or a ring bond is deleted the polygon would shade an open chain.
+    fn drop_broken_ring_fills(&mut self) {
+        let mut fills = std::mem::take(&mut self.ring_fills);
+        fills.retain(|rf| self.ring_is_closed(&rf.atoms));
+        self.ring_fills = fills;
+    }
+
+    fn ring_is_closed(&self, cycle: &[u32]) -> bool {
+        let n = cycle.len();
+        cycle.iter().all(|&id| self.atom_by_id(id).is_some())
+            && (0..n).all(|k| self.bond_between(cycle[k], cycle[(k + 1) % n]).is_some())
     }
 
     pub fn atom_by_id(&self, id: u32) -> Option<&Atom> {
@@ -830,5 +845,43 @@ mod tests {
         // Deleting a ring atom drops the now-meaningless fill.
         m.remove_atom(ids[0]);
         assert!(m.ring_fills.is_empty(), "a fill whose ring lost an atom is removed");
+    }
+
+    #[test]
+    fn removing_a_ring_bond_drops_the_fill_but_other_bonds_do_not() {
+        let (mut m, ids) = carbon_ring(6);
+        let sub = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        let sub_bond = m.add_bond(ids[0], sub, BondOrder::Single);
+        let ring = m.smallest_ring_containing(ids[0]).unwrap();
+        m.set_ring_fill(ring, [1, 2, 3, 4]);
+
+        // A bond that is not on the filled cycle leaves the ring intact.
+        m.remove_bond(sub_bond);
+        assert_eq!(m.ring_fills.len(), 1, "an unrelated bond's removal keeps the fill");
+
+        // Opening the ring leaves a chain: the fill no longer describes a ring.
+        let ring_bond = m.bond_between(ids[2], ids[3]).unwrap().id;
+        m.remove_bond(ring_bond);
+        assert!(m.ring_fills.is_empty(), "a fill whose ring lost a bond is removed");
+    }
+
+    #[test]
+    fn removing_a_bond_of_the_other_fused_ring_keeps_the_fill() {
+        // A cyclohexane fused to a cyclopropane on the ids[0]-ids[1] edge; only the
+        // six-membered ring is filled.
+        let (mut m, ids) = carbon_ring(6);
+        let bridge = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        let b0 = m.add_bond(ids[0], bridge, BondOrder::Single);
+        m.add_bond(ids[1], bridge, BondOrder::Single);
+        m.set_ring_fill(ids.clone(), [1, 2, 3, 4]);
+
+        // Breaking the three-membered ring does not touch the filled six-ring.
+        m.remove_bond(b0);
+        assert_eq!(m.ring_fills.len(), 1);
+
+        // Removing the shared edge does open the six-ring.
+        let shared = m.bond_between(ids[0], ids[1]).unwrap().id;
+        m.remove_bond(shared);
+        assert!(m.ring_fills.is_empty(), "the shared edge was on the filled cycle");
     }
 }
