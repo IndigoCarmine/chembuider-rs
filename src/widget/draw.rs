@@ -16,15 +16,10 @@ pub(crate) use scene::{
 /// [`SceneLabel`] so callers (the reaction figure, tests) keep the old type name.
 pub use scene::SceneLabel as AtomLabelLayout;
 
-/// The mapping from editor pan/zoom to the backend-neutral [`RenderTransform`]. Positions scale
-/// by `zoom * SCALE_FACTOR`; visual sizes (widths, font) scale by `zoom` alone — so at zoom = 1
-/// the editor and the image exporter (which uses `SCALE_FACTOR`, `visual_scale = 1`) agree exactly.
+/// The mapping from editor pan/zoom to the backend-neutral [`RenderTransform`], taken from the
+/// editor's [`ViewTransform`](super::ViewTransform) so drawing and hit-testing share one camera.
 fn editor_transform(editor: &ChemStructEditor, center: egui::Pos2) -> RenderTransform {
-    RenderTransform {
-        coord_scale: editor.zoom * super::SCALE_FACTOR,
-        offset: center.to_vec2() + editor.pan,
-        visual_scale: editor.zoom,
-    }
+    editor.view(center).render_transform()
 }
 
 /// Test-only window onto [`editor_transform`], so `widget::view_tests` can check that the
