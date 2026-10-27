@@ -110,6 +110,10 @@ Selected atoms can be nudged with `Shift`+arrows (or `Ctrl`+arrows) and rotated 
 `Alt`+arrows. The full, user-editable key map lives in
 [`assets/default_config.json`](assets/default_config.json).
 
+egui's default `zoom_with_keyboard` option also treats `Ctrl`+`0` as "reset GUI zoom", so if
+the GUI scale was changed with `Ctrl`+`+`/`-`, the same key resets it too. A host app can turn
+that off with `ctx.options_mut(|o| o.zoom_with_keyboard = false)`.
+
 ## Rich text labels
 
 Atom labels are drawn by a dedicated rich-text renderer (`widget::rich_text`) that lays each

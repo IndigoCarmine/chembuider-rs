@@ -108,6 +108,10 @@ impl eframe::App for MyApp {
 選択した原子は `Shift`+矢印（または `Ctrl`+矢印）で移動、`Alt`+矢印で回転できます。
 編集可能なキーマップの全体は [`assets/default_config.json`](assets/default_config.json) にあります。
 
+egui の既定の `zoom_with_keyboard` も `Ctrl`+`0` を「GUI の倍率を元に戻す」に使うため、`Ctrl`+`+`/`-` で
+GUI の倍率を変えていた場合は同時に元に戻ります。ホストアプリは
+`ctx.options_mut(|o| o.zoom_with_keyboard = false)` でこれを止められます。
+
 ## リッチテキストラベル
 
 原子ラベルは専用のリッチテキストレンダラ（`widget::rich_text`）で描画されます。スタイルごとの

@@ -1960,15 +1960,29 @@ mod fit_tests {
 
     #[test]
     fn ctrl_0_fits_the_view_in_the_same_frame_in_every_tool() {
+        // A hotspot gives the plain `0` shortcut (extend by one carbon) a target, so a Ctrl+0
+        // that leaked into the drawing shortcuts would add an atom.
+        let with_hotspot = |tool: Tool| {
+            let mut editor = ChemStructEditor { tool, ..labeled_editor() };
+            editor.hotspot_atom = Some(editor.molecule.atoms[1].id);
+            editor
+        };
+
+        // Control: with that hotspot, plain `0` does draw in the Bond tool.
+        let mut plain = with_hotspot(Tool::Bond);
+        let atoms = plain.molecule.atoms.len();
+        chord_frame(&egui::Context::default(), &mut plain, "0", None);
+        assert!(plain.molecule.atoms.len() > atoms, "plain `0` extends the hotspot");
+
         for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
             let ctx = egui::Context::default();
-            let mut editor = ChemStructEditor { tool: tool.clone(), ..labeled_editor() };
+            let mut editor = with_hotspot(tool.clone());
             let atoms = editor.molecule.atoms.len();
             let undo_len = editor.undo_stack.len();
             let canvas = chord_frame(&ctx, &mut editor, "Ctrl+0", None);
             assert!(editor.zoom < 1.0, "{tool:?}: Ctrl+0 zooms out to fit");
             assert_framed(&editor, canvas);
-            // Plain `0` draws (a carbon / a 10-ring); Ctrl+0 must not.
+            // Ctrl+0 only moves the view: it does not also run the plain `0` shortcut.
             assert_eq!(editor.molecule.atoms.len(), atoms, "{tool:?}: nothing drawn");
             assert_eq!(editor.undo_stack.len(), undo_len, "{tool:?}: no undo snapshot");
         }
