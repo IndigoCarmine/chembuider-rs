@@ -225,4 +225,4 @@ Pre-1.0 and evolving; the public API may change between minor versions.
 
 Copyright © 2026 IndigoCarmine.
 
-Licensed under the [GNU General Public License, version 2 or (at your option) any later version](LICENSE) (GPL-2.0-or-later).
+Licensed under the either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option (MIT OR Apache-2.0).

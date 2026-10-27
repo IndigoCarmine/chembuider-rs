@@ -223,4 +223,4 @@ assets/               デフォルト設定と組み込みフラグメント JSO
 
 Copyright © 2026 IndigoCarmine.
 
-[GNU General Public License バージョン 2、または（任意で）それ以降のバージョン](LICENSE)（GPL-2.0-or-later）の下でライセンスされています。
+[MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のどちらか好きな方（MIT OR Apache-2.0）の下でライセンスされています。

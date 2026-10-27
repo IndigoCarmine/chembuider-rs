@@ -3,7 +3,7 @@ name = "chembuider-rs"
 version = "0.4.2"
 edition = "2024"
 description = "An egui widget library for drawing and editing 2D chemical structure diagrams"
-license = "GPL-2.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "chembuider_rs"
@@ -23,7 +23,7 @@ egui = "0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # ChemDraw CDXML (and the CDX object model) without its renderer/viewer.
-cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "b29982e5ca67fdcaaff7961e3562a7e2387e0a04", default-features = false }
+cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "e98de81a15c41ab4b6edb001de97956088b6f3f7", default-features = false }
 
 # Only the example host app needs a windowing backend / file dialogs.
 # Native: glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12
