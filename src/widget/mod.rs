@@ -1,3 +1,4 @@
+pub mod bond_menu;
 pub mod draw;
 pub mod interact;
 #[cfg(test)]
@@ -13,7 +14,7 @@ pub mod view;
 pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
-use crate::molecule::{BondOrder, BondStereo, Molecule};
+use crate::molecule::{BondOrder, BondStereo, DoublePosition, Molecule};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
@@ -42,6 +43,8 @@ struct ClipBond {
     order: BondOrder,
     #[serde(default)]
     stereo: BondStereo,
+    #[serde(default)]
+    double_position: DoublePosition,
 }
 
 /// A ring fill on the clipboard: atom *indices* (positions within `ClipMol::atoms`, not ids,
@@ -167,6 +170,17 @@ pub struct ChemStructEditor {
 
     /// Set by [`request_fit`](Self::request_fit); the next `ui()` fits the view and clears it.
     fit_requested: bool,
+
+    /// The bond under the pointer when the canvas was last right-clicked: what the host's
+    /// context menu acts on. Kept until [`clear_context_bond`](Self::clear_context_bond).
+    context_bond: Option<u32>,
+}
+
+/// What [`ChemStructEditor::show`] hands back: the canvas response, for a host to attach a
+/// [`context_menu`](egui::Response::context_menu) to, and whether the molecule was modified.
+pub struct EditorResponse {
+    pub response: egui::Response,
+    pub modified: bool,
 }
 
 impl Default for ChemStructEditor {
@@ -202,6 +216,7 @@ impl Default for ChemStructEditor {
             rotate_last_angle: None,
             last_label_rects: std::collections::HashMap::new(),
             fit_requested: false,
+            context_bond: None,
         }
     }
 }
@@ -218,6 +233,70 @@ impl ChemStructEditor {
             self.undo_stack.push_back(self.molecule.clone());
             self.redo_stack.clear();
         }
+    }
+
+    /// The bond the canvas was right-clicked on, for the host's context menu. The pointer is
+    /// over the menu while it is open, so the hover cannot say this; read it inside the
+    /// [`context_menu`](egui::Response::context_menu) closure of [`show`](Self::show)'s response.
+    pub fn context_bond(&self) -> Option<u32> {
+        self.context_bond
+    }
+
+    /// Forget the context-menu bond (once the menu has closed).
+    pub fn clear_context_bond(&mut self) {
+        self.context_bond = None;
+    }
+
+    /// Give bond `bond_id` an order and line style in one undo step — what a ChemDraw-style
+    /// bond menu's "Single ▸ Hashed Wedged" or "Double" does. Raising the order consumes the
+    /// group hydrogens it leaves no room for, as the order keys do. A style is drawn only on a
+    /// single bond, so it is dropped for any higher order. Returns false when the bond does
+    /// not exist or already looks like this.
+    pub fn set_bond_type(&mut self, bond_id: u32, order: BondOrder, stereo: BondStereo) -> bool {
+        let stereo = if order == BondOrder::Single { stereo } else { BondStereo::None };
+        let Some(bond) = self.molecule.bond_by_id(bond_id) else { return false };
+        if bond.order == order && bond.stereo == stereo {
+            return false;
+        }
+        self.push_undo();
+        let Some(bond) = self.molecule.bond_by_id_mut(bond_id) else { return false };
+        let grew = order.valence() > bond.order.valence();
+        bond.order = order;
+        bond.stereo = stereo;
+        let (begin, end) = (bond.begin, bond.end);
+        if grew {
+            interact::consume_group_h(self, &[begin, end]);
+        }
+        true
+    }
+
+    /// Choose which side of bond `bond_id` its double-bond line goes on ([`DoublePosition`]).
+    /// One undo step; false when the bond does not exist or already has this position.
+    pub fn set_bond_double_position(&mut self, bond_id: u32, position: DoublePosition) -> bool {
+        match self.molecule.bond_by_id(bond_id) {
+            Some(bond) if bond.double_position != position => {}
+            _ => return false,
+        }
+        self.push_undo();
+        if let Some(bond) = self.molecule.bond_by_id_mut(bond_id) {
+            bond.double_position = position;
+        }
+        true
+    }
+
+    /// Delete bond `bond_id` (its atoms stay). One undo step; false when there is no such bond.
+    pub fn delete_bond(&mut self, bond_id: u32) -> bool {
+        if self.molecule.bond_by_id(bond_id).is_none() {
+            return false;
+        }
+        self.push_undo();
+        self.molecule.remove_bond(bond_id);
+        for slot in [&mut self.hovered_bond, &mut self.hotspot_bond, &mut self.context_bond] {
+            if *slot == Some(bond_id) {
+                *slot = None;
+            }
+        }
+        true
     }
 
     /// Fill the smallest ring passing through `atom_id` with `color` (straight RGBA), drawn
@@ -360,6 +439,7 @@ impl ChemStructEditor {
                 end: *index.get(&b.end)?,
                 order: b.order.clone(),
                 stereo: b.stereo.clone(),
+                double_position: b.double_position,
             })
         }).collect();
 
@@ -436,6 +516,7 @@ impl ChemStructEditor {
                 if bid != 0 {
                     if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
                         bond.stereo = b.stereo.clone();
+                        bond.double_position = b.double_position;
                     }
                 }
             }
@@ -480,6 +561,7 @@ impl ChemStructEditor {
                 if bid != 0 {
                     if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
                         bond.stereo = b.stereo.clone();
+                        bond.double_position = b.double_position;
                     }
                 }
             }
@@ -956,7 +1038,15 @@ impl ChemStructEditor {
     }
 
     /// Main entry point called from the app each frame. Returns true if molecule was modified.
+    ///
+    /// A host that wants the canvas [`Response`](egui::Response) — to attach a context menu,
+    /// say — calls [`show`](Self::show) instead.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+        self.show(ui).modified
+    }
+
+    /// [`ui`](Self::ui), also returning the canvas response.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> EditorResponse {
         let (rect, response) = ui.allocate_exact_size(
             ui.available_size(),
             egui::Sense::click_and_drag(),
@@ -1011,6 +1101,17 @@ impl ChemStructEditor {
             if !self.molecule.bonds.iter().any(|b| b.id == bid) {
                 self.hotspot_bond = None;
             }
+        }
+        if let Some(bid) = self.context_bond {
+            if !self.molecule.bonds.iter().any(|b| b.id == bid) {
+                self.context_bond = None;
+            }
+        }
+
+        // A right-click remembers the bond under the pointer (or none) for the host's context
+        // menu: once the menu opens the pointer is over it, and the hover is gone.
+        if response.secondary_clicked() {
+            self.context_bond = self.hovered_bond;
         }
 
         // Zoom via scroll wheel. `smooth_scroll_delta` is egui's *smoothed* delta — one wheel
@@ -1212,7 +1313,7 @@ impl ChemStructEditor {
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
         draw::draw_overlays(self, &painter, center);
 
-        modified
+        EditorResponse { response, modified }
     }
 }
 

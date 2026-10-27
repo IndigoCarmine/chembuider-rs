@@ -5,7 +5,7 @@ use super::content;
 use super::message::{EditorMsg, HostMsg, OleContent};
 use super::session::{self, Args, Sender};
 use crate::molecule::cdx;
-use crate::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
+use crate::{bond_menu, BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -433,10 +433,30 @@ impl eframe::App for OfficeApp {
         });
 
         let pressed = ctx.input(|i| i.pointer.any_down());
+        let ja = self.ja;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else { return };
+            let out = tab.editor.show(ui);
+            // Right-click on a bond: ChemDraw's bond menu, applied once the closure is done
+            // with the editor.
+            let mut chosen = None;
+            let menu = out.response.context_menu(|ui| {
+                match tab.editor.context_bond().and_then(|id| tab.editor.molecule.bond_by_id(id)) {
+                    Some(bond) => chosen = bond_menu(ui, bond, ja),
+                    None => {
+                        ui.label(if ja { "結合を右クリックすると変更できます" } else { "Right-click a bond to change it." });
+                    }
+                }
+            });
+            if menu.is_none() {
+                tab.editor.clear_context_bond();
+            }
+            let menu_modified = match (chosen, tab.editor.context_bond()) {
+                (Some(action), Some(id)) => tab.editor.apply_bond_menu(id, action),
+                _ => false,
+            };
             // Each edit starts the wait again, so a gesture goes back as one change.
-            if tab.editor.ui(ui) {
+            if out.modified || menu_modified {
                 tab.changed = Some(Instant::now());
             }
         });

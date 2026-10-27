@@ -95,6 +95,7 @@ pub fn parse(s: &str) -> (Molecule, Vec<u32>) {
             '-' => pending = Some(BondOrder::Single),
             '=' => pending = Some(BondOrder::Double),
             '#' => pending = Some(BondOrder::Triple),
+            '$' => pending = Some(BondOrder::Quadruple),
             '(' => branches.push(prev),
             ')' => prev = branches.pop().unwrap_or_else(|| panic!("unbalanced ')' in {s:?}")),
             '.' => prev = None,
@@ -147,6 +148,7 @@ pub fn parse(s: &str) -> (Molecule, Vec<u32>) {
             BondOrder::Single => 1,
             BondOrder::Double => 2,
             BondOrder::Triple => 3,
+            BondOrder::Quadruple => 4,
         };
         bond_sum[*a] += v;
         bond_sum[*b] += v;

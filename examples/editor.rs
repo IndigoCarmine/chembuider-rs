@@ -12,7 +12,7 @@
 use chembuider_rs::molecule::cdxml::to_cdxml;
 use chembuider_rs::molecule::mol2::to_mol2_string;
 use chembuider_rs::molecule::smiles::to_smiles;
-use chembuider_rs::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
+use chembuider_rs::{bond_menu, BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use eframe::{egui, App};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -262,7 +262,26 @@ impl App for EditorApp {
             // Refresh the status line once a canvas edit makes the last toolbar message (e.g.
             // "Canvas cleared.") stale. Takes effect next repaint, since this panel draws after
             // the status bar above — imperceptible, as canvas edits already trigger a repaint.
-            if self.editor.ui(ui) {
+            let out = self.editor.show(ui);
+            // Right-click on a bond: ChemDraw's bond menu (order, line style, double-bond
+            // side, delete). The choice is applied after the menu closure lets go of the editor.
+            let mut chosen = None;
+            let menu = out.response.context_menu(|ui| {
+                match self.editor.context_bond().and_then(|id| self.editor.molecule.bond_by_id(id)) {
+                    Some(bond) => chosen = bond_menu(ui, bond, false),
+                    None => {
+                        ui.label("Right-click a bond to change it.");
+                    }
+                }
+            });
+            if menu.is_none() {
+                self.editor.clear_context_bond();
+            }
+            let menu_modified = match (chosen, self.editor.context_bond()) {
+                (Some(action), Some(id)) => self.editor.apply_bond_menu(id, action),
+                _ => false,
+            };
+            if out.modified || menu_modified {
                 self.status = tool_status(self.editor.tool.clone());
             }
         });

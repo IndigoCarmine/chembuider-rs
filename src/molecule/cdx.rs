@@ -16,7 +16,7 @@
 
 use super::cdx_codec::{self, CdxObject};
 use super::lookup::{AtomLookup, MolIndex};
-use super::{elements, BondOrder, BondStereo, Molecule};
+use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule};
 use super::depict;
 use crate::widget::rich_text::{RichSpan, RichText, Script, SpanStyle};
 use std::collections::{HashMap, HashSet};
@@ -43,8 +43,12 @@ const PROP_LABEL_ALIGNMENT: u16 = 0x0705;
 const PROP_UTF8_TEXT: u16 = 0x0709;
 const PROP_BOND_ORDER: u16 = 0x0600;
 const PROP_BOND_DISPLAY: u16 = 0x0601;
+const PROP_BOND_DOUBLE_POSITION: u16 = 0x0602;
 const PROP_BOND_BEGIN: u16 = 0x0604;
 const PROP_BOND_END: u16 = 0x0605;
+
+/// kCDXBondOrder_Dative: a dative bond is an order of its own in CDX.
+const ORDER_DATIVE: i16 = 0x1000;
 
 /// Node types (kCDXNodeType_*) this module writes or reads specially.
 const NODE_UNSPECIFIED: i16 = 0;
@@ -454,21 +458,42 @@ fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject
             let mut b = CdxObject::new(OBJ_BOND, id());
             b.set(PROP_BOND_BEGIN, begin.to_le_bytes().to_vec());
             b.set(PROP_BOND_END, end.to_le_bytes().to_vec());
-            match bond.order {
-                BondOrder::Single => {}
-                BondOrder::Double => b.set(PROP_BOND_ORDER, 2i16.to_le_bytes().to_vec()),
-                BondOrder::Triple => b.set(PROP_BOND_ORDER, 4i16.to_le_bytes().to_vec()),
+            // kCDXBondOrder flags. ChemDraw keeps a dative bond as an order of its own (0x1000),
+            // not as a display.
+            let order: i16 = match (&bond.order, &bond.stereo) {
+                (_, BondStereo::Dative) => ORDER_DATIVE,
+                (BondOrder::Single, _) => 1,
+                (BondOrder::Double, _) => 2,
+                (BondOrder::Triple, _) => 4,
+                (BondOrder::Quadruple, _) => 8,
+            };
+            if order != 1 {
+                b.set(PROP_BOND_ORDER, order.to_le_bytes().to_vec());
             }
             let display: i16 = match bond.stereo {
-                BondStereo::None => 0,
+                BondStereo::None | BondStereo::Dative => 0,
                 BondStereo::Dashed => 1,
+                BondStereo::Hashed => 2,
                 BondStereo::WedgeDown => 3,
                 BondStereo::Bold => 5,
                 BondStereo::WedgeUp => 6,
                 BondStereo::Wavy => 8,
+                BondStereo::HollowWedge => 9,
             };
             if display != 0 {
                 b.set(PROP_BOND_DISPLAY, display.to_le_bytes().to_vec());
+            }
+            // kCDXBondDoublePosition: only a side the user chose (the "User…" values); an
+            // automatic one is ChemDraw's default and left unwritten.
+            let position: Option<i16> = match bond.double_position {
+                _ if bond.order != BondOrder::Double => None,
+                DoublePosition::Auto => None,
+                DoublePosition::Center => Some(0x0100),
+                DoublePosition::Right => Some(0x0101),
+                DoublePosition::Left => Some(0x0102),
+            };
+            if let Some(position) = position {
+                b.set(PROP_BOND_DOUBLE_POSITION, position.to_le_bytes().to_vec());
             }
             frag.children.push(b);
         }
@@ -625,25 +650,40 @@ fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
     for bond in frag.children.iter().filter(|c| c.tag == OBJ_BOND) {
         let (Some(begin), Some(end)) = (bond.prop_u32(PROP_BOND_BEGIN), bond.prop_u32(PROP_BOND_END)) else { continue };
         let (Some(&a), Some(&b)) = (atoms.get(&begin), atoms.get(&end)) else { continue };
-        let order = match bond.prop_i16(PROP_BOND_ORDER) {
+        let order_flags = bond.prop_i16(PROP_BOND_ORDER);
+        let order = match order_flags {
             Some(2) => BondOrder::Double,
             Some(4) => BondOrder::Triple,
+            Some(8) => BondOrder::Quadruple,
             _ => BondOrder::Single,
         };
         // The "…End" displays have the narrow end at the bond's end: turned around.
         let (stereo, a, b) = match bond.prop_i16(PROP_BOND_DISPLAY).unwrap_or(0) {
-            1 | 2 => (BondStereo::Dashed, a, b),
+            1 => (BondStereo::Dashed, a, b),
+            2 => (BondStereo::Hashed, a, b),
             3 => (BondStereo::WedgeDown, a, b),
             4 => (BondStereo::WedgeDown, b, a),
             5 => (BondStereo::Bold, a, b),
             6 => (BondStereo::WedgeUp, a, b),
             7 => (BondStereo::WedgeUp, b, a),
             8 => (BondStereo::Wavy, a, b),
+            9 => (BondStereo::HollowWedge, a, b),
+            10 => (BondStereo::HollowWedge, b, a),
+            _ if order_flags == Some(ORDER_DATIVE) => (BondStereo::Dative, a, b),
             _ => (BondStereo::None, a, b),
+        };
+        let double_position = match bond.prop_i16(PROP_BOND_DOUBLE_POSITION) {
+            Some(0x0100) => DoublePosition::Center,
+            Some(0x0101) => DoublePosition::Right,
+            Some(0x0102) => DoublePosition::Left,
+            _ => DoublePosition::Auto,
         };
         // A bond given twice is one bond, the first, as `Molecule::add_bond` has it.
         if bonds.insert((a.min(b), a.max(b))) {
             mol.push_bond(a, b, order, stereo);
+            if let Some(last) = mol.bonds.last_mut() {
+                last.double_position = double_position;
+            }
             bonded.extend([a, b]);
         }
     }
@@ -941,6 +981,64 @@ mod tests {
         set_element(&mut doc);
         let back = cdx_bytes_to_molecule(&cdx_codec::write(&doc)).expect("reads");
         assert_eq!(elements_of(&back), ["Ac"]);
+    }
+
+    /// A chain of carbons `C0–C1–…`, bond k from Ck to Ck+1 with the given order and stereo.
+    fn chain_of(bonds: &[(BondOrder, BondStereo, DoublePosition)]) -> Molecule {
+        let mut mol = Molecule::default();
+        let atoms: Vec<u32> = (0..=bonds.len())
+            .map(|k| mol.add_atom("C".to_string(), [k as f32 * 1.5, (k % 2) as f32], 0))
+            .collect();
+        for (k, (order, stereo, position)) in bonds.iter().enumerate() {
+            let id = mol.add_bond(atoms[k], atoms[k + 1], order.clone());
+            let bond = mol.bond_by_id_mut(id).unwrap();
+            bond.stereo = stereo.clone();
+            bond.double_position = *position;
+        }
+        mol
+    }
+
+    /// The bond styles of the bond context menu that the first CDX writer had no value for —
+    /// quadruple, plain hashed, hollow wedge, dative — and a chosen double-bond side all
+    /// survive a write and read, with each bond's direction kept.
+    #[test]
+    fn round_trips_the_bond_menus_orders_styles_and_double_positions() {
+        use DoublePosition::*;
+        let bonds = [
+            (BondOrder::Quadruple, BondStereo::None, Auto),
+            (BondOrder::Single, BondStereo::Hashed, Auto),
+            (BondOrder::Single, BondStereo::HollowWedge, Auto),
+            (BondOrder::Single, BondStereo::Dative, Auto),
+            (BondOrder::Double, BondStereo::None, Left),
+            (BondOrder::Double, BondStereo::None, Right),
+            (BondOrder::Double, BondStereo::None, Center),
+            (BondOrder::Double, BondStereo::None, Auto),
+        ];
+        let mol = chain_of(&bonds);
+        let back = cdx_bytes_to_molecule(&molecule_to_cdx_document(&mol)).expect("reads back");
+        assert_eq!(back.bonds.len(), bonds.len());
+        for (k, (bond, (order, stereo, position))) in back.bonds.iter().zip(&bonds).enumerate() {
+            assert_eq!((&bond.order, &bond.stereo, bond.double_position), (order, stereo, *position), "bond {k}");
+            assert_eq!((bond.begin, bond.end), (back.atoms[k].id, back.atoms[k + 1].id), "bond {k} keeps its direction");
+        }
+    }
+
+    /// ChemDraw's "…End" hollow wedge has its narrow end at the bond's end atom: read turned around.
+    #[test]
+    fn a_hollow_wedge_drawn_from_the_end_is_read_from_its_narrow_end() {
+        let mol = chain_of(&[(BondOrder::Single, BondStereo::HollowWedge, DoublePosition::Auto)]);
+        let mut doc = cdx_codec::parse(&molecule_to_cdx_document(&mol)).unwrap();
+        fn flip(obj: &mut CdxObject) {
+            if obj.tag == OBJ_BOND {
+                obj.set(PROP_BOND_DISPLAY, 10i16.to_le_bytes().to_vec());
+            }
+            obj.children.iter_mut().for_each(flip);
+        }
+        flip(&mut doc);
+        let back = cdx_bytes_to_molecule(&cdx_codec::write(&doc)).unwrap();
+        let bond = &back.bonds[0];
+        assert_eq!(bond.stereo, BondStereo::HollowWedge);
+        assert_eq!((bond.begin, bond.end), (back.atoms[1].id, back.atoms[0].id));
     }
 
     #[test]

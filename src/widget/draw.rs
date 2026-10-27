@@ -86,8 +86,9 @@ pub fn draw_bonds(
         labels,
     );
     for bond in bonds {
-        // A hovered bond is tinted green; the geometry is identical to the exported picture.
-        let color = if editor.hovered_bond == Some(bond.bond_id) {
+        // A hovered bond is tinted green, and so is the bond a context menu is open on; the
+        // geometry is identical to the exported picture.
+        let color = if editor.hovered_bond == Some(bond.bond_id) || editor.context_bond == Some(bond.bond_id) {
             egui::Color32::from_rgb(50, 180, 50)
         } else {
             egui::Color32::BLACK

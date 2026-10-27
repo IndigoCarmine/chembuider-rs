@@ -703,6 +703,7 @@ mod tests {
             let nb = out.add_bond(id_map[&b.end], id_map[&b.begin], b.order.clone());
             if let Some(bond) = out.bond_by_id_mut(nb) {
                 bond.stereo = b.stereo.clone();
+                bond.double_position = b.double_position.reversed();
             }
         }
         out

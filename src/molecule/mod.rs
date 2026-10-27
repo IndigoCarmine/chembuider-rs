@@ -25,22 +25,52 @@ pub enum BondStereo {
     Bold,      // H/b: thick/heavy bond
     Dashed,    // d: dashed line
     Wavy,      // y: wavy bond (undefined stereo)
+    Hashed,      // plain (non-wedged) hashed bond: evenly spaced ticks of constant width
+    HollowWedge, // outlined (unfilled) wedge, narrow at begin
+    Dative,      // dative (coordinate) bond: an arrow pointing from begin to end
 }
 
+/// Which side of a double bond its second line is drawn on (ChemDraw's "Bond Position").
+///
+/// `Left`/`Right` are relative to the bond's begin→end direction as seen on screen, so
+/// reversing a bond must swap them (see [`DoublePosition::reversed`]). `Auto` leaves the
+/// choice to the depiction, which picks the side the substituents are on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DoublePosition {
+    #[default]
+    Auto,
+    Left,
+    Center,
+    Right,
+}
+
+impl DoublePosition {
+    /// The same position for the bond read end→begin.
+    pub fn reversed(self) -> Self {
+        match self {
+            DoublePosition::Left => DoublePosition::Right,
+            DoublePosition::Right => DoublePosition::Left,
+            other => other,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BondOrder {
     Single,
     Double,
     Triple,
+    Quadruple,
 }
 
 impl BondOrder {
+    /// The click gesture's order cycle. Quadruple is reachable only by choosing it, so the
+    /// cycle stays Single → Double → Triple, and a quadruple bond drops back to single.
     pub fn cycle(&self) -> Self {
         match self {
             BondOrder::Single => BondOrder::Double,
             BondOrder::Double => BondOrder::Triple,
-            BondOrder::Triple => BondOrder::Single,
+            BondOrder::Triple | BondOrder::Quadruple => BondOrder::Single,
         }
     }
 
@@ -50,6 +80,7 @@ impl BondOrder {
             BondOrder::Single => 1,
             BondOrder::Double => 2,
             BondOrder::Triple => 3,
+            BondOrder::Quadruple => 4,
         }
     }
 
@@ -58,6 +89,8 @@ impl BondOrder {
             BondOrder::Single => "1",
             BondOrder::Double => "2",
             BondOrder::Triple => "3",
+            // Tripos MOL2 has no quadruple bond type.
+            BondOrder::Quadruple => "un",
         }
     }
 }
@@ -184,6 +217,8 @@ pub struct Bond {
     pub end: u32,
     pub order: BondOrder,
     pub stereo: BondStereo,
+    /// Where a double bond's second line goes; meaningless on any other order.
+    pub double_position: DoublePosition,
 }
 
 /// A colored fill painted inside a ring, *behind* the bond lines (ChemDraw's ring shading).
@@ -256,7 +291,7 @@ impl Molecule {
     /// [`add_bond`](Self::add_bond)'s search through every bond would make reading quadratic).
     fn push_bond(&mut self, begin: u32, end: u32, order: BondOrder, stereo: BondStereo) -> u32 {
         let id = self.alloc_id();
-        self.bonds.push(Bond { id, begin, end, order, stereo });
+        self.bonds.push(Bond { id, begin, end, order, stereo, double_position: DoublePosition::Auto });
         id
     }
 
@@ -292,6 +327,10 @@ impl Molecule {
 
     pub fn atom_by_id_mut(&mut self, id: u32) -> Option<&mut Atom> {
         self.atoms.iter_mut().find(|a| a.id == id)
+    }
+
+    pub fn bond_by_id(&self, id: u32) -> Option<&Bond> {
+        self.bonds.iter().find(|b| b.id == id)
     }
 
     pub fn bond_by_id_mut(&mut self, id: u32) -> Option<&mut Bond> {
