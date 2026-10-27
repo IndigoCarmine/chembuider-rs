@@ -335,8 +335,14 @@ pub fn process_select_tool(
         if let Some(atom_id) = seed {
             editor.selected_atoms = editor.molecule.connected_atoms(atom_id).into_iter().collect();
         } else if let Some(id) = editor.hovered_object {
-            // Double-click a text to edit it.
-            editor.edit_text(id);
+            // Double-click a text to edit it, a table's cell to enter its value.
+            if editor.molecule.object_by_id(id).is_some_and(|o| o.as_table().is_some()) {
+                if let Some(cell) = editor.table_cell_at(id, mouse) {
+                    modified |= editor.edit_table_cell(id, cell);
+                }
+            } else {
+                editor.edit_text(id);
+            }
         }
     } else if response.clicked() {
         editor.lasso_path.clear();

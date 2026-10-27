@@ -260,3 +260,106 @@ fn double_clicking_a_text_with_select_edits_it() {
     d.double_click(at([0.2, -0.05]));
     assert_eq!(d.editor.text_edit.as_ref().and_then(|e| e.id), Some(id));
 }
+
+/// Ethane → propane, drawn left of the screen's middle, for the reaction-table tests.
+fn reaction(d: &mut Driver) {
+    let m = &mut d.editor.molecule;
+    let a = m.add_atom("C".into(), [-5.0, -3.0], 0);
+    let b = m.add_atom("C".into(), [-3.7, -3.0], 0);
+    m.add_bond(a, b, crate::molecule::BondOrder::Single);
+    m.add_arrow([-2.5, -3.0], [0.5, -3.0], ArrowKind::Reaction);
+    let c = m.add_atom("C".into(), [1.5, -3.0], 0);
+    let e = m.add_atom("C".into(), [2.8, -3.0], 0);
+    let f = m.add_atom("C".into(), [4.1, -3.0], 0);
+    m.add_bond(c, e, crate::molecule::BondOrder::Single);
+    m.add_bond(e, f, crate::molecule::BondOrder::Single);
+}
+
+fn table(d: &Driver) -> crate::molecule::ReactionTable {
+    d.editor.molecule.objects.iter().find_map(|o| o.as_table().cloned()).expect("a table")
+}
+
+fn cell_center(d: &Driver, id: u32, cell: crate::reaction::edit::CellRef) -> egui::Pos2 {
+    d.editor.last_table_cells[&id].iter().find(|(c, _)| *c == cell).expect("painted").1.center()
+}
+
+#[test]
+fn a_reaction_table_is_inserted_edited_moved_and_deleted() {
+    use crate::reaction::edit::CellRef;
+    use crate::reaction::BlockKind;
+    let mut d = Driver::new(Tool::Select);
+    // Small labels, so the whole table fits the test screen.
+    d.editor.config.style.label_size = 6.0;
+    reaction(&mut d);
+    let id = d.editor.insert_reaction_table().expect("there is a reaction");
+    assert_eq!(d.editor.undo_stack.len(), 1);
+    assert_eq!(d.editor.selected_objects, [id].into_iter().collect());
+    d.frame(Vec::new());
+    assert!(d.editor.last_object_rects.contains_key(&id), "painted");
+
+    // Double-click the reactant's Sample Mass and type a value: the table recomputes.
+    let sample = CellRef::new(BlockKind::Reactants, 0, 4);
+    d.double_click(cell_center(&d, id, sample));
+    assert_eq!(d.editor.table_edit.as_ref().map(|e| (e.id, e.cell)), Some((id, sample)));
+    d.type_text("300 mg");
+    d.key(egui::Key::Enter, Default::default());
+    assert!(d.editor.table_edit.is_none(), "{:?}", d.editor.table_edit);
+    let t = table(&d);
+    assert!((t.reactants[0].sample_mass.unwrap() - 0.3).abs() < 1e-9, "{t:?}");
+    let state = crate::molecule::reaction_table::TableState::of(&d.editor.molecule, &t);
+    assert_eq!(state.blocks()[1].columns[0][4].plain(), "439.94mg", "expected mass of propane");
+    assert_eq!(d.editor.undo_stack.len(), 2, "one undo step for the entry");
+
+    // A value that does not read keeps the box open with the reason. (The harness does not
+    // advance time, so a second double-click would count as more clicks of the first.)
+    d.frame(Vec::new());
+    let eq = CellRef::new(BlockKind::Reactants, 0, 3);
+    assert!(!d.editor.edit_table_cell(id, eq), "opening the box changes nothing");
+    assert!(d.editor.table_edit.is_some(), "the box opens");
+    d.type_text("abc");
+    assert_eq!(d.editor.table_edit.as_ref().map(|e| e.text.as_str()), Some("abc"));
+    d.key(egui::Key::Enter, Default::default());
+    assert!(d.editor.table_edit.as_ref().is_some_and(|e| e.error.is_some()), "{:?}", d.editor.table_edit);
+    d.key(egui::Key::Escape, Default::default());
+    assert!(d.editor.table_edit.is_none());
+
+    // A computed cell has nothing to edit.
+    assert!(!d.editor.edit_table_cell(id, CellRef::new(BlockKind::Reactants, 0, 9)));
+    assert!(d.editor.table_edit.is_none());
+
+    // Dragging the table moves it.
+    let before = table(&d).pos;
+    let from = cell_center(&d, id, CellRef::new(BlockKind::Reactants, 0, 9));
+    d.drag(from, from + egui::vec2(50.0, 25.0), Default::default());
+    let after = table(&d).pos;
+    assert!(close(after, [before[0] + 1.0, before[1] + 0.5]), "{before:?} → {after:?}");
+
+    // Delete removes it; undo brings it back.
+    d.editor.selected_objects = [id].into_iter().collect();
+    assert!(d.editor.delete_selection());
+    assert!(d.editor.molecule.objects.iter().all(|o| o.as_table().is_none()));
+    assert!(d.editor.undo());
+    assert_eq!(table(&d).reactants[0].sample_mass, Some(0.3));
+}
+
+#[test]
+fn the_tables_limiting_cell_toggles() {
+    use crate::reaction::edit::CellRef;
+    use crate::reaction::BlockKind;
+    let mut d = Driver::new(Tool::Select);
+    reaction(&mut d);
+    let id = d.editor.insert_reaction_table().unwrap();
+    assert!(table(&d).reactants[0].limiting, "a new table's first reactant is limiting");
+    assert!(d.editor.edit_table_cell(id, CellRef::new(BlockKind::Reactants, 0, 2)));
+    assert!(!table(&d).reactants[0].limiting);
+    assert!(d.editor.undo());
+    assert!(table(&d).reactants[0].limiting);
+}
+
+#[test]
+fn a_table_without_structures_is_not_inserted() {
+    let mut d = Driver::new(Tool::Select);
+    d.editor.molecule.add_arrow([0.0, 0.0], [3.0, 0.0], ArrowKind::Reaction);
+    assert_eq!(d.editor.insert_reaction_table(), None);
+    assert!(d.editor.undo_stack.is_empty());
+}

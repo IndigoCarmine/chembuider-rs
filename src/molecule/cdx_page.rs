@@ -1,4 +1,5 @@
-//! Page objects ([`PageObject`]: reaction arrows and text) in a ChemDraw document.
+//! Page objects ([`PageObject`]: reaction arrows, text and reaction tables) in a ChemDraw
+//! document. Tables are ChemDraw's stoichiometry grids; [`cdx_table`] reads and writes those.
 //!
 //! Reading turns the arrows and texts on a document's pages into page objects, each remembering
 //! the id of the ChemDraw object it came from (`source`). An arrow is ChemDraw's `arrow` object
@@ -19,7 +20,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::cdx::{self, OBJ_GROUP, OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT, SCALE};
 use super::cdx_codec::CdxObject;
-use super::page::{ArrowKind, PageArrow, PageObject, PageText, TextAlign};
+use super::cdx_table::{self, OBJ_STOICHIOMETRY_GRID};
+use super::page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TextAlign};
+use super::Molecule;
 use crate::reaction::cdxml::{text_of, utf8_string};
 use crate::widget::rich_text::{RichText, Script};
 use crate::widget::scene::{
@@ -231,13 +234,81 @@ pub(crate) fn convert_page(page: &CdxObject) -> Vec<Converted> {
                     out.push(Converted { object: PageObject::Text(text), ids: vec![obj.id] });
                 }
             }
+            OBJ_STOICHIOMETRY_GRID => {
+                if let Some(table) = cdx_table::read_grid(obj) {
+                    out.push(Converted { object: PageObject::Table(table), ids: vec![obj.id] });
+                }
+            }
             _ => {}
         }
     }
     out
 }
 
+const OBJ_REACTION_SCHEME: u16 = 0x800D;
+const OBJ_REACTION_STEP: u16 = 0x800E;
+const PROP_STEP_REACTANTS: u16 = 0x0C01;
+const PROP_STEP_PRODUCTS: u16 = 0x0C02;
+const PROP_STEP_ARROWS: u16 = 0x0C04;
+
+/// The reaction steps of `page` (inside its reaction schemes, looking inside groups).
+pub(crate) fn reaction_steps(page: &CdxObject) -> Vec<&CdxObject> {
+    let mut objects = Vec::new();
+    page_level(page, &mut objects);
+    objects
+        .into_iter()
+        .filter(|o| o.tag == OBJ_REACTION_SCHEME)
+        .flat_map(|s| s.children.iter().filter(|c| c.tag == OBJ_REACTION_STEP))
+        .collect()
+}
+
+fn id_array(obj: &CdxObject, tag: u16) -> Vec<u32> {
+    obj.prop(tag)
+        .map(|v| v.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
+        .unwrap_or_default()
+}
+
+/// Tie a table read from a document to the drawing it was read into: each column to the first
+/// atom of the fragment it named (`first_atom`), and the table to the arrow of the reaction
+/// step those fragments take part in (`object_of` maps ChemDraw ids to page objects).
+pub(crate) fn link_table(
+    table: &mut ReactionTable,
+    first_atom: &HashMap<u32, u32>,
+    object_of: &HashMap<u32, u32>,
+    steps: &[&CdxObject],
+) {
+    let mut fragments = HashSet::new();
+    for e in table.reactants.iter_mut().chain(table.products.iter_mut()) {
+        if let Some(f) = e.fragment {
+            e.atom = first_atom.get(&f).copied();
+            fragments.insert(f);
+        }
+    }
+    table.arrow = steps
+        .iter()
+        .find(|s| {
+            id_array(s, PROP_STEP_REACTANTS).iter().chain(&id_array(s, PROP_STEP_PRODUCTS)).any(|f| fragments.contains(f))
+        })
+        .and_then(|s| id_array(s, PROP_STEP_ARROWS).into_iter().find_map(|a| object_of.get(&a).copied()));
+}
+
 // ─── Writing ─────────────────────────────────────────────────────────────────
+
+/// Whether the grid `read` came from still shows what `table` shows on `mol`: the same
+/// entries, and columns with the same formulas as the file printed. Then the file's own grid
+/// can be kept; otherwise it is written anew.
+fn table_unchanged(mol: &Molecule, table: &ReactionTable, read: &ReactionTable) -> bool {
+    let same = |a: &[super::TableEntry], b: &[super::TableEntry]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.same_quantities(y))
+    };
+    if !same(&table.reactants, &read.reactants) || !same(&table.products, &read.products) {
+        return false;
+    }
+    let state = super::reaction_table::TableState::of(mol, table);
+    let (reactants, products) = state.formulas();
+    let shown = |entries: &[super::TableEntry]| entries.iter().map(|e| e.formula.clone().unwrap_or_default()).collect::<Vec<_>>();
+    reactants == shown(&read.reactants) && products == shown(&read.products)
+}
 
 fn point_3d_value(p: (f64, f64)) -> Vec<u8> {
     [p.0, p.1, 0.0].iter().flat_map(|v| (v.round() as i32).to_le_bytes()).collect()
@@ -447,12 +518,19 @@ fn same_point(a: (f64, f64), b: (f64, f64)) -> bool {
     (a.0 - b.0).abs() < 2.0 && (a.1 - b.1).abs() < 2.0
 }
 
-/// The ChemDraw objects for `objects`, moved by `shift` (CDX units), with new ids from `next`.
-/// An object whose source is in `owned` is written as its original objects with what changed
-/// rewritten; any other is written new.
-pub(crate) fn write_objects(objects: &[PageObject], owned: &mut Owned, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
+/// The ChemDraw objects for `mol`'s page objects, moved by `shift` (CDX units), with new ids
+/// from `next`. An object whose source is in `owned` is written as its original objects with
+/// what changed rewritten; any other is written new. `fragment_of` is the fragment each atom
+/// was written in (a table names the fragments of its columns).
+pub(crate) fn write_objects(
+    mol: &Molecule,
+    fragment_of: &HashMap<u32, u32>,
+    owned: &mut Owned,
+    shift: (f64, f64),
+    next: &mut u32,
+) -> Vec<CdxObject> {
     let mut out = Vec::new();
-    for object in objects {
+    for object in &mol.objects {
         let original = object.source().and_then(|s| owned.remove(&s));
         match (object, original) {
             (PageObject::Arrow(a), Some((PageObject::Arrow(read), mut cdx_objects))) if read.kind == a.kind => {
@@ -481,7 +559,29 @@ pub(crate) fn write_objects(objects: &[PageObject], owned: &mut Owned, shift: (f
                 }
                 out.extend(cdx_objects);
             }
+            (PageObject::Table(t), Some((PageObject::Table(read), mut cdx_objects))) if cdx_objects.len() == 1 => {
+                let at = cdx_point(t.pos, shift);
+                let was = cdx_point(read.pos, (0.0, 0.0));
+                if table_unchanged(mol, t, &read) {
+                    // ChemDraw's own grid still says what the table says: keep it, moved if
+                    // need be, its columns pointing at their structures' fragments as written now.
+                    let grid = &mut cdx_objects[0];
+                    if !same_point(at, was) {
+                        cdx_table::translate_grid(grid, (at.0 - was.0, at.1 - was.1));
+                    }
+                    let entries: Vec<_> = t.reactants.iter().chain(&t.products).collect();
+                    cdx_table::relink_grid(grid, &entries, fragment_of);
+                    out.extend(cdx_objects);
+                } else {
+                    out.push(cdx_table::grid_object(cdx_objects[0].id, t, mol, at, fragment_of, next));
+                }
+            }
             (PageObject::Arrow(a), _) => out.extend(new_arrow(a, shift, next)),
+            (PageObject::Table(t), _) => {
+                *next += 1;
+                let id = *next;
+                out.push(cdx_table::grid_object(id, t, mol, cdx_point(t.pos, shift), fragment_of, next));
+            }
             (PageObject::Text(t), _) => {
                 if !t.is_blank() {
                     out.push(new_text(t, shift, next));
@@ -675,6 +775,13 @@ mod tests {
                 }
                 (PageObject::Text(x), PageObject::Text(y)) => {
                     assert_eq!((&x.text, x.align), (&y.text, y.align));
+                    assert!((x.pos[0] - y.pos[0]).abs() < 1e-3 && (x.pos[1] - y.pos[1]).abs() < 1e-3, "{x:?} vs {y:?}");
+                }
+                (PageObject::Table(x), PageObject::Table(y)) => {
+                    let same = |a: &[super::super::TableEntry], b: &[super::super::TableEntry]| {
+                        a.len() == b.len() && a.iter().zip(b).all(|(p, q)| p.same_quantities(q))
+                    };
+                    assert!(same(&x.reactants, &y.reactants) && same(&x.products, &y.products), "{x:?} vs {y:?}");
                     assert!((x.pos[0] - y.pos[0]).abs() < 1e-3 && (x.pos[1] - y.pos[1]).abs() < 1e-3, "{x:?} vs {y:?}");
                 }
                 _ => panic!("{x:?} vs {y:?}"),

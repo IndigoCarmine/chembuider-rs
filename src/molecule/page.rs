@@ -1,5 +1,5 @@
-//! Free-form objects on the page beside the structures: reaction arrows and text (reaction
-//! conditions, captions).
+//! Free-form objects on the page beside the structures: reaction arrows, text (reaction
+//! conditions, captions) and reaction (stoichiometry) tables.
 //!
 //! They live in [`Molecule::objects`](super::Molecule::objects), next to the atoms and bonds,
 //! so everything that already handles a drawing as one value — the editor's undo/redo
@@ -79,11 +79,78 @@ impl PageText {
     }
 }
 
+/// What the user entered for one column of a [`ReactionTable`]: a reactant's or a product's
+/// quantities. Everything else the column shows (formula, MW, moles, masses, yield) is
+/// computed from these and from the structure the column stands for.
+///
+/// Units are the ones [`reaction`](crate::reaction) works in: grams, millilitres, mol/L, g/mL
+/// and percent (0–100). A reactant uses `limiting` … `volume`; a product `equivalents`,
+/// `percent_completion`, `measured_mass` and `purity`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TableEntry {
+    /// An atom of the structure this column stands for, so the entries stay with that
+    /// structure when others are added, removed or moved. `None` for a column read from a
+    /// file before it was matched to a structure: it takes the first structure no other entry
+    /// claims.
+    pub atom: Option<u32>,
+    pub limiting: bool,
+    pub equivalents: Option<f64>,
+    pub sample_mass: Option<f64>,
+    pub percent_weight: Option<f64>,
+    pub molarity: Option<f64>,
+    pub density: Option<f64>,
+    pub volume: Option<f64>,
+    pub percent_completion: Option<f64>,
+    pub measured_mass: Option<f64>,
+    pub purity: Option<f64>,
+    /// The ChemDraw fragment this column referred to (`ComponentReferenceID`), when read from
+    /// a file. Reading resolves it to [`atom`](Self::atom).
+    pub fragment: Option<u32>,
+    /// The formula the file showed for this column, when read from one: saving compares it
+    /// with the structure's current formula to tell whether ChemDraw's table is still right.
+    pub formula: Option<String>,
+}
+
+impl TableEntry {
+    /// Whether the two entries hold the same quantities (ignoring which structure they are
+    /// attached to and what a file said about them).
+    pub fn same_quantities(&self, other: &TableEntry) -> bool {
+        let strip = |e: &TableEntry| TableEntry { atom: None, fragment: None, formula: None, ..e.clone() };
+        strip(self) == strip(other)
+    }
+}
+
+/// A stoichiometry table (ChemDraw's "Reaction Analysis" stoichiometry grid) placed on the
+/// page: a *Reactants* block and a *Products* block, one column per structure, describing the
+/// reaction of one arrow — the structures before the arrow (and the reagents drawn over it)
+/// are its reactants, the ones after it its products. Which structures those are is worked out
+/// from the drawing every time (see [`Molecule::reaction_table_columns`](super::Molecule::reaction_table_columns)),
+/// so the table follows the scheme as it is edited; only the entered quantities are stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReactionTable {
+    pub id: u32,
+    /// The table's top-left corner (where ChemDraw places the grid), in molecule units.
+    pub pos: [f32; 2],
+    /// The arrow ([`PageArrow::id`]) whose reaction the table describes. `None`, or an arrow
+    /// that is gone, means the reaction arrow nearest to the table.
+    #[serde(default)]
+    pub arrow: Option<u32>,
+    #[serde(default)]
+    pub reactants: Vec<TableEntry>,
+    #[serde(default)]
+    pub products: Vec<TableEntry>,
+    /// The id of the ChemDraw stoichiometry grid this was read from; see [`PageArrow::source`].
+    #[serde(default)]
+    pub source: Option<u32>,
+}
+
 /// One free-form object on the page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PageObject {
     Arrow(PageArrow),
     Text(PageText),
+    Table(ReactionTable),
 }
 
 impl PageObject {
@@ -91,6 +158,16 @@ impl PageObject {
         match self {
             PageObject::Arrow(a) => a.id,
             PageObject::Text(t) => t.id,
+            PageObject::Table(t) => t.id,
+        }
+    }
+
+    /// Give the object a new id.
+    pub fn set_id(&mut self, id: u32) {
+        match self {
+            PageObject::Arrow(a) => a.id = id,
+            PageObject::Text(t) => t.id = id,
+            PageObject::Table(t) => t.id = id,
         }
     }
 
@@ -99,6 +176,7 @@ impl PageObject {
         match self {
             PageObject::Arrow(a) => a.source,
             PageObject::Text(t) => t.source,
+            PageObject::Table(t) => t.source,
         }
     }
 
@@ -114,11 +192,12 @@ impl PageObject {
                 shift(&mut a.head);
             }
             PageObject::Text(t) => shift(&mut t.pos),
+            PageObject::Table(t) => shift(&mut t.pos),
         }
     }
 
     /// Rotate the object's reference points by `angle` (radians) about `center`. A text keeps
-    /// its orientation; only its anchor moves.
+    /// its orientation, as does a table; only their anchors move.
     pub fn rotate_about(&mut self, center: [f32; 2], angle: f32) {
         let (s, c) = angle.sin_cos();
         let rot = |p: &mut [f32; 2]| {
@@ -131,15 +210,17 @@ impl PageObject {
                 rot(&mut a.head);
             }
             PageObject::Text(t) => rot(&mut t.pos),
+            PageObject::Table(t) => rot(&mut t.pos),
         }
     }
 
     /// The points that stand for the object in a lasso or a bounding box: an arrow's two ends,
-    /// a text's anchor.
+    /// a text's anchor, a table's top-left corner.
     pub fn key_points(&self) -> Vec<[f32; 2]> {
         match self {
             PageObject::Arrow(a) => vec![a.tail, a.head],
             PageObject::Text(t) => vec![t.pos],
+            PageObject::Table(t) => vec![t.pos],
         }
     }
 
@@ -153,6 +234,13 @@ impl PageObject {
     pub fn as_text(&self) -> Option<&PageText> {
         match self {
             PageObject::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn as_table(&self) -> Option<&ReactionTable> {
+        match self {
+            PageObject::Table(t) => Some(t),
             _ => None,
         }
     }

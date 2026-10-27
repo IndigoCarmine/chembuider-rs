@@ -6,6 +6,8 @@ pub mod smiles;
 pub mod cdx;
 pub mod cdx_codec;
 pub(crate) mod cdx_page;
+pub(crate) mod cdx_table;
+pub mod reaction_table;
 pub mod elements;
 pub mod depict;
 pub mod page;
@@ -17,7 +19,7 @@ pub mod ole;
 
 use serde::{Deserialize, Serialize};
 
-pub use page::{ArrowKind, PageArrow, PageObject, PageText, TextAlign};
+pub use page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TableEntry, TextAlign};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum BondStereo {
@@ -363,10 +365,7 @@ impl Molecule {
     /// Add a page object as it is, giving it a fresh id (the one it carries is ignored).
     pub fn push_object(&mut self, mut object: PageObject) -> u32 {
         let id = self.alloc_id();
-        match &mut object {
-            PageObject::Arrow(a) => a.id = id,
-            PageObject::Text(t) => t.id = id,
-        }
+        object.set_id(id);
         self.objects.push(object);
         id
     }

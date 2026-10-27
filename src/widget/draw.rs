@@ -183,13 +183,16 @@ const HOVERED: egui::Color32 = egui::Color32::from_rgb(50, 180, 50);
 
 /// Paint the page objects from the shared scene (the geometry the image export draws), tinted
 /// when hovered or selected, with the end handles of a lone selected arrow and the arrow being
-/// drawn. Returns the screen rect of every text painted, for next frame's hit testing.
-pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) -> HashMap<u32, egui::Rect> {
+/// drawn. Returns the screen rect of every text and table painted, and every table's cells,
+/// for next frame's hit testing.
+pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) -> PageObjectRects {
     use crate::molecule::PageObject;
     let xf = editor_transform(editor, center);
     let style = &editor.config.style;
     let editing = editor.text_edit.as_ref().and_then(|e| e.id);
     let mut rects = HashMap::new();
+    let mut cells = HashMap::new();
+    let editing_cell = editor.table_edit.as_ref().map(|e| (e.id, e.cell));
     let paint = |obj: &scene::SceneObject, color: egui::Color32| {
         for s in &obj.strokes {
             painter.line_segment([s.a, s.b], egui::Stroke::new(s.width, color));
@@ -206,10 +209,26 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
         if editing == Some(id) {
             continue;
         }
-        let obj = scene::build_object(object, style, xf, |job| painter.layout_job(job));
         let selected = editor.selected_objects.contains(&id);
         let hovered = editor.hovered_object == Some(id);
         let color = if selected { SELECTED } else if hovered { HOVERED } else { egui::Color32::BLACK };
+        if let PageObject::Table(t) = object {
+            let mut table = scene::build_table(t, &editor.molecule, style, xf, |job| painter.layout_job(job));
+            // The cell being typed into shows the edit box instead of its value.
+            if let Some((_, cell)) = editing_cell.filter(|(eid, _)| *eid == id)
+                && let Some(&(_, r)) = table.cells.iter().find(|(c, _)| *c == cell)
+            {
+                table.object.texts.retain(|line| !r.contains(line.rect.center()));
+            }
+            paint(&table.object, color);
+            rects.insert(id, table.object.rect);
+            cells.insert(id, table.cells);
+            if selected || hovered {
+                painter.rect_stroke(table.object.rect.expand(2.0), 2.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Outside);
+            }
+            continue;
+        }
+        let obj = scene::build_object(object, &editor.molecule, style, xf, |job| painter.layout_job(job));
         paint(&obj, color);
         if matches!(object, PageObject::Text(_)) {
             rects.insert(id, obj.rect);
@@ -228,10 +247,18 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
     // The arrow being drawn with the Arrow tool.
     if let Some(super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag {
         let preview = PageObject::Arrow(crate::molecule::PageArrow { id: 0, tail, head, kind, source: None });
-        let obj = scene::build_object(&preview, style, xf, |job| painter.layout_job(job));
+        let obj = scene::build_object(&preview, &editor.molecule, style, xf, |job| painter.layout_job(job));
         paint(&obj, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
     }
-    rects
+    PageObjectRects { rects, cells }
+}
+
+/// Where page objects were painted, for hit testing on the next frame: the rect of each text
+/// and table, and each table's value cells.
+#[derive(Default)]
+pub struct PageObjectRects {
+    pub rects: HashMap<u32, egui::Rect>,
+    pub cells: HashMap<u32, Vec<(crate::reaction::edit::CellRef, egui::Rect)>>,
 }
 
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────

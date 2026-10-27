@@ -112,6 +112,18 @@ pub struct TextEditState {
     pub text: String,
 }
 
+/// A reaction-table cell being typed into ([`ChemStructEditor::table_edit`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCellEdit {
+    /// The table ([`ReactionTable::id`](crate::molecule::ReactionTable::id)).
+    pub id: u32,
+    pub cell: crate::reaction::edit::CellRef,
+    /// What has been typed: a value with an optional unit (`1.5`, `250 mg`, `2 M`).
+    pub text: String,
+    /// Why the last Enter was refused, shown under the box.
+    pub error: Option<String>,
+}
+
 pub struct ChemStructEditor {
     pub molecule: Molecule,
     pub tool: Tool,
@@ -213,8 +225,13 @@ pub struct ChemStructEditor {
     /// A drag on page objects in progress (drawing an arrow, moving objects, an arrow's end).
     pub(crate) object_drag: Option<interact::ObjectDrag>,
 
-    /// Screen rects of the page texts painted last frame, for hit testing, as for labels.
+    /// A reaction-table cell being typed into, while its box is open.
+    pub table_edit: Option<TableCellEdit>,
+
+    /// Screen rects of the page texts and tables painted last frame, for hit testing, as for
+    /// labels; and the cells of each table.
     last_object_rects: std::collections::HashMap<u32, egui::Rect>,
+    last_table_cells: std::collections::HashMap<u32, Vec<(crate::reaction::edit::CellRef, egui::Rect)>>,
 }
 
 /// What [`ChemStructEditor::show`] hands back: the canvas response, for a host to attach a
@@ -262,7 +279,9 @@ impl Default for ChemStructEditor {
             hovered_object: None,
             text_edit: None,
             object_drag: None,
+            table_edit: None,
             last_object_rects: std::collections::HashMap::new(),
+            last_table_cells: std::collections::HashMap::new(),
         }
     }
 }
@@ -816,6 +835,7 @@ impl ChemStructEditor {
         self.hotspot_atom = None;
         self.label_edit = None;
         self.text_edit = None;
+        self.table_edit = None;
         self.object_drag = None;
     }
 
@@ -879,6 +899,75 @@ impl ChemStructEditor {
         }
     }
 
+    /// Insert a reaction table for the reaction of the selected arrow (or of the first reaction
+    /// arrow on the page; every structure when there is none), under it, as one undo step, and
+    /// select it. Returns its id, or `None` when there are no structures to tabulate.
+    pub fn insert_reaction_table(&mut self) -> Option<u32> {
+        let arrow = self
+            .selected_objects
+            .iter()
+            .copied()
+            .find(|id| self.molecule.object_by_id(*id).is_some_and(|o| o.as_arrow().is_some()));
+        let table = crate::molecule::reaction_table::new_table(&self.molecule, arrow)?;
+        self.push_undo();
+        let id = self.molecule.push_object(PageObject::Table(table));
+        self.selected_atoms.clear();
+        self.selected_objects = [id].into_iter().collect();
+        Some(id)
+    }
+
+    /// Edit `cell` of table `id`, as a double-click on it does: `Limiting?` toggles at once (one
+    /// undo step), an entered quantity opens the edit box. Returns whether the molecule changed.
+    pub fn edit_table_cell(&mut self, id: u32, cell: crate::reaction::edit::CellRef) -> bool {
+        use crate::molecule::reaction_table::{cell_action, edit_cell, CellAction};
+        let Some(PageObject::Table(table)) = self.molecule.object_by_id(id) else { return false };
+        match cell_action(&self.molecule, table, cell) {
+            CellAction::ReadOnly => false,
+            CellAction::Toggle => match edit_cell(&self.molecule, table, cell, "") {
+                Ok(Some(edited)) if &edited != table => {
+                    self.push_undo();
+                    if let Some(PageObject::Table(t)) = self.molecule.object_by_id_mut(id) {
+                        *t = edited;
+                    }
+                    true
+                }
+                _ => false,
+            },
+            CellAction::Type(text) => {
+                self.table_edit = Some(TableCellEdit { id, cell, text, error: None });
+                false
+            }
+        }
+    }
+
+    /// Close the table cell box, writing what was typed (one undo step when it changes the
+    /// table). A value that does not read is refused: the box stays open with the reason in
+    /// [`TableCellEdit::error`]. Returns whether the molecule changed.
+    pub fn commit_table_edit(&mut self) -> bool {
+        use crate::molecule::reaction_table::edit_cell;
+        let Some(edit) = self.table_edit.take() else { return false };
+        let Some(PageObject::Table(table)) = self.molecule.object_by_id(edit.id) else { return false };
+        match edit_cell(&self.molecule, table, edit.cell, &edit.text) {
+            Ok(Some(edited)) if &edited != table => {
+                self.push_undo();
+                if let Some(PageObject::Table(t)) = self.molecule.object_by_id_mut(edit.id) {
+                    *t = edited;
+                }
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                self.table_edit = Some(TableCellEdit { error: Some(e.to_string()), ..edit });
+                false
+            }
+        }
+    }
+
+    /// The value cell of table `id` under screen point `screen`, as painted last frame.
+    pub fn table_cell_at(&self, id: u32, screen: egui::Pos2) -> Option<crate::reaction::edit::CellRef> {
+        self.last_table_cells.get(&id)?.iter().find(|(_, r)| r.contains(screen)).map(|(c, _)| *c)
+    }
+
     /// The page object under screen point `screen`: an arrow near its shaft, a text over the
     /// rect it was painted in last frame. The topmost (last drawn) wins.
     pub fn hit_test_object(&self, screen: egui::Pos2, center: egui::Pos2) -> Option<u32> {
@@ -897,6 +986,10 @@ impl ChemStructEditor {
                 }
                 PageObject::Text(t) => match self.last_object_rects.get(&t.id) {
                     Some(r) => r.expand(3.0).contains(screen),
+                    None => view.mol_to_screen(t.pos).distance(screen) <= NODE_HIT_RADIUS_PX,
+                },
+                PageObject::Table(t) => match self.last_object_rects.get(&t.id) {
+                    Some(r) => r.contains(screen),
                     None => view.mol_to_screen(t.pos).distance(screen) <= NODE_HIT_RADIUS_PX,
                 },
             };
@@ -1234,6 +1327,56 @@ impl ChemStructEditor {
         }
     }
 
+    /// Show the box of the table cell being typed into, over that cell; Enter commits (unless
+    /// the value does not read), Escape cancels, a click elsewhere commits. Returns whether a
+    /// commit changed the molecule.
+    fn show_table_edit(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(edit) = self.table_edit.as_ref() else { return false };
+        let cell_rect = self.last_table_cells.get(&edit.id).and_then(|cells| cells.iter().find(|(c, _)| *c == edit.cell)).map(|(_, r)| *r);
+        let (Some(rect), true) = (cell_rect, self.molecule.object_by_id(edit.id).is_some()) else {
+            self.table_edit = None;
+            return false;
+        };
+        let size = (rect.height() * 0.6).max(10.0);
+        let Some(edit) = self.table_edit.as_mut() else { return false };
+        let area = egui::Area::new(egui::Id::unique("chembuilder_table_cell_edit"))
+            .fixed_pos(rect.min)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                let response = egui::TextEdit::singleline(&mut edit.text)
+                    .desired_width(rect.width().max(80.0))
+                    .font(egui::FontId::proportional(size))
+                    .show(ui)
+                    .response;
+                if let Some(error) = &edit.error {
+                    ui.colored_label(egui::Color32::from_rgb(200, 40, 40), error);
+                }
+                response
+            });
+        let response = area.inner;
+        response.request_focus();
+        let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        let clicked_elsewhere = ui.input(|i| i.pointer.any_pressed())
+            && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !area.response.rect.contains(p));
+        if escape {
+            self.table_edit = None;
+            response.surrender_focus();
+            false
+        } else if enter || clicked_elsewhere {
+            let changed = self.commit_table_edit();
+            if clicked_elsewhere {
+                // A click away never leaves a refused box behind.
+                self.table_edit = None;
+            }
+            if self.table_edit.is_none() {
+                response.surrender_focus();
+            }
+            changed
+        } else {
+            false
+        }
+    }
+
     /// Main entry point called from the app each frame. Returns true if molecule was modified.
     ///
     /// A host that wants the canvas [`Response`](egui::Response) — to attach a context menu,
@@ -1255,7 +1398,10 @@ impl ChemStructEditor {
         // the fit lands in this very frame. Not while a text field (the label editor, or a host
         // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
         // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
-        let text_input = self.label_edit.is_some() || self.text_edit.is_some() || ui.ctx().egui_wants_keyboard_input();
+        let text_input = self.label_edit.is_some()
+            || self.text_edit.is_some()
+            || self.table_edit.is_some()
+            || ui.ctx().egui_wants_keyboard_input();
         if !text_input && ui.input(|i| i.key_pressed(egui::Key::Num0) && i.modifiers.ctrl) {
             self.request_fit();
         }
@@ -1362,12 +1508,12 @@ impl ChemStructEditor {
         // Ctrl+Z: undo. Ctrl+Y or Ctrl+Shift+Z: redo.
         let undo_pressed = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
         // The text box keeps Ctrl+Z / Ctrl+Y for its own typing.
-        let did_undo = undo_pressed && self.text_edit.is_none() && self.undo();
+        let did_undo = undo_pressed && self.text_edit.is_none() && self.table_edit.is_none() && self.undo();
         let redo_pressed = ui.input(|i| {
             (i.key_pressed(egui::Key::Y) && i.modifiers.ctrl)
                 || (i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && i.modifiers.shift)
         });
-        let did_redo = redo_pressed && self.text_edit.is_none() && self.redo();
+        let did_redo = redo_pressed && self.text_edit.is_none() && self.table_edit.is_none() && self.redo();
 
         // Copy/paste only act on the canvas when no text field has focus.
         let editing_text = ui.ctx().egui_wants_keyboard_input();
@@ -1487,8 +1633,8 @@ impl ChemStructEditor {
         let label_editing = self.label_edit.is_some();
 
         // ── Page text box ────────────────────────────────────────────────────
-        let text_committed = self.show_text_edit(ui, center);
-        let text_editing = self.text_edit.is_some();
+        let text_committed = self.show_text_edit(ui, center) | self.show_table_edit(ui);
+        let text_editing = self.text_edit.is_some() || self.table_edit.is_some();
 
         // Suppress canvas key/mouse handling whenever a text field (our label editor or a
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
@@ -1526,7 +1672,9 @@ impl ChemStructEditor {
         draw::draw_bonds(self, &painter, center, &label_layouts);
         draw::draw_atom_backgrounds(self, &painter, center, &label_layouts);
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
-        self.last_object_rects = draw::draw_page_objects(self, &painter, center);
+        let painted = draw::draw_page_objects(self, &painter, center);
+        self.last_object_rects = painted.rects;
+        self.last_table_cells = painted.cells;
         draw::draw_overlays(self, &painter, center);
 
         EditorResponse { response, modified }

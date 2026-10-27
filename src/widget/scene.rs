@@ -24,7 +24,9 @@ use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
-use crate::molecule::{ArrowKind, BondOrder, BondStereo, DoublePosition, Molecule, PageObject, PageText, TextAlign};
+use crate::molecule::{ArrowKind, BondOrder, BondStereo, DoublePosition, Molecule, PageObject, PageText, ReactionTable, TextAlign};
+use crate::reaction::edit::CellRef;
+use crate::widget::rich_text::{RichText, SpanStyle};
 
 use crate::molecule::depict::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
@@ -221,12 +223,14 @@ pub fn build_objects(
     xf: RenderTransform,
     mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
 ) -> Vec<SceneObject> {
-    mol.objects.iter().map(|o| build_object(o, style, xf, &mut layout)).collect()
+    mol.objects.iter().map(|o| build_object(o, mol, style, xf, &mut layout)).collect()
 }
 
-/// Primitives of one page object; see [`build_objects`].
+/// Primitives of one page object of `mol` (a table needs the structures it describes); see
+/// [`build_objects`].
 pub fn build_object(
     object: &PageObject,
+    mol: &Molecule,
     style: &StyleConfig,
     xf: RenderTransform,
     layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
@@ -254,7 +258,154 @@ pub fn build_object(
             });
             SceneObject { object_id: t.id, strokes: Vec::new(), fills: Vec::new(), texts, rect }
         }
+        PageObject::Table(t) => build_table(t, mol, style, xf, layout).object,
     }
+}
+
+// ─── Reaction tables ──────────────────────────────────────────────────────────
+
+/// ChemDraw's stoichiometry grid, in points (its text is 10 pt): from the grid's top to its
+/// frames. The other `TABLE_` constants are the row height, from a row's top to its baseline,
+/// the padding left of a cell's text (and right of the widest), the gap between the two
+/// blocks, and from the frames' top up to the block titles' baseline — all measured off
+/// ChemDraw 25's own `ReactionAnalysis` document.
+pub const TABLE_FRAME_TOP: f32 = 15.0;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_ROW_HEIGHT: f32 = 15.0;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_BASELINE: f32 = 11.25;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_CELL_PAD: f32 = 7.5;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_BLOCK_GAP: f32 = 1.875;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_TITLE_RAISE: f32 = 3.75;
+/// Letter spacing of the block titles (*R e a c t a n t s*), in points.
+pub const TABLE_TITLE_TRACKING: f32 = 3.0;
+/// The narrowest a value column gets, in points (a column with nothing in it yet).
+pub const TABLE_MIN_COLUMN: f32 = 40.0;
+/// Size of a unit after its number (`1.00`g), relative to the text.
+pub const TABLE_UNIT_SCALE: f32 = 0.75;
+
+/// A reaction table's primitives, and where each of its cells is (for picking the one to
+/// edit): `cells` holds every value cell, labels and titles excluded, at its row's full height
+/// and its column's full width.
+pub struct TableScene {
+    pub object: SceneObject,
+    pub cells: Vec<(CellRef, Rect)>,
+}
+
+/// Lay `table` out against the structures of `mol`, as ChemDraw draws its stoichiometry grid:
+/// the italic, letter-spaced block title over a framed block with a rule between columns,
+/// row labels in the first column, values left-aligned, units smaller. Sizes follow the atom
+/// label size (taken as ChemDraw's 10 pt).
+pub fn build_table(
+    table: &ReactionTable,
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> TableScene {
+    let state = crate::molecule::reaction_table::TableState::of(mol, table);
+    let blocks = state.blocks();
+    let pt = style.label_size * xf.visual_scale / 10.0;
+    let width = style.bond_width * xf.visual_scale;
+    let text_style = RichTextStyle::new(10.0 * pt, Color32::BLACK);
+    let unit_style = RichTextStyle::new(10.0 * pt * TABLE_UNIT_SCALE, Color32::BLACK);
+    let origin = xf.apply(table.pos);
+    let frame_top = origin.y + TABLE_FRAME_TOP * pt;
+    let rows = blocks.iter().map(|b| b.row_labels.len()).max().unwrap_or(0);
+    let frame_bottom = frame_top + rows as f32 * TABLE_ROW_HEIGHT * pt;
+    let pad = TABLE_CELL_PAD * pt;
+    let mut strokes = Vec::new();
+    let mut texts = Vec::new();
+    let mut cells = Vec::new();
+    // Put a laid-out text with its baseline at `baseline`, its left end at `x`; its width.
+    let place = |galley: super::rich_text::RichGalley, x: f32, baseline: f32, texts: &mut Vec<SceneText>| -> f32 {
+        let w = galley.size().x;
+        let rect = Rect::from_min_size(Pos2::new(x, baseline - galley.baseline()), galley.size());
+        if !galley.parts.is_empty() {
+            texts.push(SceneText { galley, rect });
+        }
+        w
+    };
+    let mut x0 = origin.x;
+    for block in &blocks {
+        // Lay every cell out first: the columns are as wide as their widest text.
+        let labels: Vec<_> =
+            block.row_labels.iter().map(|l| RichText::plain(l.clone()).layout_with(&text_style, &mut layout)).collect();
+        let values: Vec<Vec<_>> = block
+            .columns
+            .iter()
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|c| {
+                        let value = c.text.layout_with(&text_style, &mut layout);
+                        let unit = (!c.unit.is_empty())
+                            .then(|| RichText::plain(c.unit.clone()).layout_with(&unit_style, &mut layout));
+                        (value, unit)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut column_x = vec![x0];
+        let label_w = labels.iter().map(|g| g.size().x).fold(0.0, f32::max);
+        column_x.push(x0 + label_w + 2.0 * pad);
+        for column in &values {
+            let w = column
+                .iter()
+                .map(|(v, u)| v.size().x + u.as_ref().map_or(0.0, |u| u.size().x))
+                .fold(0.0, f32::max);
+            let last = *column_x.last().expect("one edge at least");
+            column_x.push(last + (w + 2.0 * pad).max(TABLE_MIN_COLUMN * pt));
+        }
+        let x1 = *column_x.last().expect("one edge at least");
+        // The frame and the rules between columns.
+        for (a, b) in [
+            ((x0, frame_top), (x1, frame_top)),
+            ((x1, frame_top), (x1, frame_bottom)),
+            ((x1, frame_bottom), (x0, frame_bottom)),
+            ((x0, frame_bottom), (x0, frame_top)),
+        ] {
+            strokes.push(SceneStroke { a: Pos2::new(a.0, a.1), b: Pos2::new(b.0, b.1), width });
+        }
+        for &x in &column_x[1..column_x.len() - 1] {
+            strokes.push(SceneStroke { a: Pos2::new(x, frame_top), b: Pos2::new(x, frame_bottom), width });
+        }
+        // The title, a letter at a time.
+        let title_style = SpanStyle { italic: true, ..Default::default() };
+        let mut tx = x0;
+        for c in block.title.chars() {
+            let g = RichText::new().span(c.to_string(), title_style).layout_with(&text_style, &mut layout);
+            tx += place(g, tx, frame_top - TABLE_TITLE_RAISE * pt, &mut texts) + TABLE_TITLE_TRACKING * pt;
+        }
+        let baseline = |r: usize| frame_top + (r as f32 * TABLE_ROW_HEIGHT + TABLE_BASELINE) * pt;
+        for (r, g) in labels.into_iter().enumerate() {
+            place(g, x0 + pad, baseline(r), &mut texts);
+        }
+        for (c, column) in values.into_iter().enumerate() {
+            let (left, right) = (column_x[c + 1], column_x[c + 2]);
+            for (r, (value, unit)) in column.into_iter().enumerate() {
+                let x = left + pad;
+                let w = place(value, x, baseline(r), &mut texts);
+                if let Some(unit) = unit {
+                    place(unit, x + w, baseline(r), &mut texts);
+                }
+                let top = frame_top + r as f32 * TABLE_ROW_HEIGHT * pt;
+                cells.push((
+                    CellRef::new(block.kind, c, r),
+                    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, top + TABLE_ROW_HEIGHT * pt)),
+                ));
+            }
+        }
+        x0 = x1 + TABLE_BLOCK_GAP * pt;
+    }
+    let mut rect = Rect::from_min_max(origin, Pos2::new(x0 - TABLE_BLOCK_GAP * pt, frame_bottom)).expand(width * 0.5);
+    for t in &texts {
+        rect = rect.union(t.rect);
+    }
+    TableScene { object: SceneObject { object_id: table.id, strokes, fills: Vec::new(), texts, rect }, cells }
 }
 
 /// The lines of a page text laid out and placed: line `k`'s baseline is `k` line heights below
@@ -1033,5 +1184,42 @@ mod tests {
         assert!(inset(&m) < 0.0, "automatic: toward the substituent");
         m.bond_by_id_mut(id).unwrap().double_position = DoublePosition::Right;
         assert!(inset(&m) > 0.0, "chosen: Right");
+    }
+
+    /// A reaction table is drawn as ChemDraw draws its grid: two framed blocks (four sides
+    /// each) with a rule between columns, the letter-spaced titles, labels and values, and a
+    /// cell rect for every value; the scene's bounds take it in.
+    #[test]
+    fn a_reaction_table_draws_frames_rules_and_cells() {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".into(), [0.0, 0.0], 0);
+        let b = m.add_atom("O".into(), [1.3, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        m.add_arrow([2.5, 0.0], [5.5, 0.0], ArrowKind::Reaction);
+        m.add_atom("C".into(), [6.5, 0.0], 0);
+        let table = crate::molecule::reaction_table::new_table(&m, None).unwrap();
+        let id = m.push_object(PageObject::Table(table));
+        let PageObject::Table(table) = m.object_by_id(id).unwrap().clone() else { unreachable!() };
+        let style = StyleConfig::chemdraw();
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let mut fonts = fonts();
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let scene = build_table(&table, &m, &style, xf, |job| view.layout_job(job));
+        let horizontal = scene.object.strokes.iter().filter(|s| (s.a.y - s.b.y).abs() < 1e-3).count();
+        assert_eq!(horizontal, 4, "top and bottom of each block, no rules between rows");
+        // Reactants: 4 sides + 1 rule; Products: 4 sides + 1 rule.
+        assert_eq!(scene.object.strokes.len(), 10);
+        assert_eq!(scene.cells.len(), 2 * 11, "one value column per block");
+        let text: String = scene.object.texts.iter().flat_map(|t| t.galley.glyph_placements()).map(|g| g.chr).collect();
+        for expected in ["Reactants", "Products", "Formula", "%Yield", "Yes", "32.04"] {
+            assert!(text.contains(expected), "{expected} in {text}");
+        }
+        // 10 pt text on a 14.4 pt bond: a row is 15 pt.
+        let pt = style.label_size / 10.0;
+        let r = scene.cells[1].1;
+        assert!((r.height() - 15.0 * pt).abs() < 1e-3);
+        let full = MoleculeScene::build(&m, &style, xf, |job| view.layout_job(job));
+        let bounds = full.bounds(&m, xf).unwrap();
+        assert!(bounds.max.y >= scene.object.rect.max.y - 1e-3 && bounds.max.x >= scene.object.rect.max.x - 1e-3);
     }
 }
