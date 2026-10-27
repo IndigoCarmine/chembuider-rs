@@ -88,9 +88,9 @@ const DOCUMENT_STYLE: [(u16, &str); 14] = [
 ];
 
 /// Font id of Arial in [`DOCUMENT_STYLE`]'s font table.
-const LABEL_FONT: u16 = 3;
+pub(super) const LABEL_FONT: u16 = 3;
 /// Label size in 1/20 pt (10 pt).
-const LABEL_SIZE: u16 = 200;
+pub(super) const LABEL_SIZE: u16 = 200;
 /// Formula face: digits become subscripts and a trailing charge a superscript.
 const FACE_FORMULA: u16 = 0x60;
 const FACE_BOLD: u16 = 0x01;
@@ -102,7 +102,7 @@ const FACE_SUPERSCRIPT: u16 = 0x40;
 pub const SCALE: f64 = 14.4 / 1.5 * 65536.0;
 
 /// One point in CDX units.
-const PT: f64 = 65536.0;
+pub(super) const PT: f64 = 65536.0;
 /// A structure starting above or left of the page edge is moved to this margin.
 const PAGE_MARGIN: f64 = 36.0 * PT;
 /// From an atom to its label's baseline, as ChemDraw places it (half the cap height of 10 pt Arial).
@@ -186,22 +186,91 @@ fn arial_width(c: char) -> f64 {
     per_mille as f64 * 10.0 * PT / 1000.0
 }
 
-/// The text object labelling an atom at `at` (CDX units): `label` with its style runs, aligned on
-/// the first character (`ALIGN_LEFT`) or the last.
-fn label_object(id: u32, at: (f64, f64), runs: &[(u16, u16)], text: &str, align: u8) -> CdxObject {
+/// Where the label `text` of an atom at `at` (CDX units) goes, aligned on its first character or,
+/// with `right`, its last: the text's origin on the baseline and its bounding box (left, top,
+/// right, bottom), in CDX units.
+pub(super) fn label_geometry(at: (f64, f64), text: &str, right: bool) -> ((f64, f64), [f64; 4]) {
     let (x, y) = at;
     let first = text.chars().next().map_or(0.0, arial_width);
     let last = text.chars().last().map_or(0.0, arial_width);
     let width: f64 = text.chars().map(arial_width).sum();
-    let (origin_x, left) = if align == ALIGN_RIGHT { (x + last / 2.0, x + last / 2.0 - width) } else { (x - first / 2.0, x - first / 2.0) };
+    let (origin_x, left) = if right { (x + last / 2.0, x + last / 2.0 - width) } else { (x - first / 2.0, x - first / 2.0) };
     let baseline = y + LABEL_BASELINE;
+    ((origin_x, baseline), [left, baseline - 7.2 * PT, left + width, baseline + 2.1 * PT])
+}
+
+/// The text object labelling an atom at `at` (CDX units): `label` with its style runs, aligned on
+/// the first character or the last.
+fn label_object(id: u32, at: (f64, f64), label: &NodeLabel) -> CdxObject {
+    let (origin, bbox) = label_geometry(at, &label.text, label.right);
     let mut t = CdxObject::new(OBJ_TEXT, id);
-    t.set(PROP_2D_POSITION, point(origin_x, baseline));
-    t.set(PROP_BOUNDING_BOX, rect([left, baseline - 7.2 * PT, left + width, baseline + 2.1 * PT]));
-    t.set(PROP_LABEL_ALIGNMENT, vec![align]);
-    t.set(PROP_TEXT, cdx_string(runs, text));
-    t.set(PROP_UTF8_TEXT, cdx_string(runs, text));
+    t.set(PROP_2D_POSITION, point(origin.0, origin.1));
+    t.set(PROP_BOUNDING_BOX, rect(bbox));
+    t.set(PROP_LABEL_ALIGNMENT, vec![if label.right { ALIGN_RIGHT } else { ALIGN_LEFT }]);
+    t.set(PROP_TEXT, cdx_string(&label.runs, &label.text));
+    t.set(PROP_UTF8_TEXT, cdx_string(&label.runs, &label.text));
     t
+}
+
+/// What an atom is written as: the node's type and element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NodeKind {
+    /// Carbon, ChemDraw's default node: no type and no element written.
+    Carbon,
+    /// Any other element, by atomic number.
+    Element(u16),
+    /// A label that is no element ("Ph", "CO_2Et", "D"): a node of no element, its text all
+    /// there is of it.
+    Unspecified,
+}
+
+/// The label a node carries: its text with its style runs (start char, face), aligned on its
+/// first character or, with `right`, its last (the hydrogens of "H2N" before the atom).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NodeLabel {
+    pub runs: Vec<(u16, u16)>,
+    pub text: String,
+    pub right: bool,
+}
+
+/// How an atom is written as a node of a ChemDraw document. One set of rules for both of
+/// ChemDraw's formats, the binary CDX here and its XML form ([`super::cdxml`]), so the two
+/// describe the same structure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NodeRules {
+    pub kind: NodeKind,
+    /// The hydrogens the label shows, for an element with a label (they are not nodes of their own).
+    pub num_hydrogens: Option<i16>,
+    pub charge: i8,
+    pub label: Option<NodeLabel>,
+}
+
+/// Whether `atom_id` is a node of its own: a hydrogen folded into its neighbour's label ("NH2")
+/// is only that label's hydrogen count, and its bond is not written either.
+pub(super) fn is_node(mol: &Molecule, atom_id: u32) -> bool {
+    !draw::is_folded_h(mol, atom_id)
+}
+
+/// The node `atom` is written as (see [`NodeRules`]).
+pub(super) fn node_rules(mol: &Molecule, atom: &super::Atom) -> NodeRules {
+    let z = elements::atomic_number(&atom.element);
+    let kind = match z {
+        Some(6) => NodeKind::Carbon,
+        Some(z) => NodeKind::Element(z),
+        None => NodeKind::Unspecified,
+    };
+    let shown = draw::should_show_label(mol, atom.id);
+    let num_hydrogens = (z.is_some() && shown).then(|| draw::displayed_h_count(mol, atom.id) as i16);
+    let label = shown.then(|| {
+        let (mut runs, text) = runs_of(&draw::atom_label(mol, atom).rich);
+        // An element's label is a formula, written the way ChemDraw writes its own.
+        if z.is_some() {
+            runs = vec![(0, FACE_FORMULA)];
+        }
+        let right = draw::displayed_h_count(mol, atom.id) > 0 && draw::h_side(mol, atom.id) == draw::HSide::Left;
+        NodeLabel { runs, text, right }
+    });
+    NodeRules { kind, num_hydrogens, charge: atom.charge, label }
 }
 
 /// Style runs (start char, face) for rich text, and its characters.
@@ -314,14 +383,14 @@ fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject
         *next += 1;
         *next
     };
-    let visible: Vec<&super::Atom> = mol.atoms.iter().filter(|a| !draw::is_folded_h(mol, a.id)).collect();
+    let visible: Vec<&super::Atom> = mol.atoms.iter().filter(|a| is_node(mol, a.id)).collect();
     let mut placed: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut out = Vec::new();
     for start in &visible {
         if placed.contains(&start.id) {
             continue;
         }
-        let members: Vec<u32> = mol.connected_atoms(start.id).into_iter().filter(|a| !draw::is_folded_h(mol, *a)).collect();
+        let members: Vec<u32> = mol.connected_atoms(start.id).into_iter().filter(|a| is_node(mol, *a)).collect();
         placed.extend(&members);
         let mut frag = CdxObject::new(OBJ_FRAGMENT, id());
         let mut bbox = None;
@@ -333,28 +402,20 @@ fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject
             bbox = Some(union(bbox, [at.0, at.1, at.0, at.1]));
             let mut node = CdxObject::new(OBJ_NODE, node_id);
             node.set(PROP_2D_POSITION, point(at.0, at.1));
-            let z = elements::atomic_number(&atom.element);
-            match z {
-                Some(6) => {}
-                Some(z) => node.set(PROP_NODE_ELEMENT, (z as i16).to_le_bytes().to_vec()),
-                None => node.set(PROP_NODE_TYPE, NODE_UNSPECIFIED.to_le_bytes().to_vec()),
+            let rules = node_rules(mol, atom);
+            match rules.kind {
+                NodeKind::Carbon => {}
+                NodeKind::Element(z) => node.set(PROP_NODE_ELEMENT, (z as i16).to_le_bytes().to_vec()),
+                NodeKind::Unspecified => node.set(PROP_NODE_TYPE, NODE_UNSPECIFIED.to_le_bytes().to_vec()),
             }
-            if z.is_some() && draw::should_show_label(mol, atom.id) {
-                node.set(PROP_ATOM_NUM_HYDROGENS, (draw::displayed_h_count(mol, atom.id) as i16).to_le_bytes().to_vec());
+            if let Some(h) = rules.num_hydrogens {
+                node.set(PROP_ATOM_NUM_HYDROGENS, h.to_le_bytes().to_vec());
             }
-            if atom.charge != 0 {
-                node.set(PROP_ATOM_CHARGE, vec![atom.charge as u8]);
+            if rules.charge != 0 {
+                node.set(PROP_ATOM_CHARGE, vec![rules.charge as u8]);
             }
-            if draw::should_show_label(mol, atom.id) {
-                let label = draw::atom_label(mol, atom);
-                let (mut runs, text) = runs_of(&label.rich);
-                // An element's label is a formula, written the way ChemDraw writes its own.
-                if z.is_some() {
-                    runs = vec![(0, FACE_FORMULA)];
-                }
-                let h_left = draw::displayed_h_count(mol, atom.id) > 0 && draw::h_side(mol, atom.id) == draw::HSide::Left;
-                let align = if h_left { ALIGN_RIGHT } else { ALIGN_LEFT };
-                node.children.push(label_object(id(), at, &runs, &text, align));
+            if let Some(label) = &rules.label {
+                node.children.push(label_object(id(), at, label));
             }
             frag.children.push(node);
         }
