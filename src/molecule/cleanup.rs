@@ -696,6 +696,8 @@ const JOB_PHASE_BUDGET: usize = 100_000;
 ///     there, one chunk per call).
 ///   * Once `is_done` returns `true`, `latest` returns the final positions.
 ///   * After `cancel`, the run must still reach `is_done` (soon), so the editor can finish.
+///   * The run may be dropped without `join` (e.g. when the editor holding it is dropped, or
+///     its `cleanup_job` is replaced); dropping it must stop any background work.
 ///
 /// Methods take `&self` because the editor holds the job behind a shared reference while it
 /// polls; a run that needs to mutate uses interior mutability.
@@ -1782,6 +1784,89 @@ mod tests {
             job.join();
             assert!(joined.load(Ordering::Relaxed));
         }
+    }
+
+    /// An engine whose runs report fixed positions, standing in for the force field.
+    struct FakeEngine {
+        positions: Vec<(u32, [f32; 2])>,
+        done: bool,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupEngine for FakeEngine {
+        fn start(&self, _mol: &Molecule) -> CleanupJob {
+            CleanupJob::from_run(FakeRun {
+                positions: self.positions.clone(),
+                done: self.done,
+                cancelled: Default::default(),
+                joined: self.joined.clone(),
+            })
+        }
+    }
+
+    /// An editor set up by [`editor_with_fake_engine`], and what the tests check it against.
+    struct FakeEngineFixture {
+        editor: crate::widget::ChemStructEditor,
+        /// The molecule before any cleanup.
+        before: Molecule,
+        /// The positions the fake engine's runs report.
+        positions: Vec<(u32, [f32; 2])>,
+        /// Set once the run is joined.
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// An editor with two atoms, cleaned up by a `FakeEngine` that moves both of them.
+    fn editor_with_fake_engine(done: bool) -> FakeEngineFixture {
+        let mut editor = crate::widget::ChemStructEditor::default();
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [5.0, 5.0], 0);
+        let before = editor.molecule.clone();
+        let positions = vec![(a, [1.25, -0.5]), (b, [2.5, 0.75])];
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        editor.set_cleanup_engine(FakeEngine { positions: positions.clone(), done, joined: joined.clone() });
+        FakeEngineFixture { editor, before, positions, joined }
+    }
+
+    fn atom_positions(mol: &Molecule) -> Vec<(u32, [f32; 2])> {
+        mol.atoms.iter().map(|a| (a.id, a.pos)).collect()
+    }
+
+    /// The editor's Cleanup runs the engine set with `set_cleanup_engine`: `poll_cleanup`
+    /// copies that engine's positions in, and on completion joins the run, clears
+    /// `cleanup_job` and leaves exactly one undo step back to the pre-cleanup molecule.
+    #[test]
+    fn set_cleanup_engine_drives_toggle_and_poll() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, positions, joined } = editor_with_fake_engine(true);
+
+        editor.toggle_cleanup();
+        assert!(editor.cleanup_job.is_some());
+        assert_eq!(editor.undo_stack.len(), 1);
+        assert_eq!(editor.undo_stack.back(), Some(&before));
+
+        assert!(!editor.poll_cleanup(), "a finished run ends the cleanup");
+        assert_eq!(atom_positions(&editor.molecule), positions);
+        assert!(editor.cleanup_job.is_none());
+        assert!(joined.load(Ordering::Relaxed));
+        assert_eq!(editor.undo_stack.len(), 1);
+
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// While the engine's run is not done, `poll_cleanup` previews its positions and keeps
+    /// the job.
+    #[test]
+    fn unfinished_engine_run_keeps_the_job() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, positions, joined, .. } = editor_with_fake_engine(false);
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup(), "an unfinished run keeps the cleanup active");
+        assert_eq!(atom_positions(&editor.molecule), positions);
+        assert!(editor.cleanup_job.is_some());
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(editor.undo_stack.len(), 1);
     }
 
     /// Wrapping the run in a trait object must not cost `CleanupJob` (and so the editor that

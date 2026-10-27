@@ -148,6 +148,10 @@ pub struct ChemStructEditor {
     /// Active background cleanup computation, if any (None when idle).
     pub cleanup_job: Option<crate::molecule::cleanup::CleanupJob>,
 
+    /// Starts the runs behind [`toggle_cleanup`](Self::toggle_cleanup); the built-in cleanup
+    /// unless replaced with [`set_cleanup_engine`](Self::set_cleanup_engine).
+    cleanup_engine: Box<dyn crate::molecule::cleanup::CleanupEngine + Send + Sync>,
+
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
@@ -191,6 +195,7 @@ impl Default for ChemStructEditor {
             last_mouse_mol: [0.0; 2],
             pointer_active: false,
             cleanup_job: None,
+            cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
             rotate_last_angle: None,
             last_label_rects: std::collections::HashMap::new(),
@@ -539,7 +544,10 @@ impl ChemStructEditor {
     }
 
     /// Toggle the background cleanup: start it if idle, otherwise request it to stop.
-    /// Starting snapshots the current molecule into a worker thread so the UI never freezes.
+    /// Starting pushes an undo step and starts a run from the cleanup engine (see
+    /// [`set_cleanup_engine`](Self::set_cleanup_engine)). The built-in engine relaxes a snapshot
+    /// of the molecule in the background (a worker thread natively, one chunk per poll on
+    /// wasm32) so the UI never freezes.
     pub fn toggle_cleanup(&mut self) {
         match &self.cleanup_job {
             Some(job) => job.cancel(),
@@ -548,9 +556,18 @@ impl ChemStructEditor {
                     return;
                 }
                 self.push_undo();
-                self.cleanup_job = Some(crate::molecule::cleanup::CleanupJob::start(&self.molecule));
+                self.cleanup_job = Some(self.cleanup_engine.start(&self.molecule));
             }
         }
+    }
+
+    /// Replace the engine that [`toggle_cleanup`](Self::toggle_cleanup) starts runs from.
+    /// A cleanup already running is unaffected; the next one uses `engine`.
+    pub fn set_cleanup_engine(
+        &mut self,
+        engine: impl crate::molecule::cleanup::CleanupEngine + Send + Sync + 'static,
+    ) {
+        self.cleanup_engine = Box::new(engine);
     }
 
     /// Pump the background cleanup once per frame: copy the latest positions in for a live
