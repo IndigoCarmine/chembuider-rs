@@ -104,6 +104,7 @@ While hovering the canvas, single keys place elements, fragments, and templates.
 | `Ctrl`+`Z` | undo |
 | `Ctrl`+`Y` / `Ctrl`+`Shift`+`Z` | redo |
 | `Ctrl`+`C` / `Ctrl`+`V` | copy / paste (Windows) |
+| `Ctrl`+`0` | fit the whole structure to the view |
 
 Selected atoms can be nudged with `Shift`+arrows (or `Ctrl`+arrows) and rotated with
 `Alt`+arrows. The full, user-editable key map lives in

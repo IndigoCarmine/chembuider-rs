@@ -103,6 +103,7 @@ impl eframe::App for MyApp {
 | `Ctrl`+`Z` | undo（元に戻す） |
 | `Ctrl`+`Y` / `Ctrl`+`Shift`+`Z` | redo（やり直し） |
 | `Ctrl`+`C` / `Ctrl`+`V` | コピー / ペースト（Windows） |
+| `Ctrl`+`0` | 構造全体がキャンバスに収まるように表示 |
 
 選択した原子は `Shift`+矢印（または `Ctrl`+矢印）で移動、`Alt`+矢印で回転できます。
 編集可能なキーマップの全体は [`assets/default_config.json`](assets/default_config.json) にあります。

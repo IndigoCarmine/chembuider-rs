@@ -895,6 +895,15 @@ impl ChemStructEditor {
         let center = rect.center();
         let painter = ui.painter_at(rect);
 
+        // Ctrl+0: fit the whole drawing to the canvas. Read here, ahead of the request below, so
+        // the fit lands in this very frame. Not while a text field (the label editor, or a host
+        // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
+        // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
+        let text_input = self.label_edit.is_some() || ui.ctx().egui_wants_keyboard_input();
+        if !text_input && ui.input(|i| i.key_pressed(egui::Key::Num0) && i.modifiers.ctrl) {
+            self.request_fit();
+        }
+
         // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
         // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
         if std::mem::take(&mut self.fit_requested) {
@@ -1919,5 +1928,75 @@ mod fit_tests {
         let pan = editor.pan;
         frame(&ctx, &mut editor);
         assert_eq!(editor.pan, pan);
+    }
+
+    /// Run one frame delivering the chord `spec`; with `text_field`, a host text field that
+    /// holds keyboard focus is shown above the editor. Returns the editor's canvas rect.
+    fn chord_frame(
+        ctx: &egui::Context,
+        editor: &mut ChemStructEditor,
+        spec: &str,
+        mut text_field: Option<&mut String>,
+    ) -> egui::Rect {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+        let (events, modifiers) = crate::testkit::chord(spec);
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            modifiers,
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let mut canvas = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            if let Some(text) = text_field.as_deref_mut() {
+                ui.add(egui::TextEdit::singleline(text)).request_focus();
+            }
+            canvas = ui.available_rect_before_wrap();
+            editor.ui(ui);
+        });
+        canvas
+    }
+
+    #[test]
+    fn ctrl_0_fits_the_view_in_the_same_frame_in_every_tool() {
+        for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
+            let ctx = egui::Context::default();
+            let mut editor = ChemStructEditor { tool: tool.clone(), ..labeled_editor() };
+            let atoms = editor.molecule.atoms.len();
+            let undo_len = editor.undo_stack.len();
+            let canvas = chord_frame(&ctx, &mut editor, "Ctrl+0", None);
+            assert!(editor.zoom < 1.0, "{tool:?}: Ctrl+0 zooms out to fit");
+            assert_framed(&editor, canvas);
+            // Plain `0` draws (a carbon / a 10-ring); Ctrl+0 must not.
+            assert_eq!(editor.molecule.atoms.len(), atoms, "{tool:?}: nothing drawn");
+            assert_eq!(editor.undo_stack.len(), undo_len, "{tool:?}: no undo snapshot");
+        }
+    }
+
+    #[test]
+    fn ctrl_0_does_nothing_while_a_host_text_field_has_focus() {
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        let mut text = String::new();
+        // First frame: the field takes focus.
+        chord_frame(&ctx, &mut editor, "Escape", Some(&mut text));
+        assert!(ctx.egui_wants_keyboard_input());
+        chord_frame(&ctx, &mut editor, "Ctrl+0", Some(&mut text));
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "view unchanged");
+    }
+
+    #[test]
+    fn ctrl_0_does_nothing_while_the_label_editor_is_open() {
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        let id = editor.molecule.atoms[1].id;
+        editor.label_edit = Some((id, "C".to_string()));
+        // On its first frame the label box is not focused yet; Ctrl+0 is still text input.
+        chord_frame(&ctx, &mut editor, "Ctrl+0", None);
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "view unchanged");
+        chord_frame(&ctx, &mut editor, "Ctrl+0", None);
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "view unchanged");
+        assert!(editor.label_edit.is_some(), "the label editor stays open");
     }
 }
