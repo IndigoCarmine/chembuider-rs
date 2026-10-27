@@ -948,7 +948,8 @@ fn linear_centers(mol: &Molecule) -> HashSet<u32> {
             match b.order {
                 BondOrder::Triple => *triples.entry(id).or_insert(0) += 1,
                 BondOrder::Double => *doubles.entry(id).or_insert(0) += 1,
-                BondOrder::Single => {}
+                // A quadruple bond (a metal–metal bond) implies no linear geometry.
+                BondOrder::Single | BondOrder::Quadruple => {}
             }
         }
     }

@@ -43,8 +43,9 @@ struct BondLabel {
 
 /// Whether `stereo` distinguishes the two ends of the bond.
 fn is_directional(stereo: u8) -> bool {
-    // 1 = WedgeUp, 2 = WedgeDown (hashed wedge). Bold/Dashed/Wavy are drawn symmetrically.
-    stereo == 1 || stereo == 2
+    // 1 = WedgeUp, 2 = WedgeDown (hashed wedge), 7 = HollowWedge, 8 = Dative (an arrow).
+    // Bold/Dashed/Wavy/Hashed are drawn symmetrically.
+    matches!(stereo, 1 | 2 | 7 | 8)
 }
 
 fn order_code(o: &BondOrder) -> u8 {
@@ -52,6 +53,7 @@ fn order_code(o: &BondOrder) -> u8 {
         BondOrder::Single => 1,
         BondOrder::Double => 2,
         BondOrder::Triple => 3,
+        BondOrder::Quadruple => 4,
     }
 }
 
@@ -63,6 +65,9 @@ fn stereo_code(s: &BondStereo) -> u8 {
         BondStereo::Bold => 3,
         BondStereo::Dashed => 4,
         BondStereo::Wavy => 5,
+        BondStereo::Hashed => 6,
+        BondStereo::HollowWedge => 7,
+        BondStereo::Dative => 8,
     }
 }
 

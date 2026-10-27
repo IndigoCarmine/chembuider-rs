@@ -174,3 +174,16 @@ fn written_cdxml_reads_back_without_warnings() {
         assert!(read.warnings.is_empty(), "{:?}", read.warnings);
     }
 }
+
+/// Line breaks and labels are part of the figure the `.rxn.json` file keeps, and a structure
+/// with no label writes none, as files from before labels have none.
+#[test]
+fn line_breaks_and_labels_survive_the_reaction_file() {
+    use crate::reaction::Reaction;
+    let reaction = demo::multi_step_scheme();
+    let read = Reaction::from_json(&reaction.to_json()).unwrap();
+    assert_eq!(outline(&read.scheme), outline(&reaction.scheme));
+    let plain = demo::williamson_ether_synthesis().to_json();
+    assert!(!plain.contains("\"label\""), "{plain}");
+    assert!(Reaction::from_json(&plain).is_ok());
+}

@@ -22,7 +22,7 @@
 
 use super::cdx::{self, NodeKind, NodeLabel, NodeRules};
 use super::lookup::{AtomLookup, MolIndex};
-use super::{Atom, BondOrder, BondStereo, Molecule};
+use super::{Atom, Bond, BondOrder, BondStereo, DoublePosition, Molecule};
 
 /// Points per molecular unit. Equals the binary writer's `SCALE` (629_145 units of 1/65536 point)
 /// divided by 65536, so a CDXML file and a CDX file built from the same `Molecule` describe the
@@ -103,10 +103,13 @@ pub fn to_cdxml(mol: &Molecule) -> String {
             "   <b B=\"{}\" E=\"{}\" Order=\"{}\"",
             bond.begin,
             bond.end,
-            bond_order_str(&bond.order),
+            bond_order_attr(bond),
         ));
         if let Some(display) = bond_display(&bond.stereo) {
             s.push_str(&format!(" Display=\"{display}\""));
+        }
+        if let Some(pos) = double_position_attr(bond) {
+            s.push_str(&format!(" DoublePosition=\"{pos}\""));
         }
         s.push_str("/>\n");
     }
@@ -118,12 +121,35 @@ pub fn to_cdxml(mol: &Molecule) -> String {
     s
 }
 
+/// CDXML `Order` value for a bond. A dative bond is its own order in ChemDraw.
+fn bond_order_attr(bond: &Bond) -> &'static str {
+    if bond.stereo == BondStereo::Dative {
+        "dative"
+    } else {
+        bond_order_str(&bond.order)
+    }
+}
+
+/// CDXML `DoublePosition` value: only for a double bond whose side the user chose.
+fn double_position_attr(bond: &Bond) -> Option<&'static str> {
+    if bond.order != BondOrder::Double {
+        return None;
+    }
+    match bond.double_position {
+        DoublePosition::Auto => None,
+        DoublePosition::Left => Some("Left"),
+        DoublePosition::Center => Some("Center"),
+        DoublePosition::Right => Some("Right"),
+    }
+}
+
 /// CDXML `Order` value for a bond order.
 fn bond_order_str(order: &BondOrder) -> &'static str {
     match order {
         BondOrder::Single => "1",
         BondOrder::Double => "2",
         BondOrder::Triple => "3",
+        BondOrder::Quadruple => "4",
     }
 }
 
@@ -140,6 +166,10 @@ fn bond_display(stereo: &BondStereo) -> Option<&'static str> {
         BondStereo::Bold => Some("Bold"),
         BondStereo::Dashed => Some("Dash"),
         BondStereo::Wavy => Some("Wavy"),
+        BondStereo::Hashed => Some("Hash"),
+        BondStereo::HollowWedge => Some("HollowWedgeBegin"),
+        // ChemDraw stores a dative bond as an order, not a display (see `bond_order_attr`).
+        BondStereo::Dative => None,
     }
 }
 
@@ -273,6 +303,32 @@ mod tests {
         // Three double bonds and three singles.
         assert_eq!(count(&xml, "Order=\"2\""), 3, "three double bonds");
         assert_eq!(count(&xml, "Order=\"1\""), 3, "three single bonds");
+    }
+
+    #[test]
+    fn the_bond_menus_orders_styles_and_double_positions_are_written() {
+        let mut mol = Molecule::default();
+        let atoms: Vec<u32> = (0..6).map(|k| mol.add_atom("C".to_string(), [k as f32, 0.0], 0)).collect();
+        let mut bond = |k: usize, order: BondOrder, stereo: BondStereo, position: DoublePosition| {
+            let id = mol.add_bond(atoms[k], atoms[k + 1], order);
+            let b = mol.bond_by_id_mut(id).unwrap();
+            b.stereo = stereo;
+            b.double_position = position;
+        };
+        bond(0, BondOrder::Quadruple, BondStereo::None, DoublePosition::Auto);
+        bond(1, BondOrder::Single, BondStereo::Hashed, DoublePosition::Auto);
+        bond(2, BondOrder::Single, BondStereo::HollowWedge, DoublePosition::Auto);
+        bond(3, BondOrder::Single, BondStereo::Dative, DoublePosition::Auto);
+        bond(4, BondOrder::Double, BondStereo::None, DoublePosition::Left);
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        assert_eq!(count(&xml, "Order=\"4\""), 1);
+        assert_eq!(count(&xml, "Display=\"Hash\""), 1);
+        assert_eq!(count(&xml, "Display=\"HollowWedgeBegin\""), 1);
+        assert_eq!(count(&xml, "Order=\"dative\""), 1);
+        assert_eq!(count(&xml, "Display="), 2, "a dative bond is an order, not a display");
+        assert_eq!(count(&xml, "DoublePosition=\"Left\""), 1);
+        assert_eq!(count(&xml, "DoublePosition="), 1, "only a chosen side is written");
     }
 
     #[test]

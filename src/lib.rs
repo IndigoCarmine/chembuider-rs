@@ -41,6 +41,7 @@ pub(crate) mod testkit;
 pub use egui;
 
 pub use config::Config;
-pub use molecule::{Atom, Bond, BondOrder, BondStereo, Molecule};
+pub use molecule::{Atom, Bond, BondOrder, BondStereo, DoublePosition, Molecule};
 pub use widget::rich_text::{RichGalley, RichLabel, RichSpan, RichText, RichTextStyle, Script, SpanStyle};
-pub use widget::{ChemStructEditor, Tool};
+pub use widget::bond_menu::{bond_menu, BondMenuAction};
+pub use widget::{ChemStructEditor, EditorResponse, Tool};

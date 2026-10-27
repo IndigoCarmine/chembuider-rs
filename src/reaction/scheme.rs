@@ -15,6 +15,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
 
 use crate::config::StyleConfig;
 use crate::molecule::Molecule;
@@ -29,7 +30,7 @@ use super::text::{Run, RunLayout, layout_runs};
 /// Every [`SchemeStructure`] gets a fresh, process-unique id when it is created, so a structure
 /// can be told apart from another one carrying an identical molecule, and followed while it
 /// moves around the scheme. Cloning a [`SchemeStructure`] keeps its id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StructureId(u64);
 
 impl StructureId {
@@ -45,11 +46,13 @@ impl StructureId {
 /// It dereferences to the molecule, so it can be drawn and inspected wherever a `&Molecule`
 /// is expected, and compares equal to a bare [`Molecule`] with the same contents (the id is
 /// ignored in that comparison).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemeStructure {
     id: StructureId,
     molecule: Molecule,
-    /// The compound label drawn under the structure (`(I)`, **4**); empty for none.
+    /// The compound label drawn under the structure (`(I)`, **4**); empty for none, and then
+    /// not written, so a file from before labels reads the same.
+    #[serde(default, skip_serializing_if = "RichText::is_empty")]
     label: RichText,
 }
 
@@ -63,6 +66,14 @@ impl SchemeStructure {
     pub fn with_label(mut self, label: impl Into<RichText>) -> Self {
         self.label = label.into();
         self
+    }
+
+    /// Give the structure a fresh id, returning `(old, new)`. Used when loading a saved
+    /// reaction, whose ids were handed out by another process and may collide with ours.
+    pub(crate) fn renew_id(&mut self) -> (StructureId, StructureId) {
+        let old = self.id;
+        self.id = StructureId::fresh();
+        (old, self.id)
     }
 
     /// This structure's id.
@@ -123,7 +134,7 @@ impl PartialEq<Molecule> for SchemeStructure {
 }
 
 /// One element of a reaction scheme, drawn left to right.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SchemeItem {
     /// A drawn structure, centred on the reaction line.
     Structure(SchemeStructure),
@@ -142,7 +153,7 @@ pub enum SchemeItem {
 /// A `Structure` label is the *same* [`Molecule`] a main-line structure carries, so it draws
 /// identically (same bond trimming, label anchoring and ring fills) — a reagent or catalyst
 /// shown as its structure rather than written out as a name.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum ArrowLabel {
     /// Nothing on this side of the shaft.
     #[default]
@@ -197,7 +208,7 @@ impl From<RichText> for ArrowLabel {
 }
 
 /// A reaction arrow and the labels riding on it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Arrow {
     /// Label above the shaft (reagents).
     pub above: ArrowLabel,
@@ -253,7 +264,7 @@ impl Arrow {
 ///     .arrow(Arrow::new().above("MeI").below("K_2CO_3"))
 ///     .structure(demo::anisole());
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ReactionScheme {
     pub items: Vec<SchemeItem>,
 }

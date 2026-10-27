@@ -20,7 +20,7 @@ use crate::molecule::{BondOrder, BondStereo};
 ///
 /// Editor state pointing at a removed hydrogen is cleaned up here; the atom hotspot is left
 /// to the caller, which knows what it should fall back to.
-fn consume_group_h(editor: &mut ChemStructEditor, atoms: &[u32]) {
+pub(crate) fn consume_group_h(editor: &mut ChemStructEditor, atoms: &[u32]) {
     for &id in atoms {
         for h in editor.molecule.consume_excess_group_h(id) {
             editor.selected_atoms.remove(&h);
