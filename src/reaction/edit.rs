@@ -34,7 +34,7 @@ use crate::molecule::Molecule;
 use crate::widget::rich_text::RichText;
 
 use super::model::{Analysis, Mass, Reaction};
-use super::scheme::{ArrowLabel, PlacedKind, ReactionScheme, SchemeItem};
+use super::scheme::{ArrowLabel, PlacedKind, ReactionScheme, SchemeItem, SchemeStructure};
 use super::table::BlockKind;
 use super::view::{FigureLayout, ReactionView};
 
@@ -391,42 +391,60 @@ pub fn scheme_arrow_structure(
     }
 }
 
-/// Put a structure on an arrow's above/below label, replacing whatever was there. Returns
-/// `false` (changing nothing) when the item is not an arrow or the part is not an arrow band.
+/// Draw `molecule` on an arrow's above/below label. Returns `false` (changing nothing) when
+/// the item is not an arrow or the part is not an arrow band.
+///
+/// When the band already holds a structure, this redraws *that* structure: it keeps its
+/// [`StructureId`](super::scheme::StructureId), the same as editing it in place. Text or
+/// nothing on the band is replaced by a new structure with a fresh id. To put an existing
+/// [`SchemeStructure`] (id and all) on a band, use [`place_scheme_arrow_structure`].
 pub fn set_scheme_arrow_structure(
     scheme: &mut ReactionScheme,
     index: usize,
     part: SchemePart,
     molecule: Molecule,
 ) -> bool {
-    let Some(SchemeItem::Arrow(a)) = scheme.items.get_mut(index) else {
+    let Some(slot) = arrow_label_mut(scheme, index, part) else {
         return false;
     };
-    match part {
-        SchemePart::ArrowAbove => a.above = ArrowLabel::Structure(molecule.into()),
-        SchemePart::ArrowBelow => a.below = ArrowLabel::Structure(molecule.into()),
-        _ => return false,
+    match slot {
+        ArrowLabel::Structure(s) => *s.molecule_mut() = molecule,
+        other => *other = ArrowLabel::Structure(SchemeStructure::new(molecule)),
     }
     true
 }
 
-/// Clear an arrow's above/below label back to empty, returning the structure it held (if any).
-/// A text label is cleared too but comes back as `None`.
+/// Put `structure` on an arrow's above/below label as it is, keeping its
+/// [`StructureId`](super::scheme::StructureId), and replacing whatever the band held. Returns
+/// `false` (changing nothing, and dropping `structure`) when the item is not an arrow or the
+/// part is not an arrow band — check the target first when the structure must not be lost.
+///
+/// This is how a structure *moves* onto a band (from the line, or from another band), as
+/// opposed to [`set_scheme_arrow_structure`], which draws a molecule there.
+pub fn place_scheme_arrow_structure(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+    structure: SchemeStructure,
+) -> bool {
+    let Some(slot) = arrow_label_mut(scheme, index, part) else {
+        return false;
+    };
+    *slot = ArrowLabel::Structure(structure);
+    true
+}
+
+/// Clear an arrow's above/below label back to empty, returning the structure it held (if any),
+/// with its [`StructureId`](super::scheme::StructureId). A text label is cleared too but comes
+/// back as `None`.
 pub fn take_scheme_arrow_structure(
     scheme: &mut ReactionScheme,
     index: usize,
     part: SchemePart,
-) -> Option<Molecule> {
-    let Some(SchemeItem::Arrow(a)) = scheme.items.get_mut(index) else {
-        return None;
-    };
-    let slot = match part {
-        SchemePart::ArrowAbove => &mut a.above,
-        SchemePart::ArrowBelow => &mut a.below,
-        _ => return None,
-    };
+) -> Option<SchemeStructure> {
+    let slot = arrow_label_mut(scheme, index, part)?;
     match std::mem::replace(slot, ArrowLabel::Empty) {
-        ArrowLabel::Structure(m) => Some(m.into_molecule()),
+        ArrowLabel::Structure(s) => Some(s),
         // Text (or nothing) leaves the slot empty and reports no structure taken.
         _ => None,
     }
@@ -446,19 +464,20 @@ pub fn move_line_structure_to_arrow_slot(
     arrow_index: usize,
     part: SchemePart,
 ) -> Option<usize> {
-    if scheme_arrow_structure(scheme, arrow_index, part).is_some() {
-        return None; // don't clobber a structure already there
+    match arrow_label(scheme, arrow_index, part) {
+        None => return None, // not an arrow band: nowhere to put the structure
+        Some(ArrowLabel::Structure(_)) => return None, // don't clobber a structure already there
+        Some(_) => {}
     }
-    if !matches!(scheme.items.get(arrow_index), Some(SchemeItem::Arrow(_))) {
+    if !matches!(scheme.items.get(from), Some(SchemeItem::Structure(_))) {
         return None;
     }
-    let Some(SchemeItem::Structure(mol)) = scheme.items.get(from) else {
-        return None;
+    // Both ends were checked above, so the structure always lands: it moves whole, id included.
+    let Some(SchemeItem::Structure(structure)) = scheme.remove(from) else {
+        unreachable!("item {from} was checked to be a structure");
     };
-    let mol = mol.molecule().clone();
-    scheme.remove(from);
     let target = if from < arrow_index { arrow_index - 1 } else { arrow_index };
-    set_scheme_arrow_structure(scheme, target, part, mol).then_some(target)
+    place_scheme_arrow_structure(scheme, target, part, structure).then_some(target)
 }
 
 /// Swap a main-line structure with a structure already riding on an arrow slot, losslessly:
@@ -476,16 +495,20 @@ pub fn swap_line_structure_with_arrow_slot(
     arrow_index: usize,
     part: SchemePart,
 ) -> bool {
-    let Some(slot_mol) = scheme_arrow_structure(scheme, arrow_index, part).cloned() else {
+    if scheme_arrow_structure(scheme, arrow_index, part).is_none() {
         return false; // only a structure-occupied slot is swappable
-    };
-    let Some(SchemeItem::Structure(line_mol)) = scheme.items.get(from) else {
+    }
+    if !matches!(scheme.items.get(from), Some(SchemeItem::Structure(_))) {
         return false;
+    }
+    // Trade the two structures whole, so each keeps its id at its new place.
+    let Some(mut moving) = take_scheme_arrow_structure(scheme, arrow_index, part) else {
+        unreachable!("the slot was checked to hold a structure");
     };
-    let line_mol = line_mol.molecule().clone();
-    set_scheme_arrow_structure(scheme, arrow_index, part, line_mol);
-    scheme.items[from] = SchemeItem::Structure(slot_mol.into());
-    true
+    if let Some(SchemeItem::Structure(line)) = scheme.items.get_mut(from) {
+        std::mem::swap(line, &mut moving);
+    }
+    place_scheme_arrow_structure(scheme, arrow_index, part, moving)
 }
 
 /// Move the structure on an arrow band back onto the reaction line: insert it as a new
@@ -502,10 +525,23 @@ pub fn move_arrow_structure_to_line(
     part: SchemePart,
     insert_at: usize,
 ) -> Option<usize> {
-    let mol = take_scheme_arrow_structure(scheme, index, part)?;
+    let structure = take_scheme_arrow_structure(scheme, index, part)?;
     let at = insert_at.min(scheme.items.len());
-    scheme.items.insert(at, SchemeItem::Structure(mol.into()));
+    scheme.items.insert(at, SchemeItem::Structure(structure));
     Some(at)
+}
+
+/// The arrow band's label, mutably, when the item is an arrow and the part names a band.
+fn arrow_label_mut(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+) -> Option<&mut ArrowLabel> {
+    match (scheme.items.get_mut(index), part) {
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => Some(&mut a.above),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => Some(&mut a.below),
+        _ => None,
+    }
 }
 
 /// The arrow band's label, when the item is an arrow and the part names a band.
@@ -1274,22 +1310,23 @@ impl ReactionEditor {
                 }
             }
             DragSource::ArrowLabel { index, part } => {
-                let Some(src_mol) =
-                    scheme_arrow_structure(&reaction.scheme, index, part).cloned()
+                // Check the target band before taking anything off, so a structure never
+                // leaves the figure for a target that cannot hold it.
+                if arrow_label(&reaction.scheme, ti, tp).is_none()
+                    || scheme_arrow_structure(&reaction.scheme, index, part).is_none()
+                {
+                    return;
+                }
+                // The structures move whole, so each keeps its id. Whatever sits in the target
+                // slot goes back to the source (a swap); an empty target leaves the source empty.
+                let Some(moving) = take_scheme_arrow_structure(&mut reaction.scheme, index, part)
                 else {
                     return;
                 };
-                // Whatever sits in the target slot goes back to the source (a swap); an empty
-                // target leaves the source empty.
                 let displaced = take_scheme_arrow_structure(&mut reaction.scheme, ti, tp);
-                set_scheme_arrow_structure(&mut reaction.scheme, ti, tp, src_mol);
-                match displaced {
-                    Some(d) => {
-                        set_scheme_arrow_structure(&mut reaction.scheme, index, part, d);
-                    }
-                    None => {
-                        take_scheme_arrow_structure(&mut reaction.scheme, index, part);
-                    }
+                place_scheme_arrow_structure(&mut reaction.scheme, ti, tp, moving);
+                if let Some(d) = displaced {
+                    place_scheme_arrow_structure(&mut reaction.scheme, index, part, d);
                 }
                 // Arrow-label structures feed reactant columns, and a swap can move which slot
                 // holds which — re-derive so the columns follow.
@@ -2171,10 +2208,10 @@ mod tests {
         set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, demo::phenol());
 
         // Swap above <-> below with the same primitives `drop_into_arrow_slot` uses.
-        let src = scheme_arrow_structure(&scheme, 0, SchemePart::ArrowAbove).cloned().unwrap();
+        let src = take_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove).unwrap();
         let displaced = take_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow);
-        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, src);
-        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, displaced.unwrap());
+        place_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, src);
+        place_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, displaced.unwrap());
 
         assert_eq!(
             MolecularFormula::of(scheme_arrow_structure(&scheme, 0, SchemePart::ArrowAbove).unwrap())
@@ -2277,6 +2314,193 @@ mod tests {
         let a = reaction.analysis.compute();
         assert_eq!(a.reactants[0].formula.plain(), "C12H10", "biphenyl now on the line, column 0");
         assert_eq!(a.reactants[1].formula.plain(), "C6H6O", "phenol now over the arrow, column 1");
+    }
+
+    // ── Structure ids travel with their structure ───────────────────────────
+
+    use crate::reaction::StructureId;
+    const ABOVE: SchemePart = SchemePart::ArrowAbove;
+    const BELOW: SchemePart = SchemePart::ArrowBelow;
+
+    /// Where the structure with `id` sits: a main-line item (`part: Structure`) or an arrow band.
+    fn find_scheme_structure(
+        scheme: &ReactionScheme,
+        id: StructureId,
+    ) -> Option<Hit> {
+        scheme.items.iter().enumerate().find_map(|(index, item)| match item {
+            SchemeItem::Structure(s) if s.id() == id => {
+                Some(Hit::Scheme { index, part: SchemePart::Structure })
+            }
+            SchemeItem::Arrow(a) => [(ABOVE, &a.above), (BELOW, &a.below)]
+                .into_iter()
+                .find(|(_, l)| matches!(l, ArrowLabel::Structure(s) if s.id() == id))
+                .map(|(part, _)| Hit::Scheme { index, part }),
+            _ => None,
+        })
+    }
+
+    fn on_line(index: usize) -> Option<Hit> {
+        Some(Hit::Scheme { index, part: SchemePart::Structure })
+    }
+
+    fn on_band(index: usize, part: SchemePart) -> Option<Hit> {
+        Some(Hit::Scheme { index, part })
+    }
+
+    fn line_id(scheme: &ReactionScheme, index: usize) -> StructureId {
+        match &scheme.items[index] {
+            SchemeItem::Structure(s) => s.id(),
+            other => panic!("item {index} is not a structure: {other:?}"),
+        }
+    }
+
+    fn slot_id(scheme: &ReactionScheme, index: usize, part: SchemePart) -> StructureId {
+        match arrow_label(scheme, index, part) {
+            Some(ArrowLabel::Structure(s)) => s.id(),
+            other => panic!("({index}, {part:?}) holds no structure: {other:?}"),
+        }
+    }
+
+    /// [Structure(phenol), Arrow(above = biphenyl, below = benzene), Structure(anisole)]
+    fn id_scheme() -> ReactionScheme {
+        ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(
+                Arrow::new()
+                    .above_structure(demo::biphenyl())
+                    .below_structure(demo::benzene()),
+            )
+            .structure(demo::anisole())
+    }
+
+    #[test]
+    fn ids_follow_a_reorder_along_the_line() {
+        let mut scheme = id_scheme();
+        let (phenol, anisole) = (line_id(&scheme, 0), line_id(&scheme, 2));
+        assert_eq!(scheme.move_item(2, -2), Some(0));
+        assert_eq!(find_scheme_structure(&scheme, anisole), on_line(0));
+        assert_eq!(find_scheme_structure(&scheme, phenol), on_line(1));
+    }
+
+    #[test]
+    fn ids_follow_a_line_structure_onto_an_empty_slot() {
+        let mut scheme = id_scheme();
+        let anisole = line_id(&scheme, 2);
+        take_scheme_arrow_structure(&mut scheme, 1, ABOVE);
+        assert_eq!(move_line_structure_to_arrow_slot(&mut scheme, 2, 1, ABOVE), Some(1));
+        assert_eq!(find_scheme_structure(&scheme, anisole), on_band(1, ABOVE));
+        assert!(scheme_arrow_structure(&scheme, 1, ABOVE).unwrap() == &demo::anisole());
+    }
+
+    /// A target that is not an arrow band is refused before the structure leaves the line, so
+    /// it is never lost.
+    #[test]
+    fn a_line_structure_is_not_lost_on_a_non_band_target() {
+        let mut scheme = id_scheme();
+        let phenol = line_id(&scheme, 0);
+        assert_eq!(move_line_structure_to_arrow_slot(&mut scheme, 0, 1, SchemePart::Text), None);
+        assert_eq!(find_scheme_structure(&scheme, phenol), on_line(0));
+        assert_eq!(scheme.items.len(), 3);
+    }
+
+    #[test]
+    fn ids_follow_a_line_slot_swap() {
+        let mut scheme = id_scheme();
+        let (phenol, biphenyl) = (line_id(&scheme, 0), slot_id(&scheme, 1, ABOVE));
+        assert!(swap_line_structure_with_arrow_slot(&mut scheme, 0, 1, ABOVE));
+        assert_eq!(find_scheme_structure(&scheme, phenol), on_band(1, ABOVE));
+        assert_eq!(find_scheme_structure(&scheme, biphenyl), on_line(0));
+    }
+
+    #[test]
+    fn ids_follow_an_arrow_structure_back_onto_the_line() {
+        let mut scheme = id_scheme();
+        let benzene = slot_id(&scheme, 1, BELOW);
+        assert_eq!(move_arrow_structure_to_line(&mut scheme, 1, BELOW, 3), Some(3));
+        assert_eq!(find_scheme_structure(&scheme, benzene), on_line(3));
+        // `take` hands the structure back with its id.
+        let biphenyl = slot_id(&scheme, 1, ABOVE);
+        let taken = take_scheme_arrow_structure(&mut scheme, 1, ABOVE).unwrap();
+        assert_eq!(taken.id(), biphenyl);
+        assert!(place_scheme_arrow_structure(&mut scheme, 1, BELOW, taken));
+        assert_eq!(find_scheme_structure(&scheme, biphenyl), on_band(1, BELOW));
+    }
+
+    /// Slot to slot through the drag handler: a swap of two occupied bands, then a move onto an
+    /// empty one.
+    #[test]
+    fn ids_follow_a_slot_to_slot_drop() {
+        let mut reaction = Reaction::new(id_scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let above = slot_id(&reaction.scheme, 1, ABOVE);
+        let below = slot_id(&reaction.scheme, 1, BELOW);
+        let source = DragSource::ArrowLabel { index: 1, part: ABOVE };
+
+        editor.drop_into_arrow_slot(&mut reaction, source, 1, BELOW);
+        assert_eq!(find_scheme_structure(&reaction.scheme, above), on_band(1, BELOW));
+        assert_eq!(find_scheme_structure(&reaction.scheme, below), on_band(1, ABOVE));
+
+        // Empty the above band, then drop the below structure onto it.
+        let taken = take_scheme_arrow_structure(&mut reaction.scheme, 1, ABOVE).unwrap();
+        assert_eq!(taken.id(), below);
+        let source = DragSource::ArrowLabel { index: 1, part: BELOW };
+        editor.drop_into_arrow_slot(&mut reaction, source, 1, ABOVE);
+        assert_eq!(find_scheme_structure(&reaction.scheme, above), on_band(1, ABOVE));
+        assert!(arrow_label(&reaction.scheme, 1, BELOW).unwrap().is_empty());
+
+        // A target that is not a band leaves the source where it was.
+        let source = DragSource::ArrowLabel { index: 1, part: ABOVE };
+        editor.drop_into_arrow_slot(&mut reaction, source, 0, BELOW);
+        assert_eq!(find_scheme_structure(&reaction.scheme, above), on_band(1, ABOVE));
+    }
+
+    /// The drag handler's line-to-slot paths keep ids too (move onto an empty band, swap with an
+    /// occupied one).
+    #[test]
+    fn ids_follow_a_line_to_slot_drop() {
+        let mut reaction = Reaction::new(id_scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let phenol = line_id(&reaction.scheme, 0);
+        let biphenyl = slot_id(&reaction.scheme, 1, ABOVE);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(0), 1, ABOVE);
+        assert_eq!(find_scheme_structure(&reaction.scheme, phenol), on_band(1, ABOVE));
+        assert_eq!(find_scheme_structure(&reaction.scheme, biphenyl), on_line(0));
+
+        take_scheme_arrow_structure(&mut reaction.scheme, 1, BELOW);
+        let anisole = line_id(&reaction.scheme, 2);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(2), 1, BELOW);
+        assert_eq!(find_scheme_structure(&reaction.scheme, anisole), on_band(1, BELOW));
+    }
+
+    /// Redrawing a structure (the canvas edit, or Replace) is an edit of the same structure: its
+    /// id stays. A band that held text or nothing gets a new structure with a fresh id.
+    #[test]
+    fn replacing_a_structure_keeps_its_id() {
+        let mut reaction = Reaction::new(id_scheme(), Analysis::new());
+        let phenol = line_id(&reaction.scheme, 0);
+        assert!(reaction.set_scheme_structure(0, demo::anisole()));
+        assert_eq!(line_id(&reaction.scheme, 0), phenol);
+        assert!(matches!(&reaction.scheme.items[0], SchemeItem::Structure(s) if *s == demo::anisole()));
+
+        let biphenyl = slot_id(&reaction.scheme, 1, ABOVE);
+        assert!(reaction.set_scheme_arrow_structure(1, ABOVE, demo::phenol()));
+        assert_eq!(slot_id(&reaction.scheme, 1, ABOVE), biphenyl);
+        assert!(scheme_arrow_structure(&reaction.scheme, 1, ABOVE).unwrap() == &demo::phenol());
+
+        // An empty band gets a brand-new structure.
+        take_scheme_arrow_structure(&mut reaction.scheme, 1, BELOW);
+        assert!(set_scheme_arrow_structure(&mut reaction.scheme, 1, BELOW, demo::benzene()));
+        let fresh = slot_id(&reaction.scheme, 1, BELOW);
+        assert_ne!(fresh, biphenyl);
+        assert_ne!(fresh, phenol);
+    }
+
+    #[test]
+    fn adding_the_same_molecule_twice_gives_two_ids() {
+        let mut scheme = ReactionScheme::new();
+        let a = scheme.add(SchemeItem::Structure(demo::phenol().into()));
+        let b = scheme.add(SchemeItem::Structure(demo::phenol().into()));
+        assert_ne!(line_id(&scheme, a), line_id(&scheme, b));
     }
 
     // ── The widget ──────────────────────────────────────────────────────────
@@ -2539,6 +2763,7 @@ mod tests {
         let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
         let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
         let last = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+        let (phenol, anisole) = (line_id(&reaction.scheme, 0), line_id(&reaction.scheme, 2));
 
         // A click on a structure selects it but leaves the scheme as it was.
         let start = last.center();
@@ -2562,6 +2787,9 @@ mod tests {
             matches!(&reaction.scheme.items[0], SchemeItem::Structure(m) if *m == demo::anisole()),
             "the drag moved anisole to the front"
         );
+        // Each structure took its id along.
+        assert_eq!(line_id(&reaction.scheme, 0), anisole);
+        assert_eq!(find_scheme_structure(&reaction.scheme, phenol), on_line(1));
         assert!(editor.take_scheme_rearranged(), "the reorder is reported");
         assert!(!editor.take_scheme_rearranged(), "and only once");
     }
