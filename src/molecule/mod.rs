@@ -7,6 +7,7 @@ pub mod smiles;
 pub mod cdx;
 pub mod cdx_codec;
 pub mod elements;
+pub(crate) mod lookup;
 #[cfg(windows)]
 pub mod image;
 #[cfg(windows)]

@@ -23,9 +23,10 @@ use egui::text::LayoutJob;
 use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
+use crate::molecule::lookup::{AtomLookup, MolIndex};
 use crate::molecule::{BondOrder, BondStereo, Molecule};
 
-use super::draw::{atom_label, is_folded_h, should_show_label};
+use super::draw::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
 
 // Fixed internal detail (not user-tunable): hash-wedge line count and wavy-bond resolution.
@@ -151,12 +152,13 @@ pub fn build_labels(
     mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
 ) -> HashMap<u32, SceneLabel> {
     let text_style = RichTextStyle::new(style.label_size * xf.visual_scale, Color32::BLACK);
+    let index = MolIndex::new(mol);
     let mut map = HashMap::new();
     for atom in &mol.atoms {
-        if !should_show_label(mol, atom.id) {
+        if !should_show_label(&index, atom.id) {
             continue;
         }
-        let label = atom_label(mol, atom);
+        let label = atom_label(&index, atom);
         let galley = label.rich.layout_with(&text_style, |job| layout(job));
         let anchor = galley
             .char_range_rect(label.anchor_chars)
@@ -174,6 +176,7 @@ pub fn build_labels(
 /// The colored ring-interior polygons of `mol` in target-pixel coordinates. A fill referencing a
 /// removed atom, or with fewer than three vertices, is skipped.
 pub fn build_ring_fills(mol: &Molecule, xf: RenderTransform) -> Vec<ScenePolygon> {
+    let index = MolIndex::new(mol);
     mol.ring_fills
         .iter()
         .filter_map(|rf| {
@@ -182,7 +185,7 @@ pub fn build_ring_fills(mol: &Molecule, xf: RenderTransform) -> Vec<ScenePolygon
             }
             let mut points = Vec::with_capacity(rf.atoms.len());
             for &id in &rf.atoms {
-                points.push(xf.apply(mol.atom_by_id(id)?.pos));
+                points.push(xf.apply(index.atom_by_id(id)?.pos));
             }
             let [r, g, b, a] = rf.color;
             Some(ScenePolygon {
@@ -207,12 +210,13 @@ pub fn build_bonds(
 ) -> Vec<SceneBond> {
     let vs = xf.visual_scale;
     let width = style.bond_width * vs;
+    let index = MolIndex::new(mol);
     let mut out = Vec::new();
     for bond in &mol.bonds {
-        if is_folded_h(mol, bond.begin) || is_folded_h(mol, bond.end) {
+        if folded_h(&index, bond.begin) || folded_h(&index, bond.end) {
             continue;
         }
-        let (Some(a), Some(b)) = (mol.atom_by_id(bond.begin), mol.atom_by_id(bond.end)) else {
+        let (Some(a), Some(b)) = (index.atom_by_id(bond.begin), index.atom_by_id(bond.end)) else {
             continue;
         };
         let p1 = xf.apply(a.pos);
@@ -232,19 +236,19 @@ pub fn build_bonds(
                 let placement = if matches!(bond.order, BondOrder::Double) {
                     let (nx, ny) = perp_normal(p1, p2);
                     let mut neighbors: Vec<Pos2> = Vec::new();
-                    for nid in mol.neighbor_atom_ids(bond.begin) {
+                    for nid in index.neighbor_atom_ids(bond.begin) {
                         if nid == bond.end {
                             continue;
                         }
-                        if let Some(na) = mol.atom_by_id(nid) {
+                        if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
                         }
                     }
-                    for nid in mol.neighbor_atom_ids(bond.end) {
+                    for nid in index.neighbor_atom_ids(bond.end) {
                         if nid == bond.begin {
                             continue;
                         }
-                        if let Some(na) = mol.atom_by_id(nid) {
+                        if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
                         }
                     }

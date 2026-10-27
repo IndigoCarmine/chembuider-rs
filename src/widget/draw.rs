@@ -1,7 +1,8 @@
 use super::ChemStructEditor;
 use super::rich_text::RichText;
 use super::scene::{self, RenderTransform};
-use crate::molecule::{max_valence, normal_valence, Molecule};
+use crate::molecule::lookup::AtomLookup;
+use crate::molecule::{max_valence, normal_valence};
 use std::collections::HashMap;
 
 // Geometry helpers moved to `scene.rs` (the backend-neutral primitive builder). Re-exported so
@@ -183,12 +184,12 @@ pub(crate) enum HSide {
 /// hydrogens flip there. Near-vertical sums inside the deadzone and unbonded atoms keep
 /// the default `Right`. (Vertical H placement — H above/below for straight-up bonds, as
 /// ChemDraw does in crowded rings — is a possible future refinement.)
-pub(crate) fn h_side(mol: &crate::molecule::Molecule, atom_id: u32) -> HSide {
+pub(crate) fn h_side(mol: &impl AtomLookup, atom_id: u32) -> HSide {
     const H_FLIP_DEADZONE: f32 = 0.1;
     let Some(atom) = mol.atom_by_id(atom_id) else { return HSide::Right };
     let mut sum_x = 0.0_f32;
     for nid in mol.neighbor_atom_ids(atom_id) {
-        if is_folded_h(mol, nid) {
+        if folded_h(mol, nid) {
             continue;
         }
         let Some(n) = mol.atom_by_id(nid) else { continue };
@@ -227,7 +228,7 @@ fn element_token_len(flat: &str) -> usize {
 /// through the rich-text markup parser, so custom labels typed into the editor can use
 /// `_`/`^` scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
 pub(crate) fn atom_label(
-    mol: &crate::molecule::Molecule,
+    mol: &impl AtomLookup,
     atom: &crate::molecule::Atom,
 ) -> AtomLabel {
     let element = RichText::parse(&atom.element);
@@ -316,6 +317,11 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
 ///   sole cause of the over-valence ring on both nitrogens of a Ph–N=N–Ph drawn from two `n`
 ///   keys: a warning the user could neither see the reason for nor delete.
 pub fn is_folded_h(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
+    folded_h(mol, atom_id)
+}
+
+/// [`is_folded_h`] over any [`AtomLookup`], so a per-atom pass can answer it from an index.
+pub(crate) fn folded_h(mol: &impl AtomLookup, atom_id: u32) -> bool {
     let Some(atom) = mol.atom_by_id(atom_id) else { return false };
     if atom.element != "H" || !atom.group_h { return false; }
     let bonds = mol.bonds_for_atom(atom_id);
@@ -340,10 +346,10 @@ pub fn is_folded_h(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
     used < valence as i16 + heavy.charge as i16
 }
 
-pub(crate) fn should_show_label(mol: &Molecule, atom_id: u32) -> bool {
+pub(crate) fn should_show_label(mol: &impl AtomLookup, atom_id: u32) -> bool {
     let Some(atom) = mol.atom_by_id(atom_id) else { return false };
     // Folded hydrogens are merged into their heavy neighbor's label.
-    if is_folded_h(mol, atom_id) { return false; }
+    if folded_h(mol, atom_id) { return false; }
     if atom.element == "C" {
         // Carbon: only show when completely isolated (no bonds) so the atom stays visible
         return atom.charge != 0 || mol.bonds_for_atom(atom_id).is_empty();
@@ -385,7 +391,7 @@ fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, 
 /// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
 /// implicit H needed to satisfy valence. Computed as `valence + charge` minus the
 /// bond-order sum to *non-folded* neighbors, which naturally includes both.
-pub(crate) fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
+pub(crate) fn displayed_h_count(mol: &impl AtomLookup, atom_id: u32) -> u8 {
     let Some(atom) = mol.atom_by_id(atom_id) else { return 0 };
     let Some(valence) = normal_valence(&atom.element) else { return 0 };
     // A lone atom (no bonds yet) shows just its symbol — placing "O"/"N"/"S" at the cursor
@@ -396,7 +402,7 @@ pub(crate) fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -
     let bond_sum_heavy: i16 = mol.bonds_for_atom(atom_id).iter()
         .filter(|b| {
             let other = if b.begin == atom_id { b.end } else { b.begin };
-            !is_folded_h(mol, other)
+            !folded_h(mol, other)
         })
         .map(|b| b.order.valence())
         .sum();
