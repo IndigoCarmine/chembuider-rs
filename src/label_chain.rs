@@ -55,7 +55,7 @@
 //! Nothing here, and that is the point. `MeOPh` on a *bare* atom yields CH3–O–C6H5 (anisole);
 //! on an atom that already carries one bond it yields –CH2–O–C6H5, because the leading carbon
 //! simply has one more neighbour. Hydrogens are implicit — they are counted at draw time from
-//! valence (`widget::draw`), never stored — so the difference costs this module no code at all.
+//! valence (`molecule::depict`), never stored — so the difference costs this module no code at all.
 
 use crate::config::Config;
 use crate::molecule::fragment::{FragAtom, FragBond, Fragment};

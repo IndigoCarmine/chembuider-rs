@@ -3,7 +3,7 @@
 //!
 //! The hydrogen count is the same one the renderer displays: explicit (folded) H neighbours
 //! plus the implicit H that fills the atom's valence, i.e.
-//! [`crate::widget::draw::displayed_h_count`]. Formula and picture therefore never disagree —
+//! [`crate::molecule::depict::displayed_h_count`]. Formula and picture therefore never disagree —
 //! if the structure shows `OH`, the formula counts that H.
 //!
 //! Element ordering is [Hill notation](https://en.wikipedia.org/wiki/Chemical_formula#Hill_system):
@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use crate::molecule::Molecule;
-use crate::widget::draw::{displayed_h_count, is_folded_h};
+use crate::molecule::depict::{displayed_h_count, is_folded_h};
 use crate::widget::rich_text::{RichText, SpanStyle};
 
 /// Standard atomic weight in g/mol (IUPAC conventional values, 2021), or `None` for a symbol
