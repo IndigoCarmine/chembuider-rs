@@ -110,10 +110,11 @@ impl Default for FitOptions {
 }
 
 impl FitOptions {
-    /// `min_zoom..=max_zoom` held to [`MIN_ZOOM`]..=[`MAX_ZOOM`]; an empty (or NaN) range
-    /// collapses to its lower end.
+    /// `min_zoom..=max_zoom` held to [`MIN_ZOOM`]..=[`MAX_ZOOM`]; an empty range collapses to
+    /// its lower end, and a NaN bound falls back to the editor's own bound on that side.
     fn zoom_range(&self) -> (f32, f32) {
-        let lo = self.min_zoom.max(MIN_ZOOM).min(MAX_ZOOM);
+        // Not `clamp`: that would carry a NaN `min_zoom` through and lose the lower bound.
+        let lo = if self.min_zoom >= MIN_ZOOM { self.min_zoom.min(MAX_ZOOM) } else { MIN_ZOOM };
         (lo, self.max_zoom.min(MAX_ZOOM).max(lo))
     }
 }
@@ -405,6 +406,11 @@ mod tests {
         // An inverted range collapses to its lower end.
         let inverted = FitOptions { min_zoom: 2.0, max_zoom: 0.5, ..Default::default() };
         assert_eq!(fit(&ethane(), big, 1.0, inverted).unwrap().zoom, 2.0);
+        // A NaN bound falls back to the editor's bound on that side.
+        let nan_floor = FitOptions { min_zoom: f32::NAN, ..Default::default() };
+        assert_eq!(fit(&wide(), small, 1.0, nan_floor).unwrap().zoom, MIN_ZOOM);
+        let nan_ceiling = FitOptions { max_zoom: f32::NAN, ..Default::default() };
+        assert_eq!(fit(&ethane(), big, 1.0, nan_ceiling).unwrap().zoom, MAX_ZOOM);
     }
 
     #[test]

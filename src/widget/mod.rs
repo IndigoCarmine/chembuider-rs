@@ -609,8 +609,13 @@ impl ChemStructEditor {
 
     /// Zoom and pan so the whole drawing — atoms, bonds, ring fills and atom labels — sits
     /// centered on `canvas` (the rect [`ui`](Self::ui) draws into) with [`FitOptions::default`].
-    /// Does nothing when the molecule is empty. `ctx` must have run a frame already (it lays
-    /// the labels out); before that, use [`request_fit`](Self::request_fit).
+    /// Does nothing when the molecule is empty. Labels are laid out with `ctx`'s fonts; before
+    /// the first frame, use [`request_fit`](Self::request_fit) instead.
+    ///
+    /// # Panics
+    ///
+    /// If `ctx` has never started a frame (egui creates its fonts then). Calling it during the
+    /// first frame, inside `run_ui`, is fine.
     pub fn fit_view(&mut self, ctx: &egui::Context, canvas: egui::Rect) {
         self.fit_view_with(ctx, canvas, FitOptions::default());
     }
@@ -623,6 +628,10 @@ impl ChemStructEditor {
     }
 
     /// [`fit_view`](Self::fit_view) with a chosen margin, zoom range, or zoom kept as is.
+    ///
+    /// # Panics
+    ///
+    /// If `ctx` has never started a frame, as for [`fit_view`](Self::fit_view).
     pub fn fit_view_with(&mut self, ctx: &egui::Context, canvas: egui::Rect, opts: FitOptions) {
         self.fit_with_layout(canvas, opts, |job| ctx.fonts_mut(|f| f.layout_job(job)));
     }
