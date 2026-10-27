@@ -56,7 +56,9 @@ pub use edit::{
     set_scheme_arrow_structure, swap_line_structure_with_arrow_slot, take_scheme_arrow_structure,
 };
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
-pub use model::{Analysis, Mass, Product, Reactant, Reaction, StructureRole};
+pub use model::{
+    Analysis, FILE_FORMAT, FILE_VERSION, Mass, Product, Reactant, Reaction, StructureRole,
+};
 pub use scheme::{
     Arrow, ArrowLabel, ReactionScheme, SchemeItem, SchemeLayout, SchemeStructure, StructureId,
 };

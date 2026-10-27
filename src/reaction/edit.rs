@@ -865,6 +865,11 @@ pub struct ReactionEditor {
     /// Set when a drag moved scheme structures to other positions; read and cleared by the host
     /// with [`take_scheme_rearranged`](Self::take_scheme_rearranged).
     scheme_rearranged: bool,
+    /// The figure was the last thing clicked, so Delete/Backspace act on its selection. Cleared
+    /// by a press anywhere else. Deliberately not egui keyboard focus: that would mute a
+    /// neighbouring structure canvas (which ignores input while any widget holds focus) until
+    /// the user had clicked it once.
+    keyboard: bool,
 }
 
 impl Default for ReactionEditor {
@@ -885,6 +890,7 @@ impl ReactionEditor {
             context_target: None,
             drag: None,
             scheme_rearranged: false,
+            keyboard: false,
         }
     }
 
@@ -931,6 +937,40 @@ impl ReactionEditor {
     /// as a canvas link, say — since it may now name a different structure.
     pub fn take_scheme_rearranged(&mut self) -> bool {
         std::mem::take(&mut self.scheme_rearranged)
+    }
+
+    /// Delete the selected scheme item — what Delete/Backspace do in [`show`](Self::show).
+    ///
+    /// * a main-line structure, `+` or text item is removed from the line;
+    /// * an arrow band holding a structure loses that structure (the arrow stays, the band is
+    ///   left empty). A band of text or nothing deletes nothing: the arrow and its conditions
+    ///   are removed from the context menu instead, never by a stray key;
+    /// * a table cell deletes nothing.
+    ///
+    /// The table follows ([`Reaction::sync_structures_from_scheme`]): a removed structure takes
+    /// its column with it. Returns `true` when something was deleted; the selection is then
+    /// cleared, and [`take_scheme_rearranged`](Self::take_scheme_rearranged) reports the change,
+    /// since the items after it moved down by one.
+    pub fn delete_selected(&mut self, reaction: &mut Reaction) -> bool {
+        let Some(Hit::Scheme { index, part }) = self.selection else {
+            return false;
+        };
+        let deleted = match part {
+            SchemePart::Structure | SchemePart::Plus | SchemePart::Text => {
+                reaction.scheme.remove(index).is_some()
+            }
+            SchemePart::ArrowAbove | SchemePart::ArrowBelow => {
+                scheme_arrow_structure(&reaction.scheme, index, part).is_some()
+                    && take_scheme_arrow_structure(&mut reaction.scheme, index, part).is_some()
+            }
+        };
+        if deleted {
+            reaction.sync_structures_from_scheme();
+            self.selection = None;
+            self.edit = None;
+            self.scheme_rearranged = true;
+        }
+        deleted
     }
 
     /// Run the automatic 2-D layout cleanup on the *selected* scheme structure, if the current
@@ -1014,6 +1054,8 @@ impl ReactionEditor {
             }
             EditTarget::SchemeText { index, part } => {
                 set_scheme_text(&mut reaction.scheme, index, part, &editing.text);
+                // Reagents written over the arrow get (or lose) their table columns.
+                reaction.sync_structures_from_scheme();
             }
         }
         self.edit = None;
@@ -1267,6 +1309,26 @@ impl ReactionEditor {
             if let Some(hit) = hover {
                 self.selection = Some(hit);
             }
+        }
+
+        // Delete/Backspace remove the selected scheme item — while the figure is what the user
+        // is working in: it was clicked last, no text box is taking the keys, and the pointer
+        // is not over some other part of the window (a structure canvas deletes what is under
+        // its pointer on the same keys).
+        if ui.input(|i| i.pointer.any_pressed()) {
+            self.keyboard = response.contains_pointer();
+        }
+        let delete = ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+        let pointer_here = ui
+            .input(|i| i.pointer.hover_pos())
+            .is_none_or(|p| ui.clip_rect().contains(p));
+        if delete
+            && self.keyboard
+            && self.edit.is_none()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && pointer_here
+        {
+            self.delete_selected(reaction);
         }
 
         response
@@ -2640,6 +2702,139 @@ mod tests {
             above.spans.iter().map(|s| s.text.as_str()).collect::<String>(),
             "Me2SO4"
         );
+    }
+
+    /// Deleting the selection: a main-line structure leaves the line and takes its column, a
+    /// structure on an arrow band leaves the band (the arrow stays), and a text band or a cell
+    /// deletes nothing.
+    #[test]
+    fn delete_selected_removes_the_selected_structure() {
+        let mut reaction = Reaction::from_scheme(
+            ReactionScheme::new()
+                .structure(demo::phenol())
+                .plus()
+                .structure(demo::benzene())
+                .arrow(Arrow::new().above_structure(demo::methyl_iodide()).below("K_2CO_3"))
+                .structure(demo::anisole()),
+        );
+        let formulas = |r: &Reaction| -> Vec<String> {
+            r.analysis.compute().reactants.iter().map(|c| c.formula.plain()).collect()
+        };
+        assert_eq!(formulas(&reaction), ["C6H6O", "C6H6", "CH3I", "CK2O3"]);
+        let mut editor = ReactionEditor::new();
+
+        // Nothing selected, or a cell: nothing to delete.
+        assert!(!editor.delete_selected(&mut reaction));
+        editor.select(Some(Hit::Cell(CellRef::new(BlockKind::Reactants, 0, 0))));
+        assert!(!editor.delete_selected(&mut reaction));
+
+        // The benzene on the line (item 2).
+        editor.select(Some(Hit::Scheme { index: 2, part: SchemePart::Structure }));
+        assert!(editor.delete_selected(&mut reaction));
+        assert_eq!(reaction.scheme.items.len(), 4);
+        assert_eq!(formulas(&reaction), ["C6H6O", "CH3I", "CK2O3"]);
+        assert_eq!(editor.selection(), None);
+        assert!(editor.take_scheme_rearranged());
+
+        // The MeI above the arrow (now item 2): the band empties, the arrow stays.
+        editor.select(Some(Hit::Scheme { index: 2, part: SchemePart::ArrowAbove }));
+        assert!(editor.delete_selected(&mut reaction));
+        assert!(matches!(&reaction.scheme.items[2], SchemeItem::Arrow(a) if a.above.is_empty()));
+        assert_eq!(formulas(&reaction), ["C6H6O", "CK2O3"]);
+
+        // The text band below it is not deleted by the key.
+        editor.select(Some(Hit::Scheme { index: 2, part: SchemePart::ArrowBelow }));
+        assert!(!editor.delete_selected(&mut reaction));
+        assert_eq!(formulas(&reaction), ["C6H6O", "CK2O3"]);
+
+        // A `+` goes like a structure.
+        editor.select(Some(Hit::Scheme { index: 1, part: SchemePart::Plus }));
+        assert!(editor.delete_selected(&mut reaction));
+        assert!(matches!(reaction.scheme.items[1], SchemeItem::Arrow(_)));
+    }
+
+    /// Through the widget: click a structure, press Delete, and it is gone. A press elsewhere
+    /// first (say, on a structure canvas beside the figure) disarms the key.
+    #[test]
+    fn delete_key_removes_the_clicked_structure() {
+        let mut reaction = Reaction::from_scheme(
+            ReactionScheme::new()
+                .structure(demo::phenol())
+                .plus()
+                .structure(demo::benzene())
+                .arrow(Arrow::new())
+                .structure(demo::anisole()),
+        );
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let mut run = |editor: &mut ReactionEditor, reaction: &mut Reaction, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut layout = None;
+            let _ = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let top_left = ui.next_widget_position();
+                    layout = Some((editor.view.measure(ui.painter(), reaction), top_left));
+                    editor.show(ui, reaction);
+                });
+            });
+            layout.unwrap()
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        let (layout, top_left) = run(&mut editor, &mut reaction, vec![]);
+        let benzene = scheme_item_rect(&layout, top_left, 2, SchemePart::Structure).unwrap().center();
+
+        // A press elsewhere first: the key does nothing.
+        let away = Pos2::new(1390.0, 890.0);
+        run(&mut editor, &mut reaction, vec![egui::Event::PointerMoved(benzene)]);
+        run(&mut editor, &mut reaction, vec![press(benzene, true), press(benzene, false)]);
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 2, part: SchemePart::Structure }));
+        run(&mut editor, &mut reaction, vec![egui::Event::PointerMoved(away), press(away, true), press(away, false)]);
+        editor.select(Some(Hit::Scheme { index: 2, part: SchemePart::Structure }));
+        run(&mut editor, &mut reaction, vec![key(egui::Key::Delete)]);
+        assert_eq!(reaction.scheme.items.len(), 5, "disarmed by the press elsewhere");
+
+        // Click the benzene, then Backspace: gone, and its column with it.
+        run(&mut editor, &mut reaction, vec![egui::Event::PointerMoved(benzene)]);
+        run(&mut editor, &mut reaction, vec![press(benzene, true), press(benzene, false)]);
+        run(&mut editor, &mut reaction, vec![key(egui::Key::Backspace)]);
+        assert_eq!(reaction.scheme.items.len(), 4);
+        let formulas: Vec<String> =
+            reaction.analysis.compute().reactants.iter().map(|c| c.formula.plain()).collect();
+        assert_eq!(formulas, ["C6H6O"]);
+    }
+
+    /// Committing arrow text regenerates the table: a formula typed over the arrow gets its
+    /// column straight away.
+    #[test]
+    fn committing_arrow_text_adds_its_reagent_column() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let mut editor = ReactionEditor::new();
+        let target = EditTarget::SchemeText { index: 1, part: SchemePart::ArrowAbove };
+
+        assert!(editor.begin_edit(target, &reaction));
+        editor.set_edit_text("MeI, NaH");
+        editor.commit_edit(&mut reaction).unwrap();
+        let formulas: Vec<String> =
+            reaction.analysis.compute().reactants.iter().map(|r| r.formula.plain()).collect();
+        // NaH is written above the arrow, K₂CO₃ below it: scheme order puts NaH first.
+        assert_eq!(formulas, ["C6H6O", "CH3I", "HNa", "CK2O3"]);
     }
 
     /// Through the widget, with a real pointer: clicking a cell of the drawn table opens the

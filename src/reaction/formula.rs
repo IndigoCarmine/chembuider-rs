@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::molecule::Molecule;
 use crate::molecule::depict::{displayed_h_count, is_folded_h};
 use crate::widget::rich_text::{RichText, SpanStyle};
@@ -116,7 +118,7 @@ pub fn atomic_weight(element: &str) -> Option<f64> {
 }
 
 /// A molecular formula: element symbols with their counts, already in Hill order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MolecularFormula {
     /// `(symbol, count)` pairs in Hill order. Counts are never zero.
     pub counts: Vec<(String, usize)>,
@@ -141,8 +143,12 @@ impl MolecularFormula {
             }
         }
 
-        // Hill order: C, H, then the rest alphabetically — unless there is no carbon, in
-        // which case everything (hydrogen included) goes alphabetically.
+        Self::hill(counts)
+    }
+
+    /// Put element counts in Hill order: C, H, then the rest alphabetically — unless there is
+    /// no carbon, in which case everything (hydrogen included) goes alphabetically.
+    fn hill(mut counts: BTreeMap<String, usize>) -> Self {
         let mut out: Vec<(String, usize)> = Vec::with_capacity(counts.len());
         if counts.contains_key("C") {
             for lead in ["C", "H"] {
@@ -153,6 +159,30 @@ impl MolecularFormula {
         }
         out.extend(counts); // BTreeMap iterates alphabetically
         Self { counts: out }
+    }
+
+    /// Read a written formula such as `K2CO3`, `NaHCO3` or `Ca(OH)2` — the text of a reagent
+    /// written over an arrow — into Hill order (`CK2O3`). `None` unless the whole string is
+    /// a formula of known elements: element symbols (with a weight, see [`atomic_weight`]),
+    /// counts, and parenthesised groups with a count. So `cat.`, `rt`, `THF`, `Et3N`, `MeOH`
+    /// or `24 h` are not formulas.
+    ///
+    /// A few reagent abbreviations happen to spell valid element symbols (`NBS` is N-B-S,
+    /// `DCC` is D-C-C, `Ar` is argon, not aryl); those are refused rather than given a
+    /// meaningless weight.
+    pub fn parse(text: &str) -> Option<Self> {
+        const ABBREVIATIONS: [&str; 10] =
+            ["NBS", "NCS", "NIS", "DCC", "DIC", "PCC", "PDC", "NMO", "Ar", "Pr"];
+        if ABBREVIATIONS.contains(&text) {
+            return None;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut pos = 0;
+        let counts = parse_group(&chars, &mut pos, 0)?;
+        if pos != chars.len() || counts.is_empty() {
+            return None;
+        }
+        Some(Self::hill(counts))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -210,6 +240,63 @@ impl MolecularFormula {
     }
 }
 
+/// One level of [`MolecularFormula::parse`]: element symbols with counts, and `( … )n`
+/// groups, until the end of the text or (when `depth > 0`) the closing parenthesis.
+fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap<String, usize>> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        let group = if c == '(' {
+            *pos += 1;
+            let inner = parse_group(chars, pos, depth + 1)?;
+            if chars.get(*pos) != Some(&')') || inner.is_empty() {
+                return None;
+            }
+            *pos += 1;
+            inner
+        } else if c == ')' && depth > 0 {
+            return Some(counts);
+        } else if c.is_ascii_uppercase() {
+            // Prefer the two-letter symbol (`Co`, `Cs`) when it is an element; a lowercase
+            // letter that does not complete one (`Me`, `Et`) is not a formula.
+            let two: Option<String> = chars
+                .get(*pos + 1)
+                .filter(|n| n.is_ascii_lowercase())
+                .map(|n| [c, *n].iter().collect());
+            let symbol = match two {
+                Some(sym) if atomic_weight(&sym).is_some() => {
+                    *pos += 2;
+                    sym
+                }
+                Some(_) => return None,
+                None => {
+                    let sym = c.to_string();
+                    atomic_weight(&sym)?;
+                    *pos += 1;
+                    sym
+                }
+            };
+            BTreeMap::from([(symbol, 1)])
+        } else {
+            return None;
+        };
+        let mut n = 0usize;
+        let start = *pos;
+        while let Some(d) = chars.get(*pos).and_then(|c| c.to_digit(10)) {
+            n = n.checked_mul(10)?.checked_add(d as usize)?;
+            *pos += 1;
+        }
+        let n = if *pos == start { 1 } else { n };
+        if n == 0 {
+            return None;
+        }
+        for (el, k) in group {
+            *counts.entry(el).or_default() += k * n;
+        }
+    }
+    (depth == 0).then_some(counts)
+}
+
 /// Convenience: [`MolecularFormula::of`].
 pub fn formula_of(mol: &Molecule) -> MolecularFormula {
     MolecularFormula::of(mol)
@@ -246,6 +333,27 @@ mod tests {
         ] {
             assert_eq!(plain(&mol), formula);
             assert_eq!(mw2(&mol), mw, "MW of {formula}");
+        }
+    }
+
+    /// Written formulas read into Hill order; text that is not a formula is refused.
+    #[test]
+    fn parse_written_formulas() {
+        let p = |t: &str| MolecularFormula::parse(t).map(|f| f.plain());
+        assert_eq!(p("K2CO3").as_deref(), Some("CK2O3"));
+        assert_eq!(p("Cs2CO3").as_deref(), Some("CCs2O3"));
+        assert_eq!(p("NaHCO3").as_deref(), Some("CHNaO3"));
+        assert_eq!(p("Ca(OH)2").as_deref(), Some("CaH2O2"));
+        assert_eq!(p("H2O").as_deref(), Some("H2O"));
+        assert_eq!(p("CO").as_deref(), Some("CO"));
+        assert_eq!(p("Co").as_deref(), Some("Co"));
+        assert_eq!(
+            format!("{:.2}", MolecularFormula::parse("K2CO3").unwrap().weight().unwrap()),
+            "138.20",
+            "same MW as the drawn carbonate"
+        );
+        for text in ["", "cat.", "rt", "THF", "Et3N", "MeOH", "24", "h", "Ca(OH", "Ca)2", "()", "H0", "NBS", "Ar"] {
+            assert_eq!(p(text), None, "{text:?} is not a formula");
         }
     }
 

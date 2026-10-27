@@ -163,7 +163,7 @@ pub(crate) fn charged_max_valence(element: &str, charge: i8) -> Option<i16> {
     Some(charged_valence(element, charge)? + expanded)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Atom {
     pub id: u32,
     pub element: String,
@@ -174,15 +174,17 @@ pub struct Atom {
     /// heavy neighbour's text ("NH2") instead of getting a vertex of its own, and the label
     /// re-derives it from valence. A hydrogen the user placed is an ordinary atom and is
     /// always drawn. Meaningless on anything that is not a hydrogen.
+    #[serde(default)]
     pub group_h: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bond {
     pub id: u32,
     pub begin: u32,
     pub end: u32,
     pub order: BondOrder,
+    #[serde(default)]
     pub stereo: BondStereo,
 }
 
@@ -201,7 +203,8 @@ pub struct RingFill {
     pub color: [u8; 4],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "MoleculeData", into = "MoleculeData")]
 pub struct Molecule {
     pub name: String,
     pub atoms: Vec<Atom>,
@@ -209,6 +212,36 @@ pub struct Molecule {
     /// Colored ring interiors (drawn behind bonds). Empty for a plain structure.
     pub ring_fills: Vec<RingFill>,
     next_id: u32,
+}
+
+/// What a saved [`Molecule`] holds: everything but the id allocator, which is re-derived on
+/// load so a new atom or bond never reuses an id already in the file.
+#[derive(Serialize, Deserialize)]
+struct MoleculeData {
+    name: String,
+    atoms: Vec<Atom>,
+    bonds: Vec<Bond>,
+    #[serde(default)]
+    ring_fills: Vec<RingFill>,
+}
+
+impl From<MoleculeData> for Molecule {
+    fn from(d: MoleculeData) -> Self {
+        let max_id = d.atoms.iter().map(|a| a.id).chain(d.bonds.iter().map(|b| b.id)).max();
+        Self {
+            name: d.name,
+            atoms: d.atoms,
+            bonds: d.bonds,
+            ring_fills: d.ring_fills,
+            next_id: max_id.map_or(1, |m| m + 1),
+        }
+    }
+}
+
+impl From<Molecule> for MoleculeData {
+    fn from(m: Molecule) -> Self {
+        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills }
+    }
 }
 
 impl Default for Molecule {
