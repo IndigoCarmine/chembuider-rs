@@ -35,9 +35,6 @@ use crate::widget::rich_text::RichText;
 
 use super::model::{Analysis, Mass, Reaction};
 use super::scheme::{ArrowLabel, PlacedKind, ReactionScheme, SchemeItem};
-use super::stoich::{
-    format_density, format_mass, format_molarity, format_number, format_percent, format_volume,
-};
 use super::table::BlockKind;
 use super::view::{FigureLayout, ReactionView};
 
@@ -313,8 +310,13 @@ pub fn set_field(analysis: &mut Analysis, cell: CellRef, value: Option<f64>) -> 
     true
 }
 
-/// The *entered* value of a cell, spelled the way the table prints it (`1.00g`, `700.00mg`) —
-/// the text an edit box starts with.
+/// The *entered* value of a cell, as text [`parse_value`] reads back to exactly the same
+/// number (`1.2345g`, `0.004`) — the text an edit box starts with.
+///
+/// The number is written in the field's base unit with Rust's shortest round-trip `f64`
+/// spelling, not with the table's two-decimal display formatting: the box is the entry
+/// itself, and seeding it with a rounded figure would overwrite `0.004` eq with `0` the
+/// moment the box is committed untouched.
 ///
 /// Empty when nothing was entered there, even if the cell currently shows a computed number:
 /// the box starts blank so that opening it and pressing Enter changes nothing, and the
@@ -323,9 +325,16 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
     let Some(field) = cell.field() else {
         return String::new();
     };
-    let joined = |q: Option<f64>, f: fn(f64) -> super::stoich::Formatted| {
-        q.map(|v| f(v).joined()).unwrap_or_default()
+    // Scale 1 in `parse_value`, so the round trip is exact.
+    let suffix = match field.unit() {
+        Unit::Mass => "g",
+        Unit::Volume => "mL",
+        Unit::Percent => "%",
+        Unit::Molarity => "M",
+        Unit::Density => "g/mL",
+        Unit::Number => "",
     };
+    let exact = |q: Option<f64>| q.map(|v| format!("{v}{suffix}")).unwrap_or_default();
     match cell.block {
         BlockKind::Reactants => {
             let Some(r) = analysis.reactants.get(cell.column) else {
@@ -333,12 +342,12 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
             };
             match field {
                 Field::Limiting => if r.limiting { "Yes" } else { "No" }.to_string(),
-                Field::Equivalents => joined(r.equivalents, format_number),
-                Field::SampleMass => joined(r.sample_mass.map(Mass::as_grams), format_mass),
-                Field::PercentWeight => joined(r.percent_weight, format_percent),
-                Field::Molarity => joined(r.molarity, format_molarity),
-                Field::Density => joined(r.density, format_density),
-                Field::Volume => joined(r.volume, format_volume),
+                Field::Equivalents => exact(r.equivalents),
+                Field::SampleMass => exact(r.sample_mass.map(Mass::as_grams)),
+                Field::PercentWeight => exact(r.percent_weight),
+                Field::Molarity => exact(r.molarity),
+                Field::Density => exact(r.density),
+                Field::Volume => exact(r.volume),
                 _ => String::new(),
             }
         }
@@ -347,10 +356,10 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
                 return String::new();
             };
             match field {
-                Field::Equivalents => joined(p.equivalents, format_number),
-                Field::PercentCompletion => joined(p.percent_completion, format_percent),
-                Field::MeasuredMass => joined(p.measured_mass.map(Mass::as_grams), format_mass),
-                Field::Purity => joined(p.purity, format_percent),
+                Field::Equivalents => exact(p.equivalents),
+                Field::PercentCompletion => exact(p.percent_completion),
+                Field::MeasuredMass => exact(p.measured_mass.map(Mass::as_grams)),
+                Field::Purity => exact(p.purity),
                 _ => String::new(),
             }
         }
@@ -1372,7 +1381,7 @@ mod tests {
     use crate::reaction::demo;
     use crate::reaction::formula::MolecularFormula;
     use crate::reaction::model::{Product, Reactant};
-    use crate::reaction::stoich::format_moles;
+    use crate::reaction::stoich::{format_mass, format_moles, format_percent};
     use crate::reaction::table::{AnalysisTable, PRODUCT_ROWS, REACTANT_ROWS};
     use crate::reaction::{Arrow, Origin};
     use egui::Vec2;
@@ -1565,7 +1574,7 @@ mod tests {
         // computed number.
         let plain = demo::williamson_ether_synthesis().analysis;
         assert_eq!(field_text(&plain, CellRef::new(BlockKind::Reactants, 1, 4)), "");
-        assert_eq!(field_text(&plain, CellRef::new(BlockKind::Reactants, 0, 4)), "1.00g");
+        assert_eq!(field_text(&plain, CellRef::new(BlockKind::Reactants, 0, 4)), "1g");
     }
 
     // ── Editing recomputes ──────────────────────────────────────────────────
@@ -2178,7 +2187,7 @@ mod tests {
         let cell = CellRef::new(BlockKind::Products, 0, 6); // Measured Mass
 
         assert!(editor.begin_edit(EditTarget::Cell(cell), &reaction));
-        assert_eq!(editor.editing().map(|(_, t)| t), Some("700.00mg"));
+        assert_eq!(editor.editing().map(|(_, t)| t), Some("0.7g"));
 
         editor.set_edit_text("1.00g");
         editor.commit_edit(&mut reaction).unwrap();
@@ -2201,6 +2210,57 @@ mod tests {
         assert!(!editor.begin_edit(EditTarget::Cell(CellRef::new(BlockKind::Products, 0, 10)), &reaction));
         assert!(!editor.begin_edit(EditTarget::Cell(CellRef::new(BlockKind::Reactants, 0, 2)), &reaction));
         assert!(!editor.begin_edit(EditTarget::SchemeText { index: 0, part: SchemePart::Structure }, &reaction));
+    }
+
+    /// Opening a box on an entered cell and committing it untouched writes back exactly the
+    /// value that was there — the table rounds to two decimals, the entry must not.
+    #[test]
+    fn an_untouched_box_leaves_the_entry_exactly_as_it_was() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        reaction.analysis.reactants[0].equivalents = Some(0.004);
+        reaction.analysis.reactants[0].sample_mass = Some(Mass::grams(1.2345));
+        reaction.analysis.reactants[0].molarity = Some(0.004);
+        reaction.analysis.reactants[0].density = Some(0.789);
+        reaction.analysis.reactants[0].volume = Some(0.125);
+        reaction.analysis.reactants[0].percent_weight = Some(99.995);
+        reaction.analysis.products[0].equivalents = Some(1.125);
+        reaction.analysis.products[0].percent_completion = Some(87.125);
+        reaction.analysis.products[0].measured_mass = Some(Mass::grams(0.7));
+        reaction.analysis.products[0].purity = Some(1.0 / 3.0);
+        let before = reaction.analysis.clone();
+
+        let mut editor = ReactionEditor::new();
+        for (block, row) in [
+            (BlockKind::Reactants, 3),
+            (BlockKind::Reactants, 4),
+            (BlockKind::Reactants, 5),
+            (BlockKind::Reactants, 6),
+            (BlockKind::Reactants, 7),
+            (BlockKind::Reactants, 8),
+            (BlockKind::Products, 2),
+            (BlockKind::Products, 3),
+            (BlockKind::Products, 6),
+            (BlockKind::Products, 7),
+        ] {
+            let cell = CellRef::new(block, 0, row);
+            assert!(editor.begin_edit(EditTarget::Cell(cell), &reaction));
+            editor
+                .commit_edit(&mut reaction)
+                .unwrap_or_else(|e| panic!("{block:?} row {row}: untouched box rejected: {e}"));
+        }
+        assert_eq!(reaction.analysis.reactants[0].equivalents, before.reactants[0].equivalents);
+        assert_eq!(reaction.analysis.reactants[0].sample_mass, before.reactants[0].sample_mass);
+        assert_eq!(reaction.analysis.reactants[0].percent_weight, before.reactants[0].percent_weight);
+        assert_eq!(reaction.analysis.reactants[0].molarity, before.reactants[0].molarity);
+        assert_eq!(reaction.analysis.reactants[0].density, before.reactants[0].density);
+        assert_eq!(reaction.analysis.reactants[0].volume, before.reactants[0].volume);
+        assert_eq!(reaction.analysis.products[0].equivalents, before.products[0].equivalents);
+        assert_eq!(
+            reaction.analysis.products[0].percent_completion,
+            before.products[0].percent_completion
+        );
+        assert_eq!(reaction.analysis.products[0].measured_mass, before.products[0].measured_mass);
+        assert_eq!(reaction.analysis.products[0].purity, before.products[0].purity);
     }
 
     /// A rejected value keeps the box open with the offending text, so nothing is lost and
@@ -2319,7 +2379,7 @@ mod tests {
         assert_eq!(editor.selection(), Some(Hit::Cell(cell)));
         assert_eq!(
             editor.editing().map(|(t, text)| (t, text.to_string())),
-            Some((EditTarget::Cell(cell), "1.10".to_string())),
+            Some((EditTarget::Cell(cell), "1.1".to_string())),
             "clicking Equivalents opens it seeded with what is entered there"
         );
 
