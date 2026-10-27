@@ -669,6 +669,17 @@ fn draw_drop_caret(
     );
 }
 
+/// The parts of a scheme item that [`hit_test`] can answer with, in the order it tries them.
+/// The first one is what selecting the item as a whole names.
+fn scheme_item_parts(item: &SchemeItem) -> &'static [SchemePart] {
+    match item {
+        SchemeItem::Structure(_) => &[SchemePart::Structure],
+        SchemeItem::Plus => &[SchemePart::Plus],
+        SchemeItem::Arrow(_) => &[SchemePart::ArrowAbove, SchemePart::ArrowBelow],
+        SchemeItem::Text(_) => &[SchemePart::Text],
+    }
+}
+
 /// What is under `pos` in a figure drawn with its top-left corner at `top_left`.
 ///
 /// The scheme is tested before the table; the two halves are stacked and never overlap, so
@@ -680,12 +691,13 @@ pub fn hit_test(
     pos: Pos2,
 ) -> Option<Hit> {
     for (index, placed) in layout.scheme.items.iter().enumerate() {
-        let item = scheme.items.get(index);
-        let parts: &[SchemePart] = match (&placed.kind, item) {
-            (PlacedKind::Arrow { .. }, _) => &[SchemePart::ArrowAbove, SchemePart::ArrowBelow],
-            (_, Some(SchemeItem::Structure(_))) => &[SchemePart::Structure],
-            (_, Some(SchemeItem::Plus)) => &[SchemePart::Plus],
-            (_, Some(SchemeItem::Text(_))) => &[SchemePart::Text],
+        let parts = match scheme.items.get(index) {
+            Some(item)
+                if matches!(placed.kind, PlacedKind::Arrow { .. })
+                    == matches!(item, SchemeItem::Arrow(_)) =>
+            {
+                scheme_item_parts(item)
+            }
             // Layout and scheme are built from the same list; a mismatch means a stale
             // layout, and hitting nothing is better than answering with the wrong item.
             _ => &[],
@@ -1104,6 +1116,8 @@ impl ReactionEditor {
             }
         } else if let Some(drag) = self.drag {
             let source_hit = match drag.source {
+                // Only drawn, never kept as a selection: `Structure` is how `scheme_item_rect`
+                // gives a main-line item's whole box — for an arrow, both bands at once.
                 DragSource::Item(index) => Hit::Scheme { index, part: SchemePart::Structure },
                 DragSource::ArrowLabel { index, part } => Hit::Scheme { index, part },
             };
@@ -1154,8 +1168,14 @@ impl ReactionEditor {
                                 reaction.sync_structures_from_scheme();
                                 // Dropped back in place moves nothing; any other landing does.
                                 self.scheme_rearranged |= landed != from;
-                                self.selection =
-                                    Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                                // Select what landed by the part a click on it would give — a
+                                // `+`, text or arrow is not a structure.
+                                self.selection = reaction
+                                    .scheme
+                                    .items
+                                    .get(landed)
+                                    .and_then(|item| scheme_item_parts(item).first())
+                                    .map(|&part| Hit::Scheme { index: landed, part });
                             }
                         }
                         DragSource::ArrowLabel { index, part } => {
@@ -2677,6 +2697,132 @@ mod tests {
             "benzene now rides above the arrow"
         );
         assert!(editor.take_scheme_rearranged());
+    }
+
+    /// Through the widget, with a real pointer: after a drag reorders a scheme item, the
+    /// selection names the landed item with the part [`hit_test`] gives that kind of item — a
+    /// `+` is selected as `Plus`, a text item as `Text`, an arrow as its above band — not as a
+    /// `Structure`, which would turn on the host's structure-only actions for a non-structure.
+    #[test]
+    fn a_drag_reorder_selects_the_landed_item_by_its_kind() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        /// Press at `start`, cross the drag threshold at `nudge`, let go at `end`.
+        fn drag(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            start: Pos2,
+            nudge: Pos2,
+            end: Pos2,
+        ) {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(ctx, editor, reaction, vec![button(start, true)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(nudge)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the item up");
+            frame(ctx, editor, reaction, vec![button(end, false)]);
+            assert!(!editor.is_dragging());
+        }
+        // phenol + benzene → anisole  heat
+        let scheme = || {
+            ReactionScheme::new()
+                .structure(demo::phenol())
+                .plus()
+                .structure(demo::benzene())
+                .arrow(Arrow::new())
+                .structure(demo::anisole())
+                .text("heat")
+        };
+
+        // The `+` dragged to the front of the line.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
+        let front = Pos2::new(first.min.x + 2.0, first.center().y);
+        let plus = scheme_item_rect(&layout, origin, 1, SchemePart::Plus).unwrap();
+        let start = plus.right_center() - Vec2::new(1.0, 0.0);
+        let nudge = plus.left_center() + Vec2::new(1.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(matches!(reaction.scheme.items[0], SchemeItem::Plus), "the `+` moved to the front");
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 0, part: SchemePart::Plus }));
+
+        // The text item dragged to the front of the line.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let text = scheme_item_rect(&layout, origin, 5, SchemePart::Text).unwrap();
+        let start = text.right_center() - Vec2::new(1.0, 0.0);
+        let nudge = text.left_center() + Vec2::new(1.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(
+            matches!(reaction.scheme.items[0], SchemeItem::Text(_)),
+            "the text moved to the front"
+        );
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 0, part: SchemePart::Text }));
+
+        // The arrow, picked up by its empty above band, dragged to the front of the line.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        let start = band.center();
+        let nudge = start - Vec2::new(12.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(
+            matches!(reaction.scheme.items[0], SchemeItem::Arrow(_)),
+            "the arrow moved to the front"
+        );
+        assert_eq!(
+            editor.selection(),
+            Some(Hit::Scheme { index: 0, part: SchemePart::ArrowAbove })
+        );
+        // Nothing structure-only acts on it.
+        assert_eq!(editor.cleanup_selected_structure(&mut reaction), None);
+
+        // A structure still lands selected as a structure.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let anisole = scheme_item_rect(&layout, origin, 4, SchemePart::Structure).unwrap();
+        let start = anisole.center();
+        let nudge = start - Vec2::new(12.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(
+            matches!(&reaction.scheme.items[0], SchemeItem::Structure(m) if *m == demo::anisole()),
+            "anisole moved to the front"
+        );
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 0, part: SchemePart::Structure }));
     }
 
     /// Through the widget, with a real pointer and keyboard: picking up a scheme item while the

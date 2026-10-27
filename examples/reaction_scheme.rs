@@ -368,9 +368,12 @@ impl ReactionApp {
             {
                 // The syncing setter carries the new structure into its analysis column, so
                 // the table's formula, MW and stoichiometry redraw with the scheme.
-                self.reaction.set_scheme_structure(index, mol);
-                self.status =
-                    "Replaced the selected structure — the table below followed it.".to_string();
+                self.status = if self.reaction.set_scheme_structure(index, mol) {
+                    "Replaced the selected structure — the table below followed it.".to_string()
+                } else {
+                    "The selection is not a structure on the reaction line — nothing replaced."
+                        .to_string()
+                };
             }
             if ui
                 .add_enabled(structure_selected, egui::Button::new("🧹 Clean up selected"))
@@ -622,9 +625,12 @@ impl ReactionApp {
             Action::ReplaceSchemeStructure(i) => {
                 if let Some(mol) = self.canvas_structure() {
                     // Redraw the structure and carry it into its table column in one step.
-                    self.reaction.set_scheme_structure(i, mol);
-                    self.status =
-                        "Replaced a scheme structure — the table column followed it.".to_string();
+                    self.status = if self.reaction.set_scheme_structure(i, mol) {
+                        "Replaced a scheme structure — the table column followed it.".to_string()
+                    } else {
+                        "That item is not a structure on the reaction line — nothing replaced."
+                            .to_string()
+                    };
                 }
             }
             Action::CleanupSchemeStructure(i) => {
