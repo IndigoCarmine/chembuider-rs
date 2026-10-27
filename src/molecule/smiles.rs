@@ -40,7 +40,7 @@
 //!   turn a labelled compound into an unlabelled one.
 //! - **Stereochemistry is dropped.** See [`to_smiles`].
 
-use super::{BondOrder, Molecule, normal_valence};
+use super::{BondOrder, Molecule};
 use std::collections::{HashMap, HashSet};
 
 /// How many complete traversals [`to_smiles`] will enumerate per connected component before
@@ -146,10 +146,11 @@ fn split_isotope(element: &str) -> (&str, Option<u16>) {
 /// worth of bonds: the shortfall against the next standard valence at or above it.
 ///
 /// These are the OpenSMILES default valences, and they are not the same list as
-/// [`normal_valence`] — that one is deliberately the *lowest* common valence so a drawn S reads
-/// as H₂S, whereas a SMILES reader will happily take an `S` with four bonds as a sulfoxide. The
-/// two lists disagreeing is exactly why [`atom_token`] checks this function instead of assuming:
-/// where they differ, the atom gets brackets and says its hydrogen count out loud.
+/// [`normal_valence`](super::normal_valence) — that one is deliberately the *lowest* common
+/// valence so a drawn S reads as H₂S, whereas a SMILES reader will happily take an `S` with
+/// four bonds as a sulfoxide. The two lists disagreeing is exactly why [`atom_token`] checks
+/// this function instead of assuming: where they differ, the atom gets brackets and says its
+/// hydrogen count out loud.
 fn smiles_implicit_h(symbol: &str, bond_sum: i16) -> u32 {
     let valences: &[i16] = match symbol {
         "B" => &[3],
@@ -323,8 +324,9 @@ impl Skeleton {
             let implicit = if is_hydrogenic(&a.element) {
                 0
             } else {
-                normal_valence(&a.element)
-                    .map(|v| ((v as i16 + a.charge as i16) - bond_sum_all).max(0) as u32)
+                // The label's own rule for what a charge does to the valence, so the two agree.
+                super::charged_valence(&a.element, a.charge)
+                    .map(|v| (v - bond_sum_all).max(0) as u32)
                     .unwrap_or(0)
             };
             let total_h = folded_count + implicit;
@@ -803,9 +805,9 @@ mod tests {
     /// 1. **Skeleton** — [`is_isomorphic`] against the original (minus folded hydrogens).
     /// 2. **Hydrogens** — the formula the *parser* derives, applying SMILES' own valence rules
     ///    to what was written, must equal the formula the *model* derives from
-    ///    [`normal_valence`]. The two arrive at the count by different routes and different
-    ///    valence tables, so agreement on all 125 structures is real evidence rather than a
-    ///    tautology.
+    ///    [`charged_valence`](super::charged_valence). The two arrive at the
+    ///    count by different routes and different valence tables, so agreement on all 125
+    ///    structures is real evidence rather than a tautology.
     /// 3. **Idempotence** — re-writing the parsed molecule reproduces the string, so the
     ///    canonical form is a fixed point and not an artefact of how the fixture was stored.
     #[test]
@@ -970,6 +972,33 @@ mod tests {
         assert_eq!(to_smiles(&mol(&[("N", 1)], &[])), "[NH4+]");
         assert_eq!(to_smiles(&mol(&[("Fe", 2)], &[])), "[Fe+2]", "past ±1 the number is spelled");
         assert_eq!(to_smiles(&mol(&[("S", -2)], &[])), "[S-2]");
+    }
+
+    /// A charged atom carries the hydrogens of the ion it is, whichever way the charge moves
+    /// its valence: up for an onium N or O, down for a carbocation or a carbanion, up for a
+    /// borate. Alone and with one bond, matching the label on the bonded one.
+    #[test]
+    fn charged_atoms_carry_the_hydrogens_of_their_ion() {
+        for (el, charge, lone, bonded) in [
+            ("C", 1, "[CH3+]", "C[CH2+]"),
+            ("C", -1, "[CH3-]", "C[CH2-]"),
+            ("N", 1, "[NH4+]", "C[NH3+]"),
+            ("O", 1, "[OH3+]", "C[OH2+]"),
+            ("B", -1, "[BH4-]", "C[BH3-]"),
+            ("Si", 1, "[SiH3+]", "C[SiH2+]"),
+        ] {
+            assert_eq!(to_smiles(&mol(&[(el, charge)], &[])), lone, "{el}{charge:+} alone");
+            let m = mol(&[("C", 0), (el, charge)], &[(0, 1, BondOrder::Single)]);
+            assert_eq!(to_smiles(&m), bonded, "{el}{charge:+} on a methyl");
+            let id = m.atoms[1].id;
+            let sk = Skeleton::build(&m);
+            let k = sk.ids.iter().position(|&i| i == id).expect("the ion is written");
+            assert_eq!(
+                sk.h[k],
+                crate::widget::draw::displayed_h_count(&m, id) as u32,
+                "{el}{charge:+}: SMILES and the label agree",
+            );
+        }
     }
 
     /// Deuterium is a label in this editor and an isotope in SMILES, and it must never be
