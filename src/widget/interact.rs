@@ -43,6 +43,38 @@ fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Primary-button drags
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The phases of a drag made with the primary button, for the tools' drag gestures.
+///
+/// egui's `drag_started()` / `dragged()` / `drag_stopped()` fire for a drag by *any* button,
+/// but the middle button belongs to the camera (`ChemStructEditor::ui` pans with it), so the
+/// tools read their drags through this instead.
+struct PrimaryDrag {
+    started: bool,
+    dragged: bool,
+    stopped: bool,
+}
+
+impl PrimaryDrag {
+    fn of(response: &egui::Response, ui: &egui::Ui) -> Self {
+        let (held, released) = ui.input(|i| {
+            (i.pointer.button_down(egui::PointerButton::Primary),
+             i.pointer.button_released(egui::PointerButton::Primary))
+        });
+        Self {
+            started: response.drag_started() && held,
+            dragged: response.dragged() && held,
+            // A primary drag ends by releasing the button, or is aborted (Escape) while it is
+            // still held. `drag_stopped_by(Primary)` would only see the release, leaving the
+            // gesture's state behind after an abort.
+            stopped: response.drag_stopped() && (released || held),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Public tool handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -54,6 +86,7 @@ pub fn process_bond_tool(
 ) -> bool {
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
+    let drag = PrimaryDrag::of(response, ui);
 
     // ── Drag tracking ────────────────────────────────────────────────────────
     // Dragging *from an atom* always draws a bond, never moves it — the Bond tool's own
@@ -63,7 +96,7 @@ pub fn process_bond_tool(
     // Dragging *from empty canvas* (no atom and no bond under the press) instead runs the same
     // rubber-band selection the Select tool offers, so a user can marquee-select without
     // leaving the Bond tool. A drag that begins on a bond keeps the Bond tool's old no-op.
-    if response.drag_started() {
+    if drag.started {
         // `drag_started()` only fires once the pointer has moved past egui's drag threshold,
         // so by now `mouse` (the *current* position) may already be well past the atom the
         // drag actually started on. Hit-test at the press origin instead, or a fast drag off
@@ -77,11 +110,11 @@ pub fn process_bond_tool(
         } else if editor.hit_test_bond(origin, center).is_none() {
             // Empty space: start a rubber-band selection instead of a bond. No undo snapshot —
             // selection does not mutate the molecule.
-            lasso_begin(editor, mouse);
+            lasso_begin(editor, origin);
         }
     }
 
-    if response.dragged() {
+    if drag.dragged {
         if editor.bond_start.is_some() {
             editor.preview_end_screen = Some(mouse);
         } else if editor.drag_origin_screen.is_some() {
@@ -90,7 +123,7 @@ pub fn process_bond_tool(
         }
     }
 
-    if response.drag_stopped() {
+    if drag.stopped {
         if editor.bond_start.is_none() && editor.drag_origin_screen.is_some() {
             // Empty-space drag: commit the rubber-band selection and tear its state down.
             lasso_select(editor, center);
@@ -170,13 +203,6 @@ pub fn process_bond_tool(
         }
     }
 
-    // ── Middle-click pan ─────────────────────────────────────────────────────
-    if ui.input(|i| i.pointer.middle_down()) {
-        if let Some(delta) = ui.input(|i| i.pointer.delta()).into() {
-            editor.pan += delta;
-        }
-    }
-
     // ── Hover + Delete: remove the atom or bond under the cursor ─────────────
     let delete_pressed =
         ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
@@ -238,13 +264,19 @@ fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
 // Rubber-band (lasso) selection — shared by the Select and Bond tools
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Begin a rubber-band selection: reset the in-progress path and remember the drag origin.
+/// Begin a rubber-band selection at `origin`, the pointer's press origin: reset the
+/// in-progress path to start there and remember it as the drag origin.
+///
+/// The path starts at the press, not at the pointer when `drag_started()` fires: by then the
+/// pointer is past egui's drag threshold, possibly far past it after a fast first move, and
+/// the polygon would lose the stretch between the two.
 ///
 /// Factored out so the Bond tool can start the exact same gesture the Select tool does when a
 /// drag begins over empty canvas (no atom and no bond under the press).
-fn lasso_begin(editor: &mut ChemStructEditor, mouse: egui::Pos2) {
+fn lasso_begin(editor: &mut ChemStructEditor, origin: egui::Pos2) {
     editor.lasso_path.clear();
-    editor.drag_origin_screen = Some(mouse);
+    editor.lasso_path.push(origin);
+    editor.drag_origin_screen = Some(origin);
 }
 
 /// Finish a rubber-band selection: replace the selection with every atom whose screen position
@@ -274,6 +306,7 @@ pub fn process_select_tool(
 ) -> bool {
     let mut modified = false;
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
+    let drag = PrimaryDrag::of(response, ui);
 
     // Double-click an atom or bond → select that whole connected molecule.
     if response.double_clicked() {
@@ -299,8 +332,11 @@ pub fn process_select_tool(
         }
     }
 
-    if response.drag_started() {
-        lasso_begin(editor, mouse);
+    if drag.started {
+        // As in the Bond tool, pick what the drag acts on at the press origin: by the time
+        // `drag_started()` fires the pointer may already have left the atom it was pressed on.
+        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
+        lasso_begin(editor, origin);
         // Alt+drag with a selection rotates the molecule around its centroid.
         if ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty() {
             editor.push_undo();
@@ -310,11 +346,16 @@ pub fn process_select_tool(
             editor.dragging_atom = None;
         } else {
             editor.rotate_last_angle = None;
-            editor.dragging_atom = editor.hovered_atom;
+            editor.dragging_atom = editor.hit_test_atom(origin, center);
+            if editor.dragging_atom.is_some() {
+                // Snapshot once, before the first frame of movement, so the whole move is one
+                // undo step (the Alt-rotation branch above does the same).
+                editor.push_undo();
+            }
         }
     }
 
-    if response.dragged() {
+    if drag.dragged {
         if let Some(last) = editor.rotate_last_angle {
             // Rotate the selection by the change in cursor angle about its centroid.
             let c = selection_centroid(editor);
@@ -325,9 +366,7 @@ pub fn process_select_tool(
             editor.rotate_last_angle = Some(angle);
             modified = true;
         } else if let Some(atom_id) = editor.dragging_atom {
-            let drag_delta = response.drag_delta();
-            let inv = 1.0 / (editor.zoom * super::SCALE_FACTOR);
-            let (dx, dy) = (drag_delta.x * inv, drag_delta.y * inv);
+            let [dx, dy] = editor.view(center).screen_delta_to_mol(response.drag_delta());
             let atoms_to_move: Vec<u32> = if editor.selected_atoms.contains(&atom_id) {
                 editor.selected_atoms.iter().cloned().collect()
             } else {
@@ -345,7 +384,7 @@ pub fn process_select_tool(
         }
     }
 
-    if response.drag_stopped() {
+    if drag.stopped {
         if editor.rotate_last_angle.take().is_some() {
             // rotation finished
         } else if editor.dragging_atom.is_some() {
@@ -1493,6 +1532,168 @@ mod tests {
         assert!(editor.undo(), "the delete must have pushed an undo snapshot");
         assert_eq!(editor.molecule.atoms.len(), 2, "undo should restore the deleted atom");
         assert_eq!(editor.molecule.bonds.len(), 1, "undo should restore its bond too");
+    }
+
+    /// Primary-button drag along `path` (press at the first point, release at the last), one
+    /// pointer move per frame, with `modifiers` held throughout.
+    fn primary_drag_along(
+        editor: &mut ChemStructEditor,
+        path: &[egui::Pos2],
+        modifiers: egui::Modifiers,
+    ) {
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let frame = |editor: &mut ChemStructEditor, events| {
+            crate::testkit::run_frame_with_modifiers(&ctx, screen_rect, editor, events, modifiers);
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        let (first, last) = (path[0], path[path.len() - 1]);
+        frame(editor, vec![egui::Event::PointerMoved(first)]);
+        frame(editor, vec![button(first, true)]);
+        for &p in &path[1..] {
+            frame(editor, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(editor, vec![button(last, false)]);
+    }
+
+    /// The canvas center of the 640x480 test screen, where mol (0, 0) sits at the default view.
+    const MID: egui::Pos2 = egui::pos2(320.0, 240.0);
+
+    /// A drag path starting on the atom at `MID`: a few small steps, then well away over many
+    /// frames.
+    fn drag_path_from_mid() -> Vec<egui::Pos2> {
+        let mut path = vec![MID, MID + egui::vec2(4.0, 2.0), MID + egui::vec2(8.0, 4.0)];
+        path.extend((1..=10).map(|k| MID + egui::vec2(8.0 + 10.0 * k as f32, 4.0 + 5.0 * k as f32)));
+        path
+    }
+
+    /// Select tool: dragging an atom moves it, and that move is one undo step — undo puts the
+    /// atom back where it was, redo moves it again. The drag spans many frames; it must not
+    /// leave a snapshot per frame behind.
+    #[test]
+    fn select_drag_of_an_atom_is_one_undo_step() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [3.0, 0.0], 0);
+        editor.molecule.add_bond(a, b, BondOrder::Single);
+        let before = editor.molecule.clone();
+
+        primary_drag_along(&mut editor, &drag_path_from_mid(), Default::default());
+
+        let moved = editor.molecule.atom_by_id(a).unwrap().pos;
+        assert_ne!(moved, [0.0, 0.0], "the drag moves the atom");
+        assert_eq!(editor.molecule.atom_by_id(b).unwrap().pos, [3.0, 0.0], "an unselected neighbour stays");
+        assert_eq!(editor.undo_stack.len(), 1, "one drag pushes exactly one undo snapshot");
+
+        assert!(editor.undo(), "the move is undoable");
+        assert_eq!(editor.molecule, before, "undo restores the pre-drag position");
+        assert!(editor.redo(), "the move is redoable");
+        assert_eq!(editor.molecule.atom_by_id(a).unwrap().pos, moved, "redo re-applies the move");
+    }
+
+    /// Select tool: dragging one atom of a multi-atom selection moves the whole selection, as
+    /// one undo step.
+    #[test]
+    fn select_drag_of_a_selection_is_one_undo_step() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c = editor.molecule.add_atom("C".to_string(), [5.0, 0.0], 0);
+        editor.selected_atoms.extend([a, b]);
+        let before = editor.molecule.clone();
+
+        primary_drag_along(&mut editor, &drag_path_from_mid(), Default::default());
+
+        assert_ne!(editor.molecule.atom_by_id(a).unwrap().pos, [0.0, 0.0], "the dragged atom moves");
+        assert_ne!(editor.molecule.atom_by_id(b).unwrap().pos, [1.5, 0.0], "the rest of the selection moves");
+        assert_eq!(editor.molecule.atom_by_id(c).unwrap().pos, [5.0, 0.0], "an unselected atom stays");
+        assert_eq!(editor.undo_stack.len(), 1, "one drag pushes exactly one undo snapshot");
+
+        assert!(editor.undo(), "the move is undoable");
+        assert_eq!(editor.molecule, before, "undo restores every selected atom");
+    }
+
+    /// Select tool: Alt+drag rotates the selection about its centroid, as one undo step.
+    #[test]
+    fn select_alt_drag_rotation_is_one_undo_step() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [-1.5, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        editor.selected_atoms.extend([a, b]);
+        let before = editor.molecule.clone();
+
+        // Start off the centroid (mol (0, 0) is at MID) and sweep round it.
+        let path: Vec<egui::Pos2> = (0..=8)
+            .map(|k| {
+                let t = k as f32 * 0.15;
+                MID + 80.0 * egui::vec2(t.cos(), t.sin())
+            })
+            .collect();
+        primary_drag_along(&mut editor, &path, egui::Modifiers::ALT);
+
+        assert_ne!(editor.molecule, before, "the Alt+drag rotates the selection");
+        assert_eq!(editor.undo_stack.len(), 1, "one rotation pushes exactly one undo snapshot");
+        assert!(editor.undo(), "the rotation is undoable");
+        assert_eq!(editor.molecule, before, "undo restores the pre-rotation positions");
+    }
+
+    /// Select tool: a click on an atom (no movement) only toggles the selection; it changes no
+    /// coordinates, so it must not leave an undo snapshot behind.
+    #[test]
+    fn select_click_on_an_atom_pushes_no_undo() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+
+        primary_drag_along(&mut editor, &[MID], Default::default());
+
+        assert!(editor.selected_atoms.contains(&a), "the click selects the atom");
+        assert_eq!(editor.molecule.atom_by_id(a).unwrap().pos, [0.0, 0.0], "the click moves nothing");
+        assert!(editor.undo_stack.is_empty(), "a click pushes no undo snapshot");
+    }
+
+    /// Select tool: a drag that leaves the atom in a single frame, far past egui's drag
+    /// threshold, still grabs the atom it was pressed on. `drag_started()` only fires once the
+    /// pointer is already off the atom, so the dragged atom must come from the press origin,
+    /// not from the hover at drag start.
+    #[test]
+    fn select_fast_drag_off_an_atom_still_moves_it() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+
+        primary_drag_along(&mut editor, &[MID, MID + egui::vec2(150.0, 80.0)], Default::default());
+
+        assert_ne!(editor.molecule.atom_by_id(a).unwrap().pos, [0.0, 0.0], "the fast drag moves the atom");
+        assert!(editor.selected_atoms.is_empty(), "a move drag runs no lasso");
+        assert_eq!(editor.undo_stack.len(), 1, "the move is one undo step");
+    }
+
+    /// Select tool: the lasso polygon starts where the button was pressed, not where the
+    /// pointer was when the drag threshold was crossed. Here the first move jumps a whole side
+    /// of the square in one frame; an atom inside the square but outside the triangle left
+    /// after dropping the press corner must still be selected.
+    #[test]
+    fn select_fast_lasso_includes_the_press_origin() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        // Near the press corner (but outside the atom hit radius of it), on its side of the
+        // square's diagonal.
+        let near_corner = editor.screen_to_mol(MID + egui::vec2(-20.0, -20.0), MID);
+        let a = editor.molecule.add_atom("C".to_string(), near_corner, 0);
+
+        let path = [
+            MID + egui::vec2(-40.0, -40.0),
+            MID + egui::vec2( 40.0, -40.0),
+            MID + egui::vec2( 40.0,  40.0),
+            MID + egui::vec2(-40.0,  40.0),
+        ];
+        primary_drag_along(&mut editor, &path, Default::default());
+
+        assert!(editor.selected_atoms.contains(&a), "the atom inside the lasso is selected");
+        assert!(editor.undo_stack.is_empty(), "a lasso changes no coordinates");
     }
 
     fn frag_shortcut(key: &str, fragment: &str) -> AtomShortcut {

@@ -10,13 +10,19 @@
 //!   equivalent factor is `SCALE / 65536 = 9.6` points per molecular unit. The y-axis is written
 //!   as-is (no flip), matching the binary writer, which is pinned to real ChemDraw output by the
 //!   `parse_real_chemdraw_cdx` fixture test.
-//! - **Element.** Atomic number, same table as `cdx`. Carbon (Z=6) is the default node type and
-//!   is omitted, exactly as the binary writer omits it.
+//! - **Nodes.** Written by the binary writer's own rules ([`cdx::node_rules`]), so both formats
+//!   describe the same structure: the atomic number as `Element` (carbon, the default node, is
+//!   omitted); a label that is no element ("Ph", "CO_2Et", "D") as `NodeType="Unspecified"`;
+//!   `NumHydrogens` and `Charge`; a label as `<t>` with one `<s>` per style run (`face` as in CDX:
+//!   96 formula, 32 subscript, 2 italic, …); a hydrogen folded into its neighbour's label ("NH2")
+//!   not as a node, nor its bond.
 //! - **Bond order.** `Order="1"|"2"|"3"` for single/double/triple.
 //! - **Stereo.** Mapped onto CDXML's `Display` bond attribute (`WedgeBegin`, `WedgedHashBegin`,
 //!   `Bold`, `Dash`, `Wavy`).
 
-use super::{BondOrder, BondStereo, Molecule};
+use super::cdx::{self, NodeKind, NodeLabel, NodeRules};
+use super::lookup::{AtomLookup, MolIndex};
+use super::{Atom, BondOrder, BondStereo, Molecule};
 
 /// Points per molecular unit. Equals the binary writer's `SCALE` (629_145 units of 1/65536 point)
 /// divided by 65536, so a CDXML file and a CDX file built from the same `Molecule` describe the
@@ -37,12 +43,26 @@ pub fn to_cdxml(mol: &Molecule) -> String {
         "<CDXML BondLength=\"{}\">\n",
         fmt_num(BOND_LENGTH_PT)
     ));
+    // The nodes, as the binary writer writes them (one set of rules, `cdx::node_rules`). A
+    // hydrogen folded into its neighbour's label is not one of them, only that label's count.
+    // Every atom is looked up, so from an index built once (the molecule's own lookups scan).
+    let index = MolIndex::new(mol);
+    let nodes: Vec<(&Atom, NodeRules)> =
+        mol.atoms.iter().filter(|a| cdx::is_node(&index, a.id)).map(|a| (a, cdx::node_rules(&index, a))).collect();
+
+    // The font the labels name (the binary writer's document font table has the same).
+    if nodes.iter().any(|(_, rules)| rules.label.is_some()) {
+        s.push_str(&format!(
+            " <fonttable>\n  <font id=\"{}\" charset=\"iso-8859-1\" name=\"Arial\"/>\n </fonttable>\n",
+            cdx::LABEL_FONT
+        ));
+    }
     s.push_str(" <page>\n");
     s.push_str("  <fragment>\n");
 
     // Nodes (atoms). The atom's own id is reused as the CDXML node id, and bonds reference it via
     // B/E — atom ids are unique and positive, so no separate remapping is needed.
-    for atom in &mol.atoms {
+    for (atom, rules) in &nodes {
         let x = atom.pos[0] as f64 * POINT_SCALE;
         let y = atom.pos[1] as f64 * POINT_SCALE;
         s.push_str(&format!(
@@ -52,21 +72,31 @@ pub fn to_cdxml(mol: &Molecule) -> String {
             fmt_num(y),
         ));
         // Carbon (Z=6) is ChemDraw's default node type and is omitted, matching the binary writer.
-        if let Some(z) = atomic_number(&atom.element) {
-            if z != 6 {
-                s.push_str(&format!(" Element=\"{z}\""));
+        match rules.kind {
+            NodeKind::Carbon => {}
+            NodeKind::Element(z) => s.push_str(&format!(" Element=\"{z}\"")),
+            NodeKind::Unspecified => s.push_str(" NodeType=\"Unspecified\""),
+        }
+        if let Some(h) = rules.num_hydrogens {
+            s.push_str(&format!(" NumHydrogens=\"{h}\""));
+        }
+        if rules.charge != 0 {
+            s.push_str(&format!(" Charge=\"{}\"", rules.charge));
+        }
+        match &rules.label {
+            None => s.push_str("/>\n"),
+            Some(label) => {
+                s.push('>');
+                push_label(&mut s, (x, y), label);
+                s.push_str("</n>\n");
             }
         }
-        if atom.charge != 0 {
-            s.push_str(&format!(" Charge=\"{}\"", atom.charge));
-        }
-        s.push_str("/>\n");
     }
 
-    // Bonds. Skip any that reference an atom that isn't present.
+    // Bonds. Skip any that reference an atom that isn't a node (missing, or a folded hydrogen).
     for bond in &mol.bonds {
-        let has_ends = mol.atom_by_id(bond.begin).is_some() && mol.atom_by_id(bond.end).is_some();
-        if !has_ends {
+        let is_node = |id: u32| index.atom_by_id(id).is_some() && cdx::is_node(&index, id);
+        if !(is_node(bond.begin) && is_node(bond.end)) {
             continue;
         }
         s.push_str(&format!(
@@ -131,10 +161,45 @@ fn fmt_num(v: f64) -> String {
     s
 }
 
-/// Escape the five XML metacharacters. Used for any text that could contain them (element labels,
-/// names). Kept even though current element symbols are alphabetic — an element field is free text
-/// in principle, and correctness here is a stated requirement.
-#[allow(dead_code)]
+/// A node's label as CDXML's `<t>`: placed and aligned as the binary writer places its text
+/// object, one `<s>` per style run (with its face, as CDX's style runs have it), the text escaped.
+fn push_label(s: &mut String, at: (f64, f64), label: &NodeLabel) {
+    // The binary writer's geometry is in CDX units (1/65536 pt), CDXML's in points.
+    let pt = |v: f64| fmt_num(v / cdx::PT);
+    let (origin, [left, top, right, bottom]) =
+        cdx::label_geometry((at.0 * cdx::PT, at.1 * cdx::PT), &label.text, label.right);
+    s.push_str(&format!(
+        "<t p=\"{} {}\" BoundingBox=\"{} {} {} {}\" LabelAlignment=\"{}\">",
+        pt(origin.0),
+        pt(origin.1),
+        pt(left),
+        pt(top),
+        pt(right),
+        pt(bottom),
+        if label.right { "Right" } else { "Left" },
+    ));
+    let chars: Vec<char> = label.text.chars().collect();
+    let runs: &[(u16, u16)] = if label.runs.is_empty() { &[(0, 0)] } else { &label.runs };
+    for (i, &(start, face)) in runs.iter().enumerate() {
+        let end = runs.get(i + 1).map_or(chars.len(), |r| r.0 as usize).min(chars.len());
+        let text: String = chars[(start as usize).min(end)..end].iter().collect();
+        s.push_str(&format!(
+            "<s font=\"{}\" size=\"{}\"",
+            cdx::LABEL_FONT,
+            fmt_num(cdx::LABEL_SIZE as f64 / 20.0)
+        ));
+        if face != 0 {
+            s.push_str(&format!(" face=\"{face}\""));
+        }
+        s.push('>');
+        s.push_str(&xml_escape(&text));
+        s.push_str("</s>");
+    }
+    s.push_str("</t>");
+}
+
+/// Escape the five XML metacharacters. Used for any text that could contain them (labels are free
+/// text: "R&D", "<1>").
 fn xml_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -150,10 +215,6 @@ fn xml_escape(input: &str) -> String {
     out
 }
 
-fn atomic_number(el: &str) -> Option<u16> {
-    super::elements::atomic_number(el)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,8 +225,9 @@ mod tests {
     }
 
     /// A minimal well-formedness check sufficient for these outputs: every container tag opens and
-    /// closes exactly once, and every `<n>`/`<b>` self-closes. We assert the specific tag pairing
-    /// instead of pulling in a full XML parser.
+    /// closes exactly once, every `<b>`/`<font>` self-closes, every `<n>` self-closes or (holding
+    /// its label) has its `</n>`, and every label's `<t>`/`<s>` is closed. We assert the specific
+    /// tag pairing instead of pulling in a full XML parser.
     fn assert_well_formed(xml: &str) {
         assert!(xml.starts_with("<?xml "), "has XML declaration");
         assert!(xml.contains("<!DOCTYPE CDXML"), "has CDXML DOCTYPE");
@@ -173,10 +235,16 @@ mod tests {
             assert_eq!(count(xml, &format!("<{tag}")), 1, "one <{tag}");
             assert_eq!(count(xml, &format!("</{tag}>")), 1, "one </{tag}>");
         }
+        assert_eq!(count(xml, "<fonttable>"), count(xml, "</fonttable>"), "<fonttable> is closed");
         let self_closing = count(xml, "/>");
         let n_open = count(xml, "<n ");
+        let n_closed = count(xml, "</n>");
         let b_open = count(xml, "<b ");
-        assert_eq!(self_closing, n_open + b_open, "every <n>/<b> self-closes");
+        let font_open = count(xml, "<font ");
+        assert_eq!(self_closing + n_closed, n_open + b_open + font_open, "every <n>/<b>/<font> is closed");
+        for tag in ["t", "s"] {
+            assert_eq!(count(xml, &format!("<{tag} ")), count(xml, &format!("</{tag}>")), "every <{tag}> is closed");
+        }
     }
 
     fn benzene() -> Molecule {
@@ -272,6 +340,181 @@ mod tests {
             let id = &rest[..rest.find('"').unwrap()];
             assert!(node_ids.contains(&id), "bond begin {id} is a real node");
         }
+    }
+
+    /// A chain of neutral carbons with a wedge and a double bond: nothing on it shows a label.
+    fn plain_chain() -> Molecule {
+        let mut mol = Molecule::default();
+        let a = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = mol.add_atom("C".to_string(), [1.3, 0.75], 0);
+        let c = mol.add_atom("C".to_string(), [2.6, 0.0], 0);
+        let d = mol.add_atom("C".to_string(), [1.3, 2.25], 0);
+        let w = mol.add_bond(a, b, BondOrder::Single);
+        mol.bond_by_id_mut(w).unwrap().stereo = BondStereo::WedgeUp;
+        mol.add_bond(b, c, BondOrder::Double);
+        mol.add_bond(b, d, BondOrder::Single);
+        mol
+    }
+
+    /// A molecule with no label at all is written exactly as before labels were written.
+    #[test]
+    fn a_structure_without_labels_is_written_as_before() {
+        let expected = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>
+<!DOCTYPE CDXML SYSTEM \"http://www.cambridgesoft.com/xml/cdxml.dtd\" >
+<CDXML BondLength=\"14.399986\">
+ <page>
+  <fragment>
+   <n id=\"1\" p=\"0 0\"/>
+   <n id=\"2\" p=\"12.479988 7.199993\"/>
+   <n id=\"3\" p=\"24.959975 0\"/>
+   <n id=\"4\" p=\"12.479988 21.599979\"/>
+   <b B=\"1\" E=\"2\" Order=\"1\" Display=\"WedgeBegin\"/>
+   <b B=\"2\" E=\"3\" Order=\"2\"/>
+   <b B=\"2\" E=\"4\" Order=\"1\"/>
+  </fragment>
+ </page>
+</CDXML>
+";
+        assert_eq!(to_cdxml(&plain_chain()), expected);
+    }
+
+    /// The `<n …>` start tag of the node with id `id`, and what it holds up to its `</n>` (empty
+    /// for a node that self-closes).
+    fn node(xml: &str, id: u32) -> (&str, &str) {
+        let start = xml.find(&format!("<n id=\"{id}\"")).unwrap_or_else(|| panic!("node {id}"));
+        let rest = &xml[start..];
+        let tag_end = rest.find('>').unwrap() + 1;
+        let tag = &rest[..tag_end];
+        if tag.ends_with("/>") {
+            (tag, "")
+        } else {
+            (tag, &rest[tag_end..rest.find("</n>").unwrap()])
+        }
+    }
+
+    #[test]
+    fn abbreviations_are_unspecified_nodes_with_their_label() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let ome = mol.add_atom("OMe".to_string(), [1.3, 0.75], 0);
+        let ph = mol.add_atom("Ph".to_string(), [-1.3, 0.75], 0);
+        let ester = mol.add_atom("CO_2Et".to_string(), [0.0, -1.5], 0);
+        for x in [ome, ph, ester] {
+            mol.add_bond(c, x, BondOrder::Single);
+        }
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        for (id, text) in [(ome, "OMe"), (ph, "Ph")] {
+            let (tag, inner) = node(&xml, id);
+            assert!(tag.contains("NodeType=\"Unspecified\""), "{text}: {tag}");
+            assert!(!tag.contains("Element="), "{text} is no element: {tag}");
+            assert!(inner.starts_with("<t "), "{text} has its label: {inner}");
+            assert!(inner.contains(&format!(">{text}</s></t>")), "{text}: {inner}");
+        }
+        // The markup's subscript is the label's own style run.
+        let (_, inner) = node(&xml, ester);
+        assert!(inner.contains(">CO</s><s font=\"3\" size=\"10\" face=\"32\">2</s><s font=\"3\" size=\"10\">Et</s>"), "{inner}");
+        // The font the labels name is in the document's font table.
+        assert!(xml.contains("<fonttable>"), "{xml}");
+        assert!(xml.contains("<font id=\"3\" charset=\"iso-8859-1\" name=\"Arial\"/>"), "{xml}");
+        // The carbon they hang on shows nothing.
+        assert_eq!(node(&xml, c).1, "");
+    }
+
+    /// "Ac" (acetyl) and "Ts" (tosyl) are labels in this editor, not actinium and tennessine.
+    #[test]
+    fn acetyl_and_tosyl_are_labels_not_elements() {
+        let mut mol = Molecule::default();
+        let n = mol.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let ac = mol.add_atom("Ac".to_string(), [1.3, 0.75], 0);
+        let ts = mol.add_atom("Ts".to_string(), [-1.3, 0.75], 0);
+        mol.add_bond(n, ac, BondOrder::Single);
+        mol.add_bond(n, ts, BondOrder::Single);
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        for (id, text) in [(ac, "Ac"), (ts, "Ts")] {
+            let (tag, inner) = node(&xml, id);
+            assert!(tag.contains("NodeType=\"Unspecified\""), "{text}: {tag}");
+            assert!(!tag.contains("Element="), "{text} is no element: {tag}");
+            assert!(!tag.contains("NumHydrogens="), "{text}: {tag}");
+            assert!(inner.contains(&format!(">{text}</s></t>")), "{text}: {inner}");
+        }
+    }
+
+    #[test]
+    fn label_text_is_escaped() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let x = mol.add_atom("R&D<1>".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(c, x, BondOrder::Single);
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        let (_, inner) = node(&xml, x);
+        assert!(inner.contains("R&amp;D&lt;1&gt;"), "{inner}");
+        assert!(!xml.contains("R&D"), "no raw metacharacters");
+    }
+
+    #[test]
+    fn deuterium_is_a_label_as_in_cdx() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let d = mol.add_atom("D".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(c, d, BondOrder::Single);
+        let xml = to_cdxml(&mol);
+        let (tag, inner) = node(&xml, d);
+        assert!(tag.contains("NodeType=\"Unspecified\""), "{tag}");
+        assert!(inner.contains(">D</s></t>"), "{inner}");
+    }
+
+    #[test]
+    fn group_hydrogens_are_the_labels_count_not_nodes() {
+        // H2N–CH3, with one hydrogen of the NH2 an atom brought in by the group.
+        let mut mol = Molecule::default();
+        let n = mol.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let c = mol.add_atom("C".to_string(), [1.3, 0.75], 0);
+        mol.add_bond(n, c, BondOrder::Single);
+        let h = mol.add_atom("H".to_string(), [-1.0, 0.5], 0);
+        mol.atom_by_id_mut(h).unwrap().group_h = true;
+        mol.add_bond(n, h, BondOrder::Single);
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        assert_eq!(count(&xml, "<n "), 2, "the group's hydrogen is not a node: {xml}");
+        assert_eq!(count(&xml, "<b "), 1, "nor is its bond: {xml}");
+        assert!(!xml.contains(&format!("<n id=\"{h}\"")));
+        let (tag, inner) = node(&xml, n);
+        assert!(tag.contains("Element=\"7\"") && tag.contains("NumHydrogens=\"2\""), "{tag}");
+        // As the CDX writer: the formula face, the hydrogens on the side away from the bond.
+        assert!(inner.contains("LabelAlignment=\"Right\""), "{inner}");
+        assert!(inner.contains("<s font=\"3\" size=\"10\" face=\"96\">H2N</s>"), "{inner}");
+    }
+
+    /// ChemDraw's own file with abbreviations (Ph and tBu as nicknames, CO2Et as a fragment, and
+    /// a label it cannot interpret), read and written as CDXML: every label is kept.
+    #[test]
+    fn chemdraw_abbreviations_keep_their_labels() {
+        let bytes = include_bytes!("../../tests/fixtures/chemdraw26_abbreviations.cdx");
+        let mol = super::super::cdx::read_cdx(bytes).expect("reads").molecule;
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        assert_eq!(count(&xml, "NodeType=\"Unspecified\""), 4, "{xml}");
+        for label in [">Ph</s>", ">CO</s>", "face=\"32\">2</s>", ">Et</s>", "face=\"2\">t</s>", ">Bu</s>", ">Xyz</s>"] {
+            assert!(xml.contains(label), "{label} in {xml}");
+        }
+        // No node of no element goes without its text.
+        for (i, _) in xml.match_indices("NodeType=\"Unspecified\"") {
+            assert!(xml[i..].starts_with("NodeType=\"Unspecified\"><t "), "{}", &xml[i..]);
+        }
+    }
+
+    /// The fixture's ammonium (NH4+ on its own) keeps its hydrogens as a count, not as nodes.
+    #[test]
+    fn chemdraw_ammonium_writes_its_hydrogen_count() {
+        let bytes = include_bytes!("../../tests/fixtures/chemdraw26_charge_stereo.cdx");
+        let mol = super::super::cdx::read_cdx(bytes).expect("reads").molecule;
+        let xml = to_cdxml(&mol);
+        assert_well_formed(&xml);
+        assert_eq!(count(&xml, "<n "), 7, "heavy atoms only: {xml}");
+        assert!(xml.contains("Element=\"7\" NumHydrogens=\"4\" Charge=\"1\""), "{xml}");
     }
 
     #[test]

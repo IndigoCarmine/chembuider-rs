@@ -519,9 +519,8 @@ impl CleanupState {
     }
 
     /// Write the current relaxed positions back to the molecule.
-    /// Used by the synchronous `cleanup_2d` (tests / fragment-cleanup script); the interactive
+    /// Used through `CleanupSchedule::apply` by the synchronous `cleanup_2d`; the interactive
     /// path streams positions through `CleanupJob` instead.
-    #[allow(dead_code)]
     pub fn apply(&self, mol: &mut Molecule) {
         for (&id, &p) in &self.pos {
             if let Some(atom) = mol.atom_by_id_mut(id) {
@@ -537,33 +536,28 @@ impl CleanupState {
 }
 
 // ─── One-shot synchronous entry point ────────────────────────────────────────
-// Blocking version, retained for tests and the fragment-cleanup script. The interactive
-// UI uses `CleanupJob` (background thread + cancel) instead so it never freezes.
+// Blocking version, for callers that need the result right away: the reaction-scheme
+// layout (`reaction::edit`), tests and the fragment-cleanup script. The interactive editor
+// uses `CleanupJob` (background thread + cancel) instead so it never freezes.
 
-#[allow(dead_code)]
 pub fn cleanup_2d(mol: &mut Molecule) {
-    if mol.atoms.is_empty() {
-        return;
-    }
-    let mut state = CleanupState::new(mol);
-    // Phase 1: normal FIRE.  Converges most molecules without any position permutation.
-    state.step(JOB_PHASE_BUDGET);
-    // Phase 2: the ring-crossing rescue, if phase 1 left a ring drawn inside-out.
-    ring_rescue(&mut state, |s| {
-        s.step(JOB_PHASE_BUDGET);
-        true
-    });
-    state.apply(mol);
+    let mut schedule = CleanupSchedule::new(mol);
+    // One call per relaxation pass; `advance` never runs more than one pass's budget.
+    while !schedule.advance(JOB_PHASE_BUDGET) {}
+    schedule.apply(mol);
 }
 
-/// Phase 2, shared by every entry point.
+/// The two-phase cleanup as a resumable state machine, so a caller can run it to the end in
+/// one go, between cancel checks on a worker thread, or one chunk per UI frame where nothing
+/// may block.
 ///
-/// Relaxation is local, so it happily settles into a minimum where a ring is drawn inside-out
-/// with its own bonds crossing.  `apply_ring_fix` permutes those ring atoms back into a valid
-/// angular order; `relax` then re-relaxes from there and returns false if it was cancelled.
+/// Phase 1 relaxes the drawing.  Relaxation is local, so it happily settles into a minimum
+/// where a ring is drawn inside-out with its own bonds crossing; phase 2, the ring rescue, then
+/// runs `apply_ring_fix` (which permutes those ring atoms back into a valid angular order) and
+/// relaxes again from there.
 ///
-/// A pass is kept only when it strictly reduced the number of crossed rings, and passes repeat
-/// while they keep helping.  Both halves of that rule are needed to leave `cleanup_2d`
+/// A rescue pass is kept only when it strictly reduced the number of crossed rings, and passes
+/// repeat while they keep helping.  Both halves of that rule are needed to leave `cleanup_2d`
 /// idempotent — the property `convergence_50_random` checks by cleaning twice:
 ///
 ///   * Without the accept/reject, a molecule that simply cannot be drawn crossing-free (a
@@ -574,19 +568,115 @@ pub fn cleanup_2d(mol: &mut Molecule) {
 ///
 /// Repeating terminates quickly: an accepted pass strictly lowers the crossing count, so there
 /// can be at most one accepted pass per ring, and the run ends on the first rejected pass.
-fn ring_rescue(state: &mut CleanupState, mut relax: impl FnMut(&mut CleanupState) -> bool) {
-    for _ in 0..state.cycles.len().max(1) {
-        let before = state.ring_crossing_count();
-        if before == 0 {
+///
+/// Each relaxation pass gets `JOB_PHASE_BUDGET` steps however it is chunked; `step` keeps all
+/// of its state between calls, so the coordinates do not depend on the chunk size.
+pub struct CleanupSchedule {
+    state: CleanupState,
+    stage: Stage,
+    /// Steps allowed per relaxation pass (`JOB_PHASE_BUDGET` outside tests).
+    pass_budget: usize,
+    /// Steps run so far in the current relaxation pass.
+    steps_in_pass: usize,
+    /// Rescue passes started so far (capped at `cycles.len().max(1)`).
+    rescue_passes: usize,
+    /// Positions to roll back to if the current rescue pass does not help, and the crossing
+    /// count it has to beat.
+    rescue_snapshot: Vec<(u32, [f32; 2])>,
+    crossings_before: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    Relax,
+    Rescue,
+    Done,
+}
+
+impl CleanupSchedule {
+    pub fn new(mol: &Molecule) -> Self {
+        Self::with_pass_budget(mol, JOB_PHASE_BUDGET)
+    }
+
+    /// `new` with another per-pass step budget, so tests can reach the end of a pass that ran
+    /// out of steps without spending `JOB_PHASE_BUDGET` of them.
+    fn with_pass_budget(mol: &Molecule, pass_budget: usize) -> Self {
+        debug_assert!(pass_budget > 0, "a zero pass budget would never finish a pass");
+        CleanupSchedule {
+            state: CleanupState::new(mol),
+            stage: if mol.atoms.is_empty() { Stage::Done } else { Stage::Relax },
+            pass_budget,
+            steps_in_pass: 0,
+            rescue_passes: 0,
+            rescue_snapshot: Vec::new(),
+            crossings_before: 0,
+        }
+    }
+
+    /// Run at most `max_steps` relaxation steps (never past the end of the current pass) and
+    /// take any phase transition that follows.  Returns `true` once the schedule is finished.
+    ///
+    /// On a finished schedule this does nothing and returns `true`.  Otherwise `max_steps`
+    /// must be positive: `advance(0)` runs no step and so never makes progress.
+    pub fn advance(&mut self, max_steps: usize) -> bool {
+        if self.stage == Stage::Done {
+            return true;
+        }
+        debug_assert!(max_steps > 0, "advance(0) never makes progress");
+        let chunk = max_steps.min(self.pass_budget - self.steps_in_pass);
+        let converged = self.state.step(chunk);
+        self.steps_in_pass += chunk;
+        if converged || self.steps_in_pass >= self.pass_budget {
+            self.finish_pass();
+        }
+        self.stage == Stage::Done
+    }
+
+    /// A relaxation pass ended: score a rescue pass (keep it only if it strictly reduced the
+    /// crossed rings), then start another rescue pass while rings are still crossed.
+    fn finish_pass(&mut self) {
+        if self.stage == Stage::Rescue
+            && self.state.ring_crossing_count() >= self.crossings_before
+        {
+            self.state.restore(&self.rescue_snapshot);
+            self.stage = Stage::Done;
             return;
         }
-        let snapshot = state.positions();
-        state.apply_ring_fix();
-        let completed = relax(state);
-        if !completed || state.ring_crossing_count() >= before {
-            state.restore(&snapshot);
+        let crossings = self.state.ring_crossing_count();
+        if crossings == 0 || self.rescue_passes >= self.state.cycles.len().max(1) {
+            self.stage = Stage::Done;
             return;
         }
+        self.crossings_before = crossings;
+        self.rescue_snapshot = self.state.positions();
+        self.state.apply_ring_fix();
+        self.rescue_passes += 1;
+        self.steps_in_pass = 0;
+        self.stage = Stage::Rescue;
+    }
+
+    /// Stop early.  Mid-rescue, roll back to the positions from before that rescue pass (an
+    /// unfinished pass is never kept); mid-relaxation, keep the atoms where they are now.
+    /// Does nothing once the schedule is finished.
+    pub fn cancel(&mut self) {
+        if self.stage == Stage::Rescue {
+            self.state.restore(&self.rescue_snapshot);
+        }
+        self.stage = Stage::Done;
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.stage == Stage::Done
+    }
+
+    /// Current positions (atom_ids order), for live preview while the schedule runs.
+    pub fn positions(&self) -> Vec<(u32, [f32; 2])> {
+        self.state.positions()
+    }
+
+    /// Write the current positions back to the molecule.
+    pub fn apply(&self, mol: &mut Molecule) {
+        self.state.apply(mol);
     }
 }
 
@@ -596,24 +686,112 @@ fn ring_rescue(state: &mut CleanupState, mut relax: impl FnMut(&mut CleanupState
 const JOB_CHUNK: usize = 500;
 const JOB_PHASE_BUDGET: usize = 100_000;
 
+/// One running cleanup computation, as the editor drives it: once per UI frame
+/// `ChemStructEditor::poll_cleanup` copies `latest()` into the molecule for a live preview and
+/// checks `is_done()`; once that is `true` it calls `join()`.  `cancel()` may come at any time.
+///
+/// Contract for implementors:
+///   * `latest` returns `(atom id, position)` pairs for atoms of the molecule the run was
+///     started from.  It may also advance the computation (the wasm run does all its work
+///     there, one chunk per call).
+///   * Once `is_done` returns `true`, `latest` returns the final positions.
+///   * After `cancel`, the run must still reach `is_done` (soon), so the editor can finish.
+///   * The run may be dropped without `join` (e.g. when the editor holding it is dropped, or
+///     `ChemStructEditor::cancel_cleanup` discards it, possibly before `is_done`); dropping it
+///     must stop any background work.
+///
+/// Methods take `&self` because the editor holds the job behind a shared reference while it
+/// polls; a run that needs to mutate uses interior mutability.
+pub trait CleanupRun {
+    /// Ask the run to stop early.  Must not block.
+    fn cancel(&self);
+    /// Whether the run has finished (normally or after `cancel`).
+    fn is_done(&self) -> bool;
+    /// The current positions, for the live preview (final once `is_done`).
+    fn latest(&self) -> Vec<(u32, [f32; 2])>;
+    /// Release the run's resources; called once, after `is_done` returned `true`.
+    fn join(self: Box<Self>);
+}
+
+/// Starts cleanup runs: the swappable part behind the editor's Cleanup command.
+pub trait CleanupEngine {
+    fn start(&self, mol: &Molecule) -> CleanupJob;
+}
+
+/// The built-in cleanup: the force-field relaxation plus ring rescue of `CleanupSchedule`,
+/// on a background thread natively and one chunk per poll on wasm32 (`CleanupJob::start`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultCleanupEngine;
+
+impl CleanupEngine for DefaultCleanupEngine {
+    fn start(&self, mol: &Molecule) -> CleanupJob {
+        CleanupJob::start(mol)
+    }
+}
+
+/// A running cleanup computation: a thin wrapper around any [`CleanupRun`], so the editor's
+/// `cleanup_job: Option<CleanupJob>` can hold the built-in run or another engine's.
+///
+/// The run must be `Send + Sync` so that `CleanupJob` — and with it `ChemStructEditor` —
+/// stays `Send + Sync` as it was when `CleanupJob` was the concrete threaded job.
+pub struct CleanupJob {
+    run: Box<dyn CleanupRun + Send + Sync>,
+}
+
+impl CleanupJob {
+    /// Start the built-in cleanup of a snapshot of `mol` (see [`DefaultCleanupEngine`]).
+    pub fn start(mol: &Molecule) -> Self {
+        Self::from_run(DefaultRun::start(mol))
+    }
+
+    /// Wrap another engine's run.
+    pub fn from_run(run: impl CleanupRun + Send + Sync + 'static) -> Self {
+        CleanupJob { run: Box::new(run) }
+    }
+
+    /// Request the run to stop early.
+    pub fn cancel(&self) {
+        self.run.cancel();
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.run.is_done()
+    }
+
+    /// Latest relaxed positions (for live preview each frame).
+    pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+        self.run.latest()
+    }
+
+    /// Finish the run (call once `is_done`).
+    pub fn join(self) {
+        self.run.join();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+use job_native::ThreadedRun as DefaultRun;
+#[cfg(target_arch = "wasm32")]
+use job_wasm::PolledRun as DefaultRun;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod job_native {
-    use super::{run_cleanup_job, Molecule};
+    use super::{run_cleanup_job, CleanupRun, Molecule};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
-    /// A cleanup computation running on a background thread. The UI thread polls
+    /// The built-in cleanup running on a background thread. The UI thread polls
     /// `latest()` for a live preview and `is_done()` for completion, and may `cancel()`
-    /// at any time. Created with `CleanupJob::start`.
-    pub struct CleanupJob {
+    /// at any time.
+    pub struct ThreadedRun {
         cancel: Arc<AtomicBool>,
         done: Arc<AtomicBool>,
         shared: Arc<Mutex<Vec<(u32, [f32; 2])>>>,
         handle: Option<JoinHandle<()>>,
     }
 
-    impl CleanupJob {
+    impl ThreadedRun {
         /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread.
         pub fn start(mol: &Molecule) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
@@ -628,32 +806,36 @@ mod job_native {
                 run_cleanup_job(&snapshot, &c, &d, &s);
             });
 
-            CleanupJob { cancel, done, shared, handle: Some(handle) }
+            ThreadedRun { cancel, done, shared, handle: Some(handle) }
         }
+    }
 
+    impl CleanupRun for ThreadedRun {
         /// Request the worker to stop at the next chunk boundary.
-        pub fn cancel(&self) {
+        fn cancel(&self) {
             self.cancel.store(true, Ordering::Relaxed);
         }
 
-        pub fn is_done(&self) -> bool {
-            self.done.load(Ordering::Relaxed)
+        fn is_done(&self) -> bool {
+            // Acquire pairs with the worker's Release store, so once this reads `true` the
+            // final positions it published are what `latest()` returns.
+            self.done.load(Ordering::Acquire)
         }
 
         /// Latest relaxed positions (for live preview each frame).
-        pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
             self.shared.lock().unwrap().clone()
         }
 
         /// Join the worker thread (call once `is_done`).
-        pub fn join(mut self) {
+        fn join(mut self: Box<Self>) {
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
             }
         }
     }
 
-    impl Drop for CleanupJob {
+    impl Drop for ThreadedRun {
         fn drop(&mut self) {
             // Make sure a still-running worker stops if the job is dropped without joining.
             self.cancel.store(true, Ordering::Relaxed);
@@ -661,127 +843,72 @@ mod job_native {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use job_native::CleanupJob;
-
 // wasm32-unknown-unknown has no `std::thread::spawn` (it always returns an "unsupported"
 // error, and `thread::spawn` panics on that) — there's no Web Worker / SharedArrayBuffer
 // setup here for real background threads. Instead, `latest()` — already polled once per UI
-// frame by `ChemStructEditor::poll_cleanup` — advances the same chunked relaxation by one
-// `JOB_CHUNK` on each call, so the tab still repaints between chunks instead of blocking on
-// one huge synchronous relaxation. `Cell`/`RefCell` stand in for the native version's atomics
-// and mutex since wasm32-unknown-unknown is single-threaded.
+// frame by `ChemStructEditor::poll_cleanup` — advances the same `CleanupSchedule` as
+// `cleanup_2d` and the native worker by one `JOB_CHUNK` on each call, so the tab still
+// repaints between chunks instead of blocking on one huge synchronous relaxation.
+// wasm32-unknown-unknown is single-threaded, so the `Mutex` here is never contended; it (and
+// the `AtomicBool`) are used instead of `RefCell`/`Cell` only because `CleanupJob` requires its
+// run to be `Sync`, and a `RefCell` is not.
 #[cfg(target_arch = "wasm32")]
 mod job_wasm {
-    use super::{CleanupState, Molecule, JOB_CHUNK, JOB_PHASE_BUDGET};
-    use std::cell::{Cell, RefCell};
+    use super::{CleanupRun, CleanupSchedule, Molecule, JOB_CHUNK};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
-    pub struct CleanupJob {
-        state: RefCell<Option<CleanupState>>,
-        phase: Cell<u8>,
-        steps_done_in_phase: Cell<usize>,
-        cancelled: Cell<bool>,
-        done: Cell<bool>,
-        positions: RefCell<Vec<(u32, [f32; 2])>>,
-        // Phase-2 (ring rescue) bookkeeping: the phase-1 result to fall back to, and the
-        // crossing count it has to beat.  See `ring_rescue` for why the retry is scored.
-        rescue_snapshot: RefCell<Vec<(u32, [f32; 2])>>,
-        crossings_before: Cell<usize>,
+    pub struct PolledRun {
+        schedule: Mutex<CleanupSchedule>,
+        /// Set by `cancel`; the next `latest` call stops the schedule, as the native worker
+        /// does at its next chunk boundary.
+        cancelled: AtomicBool,
     }
 
-    impl CleanupJob {
+    impl PolledRun {
         pub fn start(mol: &Molecule) -> Self {
-            if mol.atoms.is_empty() {
-                return Self {
-                    state: RefCell::new(None),
-                    phase: Cell::new(1),
-                    steps_done_in_phase: Cell::new(0),
-                    cancelled: Cell::new(false),
-                    done: Cell::new(true),
-                    positions: RefCell::new(Vec::new()),
-                    rescue_snapshot: RefCell::new(Vec::new()),
-                    crossings_before: Cell::new(0),
-                };
-            }
-            let state = CleanupState::new(mol);
-            let positions = state.positions();
-            Self {
-                state: RefCell::new(Some(state)),
-                phase: Cell::new(1),
-                steps_done_in_phase: Cell::new(0),
-                cancelled: Cell::new(false),
-                done: Cell::new(false),
-                positions: RefCell::new(positions),
-                rescue_snapshot: RefCell::new(Vec::new()),
-                crossings_before: Cell::new(0),
+            PolledRun {
+                schedule: Mutex::new(CleanupSchedule::new(mol)),
+                cancelled: AtomicBool::new(false),
             }
         }
+    }
 
-        pub fn cancel(&self) {
-            self.cancelled.set(true);
+    impl CleanupRun for PolledRun {
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Relaxed);
         }
 
-        pub fn is_done(&self) -> bool {
-            self.done.get()
+        fn is_done(&self) -> bool {
+            self.schedule.lock().unwrap().is_done()
         }
 
-        /// Advance one chunk of the relaxation (mirrors `run_phase`'s two-phase logic, just
-        /// spread across polls instead of a background-thread loop), then return positions.
-        pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
-            if !self.done.get() {
-                if self.cancelled.get() {
-                    self.done.set(true);
-                } else if let Some(state) = self.state.borrow_mut().as_mut() {
-                    let budget_left = JOB_PHASE_BUDGET - self.steps_done_in_phase.get();
-                    let chunk = JOB_CHUNK.min(budget_left);
-                    let converged = state.step(chunk);
-                    self.steps_done_in_phase.set(self.steps_done_in_phase.get() + chunk);
-                    *self.positions.borrow_mut() = state.positions();
-
-                    let phase_exhausted = self.steps_done_in_phase.get() >= JOB_PHASE_BUDGET;
-                    if converged || phase_exhausted {
-                        // Same schedule as `cleanup_2d` / `ring_rescue`, unrolled across polls:
-                        // retry the ring-crossing rescue while each pass keeps removing
-                        // crossings, and roll back the first pass that does not.
-                        let rejected = self.phase.get() == 2
-                            && state.ring_crossing_count() >= self.crossings_before.get();
-                        if rejected {
-                            state.restore(&self.rescue_snapshot.borrow());
-                            *self.positions.borrow_mut() = state.positions();
-                            self.done.set(true);
-                        } else {
-                            let crossings = state.ring_crossing_count();
-                            if crossings > 0 {
-                                self.crossings_before.set(crossings);
-                                *self.rescue_snapshot.borrow_mut() = state.positions();
-                                state.apply_ring_fix();
-                                self.phase.set(2);
-                                self.steps_done_in_phase.set(0);
-                            } else {
-                                self.done.set(true);
-                            }
-                        }
-                    }
-                }
+        /// Advance the schedule by one chunk (or stop it, once cancelled), then return the
+        /// positions.  On a finished schedule both `advance` and `cancel` do nothing, so this
+        /// then just returns the final positions.
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            let mut schedule = self.schedule.lock().unwrap();
+            if self.cancelled.load(Ordering::Relaxed) {
+                schedule.cancel();
+            } else {
+                schedule.advance(JOB_CHUNK);
             }
-            self.positions.borrow().clone()
+            schedule.positions()
         }
 
         /// Nothing to join — there is no worker thread on wasm32.
-        pub fn join(self) {}
+        fn join(self: Box<Self>) {}
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-pub use job_wasm::CleanupJob;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
-/// Worker body: mirrors `cleanup_2d`'s two-phase logic, but chunked so it can check the
-/// cancel flag and publish intermediate positions for a live preview.
+/// Worker body: the same `CleanupSchedule` as `cleanup_2d`, advanced `JOB_CHUNK` steps at a
+/// time so the worker can check the cancel flag and publish intermediate positions for the
+/// live preview in between.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_cleanup_job(
     mol: &Molecule,
@@ -789,46 +916,19 @@ fn run_cleanup_job(
     done: &AtomicBool,
     shared: &Mutex<Vec<(u32, [f32; 2])>>,
 ) {
-    if mol.atoms.is_empty() {
-        done.store(true, Ordering::Relaxed);
-        return;
-    }
-    // Same two phases as `cleanup_2d`, just chunked so the worker can be cancelled and can
-    // publish intermediate positions for the live preview.
-    let mut state = CleanupState::new(mol);
-    run_phase(&mut state, cancel, shared);
-    if !cancel.load(Ordering::Relaxed) {
-        ring_rescue(&mut state, |s| {
-            run_phase(s, cancel, shared);
-            !cancel.load(Ordering::Relaxed)
-        });
-    }
-
-    *shared.lock().unwrap() = state.positions();
-    done.store(true, Ordering::Relaxed);
-}
-
-/// Run one JOB_PHASE_BUDGET phase in chunks; returns true if it converged.
-#[cfg(not(target_arch = "wasm32"))]
-fn run_phase(
-    state: &mut CleanupState,
-    cancel: &AtomicBool,
-    shared: &Mutex<Vec<(u32, [f32; 2])>>,
-) -> bool {
-    let mut done_steps = 0;
-    while done_steps < JOB_PHASE_BUDGET {
+    let mut schedule = CleanupSchedule::new(mol);
+    while !schedule.is_done() {
         if cancel.load(Ordering::Relaxed) {
-            return false;
+            schedule.cancel();
+            break;
         }
-        let chunk = JOB_CHUNK.min(JOB_PHASE_BUDGET - done_steps);
-        let converged = state.step(chunk);
-        done_steps += chunk;
-        *shared.lock().unwrap() = state.positions();
-        if converged {
-            return true;
-        }
+        schedule.advance(JOB_CHUNK);
+        *shared.lock().unwrap() = schedule.positions();
     }
-    false
+
+    *shared.lock().unwrap() = schedule.positions();
+    // Release: publishes the final positions above to whoever sees `done` (see `is_done`).
+    done.store(true, Ordering::Release);
 }
 
 // ─── Force field ──────────────────────────────────────────────────────────────
@@ -1403,6 +1503,719 @@ mod tests {
                 failures.len(),
                 failures.join("\n")
             );
+        }
+    }
+
+    // ─── Characterization: today's cleanup result, pinned bit for bit ─────────
+    //
+    // A safety net for restructuring how the two-phase schedule (relax → ring rescue) is
+    // driven: `cleanup_2d` and the native `CleanupJob` must keep producing exactly the
+    // coordinates they produce now.  The fingerprints below were recorded from the code as it
+    // stood, not derived from any expectation of what a "good" layout is.  The f32 trig calls
+    // (`atan2`) come from the platform's libm and 100k relaxation steps amplify a 1-ulp
+    // difference, so they were recorded on x86_64-pc-windows-msvc; if they disagree on another
+    // platform without any code change, that is the libm, not a regression.
+
+    /// What phase 2 (the ring rescue in `CleanupSchedule`) ended up doing for a fixture.
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    enum Rescue {
+        /// Phase 1 left no crossed ring, so `apply_ring_fix` was never called.
+        NotNeeded,
+        /// The first rescue pass did not help and was rolled back to the phase-1 result.
+        Rejected,
+        /// The first pass reduced the crossing count and was kept; nothing further was kept.
+        KeptOnePass,
+        /// The repeat loop kept a second (or later) pass as well.
+        KeptSeveralPasses,
+    }
+
+    struct Fixture {
+        name: &'static str,
+        mol: Molecule,
+        rescue: Rescue,
+        /// `fingerprint` of the coordinates `cleanup_2d` produces today.
+        fingerprint: u64,
+    }
+
+    /// Exact coordinates (as f32 bit patterns) in `mol.atoms` order.
+    fn coord_bits(mol: &Molecule) -> Vec<(u32, [u32; 2])> {
+        mol.atoms.iter().map(|a| (a.id, [a.pos[0].to_bits(), a.pos[1].to_bits()])).collect()
+    }
+
+    fn position_bits(positions: &[(u32, [f32; 2])]) -> Vec<(u32, [u32; 2])> {
+        positions.iter().map(|&(id, p)| (id, [p[0].to_bits(), p[1].to_bits()])).collect()
+    }
+
+    /// FNV-1a over every atom's id and coordinate bits, in order.
+    fn fingerprint(bits: &[(u32, [u32; 2])]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &(id, [x, y]) in bits {
+            for word in [id, x, y] {
+                for byte in word.to_le_bytes() {
+                    h ^= u64::from(byte);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    /// Molecules `convergence_50_random` draws (same seed and recipe), picked by trial index.
+    fn random_trials(picks: &[usize]) -> Vec<Molecule> {
+        let last = *picks.iter().max().unwrap();
+        let mut rng = Lcg(0xDEAD_BEEF_CAFE_1234);
+        let mut out = Vec::new();
+        for trial in 0..=last {
+            let n_atoms = rng.usize_range(2, 21);
+            let extra_bonds = rng.usize_range(0, n_atoms / 2 + 1);
+            let range = rng.f32_range(5.0, 15.0);
+            let mol = random_molecule(&mut rng, n_atoms, extra_bonds, range);
+            if picks.contains(&trial) {
+                out.push(mol);
+            }
+        }
+        out
+    }
+
+    fn characterization_fixtures() -> Vec<Fixture> {
+        let empty = Molecule::default();
+
+        let mut single = Molecule::default();
+        single.add_atom("C".to_string(), [0.7, -0.3], 0);
+
+        // C0–C1≡C2 bent to ~90° at the sp carbon (exercises the linear-centre term).
+        let mut propyne = Molecule::default();
+        let c0 = propyne.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c1 = propyne.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c2 = propyne.add_atom("C".to_string(), [1.5, 1.5], 0);
+        propyne.add_bond(c0, c1, BondOrder::Single);
+        propyne.add_bond(c1, c2, BondOrder::Triple);
+
+        // A badly drawn but uncrossed benzene ring with a methyl group.
+        let mut toluene = Molecule::default();
+        let ring: Vec<u32> = [[0.0, 1.2], [1.4, 0.9], [1.1, -0.6], [0.1, -1.7], [-1.3, -0.4], [-1.0, 0.5]]
+            .iter()
+            .map(|&p| toluene.add_atom("C".to_string(), p, 0))
+            .collect();
+        for i in 0..6 {
+            let order = if i % 2 == 0 { BondOrder::Double } else { BondOrder::Single };
+            toluene.add_bond(ring[i], ring[(i + 1) % 6], order);
+        }
+        let methyl = toluene.add_atom("C".to_string(), [0.3, 2.0], 0);
+        toluene.add_bond(ring[0], methyl, BondOrder::Single);
+
+        let mut random = random_trials(&[1, 2, 5, 10, 22, 42]).into_iter();
+        let mut next = || random.next().unwrap();
+
+        vec![
+            Fixture { name: "empty", mol: empty, rescue: Rescue::NotNeeded, fingerprint: 0xcbf2_9ce4_8422_2325 },
+            Fixture { name: "single_atom", mol: single, rescue: Rescue::NotNeeded, fingerprint: 0x5f24_2d39_c242_2be4 },
+            Fixture { name: "propyne_bent", mol: propyne, rescue: Rescue::NotNeeded, fingerprint: 0x0dcf_aa10_fc30_b7e9 },
+            Fixture { name: "toluene_distorted", mol: toluene, rescue: Rescue::NotNeeded, fingerprint: 0x1d45_d142_bb29_38ca },
+            // Random trials, chosen to cover every route through phase 2 (see `Rescue`).
+            Fixture { name: "random_trial_01", mol: next(), rescue: Rescue::NotNeeded, fingerprint: 0x7c68_05f3_d142_0581 },
+            Fixture { name: "random_trial_02", mol: next(), rescue: Rescue::NotNeeded, fingerprint: 0xf609_5d14_1c2e_9375 },
+            Fixture { name: "random_trial_05", mol: next(), rescue: Rescue::KeptOnePass, fingerprint: 0xa05e_aa4f_57dd_f0dd },
+            Fixture { name: "random_trial_10", mol: next(), rescue: Rescue::KeptSeveralPasses, fingerprint: 0xf461_4345_0557_b563 },
+            Fixture { name: "random_trial_22", mol: next(), rescue: Rescue::Rejected, fingerprint: 0x88b0_afef_6dfb_28b9 },
+            Fixture { name: "random_trial_42", mol: next(), rescue: Rescue::KeptOnePass, fingerprint: 0x2f8b_bd1c_9ab9_256a },
+        ]
+    }
+
+    /// Run the native background job to completion the way `poll_cleanup` consumes it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_native_job(mol: &Molecule) -> Vec<(u32, [f32; 2])> {
+        let job = CleanupJob::start(mol);
+        while !job.is_done() {
+            std::thread::yield_now();
+        }
+        let positions = job.latest();
+        job.join();
+        positions
+    }
+
+    /// Which route through phase 2 `cleanup_2d` took to produce `got`, found by replaying
+    /// phase 1 and a single rescue pass by hand and comparing.
+    fn observed_rescue(name: &str, mol: &Molecule, got: &[(u32, [u32; 2])], cleaned: &Molecule) -> Rescue {
+        if mol.atoms.is_empty() {
+            return Rescue::NotNeeded;
+        }
+        let mut st = CleanupState::new(mol);
+        st.step(JOB_PHASE_BUDGET);
+        let after_phase1 = position_bits(&st.positions());
+        let crossings_after_phase1 = st.ring_crossing_count();
+        if crossings_after_phase1 == 0 {
+            assert_eq!(got, after_phase1, "{name}: no crossed ring, yet the result is not phase 1's");
+            return Rescue::NotNeeded;
+        }
+        if got == after_phase1 {
+            return Rescue::Rejected;
+        }
+
+        st.apply_ring_fix();
+        st.step(JOB_PHASE_BUDGET);
+        let after_one_pass = position_bits(&st.positions());
+        let crossings_after_one_pass = st.ring_crossing_count();
+        assert!(
+            crossings_after_one_pass < crossings_after_phase1,
+            "{name}: a rescue pass was kept although it did not reduce crossings \
+             ({crossings_after_phase1} → {crossings_after_one_pass})"
+        );
+        let crossings_final = CleanupState::new(cleaned).ring_crossing_count();
+        if crossings_final < crossings_after_one_pass {
+            Rescue::KeptSeveralPasses
+        } else {
+            // Any later pass was rolled back, which restores the one-pass result exactly.
+            assert_eq!(got, after_one_pass, "{name}: later passes were rejected, yet the result moved");
+            Rescue::KeptOnePass
+        }
+    }
+
+    /// `cleanup_2d` still produces exactly the recorded coordinates, and each fixture still
+    /// takes the recorded route through phase 2 — so every branch of the ring rescue (skipped,
+    /// rolled back, one pass kept, repeated passes kept) is pinned.
+    #[test]
+    fn cleanup_2d_matches_recorded_coordinates() {
+        let fixtures = characterization_fixtures();
+        for route in [Rescue::NotNeeded, Rescue::Rejected, Rescue::KeptOnePass, Rescue::KeptSeveralPasses] {
+            assert!(fixtures.iter().any(|f| f.rescue == route), "no fixture covers {route:?}");
+        }
+
+        let mut mismatches = Vec::new();
+        for fx in &fixtures {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            let got = coord_bits(&mol);
+
+            let rescue = observed_rescue(fx.name, &fx.mol, &got, &mol);
+            assert_eq!(rescue, fx.rescue, "{}: route through the ring rescue changed", fx.name);
+
+            let fp = fingerprint(&got);
+            if fp != fx.fingerprint {
+                mismatches.push(format!(
+                    "{}: fingerprint 0x{fp:016x} (recorded 0x{:016x}), coordinates {:?}",
+                    fx.name,
+                    fx.fingerprint,
+                    mol.atoms.iter().map(|a| (a.id, a.pos)).collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "cleanup_2d output changed:\n{}", mismatches.join("\n"));
+    }
+
+    /// The native background job and the synchronous `cleanup_2d` agree bit for bit.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_job_matches_cleanup_2d() {
+        for fx in characterization_fixtures() {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            let from_job = position_bits(&run_native_job(&fx.mol));
+            assert_eq!(from_job, coord_bits(&mol), "{}: CleanupJob differs from cleanup_2d", fx.name);
+        }
+    }
+
+    /// Drive a job the way `poll_cleanup` does (call `latest` until `is_done`), on any target.
+    fn run_polled(job: CleanupJob) -> Vec<(u32, [f32; 2])> {
+        while !job.is_done() {
+            job.latest();
+            std::thread::yield_now();
+        }
+        let positions = job.latest();
+        job.join();
+        positions
+    }
+
+    /// `DefaultCleanupEngine` is the built-in cleanup: same coordinates as `cleanup_2d`.
+    #[test]
+    fn default_engine_matches_cleanup_2d() {
+        for fx in characterization_fixtures() {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            let from_engine = position_bits(&run_polled(DefaultCleanupEngine.start(&fx.mol)));
+            assert_eq!(from_engine, coord_bits(&mol), "{}: DefaultCleanupEngine differs from cleanup_2d", fx.name);
+        }
+    }
+
+    /// A run that records what was forwarded to it.
+    struct FakeRun {
+        positions: Vec<(u32, [f32; 2])>,
+        done: bool,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupRun for FakeRun {
+        fn cancel(&self) {
+            self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn is_done(&self) -> bool {
+            self.done
+        }
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            self.positions.clone()
+        }
+        fn join(self: Box<Self>) {
+            self.joined.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// `CleanupJob::from_run` wraps any run and forwards every call to it.
+    #[test]
+    fn from_run_forwards_to_the_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        for done in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let joined = Arc::new(AtomicBool::new(false));
+            let positions = vec![(3, [1.5, -2.0]), (7, [0.25, 4.0])];
+            let job = CleanupJob::from_run(FakeRun {
+                positions: positions.clone(),
+                done,
+                cancelled: cancelled.clone(),
+                joined: joined.clone(),
+            });
+
+            assert_eq!(job.latest(), positions);
+            assert_eq!(job.is_done(), done);
+            assert!(!cancelled.load(Ordering::Relaxed));
+            job.cancel();
+            assert!(cancelled.load(Ordering::Relaxed));
+            assert!(!joined.load(Ordering::Relaxed));
+            job.join();
+            assert!(joined.load(Ordering::Relaxed));
+        }
+    }
+
+    /// An engine whose runs report fixed positions, standing in for the force field.
+    struct FakeEngine {
+        positions: Vec<(u32, [f32; 2])>,
+        done: bool,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupEngine for FakeEngine {
+        fn start(&self, _mol: &Molecule) -> CleanupJob {
+            CleanupJob::from_run(FakeRun {
+                positions: self.positions.clone(),
+                done: self.done,
+                cancelled: self.cancelled.clone(),
+                joined: self.joined.clone(),
+            })
+        }
+    }
+
+    /// An editor set up by [`editor_with_fake_engine`], and what the tests check it against.
+    struct FakeEngineFixture {
+        editor: crate::widget::ChemStructEditor,
+        /// The molecule before any cleanup.
+        before: Molecule,
+        /// The positions the fake engine's runs report.
+        positions: Vec<(u32, [f32; 2])>,
+        /// Set once the run is cancelled.
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Set once the run is joined.
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// An editor with two atoms, cleaned up by a `FakeEngine` that moves both of them.
+    fn editor_with_fake_engine(done: bool) -> FakeEngineFixture {
+        let mut editor = crate::widget::ChemStructEditor::default();
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [5.0, 5.0], 0);
+        let before = editor.molecule.clone();
+        let positions = vec![(a, [1.25, -0.5]), (b, [2.5, 0.75])];
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        editor.set_cleanup_engine(FakeEngine {
+            positions: positions.clone(),
+            done,
+            cancelled: cancelled.clone(),
+            joined: joined.clone(),
+        });
+        FakeEngineFixture { editor, before, positions, cancelled, joined }
+    }
+
+    fn atom_positions(mol: &Molecule) -> Vec<(u32, [f32; 2])> {
+        mol.atoms.iter().map(|a| (a.id, a.pos)).collect()
+    }
+
+    /// The editor's Cleanup runs the engine set with `set_cleanup_engine`: `poll_cleanup`
+    /// copies that engine's positions in, and on completion joins the run, clears
+    /// `cleanup_job` and leaves exactly one undo step back to the pre-cleanup molecule.
+    #[test]
+    fn set_cleanup_engine_drives_toggle_and_poll() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, positions, joined, .. } = editor_with_fake_engine(true);
+
+        editor.toggle_cleanup();
+        assert!(editor.cleanup_job.is_some());
+        assert_eq!(editor.undo_stack.len(), 1);
+        assert_eq!(editor.undo_stack.back(), Some(&before));
+
+        assert!(!editor.poll_cleanup(), "a finished run ends the cleanup");
+        assert_eq!(atom_positions(&editor.molecule), positions);
+        assert!(editor.cleanup_job.is_none());
+        assert!(joined.load(Ordering::Relaxed));
+        assert_eq!(editor.undo_stack.len(), 1);
+
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// While the engine's run is not done, `poll_cleanup` previews its positions and keeps
+    /// the job.
+    #[test]
+    fn unfinished_engine_run_keeps_the_job() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, positions, joined, .. } = editor_with_fake_engine(false);
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup(), "an unfinished run keeps the cleanup active");
+        assert_eq!(atom_positions(&editor.molecule), positions);
+        assert!(editor.cleanup_job.is_some());
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(editor.undo_stack.len(), 1);
+    }
+
+    /// Undo while a cleanup runs cancels it: the run is cancelled and dropped, the molecule is
+    /// back to its pre-cleanup structure, a later poll writes nothing over it, and neither
+    /// stack keeps the half-relaxed preview (the redo history is the one from before Cleanup).
+    #[test]
+    fn undo_during_cleanup_cancels_it_and_restores_the_pre_cleanup_molecule() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, positions, cancelled, joined } =
+            editor_with_fake_engine(false);
+
+        editor.toggle_cleanup();
+        let redo_at_start = editor.redo_stack.clone();
+        assert!(editor.poll_cleanup());
+        assert_eq!(atom_positions(&editor.molecule), positions, "preview applied");
+
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+        assert!(editor.cleanup_job.is_none());
+        assert!(!editor.is_cleaning());
+        assert!(cancelled.load(Ordering::Relaxed), "the run was cancelled");
+        assert!(!joined.load(Ordering::Relaxed), "the run was dropped, not joined");
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        assert!(editor.undo_stack.is_empty(), "the pre-cleanup snapshot was consumed");
+        assert_eq!(editor.redo_stack, redo_at_start, "no half-relaxed state on the redo stack");
+
+        assert!(!editor.poll_cleanup());
+        assert_eq!(editor.molecule, before, "nothing overwrites the restored molecule");
+        assert!(!editor.redo(), "nothing to redo: the cleanup was cancelled, not undone");
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// The redo history from before Cleanup survives an undo that cancels the cleanup.
+    #[test]
+    fn undo_during_cleanup_keeps_the_redo_history_from_before_it() {
+        let FakeEngineFixture { mut editor, before, .. } = editor_with_fake_engine(false);
+        // An undo entry equal to the current molecule makes Cleanup's own snapshot a
+        // duplicate, so `push_undo` skips it and leaves the redo stack alone.
+        let mut later = before.clone();
+        later.add_atom("O".to_string(), [9.0, 9.0], 0);
+        editor.undo_stack.push_back(before.clone());
+        editor.redo_stack.push_back(later.clone());
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup());
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+        assert_eq!(editor.redo_stack, std::collections::VecDeque::from(vec![later.clone()]));
+        assert!(editor.redo());
+        assert_eq!(editor.molecule, later);
+    }
+
+    /// Redo while a cleanup runs stops it at once: the run is cancelled and dropped and a later
+    /// poll writes nothing more.  With nothing to redo the stopped layout stays (as a Ctrl+K
+    /// stop would leave it) and Undo still returns to the pre-cleanup molecule.
+    #[test]
+    fn redo_during_cleanup_stops_it() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, positions, cancelled, joined } =
+            editor_with_fake_engine(false);
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup());
+        assert!(!editor.redo(), "nothing to redo");
+        assert!(editor.cleanup_job.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        assert_eq!(atom_positions(&editor.molecule), positions);
+
+        assert!(!editor.poll_cleanup());
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// Pasting while a cleanup runs stops it, so the run can no longer move atoms.
+    #[test]
+    fn paste_during_cleanup_stops_it() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, cancelled, joined, .. } = editor_with_fake_engine(false);
+        let mut source = crate::widget::ChemStructEditor::default();
+        let id = source.molecule.add_atom("N".to_string(), [0.0, 0.0], 0);
+        source.selected_atoms.insert(id);
+        let clip = source.copy_to_string().expect("one selected atom copies");
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup());
+        assert!(editor.paste_from_string(&clip));
+        assert!(editor.cleanup_job.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        let after_paste = editor.molecule.clone();
+        assert!(!editor.poll_cleanup());
+        assert_eq!(editor.molecule, after_paste);
+    }
+
+    /// `cancel_cleanup` stops a running cleanup without writing any more positions, and
+    /// reports whether there was one.
+    #[test]
+    fn cancel_cleanup_stops_the_run_without_writing() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, cancelled, joined, .. } =
+            editor_with_fake_engine(false);
+
+        assert!(!editor.cancel_cleanup(), "nothing to cancel while idle");
+        editor.toggle_cleanup();
+        assert!(editor.cancel_cleanup());
+        assert!(editor.cleanup_job.is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!joined.load(Ordering::Relaxed));
+        assert_eq!(std::sync::Arc::strong_count(&cancelled), 2, "only the test and the engine hold the flag: the run was dropped");
+        assert_eq!(editor.molecule, before, "no preview was polled, so nothing moved");
+        // A host replacing the molecule after cancelling keeps what it put there.
+        editor.molecule = Molecule::default();
+        assert!(!editor.poll_cleanup());
+        assert!(editor.molecule.atoms.is_empty());
+    }
+
+    /// A run that already reports done when `cancel_cleanup` comes is joined, not just dropped,
+    /// and its final positions are not written either.
+    #[test]
+    fn cancel_cleanup_joins_a_finished_run() {
+        use std::sync::atomic::Ordering;
+        let FakeEngineFixture { mut editor, before, joined, .. } = editor_with_fake_engine(true);
+
+        editor.toggle_cleanup();
+        assert!(editor.cancel_cleanup());
+        assert!(editor.cleanup_job.is_none());
+        assert!(joined.load(Ordering::Relaxed), "a finished run is joined");
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// `cancel_cleanup` discards a running built-in (native, threaded) run without writing its
+    /// positions and without waiting for the worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cancel_cleanup_discards_a_running_native_job() {
+        let mut rng = Lcg(0x1053);
+        let mol = random_molecule(&mut rng, 120, 30, 40.0);
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.toggle_cleanup();
+        assert!(editor.cancel_cleanup());
+        assert!(editor.cleanup_job.is_none());
+        assert_eq!(editor.molecule, mol);
+    }
+
+    /// A run that finishes between two calls of the editor's poll: its first `latest()` returns
+    /// the preview and, as a worker publishing its last chunk and setting `done` would, makes
+    /// `is_done()` true from then on; every later `latest()` returns the final positions (e.g.
+    /// the restore after a rejected rescue pass, or after a cancel mid-rescue).
+    struct FinishesAfterFirstLatestRun {
+        preview: Vec<(u32, [f32; 2])>,
+        finished: Vec<(u32, [f32; 2])>,
+        done: std::sync::atomic::AtomicBool,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupRun for FinishesAfterFirstLatestRun {
+        fn cancel(&self) {}
+        fn is_done(&self) -> bool {
+            self.done.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            if self.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.finished.clone()
+            } else {
+                self.preview.clone()
+            }
+        }
+        fn join(self: Box<Self>) {
+            self.joined.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct FinishesAfterFirstLatestEngine {
+        preview: Vec<(u32, [f32; 2])>,
+        finished: Vec<(u32, [f32; 2])>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupEngine for FinishesAfterFirstLatestEngine {
+        fn start(&self, _mol: &Molecule) -> CleanupJob {
+            CleanupJob::from_run(FinishesAfterFirstLatestRun {
+                preview: self.preview.clone(),
+                finished: self.finished.clone(),
+                done: Default::default(),
+                joined: self.joined.clone(),
+            })
+        }
+    }
+
+    /// A run that becomes done right after `poll_cleanup` read its preview must still end on
+    /// the final positions: the editor may only treat what `latest()` returns as final when
+    /// `is_done()` was already true before that `latest()` call.
+    #[test]
+    fn run_finishing_after_the_preview_read_ends_on_the_final_positions() {
+        use std::sync::atomic::Ordering;
+        let mut editor = crate::widget::ChemStructEditor::default();
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [5.0, 5.0], 0);
+        let before = editor.molecule.clone();
+        let preview = vec![(a, [1.25, -0.5]), (b, [2.5, 0.75])];
+        let finished = vec![(a, [-3.0, 1.0]), (b, [4.0, -2.0])];
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        editor.set_cleanup_engine(FinishesAfterFirstLatestEngine {
+            preview: preview.clone(),
+            finished: finished.clone(),
+            joined: joined.clone(),
+        });
+
+        editor.toggle_cleanup();
+        assert!(editor.poll_cleanup(), "the run was not done before the preview was read");
+        assert_eq!(atom_positions(&editor.molecule), preview);
+        assert!(editor.cleanup_job.is_some());
+        assert!(!joined.load(Ordering::Relaxed));
+
+        assert!(!editor.poll_cleanup(), "a finished run ends the cleanup");
+        assert_eq!(atom_positions(&editor.molecule), finished);
+        assert!(editor.cleanup_job.is_none());
+        assert!(joined.load(Ordering::Relaxed));
+        assert_eq!(editor.undo_stack.len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before);
+    }
+
+    /// Wrapping the run in a trait object must not cost `CleanupJob` (and so the editor that
+    /// holds one) the `Send + Sync` it had as a concrete threaded job.
+    #[test]
+    fn cleanup_job_and_editor_stay_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CleanupJob>();
+        assert_send_sync::<crate::widget::ChemStructEditor>();
+    }
+
+    /// `CleanupSchedule` advanced in small chunks (as a worker or a per-frame poll would) lands
+    /// on exactly the coordinates of the one-shot `cleanup_2d`.
+    #[test]
+    fn chunked_schedule_matches_cleanup_2d() {
+        for fx in characterization_fixtures() {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            for chunk in [JOB_CHUNK, 777] {
+                let mut schedule = CleanupSchedule::new(&fx.mol);
+                while !schedule.advance(chunk) {
+                    assert!(!schedule.is_done());
+                }
+                assert!(schedule.is_done());
+                assert_eq!(
+                    position_bits(&schedule.positions()),
+                    coord_bits(&mol),
+                    "{}: schedule in chunks of {chunk} differs from cleanup_2d",
+                    fx.name
+                );
+            }
+        }
+    }
+
+    fn fixture(name: &str) -> Molecule {
+        characterization_fixtures().into_iter().find(|f| f.name == name).unwrap().mol
+    }
+
+    /// Cancelled during phase 1, the schedule stops where the atoms are.
+    #[test]
+    fn cancel_mid_relaxation_keeps_current_positions() {
+        let mut schedule = CleanupSchedule::new(&fixture("toluene_distorted"));
+        assert!(!schedule.advance(10));
+        let before = position_bits(&schedule.positions());
+        schedule.cancel();
+        assert!(schedule.is_done());
+        assert!(schedule.advance(10));
+        assert_eq!(position_bits(&schedule.positions()), before);
+    }
+
+    /// A finished schedule answers `advance` with `true` whatever the step count, including 0
+    /// (the positive-step requirement only guards an unfinished schedule against stalling).
+    #[test]
+    fn advance_on_a_finished_schedule_is_a_no_op() {
+        let mut schedule = CleanupSchedule::new(&fixture("toluene_distorted"));
+        schedule.cancel();
+        let before = position_bits(&schedule.positions());
+        assert!(schedule.advance(0));
+        assert!(schedule.advance(JOB_CHUNK));
+        assert_eq!(position_bits(&schedule.positions()), before);
+    }
+
+    /// Cancelled during a rescue pass, the schedule rolls back to the phase-1 result — the same
+    /// positions a finished schedule ends on when it rejects that pass.
+    #[test]
+    fn cancel_mid_rescue_restores_the_phase1_result() {
+        let mol = fixture("random_trial_05");
+        let mut st = CleanupState::new(&mol);
+        st.step(JOB_PHASE_BUDGET);
+        let after_phase1 = position_bits(&st.positions());
+
+        let mut schedule = CleanupSchedule::new(&mol);
+        while schedule.stage == Stage::Relax {
+            schedule.advance(JOB_CHUNK);
+        }
+        assert!(schedule.stage == Stage::Rescue);
+        schedule.advance(1);
+        assert!(schedule.stage == Stage::Rescue);
+        assert_ne!(position_bits(&schedule.positions()), after_phase1);
+        schedule.cancel();
+        assert!(schedule.is_done());
+        assert_eq!(position_bits(&schedule.positions()), after_phase1);
+    }
+
+    /// A pass that runs out of its budget ends there, and a chunk that would cross the end of
+    /// the pass is cut short: 3 + 3 + 3 requested against a budget of 7 runs exactly 7 steps.
+    #[test]
+    fn pass_ends_at_its_budget_and_caps_the_last_chunk() {
+        let mol = fixture("toluene_distorted");
+        let mut st = CleanupState::new(&mol);
+        assert!(!st.step(7), "the fixture must not converge within the test budget");
+        assert_eq!(st.ring_crossing_count(), 0, "no rescue may follow the pass");
+
+        let mut schedule = CleanupSchedule::with_pass_budget(&mol, 7);
+        assert!(!schedule.advance(3));
+        assert!(!schedule.advance(3));
+        assert!(schedule.advance(3), "the pass ran out of budget, so the schedule is done");
+        assert_eq!(position_bits(&schedule.positions()), position_bits(&st.positions()));
+    }
+
+    /// With every pass (phase 1 and the rescue passes) cut off by a small budget, the result
+    /// still does not depend on the chunk size.
+    #[test]
+    fn budget_limited_rescue_passes_do_not_depend_on_chunk_size() {
+        let mol = fixture("random_trial_10");
+        let run = |chunk: usize| {
+            let mut schedule = CleanupSchedule::with_pass_budget(&mol, 50);
+            while !schedule.advance(chunk) {}
+            assert!(schedule.rescue_passes > 0, "the fixture must reach the rescue");
+            position_bits(&schedule.positions())
+        };
+        let whole = run(50);
+        for chunk in [1, 7, 1000] {
+            assert_eq!(run(chunk), whole, "chunks of {chunk} differ from whole passes");
         }
     }
 

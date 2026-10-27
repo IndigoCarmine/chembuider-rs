@@ -316,6 +316,206 @@ pub(crate) fn script_fixtures() -> Vec<(String, crate::molecule::Molecule)> {
         .collect()
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shape fingerprints
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A line-per-shape text fingerprint of a frame's painted shapes, in paint order.
+///
+/// Used to pin what the editor draws so a restructuring of the draw path can show that the
+/// output did not change. `Shape::Vec` groups are flattened (grouping is not visible on
+/// screen), `Noop` is skipped, and a `clip` line is emitted whenever the clip rect changes.
+///
+/// Coordinates are rounded to 3 decimals so the fingerprint does not hinge on the last bits
+/// of float arithmetic. Text is recorded by its string, section colours, font sizes and
+/// families, its rounded position and the shape-level paint attributes (override colour,
+/// opacity, angle, fallback colour, underline), not by its glyph geometry, so it does not
+/// depend on how the font is rasterized. Rects and paths carry every attribute that changes
+/// what they paint (corner radius, stroke kind, blur, pixel rounding, angle, brush).
+///
+/// One ordering is deliberately not pinned: within a run of consecutive unstroked rects of
+/// the same fill colour, the lines are sorted. Painting one colour over itself gives the same
+/// pixels in any order, and the editor paints its white label backgrounds by iterating a
+/// `HashMap`, so their order varies from run to run without any visible effect.
+pub(crate) fn shape_fingerprint(shapes: &[egui::epaint::ClippedShape]) -> String {
+    let mut lines = Vec::new();
+    let mut clip = None;
+    for clipped in shapes {
+        if clip != Some(clipped.clip_rect) {
+            clip = Some(clipped.clip_rect);
+            lines.push(FpLine::new(format!("clip {}", fp_rect(clipped.clip_rect))));
+        }
+        fp_shape(&clipped.shape, &mut lines);
+    }
+
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i + 1;
+        if let Some(fill) = lines[i].plain_fill {
+            while j < lines.len() && lines[j].plain_fill == Some(fill) {
+                j += 1;
+            }
+        }
+        let mut run: Vec<&str> = lines[i..j].iter().map(|l| l.text.as_str()).collect();
+        run.sort_unstable();
+        out.extend(run);
+        i = j;
+    }
+    out.join("\n")
+}
+
+/// One fingerprint line. `plain_fill` is the fill colour of an unstroked rect, which decides
+/// the neighbours it commutes with (see [`shape_fingerprint`]); `None` for every other shape.
+struct FpLine {
+    text: String,
+    plain_fill: Option<egui::Color32>,
+}
+
+impl FpLine {
+    fn new(text: String) -> Self {
+        Self { text, plain_fill: None }
+    }
+}
+
+fn fp_num(v: f32) -> String {
+    let r = (v * 1000.0).round() / 1000.0;
+    // Fold -0.000 into 0.000 so the sign of a vanishing value is not part of the fingerprint.
+    format!("{:.3}", if r == 0.0 { 0.0 } else { r })
+}
+
+fn fp_pos(p: egui::Pos2) -> String {
+    format!("({},{})", fp_num(p.x), fp_num(p.y))
+}
+
+fn fp_rect(r: egui::Rect) -> String {
+    format!("{}-{}", fp_pos(r.min), fp_pos(r.max))
+}
+
+fn fp_color(c: egui::Color32) -> String {
+    let [r, g, b, a] = c.to_array();
+    format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+}
+
+fn fp_stroke(s: egui::Stroke) -> String {
+    format!("{}/{}", fp_num(s.width), fp_color(s.color))
+}
+
+fn fp_shape(shape: &egui::Shape, out: &mut Vec<FpLine>) {
+    use egui::Shape;
+    let text = match shape {
+        Shape::Noop => return,
+        Shape::Vec(shapes) => {
+            for s in shapes {
+                fp_shape(s, out);
+            }
+            return;
+        }
+        Shape::Rect(r) => {
+            let unstroked = r.stroke.width == 0.0 || r.stroke.color.a() == 0;
+            let cr = r.corner_radius;
+            out.push(FpLine {
+                text: format!(
+                    "rect {} fill={} stroke={} corner={}/{}/{}/{} kind={:?} blur={} round_px={:?} \
+                     angle={} brush={}",
+                    fp_rect(r.rect),
+                    fp_color(r.fill),
+                    fp_stroke(r.stroke),
+                    cr.nw,
+                    cr.ne,
+                    cr.sw,
+                    cr.se,
+                    r.stroke_kind,
+                    fp_num(r.blur_width),
+                    r.round_to_pixels,
+                    fp_num(r.angle),
+                    if r.brush.is_some() { "set" } else { "none" },
+                ),
+                plain_fill: unstroked.then_some(r.fill),
+            });
+            return;
+        }
+        Shape::Circle(c) => format!(
+            "circle c={} r={} fill={} stroke={}",
+            fp_pos(c.center),
+            fp_num(c.radius),
+            fp_color(c.fill),
+            fp_stroke(c.stroke),
+        ),
+        Shape::Ellipse(e) => format!(
+            "ellipse c={} r=({},{}) fill={} stroke={}",
+            fp_pos(e.center),
+            fp_num(e.radius.x),
+            fp_num(e.radius.y),
+            fp_color(e.fill),
+            fp_stroke(e.stroke),
+        ),
+        Shape::LineSegment { points, stroke } => format!(
+            "line {} {} stroke={}",
+            fp_pos(points[0]),
+            fp_pos(points[1]),
+            fp_stroke(*stroke),
+        ),
+        Shape::Path(p) => {
+            let stroke_color = match &p.stroke.color {
+                egui::epaint::ColorMode::Solid(c) => fp_color(*c),
+                egui::epaint::ColorMode::UV(_) => "uv".to_string(),
+            };
+            let pts: Vec<String> = p.points.iter().map(|q| fp_pos(*q)).collect();
+            format!(
+                "path closed={} fill={} stroke={}/{} pts=[{}] kind={:?}",
+                p.closed,
+                fp_color(p.fill),
+                fp_num(p.stroke.width),
+                stroke_color,
+                pts.join(" "),
+                p.stroke.kind,
+            )
+        }
+        Shape::Text(t) => {
+            let job = &t.galley.job;
+            let sections: Vec<String> = job
+                .sections
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{:?}:{}@{}",
+                        &job.text[s.byte_range.start.0..s.byte_range.end.0],
+                        fp_color(s.format.color),
+                        fp_num(s.format.font_id.size),
+                    )
+                })
+                .collect();
+            let families: Vec<String> =
+                job.sections.iter().map(|s| format!("{:?}", s.format.font_id.family)).collect();
+            format!(
+                "text {:?} at={} sections=[{}] families=[{}] override={} opacity={} angle={} \
+                 fallback={} underline={}",
+                job.text,
+                fp_pos(t.pos),
+                sections.join(" "),
+                families.join(" "),
+                t.override_text_color.map_or_else(|| "none".to_string(), fp_color),
+                fp_num(t.opacity_factor),
+                fp_num(t.angle),
+                fp_color(t.fallback_color),
+                fp_stroke(t.underline),
+            )
+        }
+        Shape::Mesh(m) => format!("mesh vertices={} indices={}", m.vertices.len(), m.indices.len()),
+        Shape::QuadraticBezier(b) => {
+            let pts: Vec<String> = b.points.iter().map(|q| fp_pos(*q)).collect();
+            format!("qbezier [{}] fill={}", pts.join(" "), fp_color(b.fill))
+        }
+        Shape::CubicBezier(b) => {
+            let pts: Vec<String> = b.points.iter().map(|q| fp_pos(*q)).collect();
+            format!("cbezier [{}] fill={}", pts.join(" "), fp_color(b.fill))
+        }
+        Shape::Callback(_) => "callback".to_string(),
+    };
+    out.push(FpLine::new(text));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

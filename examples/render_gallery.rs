@@ -16,11 +16,25 @@
 //! Use this to eyeball label anchoring, H-side flips, bond trimming and overlaps
 //! whenever the drawing code changes.
 
+use chembuider_rs::widget::FitOptions;
 use chembuider_rs::{ChemStructEditor, egui};
 use std::collections::HashMap;
 
 const CELL_W: usize = 380;
 const CELL_H: usize = 280;
+/// How each structure is framed in its cell: a 14 px margin, and a zoom between 0.2 and
+/// 1.3 so small molecules are drawn a little larger than the editor's natural size.
+const FIT: FitOptions = FitOptions {
+    margin: 14.0,
+    min_zoom: 0.2,
+    max_zoom: 1.3,
+    keep_zoom: false,
+};
+/// Height of the strip at the top of each cell that the editor's canvas leaves out, so the
+/// drawing stays below the caption (drawn at y = 4 in a 13 px font; its glyphs end by
+/// y = 18). The fitted drawing starts `FIT.margin` below the canvas top, at y = 24, and
+/// bond strokes reach a pixel or two above that, still clear of the caption rows.
+const CAPTION_BAND_H: f32 = 10.0;
 
 fn main() {
     // Args: `--single` picks the compact one-cell-per-fixture mode; the first
@@ -62,7 +76,6 @@ fn main() {
             if cleaned {
                 chembuider_rs::molecule::cleanup::cleanup_2d(&mut editor.molecule);
             }
-            fit_view(&mut editor);
             let label = if single {
                 name.clone()
             } else {
@@ -103,77 +116,6 @@ fn main() {
     println!("wrote {} cells + {sheet_path}", cells.len());
 }
 
-/// Zoom/pan the editor so the molecule fills the cell with a comfortable margin.
-/// Label extents aren't known before a frame runs, so leave generous headroom here;
-/// `refine_fit` tightens it from the actual label rects after a warm-up frame.
-fn fit_view(editor: &mut ChemStructEditor) {
-    use chembuider_rs::widget::SCALE_FACTOR;
-    let xs: Vec<f32> = editor.molecule.atoms.iter().map(|a| a.pos[0]).collect();
-    let ys: Vec<f32> = editor.molecule.atoms.iter().map(|a| a.pos[1]).collect();
-    if xs.is_empty() {
-        return;
-    }
-    let (min_x, max_x) = (
-        xs.iter().cloned().fold(f32::MAX, f32::min),
-        xs.iter().cloned().fold(f32::MIN, f32::max),
-    );
-    let (min_y, max_y) = (
-        ys.iter().cloned().fold(f32::MAX, f32::min),
-        ys.iter().cloned().fold(f32::MIN, f32::max),
-    );
-    let w = (max_x - min_x).max(1.0) * SCALE_FACTOR;
-    let h = (max_y - min_y).max(1.0) * SCALE_FACTOR;
-    let zoom = ((CELL_W as f32 - 120.0) / w).min((CELL_H as f32 - 100.0) / h);
-    editor.zoom = zoom.clamp(0.2, 1.3);
-    let cx = (min_x + max_x) * 0.5;
-    let cy = (min_y + max_y) * 0.5;
-    editor.pan = egui::vec2(
-        -cx * editor.zoom * SCALE_FACTOR,
-        -cy * editor.zoom * SCALE_FACTOR,
-    );
-}
-
-/// After a warm-up frame the editor knows every label's screen rect; shrink the zoom and
-/// recenter so the union of atoms + labels sits inside the cell with a fixed margin.
-fn refine_fit(editor: &mut ChemStructEditor, canvas: egui::Rect) {
-    const MARGIN: f32 = 14.0;
-    let mut bounds: Option<egui::Rect> = None;
-    let center = canvas.center();
-    for atom in &editor.molecule.atoms {
-        let sp = editor.mol_to_screen(atom.pos, center);
-        let r = egui::Rect::from_center_size(sp, egui::vec2(8.0, 8.0));
-        bounds = Some(bounds.map_or(r, |b| b.union(r)));
-    }
-    for rect in editor.label_rects().values() {
-        bounds = Some(bounds.map_or(*rect, |b| b.union(*rect)));
-    }
-    let Some(bounds) = bounds else { return };
-    let avail = canvas.shrink(MARGIN);
-    let scale = (avail.width() / bounds.width())
-        .min(avail.height() / bounds.height())
-        .min(1.0); // only shrink, never blow tiny structures up further
-    // Screen-space transform is affine in (zoom, pan): scaling zoom by `s` around the
-    // canvas center and fixing pan keeps molecule points at
-    // p' = center + (p - center - pan)*s + pan... simpler to recompute pan directly.
-    editor.zoom *= scale;
-    // Recenter: the bounds center corresponds to a molecule-space point; after the zoom
-    // change, choose pan so that point lands on the canvas center.
-    let bc = bounds.center();
-    // Point in mol coords that was at bc (using the OLD zoom / pan via inverse transform
-    // captured before mutation would be cleaner; recompute from atoms instead):
-    // just recompute the label-aware bounds center in mol coords approximately from the
-    // pre-scale transform: mol = (bc - center - pan_old) / (zoom_old * SCALE)
-    // Since we already overwrote zoom, reconstruct zoom_old:
-    let zoom_old = editor.zoom / scale;
-    use chembuider_rs::widget::SCALE_FACTOR;
-    let mol_cx = (bc.x - center.x - editor.pan.x) / (zoom_old * SCALE_FACTOR);
-    let mol_cy = (bc.y - center.y - editor.pan.y) / (zoom_old * SCALE_FACTOR);
-    editor.pan = egui::vec2(
-        -mol_cx * editor.zoom * SCALE_FACTOR,
-        -mol_cy * editor.zoom * SCALE_FACTOR,
-    );
-}
-
 /// Renders one editor frame into an RGB cell buffer. Owns a persistent egui context so
 /// the font atlas builds once and texture deltas accumulate across cells.
 struct CellRenderer {
@@ -196,8 +138,15 @@ impl CellRenderer {
             screen_rect: Some(cell),
             ..Default::default()
         };
+        // The editor draws below the caption band; the fit uses that same rect, so the
+        // drawing is centered in it and its margin keeps it clear of the caption.
+        let canvas = egui::Rect::from_min_max(egui::pos2(0.0, CAPTION_BAND_H), cell.max);
         let frame = |editor: &mut ChemStructEditor, ui: &mut egui::Ui| {
-            editor.ui(ui);
+            // Fit the whole drawing, labels included, into the canvas before drawing it.
+            editor.fit_view_with(ui.ctx(), canvas, FIT);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(canvas), |ui| {
+                editor.ui(ui);
+            });
             // Caption + cell border on top of the editor's white canvas.
             let painter = ui.painter();
             painter.text(
@@ -214,11 +163,6 @@ impl CellRenderer {
                 egui::StrokeKind::Inside,
             );
         };
-        // Warm-up frame: teaches the editor its label rects, then tighten the fit so
-        // wide edge labels (H2N, OH...) don't spill out of the cell.
-        let warm = self.ctx.run_ui(raw.clone(), |ui| frame(editor, ui));
-        self.fold_textures(&warm.textures_delta);
-        refine_fit(editor, cell);
         let output = self.ctx.run_ui(raw, |ui| frame(editor, ui));
         self.fold_textures(&output.textures_delta);
 

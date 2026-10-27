@@ -34,10 +34,7 @@ use crate::molecule::Molecule;
 use crate::widget::rich_text::RichText;
 
 use super::model::{Analysis, Mass, Reaction};
-use super::scheme::{ArrowLabel, PlacedKind, ReactionScheme, SchemeItem};
-use super::stoich::{
-    format_density, format_mass, format_molarity, format_number, format_percent, format_volume,
-};
+use super::scheme::{ArrowLabel, PlacedKind, ReactionScheme, SchemeItem, SchemeStructure};
 use super::table::BlockKind;
 use super::view::{FigureLayout, ReactionView};
 
@@ -313,8 +310,13 @@ pub fn set_field(analysis: &mut Analysis, cell: CellRef, value: Option<f64>) -> 
     true
 }
 
-/// The *entered* value of a cell, spelled the way the table prints it (`1.00g`, `700.00mg`) —
-/// the text an edit box starts with.
+/// The *entered* value of a cell, as text [`parse_value`] reads back to exactly the same
+/// number (`1.2345g`, `0.004`) — the text an edit box starts with.
+///
+/// The number is written in the field's base unit with Rust's shortest round-trip `f64`
+/// spelling, not with the table's two-decimal display formatting: the box is the entry
+/// itself, and seeding it with a rounded figure would overwrite `0.004` eq with `0` the
+/// moment the box is committed untouched.
 ///
 /// Empty when nothing was entered there, even if the cell currently shows a computed number:
 /// the box starts blank so that opening it and pressing Enter changes nothing, and the
@@ -323,9 +325,16 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
     let Some(field) = cell.field() else {
         return String::new();
     };
-    let joined = |q: Option<f64>, f: fn(f64) -> super::stoich::Formatted| {
-        q.map(|v| f(v).joined()).unwrap_or_default()
+    // Scale 1 in `parse_value`, so the round trip is exact.
+    let suffix = match field.unit() {
+        Unit::Mass => "g",
+        Unit::Volume => "mL",
+        Unit::Percent => "%",
+        Unit::Molarity => "M",
+        Unit::Density => "g/mL",
+        Unit::Number => "",
     };
+    let exact = |q: Option<f64>| q.map(|v| format!("{v}{suffix}")).unwrap_or_default();
     match cell.block {
         BlockKind::Reactants => {
             let Some(r) = analysis.reactants.get(cell.column) else {
@@ -333,12 +342,12 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
             };
             match field {
                 Field::Limiting => if r.limiting { "Yes" } else { "No" }.to_string(),
-                Field::Equivalents => joined(r.equivalents, format_number),
-                Field::SampleMass => joined(r.sample_mass.map(Mass::as_grams), format_mass),
-                Field::PercentWeight => joined(r.percent_weight, format_percent),
-                Field::Molarity => joined(r.molarity, format_molarity),
-                Field::Density => joined(r.density, format_density),
-                Field::Volume => joined(r.volume, format_volume),
+                Field::Equivalents => exact(r.equivalents),
+                Field::SampleMass => exact(r.sample_mass.map(Mass::as_grams)),
+                Field::PercentWeight => exact(r.percent_weight),
+                Field::Molarity => exact(r.molarity),
+                Field::Density => exact(r.density),
+                Field::Volume => exact(r.volume),
                 _ => String::new(),
             }
         }
@@ -347,10 +356,10 @@ pub fn field_text(analysis: &Analysis, cell: CellRef) -> String {
                 return String::new();
             };
             match field {
-                Field::Equivalents => joined(p.equivalents, format_number),
-                Field::PercentCompletion => joined(p.percent_completion, format_percent),
-                Field::MeasuredMass => joined(p.measured_mass.map(Mass::as_grams), format_mass),
-                Field::Purity => joined(p.purity, format_percent),
+                Field::Equivalents => exact(p.equivalents),
+                Field::PercentCompletion => exact(p.percent_completion),
+                Field::MeasuredMass => exact(p.measured_mass.map(Mass::as_grams)),
+                Field::Purity => exact(p.purity),
                 _ => String::new(),
             }
         }
@@ -382,42 +391,60 @@ pub fn scheme_arrow_structure(
     }
 }
 
-/// Put a structure on an arrow's above/below label, replacing whatever was there. Returns
-/// `false` (changing nothing) when the item is not an arrow or the part is not an arrow band.
+/// Draw `molecule` on an arrow's above/below label. Returns `false` (changing nothing) when
+/// the item is not an arrow or the part is not an arrow band.
+///
+/// When the band already holds a structure, this redraws *that* structure: it keeps its
+/// [`StructureId`](super::scheme::StructureId), the same as editing it in place. Text or
+/// nothing on the band is replaced by a new structure with a fresh id. To put an existing
+/// [`SchemeStructure`] (id and all) on a band, use [`place_scheme_arrow_structure`].
 pub fn set_scheme_arrow_structure(
     scheme: &mut ReactionScheme,
     index: usize,
     part: SchemePart,
     molecule: Molecule,
 ) -> bool {
-    let Some(SchemeItem::Arrow(a)) = scheme.items.get_mut(index) else {
+    let Some(slot) = arrow_label_mut(scheme, index, part) else {
         return false;
     };
-    match part {
-        SchemePart::ArrowAbove => a.above = ArrowLabel::Structure(molecule),
-        SchemePart::ArrowBelow => a.below = ArrowLabel::Structure(molecule),
-        _ => return false,
+    match slot {
+        ArrowLabel::Structure(s) => *s.molecule_mut() = molecule,
+        other => *other = ArrowLabel::Structure(SchemeStructure::new(molecule)),
     }
     true
 }
 
-/// Clear an arrow's above/below label back to empty, returning the structure it held (if any).
-/// A text label is cleared too but comes back as `None`.
+/// Put `structure` on an arrow's above/below label as it is, keeping its
+/// [`StructureId`](super::scheme::StructureId), and replacing whatever the band held. Returns
+/// `false` (changing nothing, and dropping `structure`) when the item is not an arrow or the
+/// part is not an arrow band — check the target first when the structure must not be lost.
+///
+/// This is how a structure *moves* onto a band (from the line, or from another band), as
+/// opposed to [`set_scheme_arrow_structure`], which draws a molecule there.
+pub fn place_scheme_arrow_structure(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+    structure: SchemeStructure,
+) -> bool {
+    let Some(slot) = arrow_label_mut(scheme, index, part) else {
+        return false;
+    };
+    *slot = ArrowLabel::Structure(structure);
+    true
+}
+
+/// Clear an arrow's above/below label back to empty, returning the structure it held (if any),
+/// with its [`StructureId`](super::scheme::StructureId). A text label is cleared too but comes
+/// back as `None`.
 pub fn take_scheme_arrow_structure(
     scheme: &mut ReactionScheme,
     index: usize,
     part: SchemePart,
-) -> Option<Molecule> {
-    let Some(SchemeItem::Arrow(a)) = scheme.items.get_mut(index) else {
-        return None;
-    };
-    let slot = match part {
-        SchemePart::ArrowAbove => &mut a.above,
-        SchemePart::ArrowBelow => &mut a.below,
-        _ => return None,
-    };
+) -> Option<SchemeStructure> {
+    let slot = arrow_label_mut(scheme, index, part)?;
     match std::mem::replace(slot, ArrowLabel::Empty) {
-        ArrowLabel::Structure(m) => Some(m),
+        ArrowLabel::Structure(s) => Some(s),
         // Text (or nothing) leaves the slot empty and reports no structure taken.
         _ => None,
     }
@@ -430,26 +457,27 @@ pub fn take_scheme_arrow_structure(
 ///
 /// The caller is expected to follow up with
 /// [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the table columns
-/// re-derive from the structures that remain on the line.
+/// follow the moved structure (by its id) back into scheme order.
 pub fn move_line_structure_to_arrow_slot(
     scheme: &mut ReactionScheme,
     from: usize,
     arrow_index: usize,
     part: SchemePart,
 ) -> Option<usize> {
-    if scheme_arrow_structure(scheme, arrow_index, part).is_some() {
-        return None; // don't clobber a structure already there
+    match arrow_label(scheme, arrow_index, part) {
+        None => return None, // not an arrow band: nowhere to put the structure
+        Some(ArrowLabel::Structure(_)) => return None, // don't clobber a structure already there
+        Some(_) => {}
     }
-    if !matches!(scheme.items.get(arrow_index), Some(SchemeItem::Arrow(_))) {
+    if !matches!(scheme.items.get(from), Some(SchemeItem::Structure(_))) {
         return None;
     }
-    let Some(SchemeItem::Structure(mol)) = scheme.items.get(from) else {
-        return None;
+    // Both ends were checked above, so the structure always lands: it moves whole, id included.
+    let Some(SchemeItem::Structure(structure)) = scheme.remove(from) else {
+        unreachable!("item {from} was checked to be a structure");
     };
-    let mol = mol.clone();
-    scheme.remove(from);
     let target = if from < arrow_index { arrow_index - 1 } else { arrow_index };
-    set_scheme_arrow_structure(scheme, target, part, mol).then_some(target)
+    place_scheme_arrow_structure(scheme, target, part, structure).then_some(target)
 }
 
 /// Swap a main-line structure with a structure already riding on an arrow slot, losslessly:
@@ -460,23 +488,27 @@ pub fn move_line_structure_to_arrow_slot(
 /// Returns `false` (changing nothing) unless `from` is a main-line structure **and** the slot
 /// holds a structure; a text- or empty-occupied slot is not swappable. The caller should follow
 /// up with [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the
-/// reactant columns re-derive from the structures that now sit at each position.
+/// columns, which follow their structures by id, are put back in scheme order.
 pub fn swap_line_structure_with_arrow_slot(
     scheme: &mut ReactionScheme,
     from: usize,
     arrow_index: usize,
     part: SchemePart,
 ) -> bool {
-    let Some(slot_mol) = scheme_arrow_structure(scheme, arrow_index, part).cloned() else {
+    if scheme_arrow_structure(scheme, arrow_index, part).is_none() {
         return false; // only a structure-occupied slot is swappable
-    };
-    let Some(SchemeItem::Structure(line_mol)) = scheme.items.get(from) else {
+    }
+    if !matches!(scheme.items.get(from), Some(SchemeItem::Structure(_))) {
         return false;
+    }
+    // Trade the two structures whole, so each keeps its id at its new place.
+    let Some(mut moving) = take_scheme_arrow_structure(scheme, arrow_index, part) else {
+        unreachable!("the slot was checked to hold a structure");
     };
-    let line_mol = line_mol.clone();
-    set_scheme_arrow_structure(scheme, arrow_index, part, line_mol);
-    scheme.items[from] = SchemeItem::Structure(slot_mol);
-    true
+    if let Some(SchemeItem::Structure(line)) = scheme.items.get_mut(from) {
+        std::mem::swap(line, &mut moving);
+    }
+    place_scheme_arrow_structure(scheme, arrow_index, part, moving)
 }
 
 /// Move the structure on an arrow band back onto the reaction line: insert it as a new
@@ -493,10 +525,23 @@ pub fn move_arrow_structure_to_line(
     part: SchemePart,
     insert_at: usize,
 ) -> Option<usize> {
-    let mol = take_scheme_arrow_structure(scheme, index, part)?;
+    let structure = take_scheme_arrow_structure(scheme, index, part)?;
     let at = insert_at.min(scheme.items.len());
-    scheme.items.insert(at, SchemeItem::Structure(mol));
+    scheme.items.insert(at, SchemeItem::Structure(structure));
     Some(at)
+}
+
+/// The arrow band's label, mutably, when the item is an arrow and the part names a band.
+fn arrow_label_mut(
+    scheme: &mut ReactionScheme,
+    index: usize,
+    part: SchemePart,
+) -> Option<&mut ArrowLabel> {
+    match (scheme.items.get_mut(index), part) {
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowAbove) => Some(&mut a.above),
+        (Some(SchemeItem::Arrow(a)), SchemePart::ArrowBelow) => Some(&mut a.below),
+        _ => None,
+    }
 }
 
 /// The arrow band's label, when the item is an arrow and the part names a band.
@@ -660,6 +705,17 @@ fn draw_drop_caret(
     );
 }
 
+/// The parts of a scheme item that [`hit_test`] can answer with, in the order it tries them.
+/// The first one is what selecting the item as a whole names.
+fn scheme_item_parts(item: &SchemeItem) -> &'static [SchemePart] {
+    match item {
+        SchemeItem::Structure(_) => &[SchemePart::Structure],
+        SchemeItem::Plus => &[SchemePart::Plus],
+        SchemeItem::Arrow(_) => &[SchemePart::ArrowAbove, SchemePart::ArrowBelow],
+        SchemeItem::Text(_) => &[SchemePart::Text],
+    }
+}
+
 /// What is under `pos` in a figure drawn with its top-left corner at `top_left`.
 ///
 /// The scheme is tested before the table; the two halves are stacked and never overlap, so
@@ -671,12 +727,13 @@ pub fn hit_test(
     pos: Pos2,
 ) -> Option<Hit> {
     for (index, placed) in layout.scheme.items.iter().enumerate() {
-        let item = scheme.items.get(index);
-        let parts: &[SchemePart] = match (&placed.kind, item) {
-            (PlacedKind::Arrow { .. }, _) => &[SchemePart::ArrowAbove, SchemePart::ArrowBelow],
-            (_, Some(SchemeItem::Structure(_))) => &[SchemePart::Structure],
-            (_, Some(SchemeItem::Plus)) => &[SchemePart::Plus],
-            (_, Some(SchemeItem::Text(_))) => &[SchemePart::Text],
+        let parts = match scheme.items.get(index) {
+            Some(item)
+                if matches!(placed.kind, PlacedKind::Arrow { .. })
+                    == matches!(item, SchemeItem::Arrow(_)) =>
+            {
+                scheme_item_parts(item)
+            }
             // Layout and scheme are built from the same list; a mismatch means a stale
             // layout, and hitting nothing is better than answering with the wrong item.
             _ => &[],
@@ -752,6 +809,16 @@ impl DragSource {
     fn is_slot(self, index: usize, part: SchemePart) -> bool {
         matches!(self, Self::ArrowLabel { index: i, part: p } if i == index && p == part)
     }
+
+    /// True when what was picked up is a structure — the only thing an arrow slot can take.
+    /// A `+`, a text item or an arrow (including one picked up by its own empty band) is not,
+    /// so passing over a band leaves it reordering along the line.
+    fn carries_structure(self, scheme: &ReactionScheme) -> bool {
+        match self {
+            Self::Item(i) => matches!(scheme.items.get(i), Some(SchemeItem::Structure(_))),
+            Self::ArrowLabel { index, part } => scheme_arrow_structure(scheme, index, part).is_some(),
+        }
+    }
 }
 
 /// A scheme item being dragged: either reordered along the line, or dropped onto an arrow slot.
@@ -762,9 +829,9 @@ struct DragReorder {
     /// Reorder slot for a main-line drag, and the insertion slot an arrow-label structure would
     /// rejoin the line at: the number of items that will sit to its left (`0..=items.len()`).
     insert_at: usize,
-    /// The arrow above/below slot under the pointer, when the drop would land on one. Only slots
-    /// that can *accept* a structure — empty or structure-occupied, never text — and never the
-    /// source's own slot.
+    /// The arrow above/below slot under the pointer, when the drop would land on one. Only while
+    /// a structure is being dragged, only slots that can *accept* it — empty or
+    /// structure-occupied, never text — and never the source's own slot.
     to_slot: Option<(usize, SchemePart)>,
     /// Whether the pointer is over any arrow band. For an arrow-label source this is what tells
     /// "resting on a band" (its own, or a text one — do nothing) apart from "over the reaction
@@ -795,6 +862,9 @@ pub struct ReactionEditor {
     context_target: Option<Hit>,
     /// A scheme item being dragged to reorder, live for the duration of the drag.
     drag: Option<DragReorder>,
+    /// Set when a drag moved scheme structures to other positions; read and cleared by the host
+    /// with [`take_scheme_rearranged`](Self::take_scheme_rearranged).
+    scheme_rearranged: bool,
 }
 
 impl Default for ReactionEditor {
@@ -814,6 +884,7 @@ impl ReactionEditor {
             edit_request: None,
             context_target: None,
             drag: None,
+            scheme_rearranged: false,
         }
     }
 
@@ -851,6 +922,15 @@ impl ReactionEditor {
     /// True while a scheme item is being dragged to reorder it.
     pub fn is_dragging(&self) -> bool {
         self.drag.is_some()
+    }
+
+    /// Take whether [`show`](Self::show) has moved scheme structures to other positions since
+    /// the last call: a drag that reordered the line, moved a structure onto or off an arrow
+    /// slot, or swapped two of them. The host must re-check anything it holds by scheme
+    /// position — a [`StructureRef`] from [`take_edit_request`](Self::take_edit_request) kept
+    /// as a canvas link, say — since it may now name a different structure.
+    pub fn take_scheme_rearranged(&mut self) -> bool {
+        std::mem::take(&mut self.scheme_rearranged)
     }
 
     /// Run the automatic 2-D layout cleanup on the *selected* scheme structure, if the current
@@ -1018,9 +1098,11 @@ impl ReactionEditor {
                     DragSource::Item(i) => i,
                     DragSource::ArrowLabel { index, .. } => index,
                 };
+                // Picking an item up is moving on from the open box, just like clicking away.
+                // Settle it now, while the indices it names still point where they did.
+                self.leave_edit(ui, reaction);
                 self.drag =
                     Some(DragReorder { source, insert_at, to_slot: None, over_band: false });
-                self.edit = None;
             }
         }
         if response.dragged() {
@@ -1028,12 +1110,16 @@ impl ReactionEditor {
                 let source = drag.source;
                 drag.insert_at = scheme_drop_index(&layout, rect.min, p);
                 // A drop onto an arrow band takes priority over reordering: the structure lands
-                // in that slot. Only an *acceptable* slot counts — not the source's own, and not
-                // a text label (dropping a structure there would clobber the text, so it is left
-                // to reorder along the line instead).
+                // in that slot. Only a dragged *structure* is offered a slot, and only an
+                // *acceptable* one — not the source's own, and not a text label (dropping a
+                // structure there would clobber the text, so it is left to reorder along the
+                // line instead). Anything else stays a reorder.
+                let carries_structure = source.carries_structure(&reaction.scheme);
                 drag.to_slot = arrow_slot_at(&reaction.scheme, &layout, rect.min, p).filter(
                     |&(ti, tp)| {
-                        !source.is_slot(ti, tp) && !arrow_slot_holds_text(&reaction.scheme, ti, tp)
+                        carries_structure
+                            && !source.is_slot(ti, tp)
+                            && !arrow_slot_holds_text(&reaction.scheme, ti, tp)
                     },
                 );
                 drag.over_band = matches!(
@@ -1066,6 +1152,8 @@ impl ReactionEditor {
             }
         } else if let Some(drag) = self.drag {
             let source_hit = match drag.source {
+                // Only drawn, never kept as a selection: `Structure` is how `scheme_item_rect`
+                // gives a main-line item's whole box — for an arrow, both bands at once.
                 DragSource::Item(index) => Hit::Scheme { index, part: SchemePart::Structure },
                 DragSource::ArrowLabel { index, part } => Hit::Scheme { index, part },
             };
@@ -1109,13 +1197,19 @@ impl ReactionEditor {
                                 if drag.insert_at > from { drag.insert_at - 1 } else { drag.insert_at };
                             let delta = target as isize - from as isize;
                             if let Some(landed) = reaction.scheme.move_item(from, delta) {
-                                // Reordering shifts the structure→column mapping, which is
-                                // positional (reactants before the arrow, products after).
-                                // Re-derive every table column from whatever structure now sits
-                                // at its position.
+                                // The columns follow their structures by id; resync so they
+                                // are put back in the scheme's new order, values and all.
                                 reaction.sync_structures_from_scheme();
-                                self.selection =
-                                    Some(Hit::Scheme { index: landed, part: SchemePart::Structure });
+                                // Dropped back in place moves nothing; any other landing does.
+                                self.scheme_rearranged |= landed != from;
+                                // Select what landed by the part a click on it would give — a
+                                // `+`, text or arrow is not a structure.
+                                self.selection = reaction
+                                    .scheme
+                                    .items
+                                    .get(landed)
+                                    .and_then(|item| scheme_item_parts(item).first())
+                                    .map(|&part| Hit::Scheme { index: landed, part });
                             }
                         }
                         DragSource::ArrowLabel { index, part } => {
@@ -1201,6 +1295,7 @@ impl ReactionEditor {
                     // Occupied by a structure: trade places rather than refuse (課題A).
                     if swap_line_structure_with_arrow_slot(&mut reaction.scheme, from, ti, tp) {
                         reaction.sync_structures_from_scheme();
+                        self.scheme_rearranged = true;
                         self.selection =
                             Some(Hit::Scheme { index: from, part: SchemePart::Structure });
                     }
@@ -1208,30 +1303,33 @@ impl ReactionEditor {
                     move_line_structure_to_arrow_slot(&mut reaction.scheme, from, ti, tp)
                 {
                     reaction.sync_structures_from_scheme();
+                    self.scheme_rearranged = true;
                     self.selection = Some(Hit::Scheme { index: landed, part: tp });
                 }
             }
             DragSource::ArrowLabel { index, part } => {
-                let Some(src_mol) =
-                    scheme_arrow_structure(&reaction.scheme, index, part).cloned()
+                // Check the target band before taking anything off, so a structure never
+                // leaves the figure for a target that cannot hold it.
+                if arrow_label(&reaction.scheme, ti, tp).is_none()
+                    || scheme_arrow_structure(&reaction.scheme, index, part).is_none()
+                {
+                    return;
+                }
+                // The structures move whole, so each keeps its id. Whatever sits in the target
+                // slot goes back to the source (a swap); an empty target leaves the source empty.
+                let Some(moving) = take_scheme_arrow_structure(&mut reaction.scheme, index, part)
                 else {
                     return;
                 };
-                // Whatever sits in the target slot goes back to the source (a swap); an empty
-                // target leaves the source empty.
                 let displaced = take_scheme_arrow_structure(&mut reaction.scheme, ti, tp);
-                set_scheme_arrow_structure(&mut reaction.scheme, ti, tp, src_mol);
-                match displaced {
-                    Some(d) => {
-                        set_scheme_arrow_structure(&mut reaction.scheme, index, part, d);
-                    }
-                    None => {
-                        take_scheme_arrow_structure(&mut reaction.scheme, index, part);
-                    }
+                place_scheme_arrow_structure(&mut reaction.scheme, ti, tp, moving);
+                if let Some(d) = displaced {
+                    place_scheme_arrow_structure(&mut reaction.scheme, index, part, d);
                 }
                 // Arrow-label structures feed reactant columns, and a swap can move which slot
                 // holds which — re-derive so the columns follow.
                 reaction.sync_structures_from_scheme();
+                self.scheme_rearranged = true;
                 self.selection = Some(Hit::Scheme { index: ti, part: tp });
             }
         }
@@ -1249,8 +1347,31 @@ impl ReactionEditor {
         if let Some(at) = move_arrow_structure_to_line(&mut reaction.scheme, index, part, insert_at)
         {
             reaction.sync_structures_from_scheme();
+            self.scheme_rearranged = true;
             self.selection = Some(Hit::Scheme { index: at, part: SchemePart::Structure });
         }
+    }
+
+    /// The edit box's widget id, fixed (rather than left to egui) so its keyboard focus can be
+    /// handed back from outside the overlay — see [`leave_edit`](Self::leave_edit).
+    fn edit_box_id(ui: &egui::Ui) -> egui::Id {
+        ui.id().with("reaction_cell_edit_text")
+    }
+
+    /// The user moved on from the open box — clicked away from it, or picked up a scheme item
+    /// to drag. What was typed is committed. Moving on must never trap the user in a box it
+    /// refuses to close, so a bad value is dropped rather than kept — [`error`](Self::error)
+    /// says what happened. Either way the box closes and gives up the keyboard. No-op when no
+    /// box is open.
+    fn leave_edit(&mut self, ui: &egui::Ui, reaction: &mut Reaction) {
+        if self.edit.is_none() {
+            return;
+        }
+        if self.commit_edit(reaction).is_err() {
+            self.edit = None;
+        }
+        let id = Self::edit_box_id(ui);
+        ui.ctx().memory_mut(|m| m.surrender_focus(id));
     }
 
     /// The floating text box, in the style of the structure editor's own label editor: an
@@ -1304,6 +1425,7 @@ impl ReactionEditor {
         };
 
         let width = anchor.width().max(88.0);
+        let box_id = Self::edit_box_id(ui);
         let area = egui::Area::new(ui.id().with("reaction_cell_edit"))
             .order(egui::Order::Foreground)
             // egui sizes a new Area with `spacing.default_area_size` (600 x 400) for its
@@ -1316,6 +1438,7 @@ impl ReactionEditor {
                 egui::Frame::popup(ui.style())
                     .show(ui, |ui| {
                         let mut output = egui::TextEdit::singleline(&mut text)
+                            .id(box_id)
                             .desired_width(width)
                             .hint_text(hint)
                             .show(ui);
@@ -1352,11 +1475,7 @@ impl ReactionEditor {
             // A rejected Enter keeps the box open with the offending text.
             let _ = self.commit_edit(reaction);
         } else if lost {
-            // Clicking away must never trap the user in a box it refuses to close, so a bad
-            // value is dropped here rather than kept — the message says what happened.
-            if self.commit_edit(reaction).is_err() {
-                self.edit = None;
-            }
+            self.leave_edit(ui, reaction);
         }
         if self.edit.is_none() {
             // Hand the keyboard back the moment the box closes; a TextEdit that simply stops
@@ -1372,7 +1491,7 @@ mod tests {
     use crate::reaction::demo;
     use crate::reaction::formula::MolecularFormula;
     use crate::reaction::model::{Product, Reactant};
-    use crate::reaction::stoich::format_moles;
+    use crate::reaction::stoich::{format_mass, format_moles, format_percent};
     use crate::reaction::table::{AnalysisTable, PRODUCT_ROWS, REACTANT_ROWS};
     use crate::reaction::{Arrow, Origin};
     use egui::Vec2;
@@ -1565,7 +1684,7 @@ mod tests {
         // computed number.
         let plain = demo::williamson_ether_synthesis().analysis;
         assert_eq!(field_text(&plain, CellRef::new(BlockKind::Reactants, 1, 4)), "");
-        assert_eq!(field_text(&plain, CellRef::new(BlockKind::Reactants, 0, 4)), "1.00g");
+        assert_eq!(field_text(&plain, CellRef::new(BlockKind::Reactants, 0, 4)), "1g");
     }
 
     // ── Editing recomputes ──────────────────────────────────────────────────
@@ -1657,6 +1776,34 @@ mod tests {
 
         editor.click(Hit::Cell(CellRef::new(BlockKind::Reactants, 2, 2)), &mut reaction);
         assert_eq!(reaction.analysis.limiting(), None, "clicking it again clears it");
+    }
+
+    /// Clearing the declaration on phenol lets the fallback pick phenol again. The cell must
+    /// still show that the click did something: the declared bold-italic "Yes" becomes an
+    /// inferred regular "Yes", matching the "No" that the entered state now holds.
+    #[test]
+    fn clearing_a_declared_limiting_reagent_shows_the_inferred_one() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let mut editor = ReactionEditor::new();
+        let cell = CellRef::new(BlockKind::Reactants, 0, 2);
+        let limiting_cell = |reaction: &Reaction| {
+            AnalysisTable::from_result(&reaction.analysis.compute()).blocks[0].columns[0][2].clone()
+        };
+
+        let before = limiting_cell(&reaction);
+        assert_eq!((before.plain(), before.is_entered()), ("Yes".to_string(), true));
+        assert_eq!(field_text(&reaction.analysis, cell), "Yes");
+
+        editor.click(Hit::Cell(cell), &mut reaction);
+        assert_eq!(reaction.analysis.limiting(), None);
+        let after = limiting_cell(&reaction);
+        assert_eq!((after.plain(), after.is_entered()), ("Yes".to_string(), false));
+        assert_eq!(field_text(&reaction.analysis, cell), "No");
+
+        // Clicking the inferred "Yes" declares it again.
+        editor.click(Hit::Cell(cell), &mut reaction);
+        assert_eq!(reaction.analysis.limiting(), Some(0));
+        assert!(limiting_cell(&reaction).is_entered());
     }
 
     /// Deleting the limiting reagent leaves the reaction without one; the derived amounts go
@@ -2059,10 +2206,10 @@ mod tests {
         set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, demo::phenol());
 
         // Swap above <-> below with the same primitives `drop_into_arrow_slot` uses.
-        let src = scheme_arrow_structure(&scheme, 0, SchemePart::ArrowAbove).cloned().unwrap();
+        let src = take_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove).unwrap();
         let displaced = take_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow);
-        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, src);
-        set_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, displaced.unwrap());
+        place_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowBelow, src);
+        place_scheme_arrow_structure(&mut scheme, 0, SchemePart::ArrowAbove, displaced.unwrap());
 
         assert_eq!(
             MolecularFormula::of(scheme_arrow_structure(&scheme, 0, SchemePart::ArrowAbove).unwrap())
@@ -2167,6 +2314,193 @@ mod tests {
         assert_eq!(a.reactants[1].formula.plain(), "C6H6O", "phenol now over the arrow, column 1");
     }
 
+    // ── Structure ids travel with their structure ───────────────────────────
+
+    use crate::reaction::StructureId;
+    const ABOVE: SchemePart = SchemePart::ArrowAbove;
+    const BELOW: SchemePart = SchemePart::ArrowBelow;
+
+    /// Where the structure with `id` sits: a main-line item (`part: Structure`) or an arrow band.
+    fn find_scheme_structure(
+        scheme: &ReactionScheme,
+        id: StructureId,
+    ) -> Option<Hit> {
+        scheme.items.iter().enumerate().find_map(|(index, item)| match item {
+            SchemeItem::Structure(s) if s.id() == id => {
+                Some(Hit::Scheme { index, part: SchemePart::Structure })
+            }
+            SchemeItem::Arrow(a) => [(ABOVE, &a.above), (BELOW, &a.below)]
+                .into_iter()
+                .find(|(_, l)| matches!(l, ArrowLabel::Structure(s) if s.id() == id))
+                .map(|(part, _)| Hit::Scheme { index, part }),
+            _ => None,
+        })
+    }
+
+    fn on_line(index: usize) -> Option<Hit> {
+        Some(Hit::Scheme { index, part: SchemePart::Structure })
+    }
+
+    fn on_band(index: usize, part: SchemePart) -> Option<Hit> {
+        Some(Hit::Scheme { index, part })
+    }
+
+    fn line_id(scheme: &ReactionScheme, index: usize) -> StructureId {
+        match &scheme.items[index] {
+            SchemeItem::Structure(s) => s.id(),
+            other => panic!("item {index} is not a structure: {other:?}"),
+        }
+    }
+
+    fn slot_id(scheme: &ReactionScheme, index: usize, part: SchemePart) -> StructureId {
+        match arrow_label(scheme, index, part) {
+            Some(ArrowLabel::Structure(s)) => s.id(),
+            other => panic!("({index}, {part:?}) holds no structure: {other:?}"),
+        }
+    }
+
+    /// [Structure(phenol), Arrow(above = biphenyl, below = benzene), Structure(anisole)]
+    fn id_scheme() -> ReactionScheme {
+        ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(
+                Arrow::new()
+                    .above_structure(demo::biphenyl())
+                    .below_structure(demo::benzene()),
+            )
+            .structure(demo::anisole())
+    }
+
+    #[test]
+    fn ids_follow_a_reorder_along_the_line() {
+        let mut scheme = id_scheme();
+        let (phenol, anisole) = (line_id(&scheme, 0), line_id(&scheme, 2));
+        assert_eq!(scheme.move_item(2, -2), Some(0));
+        assert_eq!(find_scheme_structure(&scheme, anisole), on_line(0));
+        assert_eq!(find_scheme_structure(&scheme, phenol), on_line(1));
+    }
+
+    #[test]
+    fn ids_follow_a_line_structure_onto_an_empty_slot() {
+        let mut scheme = id_scheme();
+        let anisole = line_id(&scheme, 2);
+        take_scheme_arrow_structure(&mut scheme, 1, ABOVE);
+        assert_eq!(move_line_structure_to_arrow_slot(&mut scheme, 2, 1, ABOVE), Some(1));
+        assert_eq!(find_scheme_structure(&scheme, anisole), on_band(1, ABOVE));
+        assert!(scheme_arrow_structure(&scheme, 1, ABOVE).unwrap() == &demo::anisole());
+    }
+
+    /// A target that is not an arrow band is refused before the structure leaves the line, so
+    /// it is never lost.
+    #[test]
+    fn a_line_structure_is_not_lost_on_a_non_band_target() {
+        let mut scheme = id_scheme();
+        let phenol = line_id(&scheme, 0);
+        assert_eq!(move_line_structure_to_arrow_slot(&mut scheme, 0, 1, SchemePart::Text), None);
+        assert_eq!(find_scheme_structure(&scheme, phenol), on_line(0));
+        assert_eq!(scheme.items.len(), 3);
+    }
+
+    #[test]
+    fn ids_follow_a_line_slot_swap() {
+        let mut scheme = id_scheme();
+        let (phenol, biphenyl) = (line_id(&scheme, 0), slot_id(&scheme, 1, ABOVE));
+        assert!(swap_line_structure_with_arrow_slot(&mut scheme, 0, 1, ABOVE));
+        assert_eq!(find_scheme_structure(&scheme, phenol), on_band(1, ABOVE));
+        assert_eq!(find_scheme_structure(&scheme, biphenyl), on_line(0));
+    }
+
+    #[test]
+    fn ids_follow_an_arrow_structure_back_onto_the_line() {
+        let mut scheme = id_scheme();
+        let benzene = slot_id(&scheme, 1, BELOW);
+        assert_eq!(move_arrow_structure_to_line(&mut scheme, 1, BELOW, 3), Some(3));
+        assert_eq!(find_scheme_structure(&scheme, benzene), on_line(3));
+        // `take` hands the structure back with its id.
+        let biphenyl = slot_id(&scheme, 1, ABOVE);
+        let taken = take_scheme_arrow_structure(&mut scheme, 1, ABOVE).unwrap();
+        assert_eq!(taken.id(), biphenyl);
+        assert!(place_scheme_arrow_structure(&mut scheme, 1, BELOW, taken));
+        assert_eq!(find_scheme_structure(&scheme, biphenyl), on_band(1, BELOW));
+    }
+
+    /// Slot to slot through the drag handler: a swap of two occupied bands, then a move onto an
+    /// empty one.
+    #[test]
+    fn ids_follow_a_slot_to_slot_drop() {
+        let mut reaction = Reaction::new(id_scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let above = slot_id(&reaction.scheme, 1, ABOVE);
+        let below = slot_id(&reaction.scheme, 1, BELOW);
+        let source = DragSource::ArrowLabel { index: 1, part: ABOVE };
+
+        editor.drop_into_arrow_slot(&mut reaction, source, 1, BELOW);
+        assert_eq!(find_scheme_structure(&reaction.scheme, above), on_band(1, BELOW));
+        assert_eq!(find_scheme_structure(&reaction.scheme, below), on_band(1, ABOVE));
+
+        // Empty the above band, then drop the below structure onto it.
+        let taken = take_scheme_arrow_structure(&mut reaction.scheme, 1, ABOVE).unwrap();
+        assert_eq!(taken.id(), below);
+        let source = DragSource::ArrowLabel { index: 1, part: BELOW };
+        editor.drop_into_arrow_slot(&mut reaction, source, 1, ABOVE);
+        assert_eq!(find_scheme_structure(&reaction.scheme, above), on_band(1, ABOVE));
+        assert!(arrow_label(&reaction.scheme, 1, BELOW).unwrap().is_empty());
+
+        // A target that is not a band leaves the source where it was.
+        let source = DragSource::ArrowLabel { index: 1, part: ABOVE };
+        editor.drop_into_arrow_slot(&mut reaction, source, 0, BELOW);
+        assert_eq!(find_scheme_structure(&reaction.scheme, above), on_band(1, ABOVE));
+    }
+
+    /// The drag handler's line-to-slot paths keep ids too (move onto an empty band, swap with an
+    /// occupied one).
+    #[test]
+    fn ids_follow_a_line_to_slot_drop() {
+        let mut reaction = Reaction::new(id_scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let phenol = line_id(&reaction.scheme, 0);
+        let biphenyl = slot_id(&reaction.scheme, 1, ABOVE);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(0), 1, ABOVE);
+        assert_eq!(find_scheme_structure(&reaction.scheme, phenol), on_band(1, ABOVE));
+        assert_eq!(find_scheme_structure(&reaction.scheme, biphenyl), on_line(0));
+
+        take_scheme_arrow_structure(&mut reaction.scheme, 1, BELOW);
+        let anisole = line_id(&reaction.scheme, 2);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(2), 1, BELOW);
+        assert_eq!(find_scheme_structure(&reaction.scheme, anisole), on_band(1, BELOW));
+    }
+
+    /// Redrawing a structure (the canvas edit, or Replace) is an edit of the same structure: its
+    /// id stays. A band that held text or nothing gets a new structure with a fresh id.
+    #[test]
+    fn replacing_a_structure_keeps_its_id() {
+        let mut reaction = Reaction::new(id_scheme(), Analysis::new());
+        let phenol = line_id(&reaction.scheme, 0);
+        assert!(reaction.set_scheme_structure(0, demo::anisole()));
+        assert_eq!(line_id(&reaction.scheme, 0), phenol);
+        assert!(matches!(&reaction.scheme.items[0], SchemeItem::Structure(s) if *s == demo::anisole()));
+
+        let biphenyl = slot_id(&reaction.scheme, 1, ABOVE);
+        assert!(reaction.set_scheme_arrow_structure(1, ABOVE, demo::phenol()));
+        assert_eq!(slot_id(&reaction.scheme, 1, ABOVE), biphenyl);
+        assert!(scheme_arrow_structure(&reaction.scheme, 1, ABOVE).unwrap() == &demo::phenol());
+
+        // An empty band gets a brand-new structure.
+        take_scheme_arrow_structure(&mut reaction.scheme, 1, BELOW);
+        assert!(set_scheme_arrow_structure(&mut reaction.scheme, 1, BELOW, demo::benzene()));
+        let fresh = slot_id(&reaction.scheme, 1, BELOW);
+        assert_ne!(fresh, biphenyl);
+        assert_ne!(fresh, phenol);
+    }
+
+    #[test]
+    fn adding_the_same_molecule_twice_gives_two_ids() {
+        let mut scheme = ReactionScheme::new();
+        let a = scheme.add(SchemeItem::Structure(demo::phenol().into()));
+        let b = scheme.add(SchemeItem::Structure(demo::phenol().into()));
+        assert_ne!(line_id(&scheme, a), line_id(&scheme, b));
+    }
+
     // ── The widget ──────────────────────────────────────────────────────────
 
     /// The whole edit cycle without a window: open a box on a cell, type, commit — and the
@@ -2178,7 +2512,7 @@ mod tests {
         let cell = CellRef::new(BlockKind::Products, 0, 6); // Measured Mass
 
         assert!(editor.begin_edit(EditTarget::Cell(cell), &reaction));
-        assert_eq!(editor.editing().map(|(_, t)| t), Some("700.00mg"));
+        assert_eq!(editor.editing().map(|(_, t)| t), Some("0.7g"));
 
         editor.set_edit_text("1.00g");
         editor.commit_edit(&mut reaction).unwrap();
@@ -2201,6 +2535,57 @@ mod tests {
         assert!(!editor.begin_edit(EditTarget::Cell(CellRef::new(BlockKind::Products, 0, 10)), &reaction));
         assert!(!editor.begin_edit(EditTarget::Cell(CellRef::new(BlockKind::Reactants, 0, 2)), &reaction));
         assert!(!editor.begin_edit(EditTarget::SchemeText { index: 0, part: SchemePart::Structure }, &reaction));
+    }
+
+    /// Opening a box on an entered cell and committing it untouched writes back exactly the
+    /// value that was there — the table rounds to two decimals, the entry must not.
+    #[test]
+    fn an_untouched_box_leaves_the_entry_exactly_as_it_was() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        reaction.analysis.reactants[0].equivalents = Some(0.004);
+        reaction.analysis.reactants[0].sample_mass = Some(Mass::grams(1.2345));
+        reaction.analysis.reactants[0].molarity = Some(0.004);
+        reaction.analysis.reactants[0].density = Some(0.789);
+        reaction.analysis.reactants[0].volume = Some(0.125);
+        reaction.analysis.reactants[0].percent_weight = Some(99.995);
+        reaction.analysis.products[0].equivalents = Some(1.125);
+        reaction.analysis.products[0].percent_completion = Some(87.125);
+        reaction.analysis.products[0].measured_mass = Some(Mass::grams(0.7));
+        reaction.analysis.products[0].purity = Some(1.0 / 3.0);
+        let before = reaction.analysis.clone();
+
+        let mut editor = ReactionEditor::new();
+        for (block, row) in [
+            (BlockKind::Reactants, 3),
+            (BlockKind::Reactants, 4),
+            (BlockKind::Reactants, 5),
+            (BlockKind::Reactants, 6),
+            (BlockKind::Reactants, 7),
+            (BlockKind::Reactants, 8),
+            (BlockKind::Products, 2),
+            (BlockKind::Products, 3),
+            (BlockKind::Products, 6),
+            (BlockKind::Products, 7),
+        ] {
+            let cell = CellRef::new(block, 0, row);
+            assert!(editor.begin_edit(EditTarget::Cell(cell), &reaction));
+            editor
+                .commit_edit(&mut reaction)
+                .unwrap_or_else(|e| panic!("{block:?} row {row}: untouched box rejected: {e}"));
+        }
+        assert_eq!(reaction.analysis.reactants[0].equivalents, before.reactants[0].equivalents);
+        assert_eq!(reaction.analysis.reactants[0].sample_mass, before.reactants[0].sample_mass);
+        assert_eq!(reaction.analysis.reactants[0].percent_weight, before.reactants[0].percent_weight);
+        assert_eq!(reaction.analysis.reactants[0].molarity, before.reactants[0].molarity);
+        assert_eq!(reaction.analysis.reactants[0].density, before.reactants[0].density);
+        assert_eq!(reaction.analysis.reactants[0].volume, before.reactants[0].volume);
+        assert_eq!(reaction.analysis.products[0].equivalents, before.products[0].equivalents);
+        assert_eq!(
+            reaction.analysis.products[0].percent_completion,
+            before.products[0].percent_completion
+        );
+        assert_eq!(reaction.analysis.products[0].measured_mass, before.products[0].measured_mass);
+        assert_eq!(reaction.analysis.products[0].purity, before.products[0].purity);
     }
 
     /// A rejected value keeps the box open with the offending text, so nothing is lost and
@@ -2319,7 +2704,7 @@ mod tests {
         assert_eq!(editor.selection(), Some(Hit::Cell(cell)));
         assert_eq!(
             editor.editing().map(|(t, text)| (t, text.to_string())),
-            Some((EditTarget::Cell(cell), "1.10".to_string())),
+            Some((EditTarget::Cell(cell), "1.1".to_string())),
             "clicking Equivalents opens it seeded with what is entered there"
         );
 
@@ -2334,6 +2719,428 @@ mod tests {
         );
         assert_eq!(editor.selection(), Some(Hit::Cell(moles)));
         assert!(editor.editing().is_none(), "Reactant Moles is computed");
+    }
+
+    /// Through the widget, with a real pointer: a drag that reorders the scheme is reported to
+    /// the host exactly once, so a host holding a positional [`StructureRef`] (e.g. a canvas
+    /// link) can tell its index went stale. A plain click reports nothing.
+    #[test]
+    fn a_drag_reorder_is_reported_to_the_host() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
+        let last = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+        let (phenol, anisole) = (line_id(&reaction.scheme, 0), line_id(&reaction.scheme, 2));
+
+        // A click on a structure selects it but leaves the scheme as it was.
+        let start = last.center();
+        frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start)]);
+        frame(&ctx, &mut editor, &mut reaction, vec![button(start, true), button(start, false)]);
+        assert!(!editor.take_scheme_rearranged(), "a click does not rearrange the scheme");
+
+        // Drag the product (anisole) to the far left, ahead of phenol.
+        let end = Pos2::new(first.min.x + 2.0, first.center().y);
+        // egui picks the item up at wherever the pointer is when it first crosses the drag
+        // threshold, so nudge it off the press point while still over the product.
+        let nudge = start + Vec2::new(-12.0, 0.0);
+        frame(&ctx, &mut editor, &mut reaction, vec![button(start, true)]);
+        frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(nudge)]);
+        frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(end)]);
+        assert!(editor.is_dragging(), "the press-and-move picked the product up");
+        frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+
+        assert!(!editor.is_dragging());
+        assert!(
+            matches!(&reaction.scheme.items[0], SchemeItem::Structure(m) if *m == demo::anisole()),
+            "the drag moved anisole to the front"
+        );
+        // Each structure took its id along.
+        assert_eq!(line_id(&reaction.scheme, 0), anisole);
+        assert_eq!(find_scheme_structure(&reaction.scheme, phenol), on_line(1));
+        assert!(editor.take_scheme_rearranged(), "the reorder is reported");
+        assert!(!editor.take_scheme_rearranged(), "and only once");
+    }
+
+    /// Through the widget, with a real pointer: only a dragged *structure* is offered an arrow
+    /// slot. A `+` (or the arrow itself, picked up by one of its own empty bands) passing over a
+    /// band is still a reorder — no slot is targeted, and letting go moves it along the line.
+    /// A structure over the same band still targets it and lands there.
+    #[test]
+    fn only_a_dragged_structure_targets_an_arrow_slot() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        /// Press at `start`, cross the drag threshold at `nudge`, move to `end`, and return
+        /// the slot the drag is targeting there (before letting go).
+        fn drag_to(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            start: Pos2,
+            nudge: Pos2,
+            end: Pos2,
+        ) -> Option<(usize, SchemePart)> {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(ctx, editor, reaction, vec![button(start, true)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(nudge)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the item up");
+            editor.drag.and_then(|d| d.to_slot)
+        }
+        let scheme = || {
+            ReactionScheme::new()
+                .structure(demo::phenol())
+                .plus()
+                .structure(demo::benzene())
+                .arrow(Arrow::new())
+                .structure(demo::anisole())
+        };
+
+        // A `+` dragged over the arrow's empty above band: no slot, and the drop reorders.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let plus = scheme_item_rect(&layout, origin, 1, SchemePart::Plus).unwrap();
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        // Just right of the arrow's centre, so four items sit left of the pointer.
+        let end = band.center() + Vec2::new(4.0, 0.0);
+        assert_eq!(scheme_drop_index(&layout, origin, end), 4);
+        let start = plus.left_center() + Vec2::new(1.0, 0.0);
+        let nudge = plus.right_center() - Vec2::new(1.0, 0.0);
+        let to_slot = drag_to(&ctx, &mut editor, &mut reaction, start, nudge, end);
+        assert_eq!(to_slot, None, "a `+` is not offered the arrow slot");
+        frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+        assert!(!editor.is_dragging());
+        assert!(
+            matches!(reaction.scheme.items[3], SchemeItem::Plus),
+            "the `+` reordered to just after the arrow"
+        );
+        let SchemeItem::Arrow(a) = &reaction.scheme.items[2] else { panic!("item 2 is the arrow") };
+        assert!(a.above.is_empty(), "the band was left alone");
+        assert!(editor.take_scheme_rearranged(), "the reorder is reported");
+
+        // The arrow itself, picked up by its own empty above band and held there: its own band
+        // is not a drop target, and letting go in place moves nothing.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        let start = band.center() - Vec2::new(10.0, 0.0);
+        let end = band.center() - Vec2::new(1.0, 0.0);
+        let to_slot = drag_to(&ctx, &mut editor, &mut reaction, start, end, end);
+        assert_eq!(to_slot, None, "the arrow is not offered its own band");
+        frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+        assert_eq!(reaction.scheme.items.len(), 5);
+        assert!(matches!(reaction.scheme.items[1], SchemeItem::Plus), "nothing moved");
+        let SchemeItem::Arrow(a) = &reaction.scheme.items[3] else { panic!("item 3 is the arrow") };
+        assert!(a.above.is_empty() && a.below.is_empty(), "the bands were left alone");
+        assert!(!editor.take_scheme_rearranged(), "dropped back in place");
+
+        // A structure over the same band still targets it, and lands on it.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let benzene = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        let start = benzene.center();
+        let to_slot = drag_to(
+            &ctx,
+            &mut editor,
+            &mut reaction,
+            start,
+            start + Vec2::new(12.0, 0.0),
+            band.center(),
+        );
+        assert_eq!(to_slot, Some((3, SchemePart::ArrowAbove)));
+        frame(&ctx, &mut editor, &mut reaction, vec![button(band.center(), false)]);
+        assert!(
+            scheme_arrow_structure(&reaction.scheme, 2, SchemePart::ArrowAbove)
+                .is_some_and(|m| *m == demo::benzene()),
+            "benzene now rides above the arrow"
+        );
+        assert!(editor.take_scheme_rearranged());
+    }
+
+    /// Through the widget, with a real pointer: after a drag reorders a scheme item, the
+    /// selection names the landed item with the part [`hit_test`] gives that kind of item — a
+    /// `+` is selected as `Plus`, a text item as `Text`, an arrow as its above band — not as a
+    /// `Structure`, which would turn on the host's structure-only actions for a non-structure.
+    #[test]
+    fn a_drag_reorder_selects_the_landed_item_by_its_kind() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        /// Press at `start`, cross the drag threshold at `nudge`, let go at `end`.
+        fn drag(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            start: Pos2,
+            nudge: Pos2,
+            end: Pos2,
+        ) {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(ctx, editor, reaction, vec![button(start, true)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(nudge)]);
+            frame(ctx, editor, reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the item up");
+            frame(ctx, editor, reaction, vec![button(end, false)]);
+            assert!(!editor.is_dragging());
+        }
+        // phenol + benzene → anisole  heat
+        let scheme = || {
+            ReactionScheme::new()
+                .structure(demo::phenol())
+                .plus()
+                .structure(demo::benzene())
+                .arrow(Arrow::new())
+                .structure(demo::anisole())
+                .text("heat")
+        };
+
+        // The `+` dragged to the front of the line.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
+        let front = Pos2::new(first.min.x + 2.0, first.center().y);
+        let plus = scheme_item_rect(&layout, origin, 1, SchemePart::Plus).unwrap();
+        let start = plus.right_center() - Vec2::new(1.0, 0.0);
+        let nudge = plus.left_center() + Vec2::new(1.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(matches!(reaction.scheme.items[0], SchemeItem::Plus), "the `+` moved to the front");
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 0, part: SchemePart::Plus }));
+
+        // The text item dragged to the front of the line.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let text = scheme_item_rect(&layout, origin, 5, SchemePart::Text).unwrap();
+        let start = text.right_center() - Vec2::new(1.0, 0.0);
+        let nudge = text.left_center() + Vec2::new(1.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(
+            matches!(reaction.scheme.items[0], SchemeItem::Text(_)),
+            "the text moved to the front"
+        );
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 0, part: SchemePart::Text }));
+
+        // The arrow, picked up by its empty above band, dragged to the front of the line.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let band = scheme_item_rect(&layout, origin, 3, SchemePart::ArrowAbove).unwrap();
+        let start = band.center();
+        let nudge = start - Vec2::new(12.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(
+            matches!(reaction.scheme.items[0], SchemeItem::Arrow(_)),
+            "the arrow moved to the front"
+        );
+        assert_eq!(
+            editor.selection(),
+            Some(Hit::Scheme { index: 0, part: SchemePart::ArrowAbove })
+        );
+        // Nothing structure-only acts on it.
+        assert_eq!(editor.cleanup_selected_structure(&mut reaction), None);
+
+        // A structure still lands selected as a structure.
+        let mut reaction = Reaction::new(scheme(), Analysis::new());
+        let mut editor = ReactionEditor::new();
+        let ctx = egui::Context::default();
+        let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+        let anisole = scheme_item_rect(&layout, origin, 4, SchemePart::Structure).unwrap();
+        let start = anisole.center();
+        let nudge = start - Vec2::new(12.0, 0.0);
+        drag(&ctx, &mut editor, &mut reaction, start, nudge, front);
+        assert!(
+            matches!(&reaction.scheme.items[0], SchemeItem::Structure(m) if *m == demo::anisole()),
+            "anisole moved to the front"
+        );
+        assert_eq!(editor.selection(), Some(Hit::Scheme { index: 0, part: SchemePart::Structure }));
+    }
+
+    /// Through the widget, with a real pointer and keyboard: picking up a scheme item while the
+    /// edit box is open leaves the box the same way clicking away does — what was typed is
+    /// committed (a bad value is dropped with its message kept), the box closes and hands the
+    /// keyboard back. Nothing typed is silently thrown away.
+    #[test]
+    fn dragging_a_scheme_item_commits_the_open_box() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+
+        /// On a fresh demo reaction: click `cell`, type `typed` into the box that opens, then
+        /// drag the product to the front of the line.
+        fn type_then_drag(cell: CellRef, typed: &str) -> (Reaction, ReactionEditor, egui::Context) {
+            let mut reaction = demo::williamson_ether_synthesis();
+            let mut editor = ReactionEditor::new();
+            let ctx = egui::Context::default();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+
+            let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+            let at = cell_rect(&layout, origin, cell).unwrap().center();
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(at)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![button(at, true), button(at, false)]);
+            assert_eq!(editor.editing().map(|(t, _)| t), Some(EditTarget::Cell(cell)));
+            // A frame for the box to take focus (and select its seeded text), then type over it.
+            frame(&ctx, &mut editor, &mut reaction, Vec::new());
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::Text(typed.to_string())]);
+            assert_eq!(editor.editing().map(|(_, t)| t), Some(typed), "the typing landed");
+            assert!(ctx.memory(|m| m.focused()).is_some(), "the box has the keyboard");
+
+            let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
+            let last = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+            let start = last.center();
+            let nudge = start + Vec2::new(-12.0, 0.0);
+            let end = Pos2::new(first.min.x + 2.0, first.center().y);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![button(start, true)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(nudge)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the product up");
+            frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+            assert!(!editor.is_dragging());
+            assert!(editor.take_scheme_rearranged(), "the drag reordered the line");
+            (reaction, editor, ctx)
+        }
+
+        // A good value is written, exactly as clicking away would write it.
+        //
+        // G-005 (I-070): the dragged anisole crosses the arrow, so its column turns into a
+        // reactant and takes the front; phenol's column — the one typed into — is reactant 1
+        // after the drag (this used to read reactant 0, when a column kept its kind).
+        let sample_mass = CellRef::new(BlockKind::Reactants, 0, 4);
+        let (reaction, editor, ctx) = type_then_drag(sample_mass, "2.5g");
+        assert_eq!(
+            reaction.analysis.reactants[1].sample_mass.map(Mass::as_grams),
+            Some(2.5),
+            "the typed Sample Mass reached the analysis"
+        );
+        assert!(editor.editing().is_none(), "the box closed");
+        assert_eq!(editor.error(), None);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "the box handed the keyboard back");
+
+        // A value that does not parse closes the box too, leaving the old value and saying why.
+        let (reaction, editor, ctx) = type_then_drag(sample_mass, "two grams");
+        assert_eq!(reaction.analysis.reactants[1].sample_mass.map(Mass::as_grams), Some(1.0));
+        assert!(editor.editing().is_none(), "a drag never leaves the box open behind it");
+        assert_eq!(editor.error(), Some("not a number"));
+        assert_eq!(ctx.memory(|m| m.focused()), None);
     }
 
     /// Through the widget: the interactive path allocates and paints exactly what the plain
@@ -2379,5 +3186,306 @@ mod tests {
             texts(&edited),
             "an idle editor must draw exactly the plain figure"
         );
+    }
+
+    // ── Entered values stay with their compound through every move ──────────
+    //
+    // Each compound below carries values of its own, so a column that ends up beside the wrong
+    // structure (or a column left in place while its structure moved) shows up as a mismatch
+    // between the column's name, its molecule, its values and the structure its id points at.
+    // None of these moves crosses the arrow: every reactant stays a reactant.
+
+    /// One reactant column as it was entered, keyed by its name.
+    struct Entered {
+        name: &'static str,
+        molecule: fn() -> Molecule,
+        limiting: bool,
+        sample_mass: Option<f64>,
+        equivalents: Option<f64>,
+        /// Whether a scheme structure draws it (K₂CO₃ is only a table column).
+        drawn: bool,
+    }
+
+    const ENTERED: [Entered; 5] = [
+        Entered {
+            name: "phenol",
+            molecule: demo::phenol,
+            limiting: true,
+            sample_mass: Some(1.0),
+            equivalents: None,
+            drawn: true,
+        },
+        Entered {
+            name: "benzene",
+            molecule: demo::benzene,
+            limiting: false,
+            sample_mass: Some(3.0),
+            equivalents: Some(2.0),
+            drawn: true,
+        },
+        Entered {
+            name: "biphenyl",
+            molecule: demo::biphenyl,
+            limiting: false,
+            sample_mass: None,
+            equivalents: Some(0.1),
+            drawn: true,
+        },
+        Entered {
+            name: "MeI",
+            molecule: demo::methyl_iodide,
+            limiting: false,
+            sample_mass: None,
+            equivalents: Some(1.5),
+            drawn: true,
+        },
+        Entered {
+            name: "K2CO3",
+            molecule: demo::potassium_carbonate,
+            limiting: false,
+            sample_mass: None,
+            equivalents: Some(3.0),
+            drawn: false,
+        },
+    ];
+
+    /// `phenol + benzene →(above: biphenyl, below: MeI or nothing) anisole`, with a column for
+    /// each structure (linked by [`Reaction::new`]) plus an undrawn K₂CO₃ column at the end.
+    fn valued_reaction(mei_below: bool) -> Reaction {
+        let mut arrow = Arrow::new().above_structure(demo::biphenyl());
+        if mei_below {
+            arrow = arrow.below_structure(demo::methyl_iodide());
+        }
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::benzene())
+            .arrow(arrow)
+            .structure(demo::anisole());
+        let mut analysis = Analysis::new();
+        for e in ENTERED.iter().filter(|e| mei_below || e.name != "MeI") {
+            let mut r = Reactant::new((e.molecule)()).name(e.name);
+            r.limiting = e.limiting;
+            r.sample_mass = e.sample_mass.map(Mass::grams);
+            r.equivalents = e.equivalents;
+            analysis.add_reactant(r);
+        }
+        analysis.add_product(
+            Product::new(demo::anisole()).name("anisole").measured_mass(Mass::grams(0.7)),
+        );
+        Reaction::new(scheme, analysis)
+    }
+
+    /// The molecule the scheme draws for `id`, on the line or on an arrow band.
+    fn drawn_molecule(scheme: &ReactionScheme, id: StructureId) -> Option<&Molecule> {
+        match find_scheme_structure(scheme, id)? {
+            Hit::Scheme { index, part: SchemePart::Structure } => match &scheme.items[index] {
+                SchemeItem::Structure(s) => Some(s.molecule()),
+                _ => None,
+            },
+            Hit::Scheme { index, part } => scheme_arrow_structure(scheme, index, part),
+            Hit::Cell(_) => None,
+        }
+    }
+
+    /// The reactant columns read `order` (by name), and every column still holds its own
+    /// compound's molecule and entered values, linked to the structure that draws it.
+    fn assert_values_follow(reaction: &Reaction, order: &[&str]) {
+        let names: Vec<_> =
+            reaction.analysis.reactants.iter().map(|r| r.name.as_deref().unwrap_or("?")).collect();
+        assert_eq!(names, order, "the reactant columns are in scheme order");
+        for r in &reaction.analysis.reactants {
+            let name = r.name.as_deref().unwrap();
+            let e = ENTERED.iter().find(|e| e.name == name).unwrap();
+            assert!(r.molecule == (e.molecule)(), "{name}: the column kept its molecule");
+            assert_eq!(r.limiting, e.limiting, "{name}: limiting stayed with the compound");
+            assert_eq!(
+                r.sample_mass.map(Mass::as_grams),
+                e.sample_mass,
+                "{name}: sample mass stayed with the compound"
+            );
+            assert_eq!(r.equivalents, e.equivalents, "{name}: equivalents stayed with the compound");
+            match r.structure {
+                Some(id) => {
+                    assert!(e.drawn, "{name}: an undrawn column was never linked");
+                    assert!(
+                        drawn_molecule(&reaction.scheme, id) == Some(&r.molecule),
+                        "{name}: the column is linked to the structure that draws it"
+                    );
+                }
+                None => assert!(!e.drawn, "{name}: the column lost its structure"),
+            }
+        }
+        let [p] = reaction.analysis.products.as_slice() else { panic!("one product column") };
+        assert_eq!(p.name.as_deref(), Some("anisole"));
+        assert!(p.molecule == demo::anisole());
+        assert_eq!(p.measured_mass.map(Mass::as_grams), Some(0.7));
+        let id = p.structure.expect("the product stays linked");
+        assert!(drawn_molecule(&reaction.scheme, id) == Some(&demo::anisole()));
+    }
+
+    /// The fixture itself: [`Reaction::new`] links by position, in scheme order.
+    #[test]
+    fn valued_reaction_starts_linked_in_scheme_order() {
+        assert_values_follow(
+            &valued_reaction(true),
+            &["phenol", "benzene", "biphenyl", "MeI", "K2CO3"],
+        );
+        assert_values_follow(&valued_reaction(false), &["phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    /// The edit-layer moves, followed by the resync the widget does after each of them.
+    #[test]
+    fn values_follow_their_compound_through_the_edit_layer_moves() {
+        // Along the line: benzene to the front.
+        let mut reaction = valued_reaction(true);
+        assert_eq!(reaction.scheme.move_item(2, -2), Some(0));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["benzene", "phenol", "biphenyl", "MeI", "K2CO3"]);
+
+        // Line → empty slot: phenol onto the empty below band (the arrow shifts to index 2).
+        let mut reaction = valued_reaction(false);
+        assert_eq!(move_line_structure_to_arrow_slot(&mut reaction.scheme, 0, 3, BELOW), Some(2));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["benzene", "biphenyl", "phenol", "K2CO3"]);
+
+        // Line ↔ occupied slot: phenol and biphenyl trade places.
+        let mut reaction = valued_reaction(true);
+        assert!(swap_line_structure_with_arrow_slot(&mut reaction.scheme, 0, 3, ABOVE));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["biphenyl", "benzene", "phenol", "MeI", "K2CO3"]);
+
+        // Slot → line: MeI to the front of the line.
+        let mut reaction = valued_reaction(true);
+        assert_eq!(move_arrow_structure_to_line(&mut reaction.scheme, 3, BELOW, 0), Some(0));
+        reaction.sync_structures_from_scheme();
+        assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    /// The drop handler's own paths: line onto an empty slot, line swapped with an occupied
+    /// slot, slot swapped with slot, slot onto an empty slot, and slot back onto the line.
+    #[test]
+    fn values_follow_their_compound_through_drop_into_arrow_slot() {
+        let mut editor = ReactionEditor::new();
+
+        let mut reaction = valued_reaction(false);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(0), 3, BELOW);
+        assert_values_follow(&reaction, &["benzene", "biphenyl", "phenol", "K2CO3"]);
+
+        let mut reaction = valued_reaction(true);
+        editor.drop_into_arrow_slot(&mut reaction, DragSource::Item(2), 3, ABOVE);
+        assert_values_follow(&reaction, &["phenol", "biphenyl", "benzene", "MeI", "K2CO3"]);
+
+        let mut reaction = valued_reaction(true);
+        let above = DragSource::ArrowLabel { index: 3, part: ABOVE };
+        editor.drop_into_arrow_slot(&mut reaction, above, 3, BELOW);
+        assert_values_follow(&reaction, &["phenol", "benzene", "MeI", "biphenyl", "K2CO3"]);
+
+        let mut reaction = valued_reaction(false);
+        editor.drop_into_arrow_slot(&mut reaction, above, 3, BELOW);
+        assert!(arrow_label(&reaction.scheme, 3, ABOVE).unwrap().is_empty());
+        assert_values_follow(&reaction, &["phenol", "benzene", "biphenyl", "K2CO3"]);
+
+        let mut reaction = valued_reaction(true);
+        editor.drop_arrow_structure_onto_line(&mut reaction, 3, BELOW, 0);
+        assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
+    }
+
+    /// Through the widget, with a real pointer: every kind of drag — a reorder along the line,
+    /// a line structure onto an empty or an occupied arrow slot, slot to slot, and slot back
+    /// onto the line — leaves limiting, sample mass and equivalents with the same compound.
+    #[test]
+    fn values_follow_their_compound_through_a_widget_drag() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+        /// On a fresh [`valued_reaction`]: press where `from` says, cross the drag threshold
+        /// `nudge` away, let go where `to` says, and hand back the reaction.
+        fn drag(
+            mei_below: bool,
+            from: impl Fn(&FigureLayout, Pos2) -> Pos2,
+            nudge: Vec2,
+            to: impl Fn(&FigureLayout, Pos2) -> Pos2,
+        ) -> Reaction {
+            let mut reaction = valued_reaction(mei_below);
+            let mut editor = ReactionEditor::new();
+            let ctx = egui::Context::default();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+            let (start, end) = (from(&layout, origin), to(&layout, origin));
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![button(start, true)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start + nudge)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the item up");
+            frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+            assert!(!editor.is_dragging());
+            assert!(editor.take_scheme_rearranged(), "the drag changed the scheme");
+            reaction
+        }
+        let center = |index, part| {
+            move |l: &FigureLayout, o: Pos2| scheme_item_rect(l, o, index, part).unwrap().center()
+        };
+        // The front of the line, over phenol (not over an arrow band).
+        let front = |l: &FigureLayout, o: Pos2| {
+            let first = scheme_item_rect(l, o, 0, SchemePart::Structure).unwrap();
+            Pos2::new(first.min.x + 2.0, first.center().y)
+        };
+        let line_draws = |r: &Reaction, index: usize, m: Molecule| {
+            matches!(&r.scheme.items[index], SchemeItem::Structure(s) if *s == m)
+        };
+        let band_draws = |r: &Reaction, index: usize, part: SchemePart, m: Molecule| {
+            scheme_arrow_structure(&r.scheme, index, part) == Some(&m)
+        };
+        let left = Vec2::new(-12.0, 0.0);
+        let right = Vec2::new(12.0, 0.0);
+
+        // Reorder along the line: benzene to the front.
+        let reaction = drag(true, center(2, SchemePart::Structure), left, front);
+        assert!(line_draws(&reaction, 0, demo::benzene()));
+        assert_values_follow(&reaction, &["benzene", "phenol", "biphenyl", "MeI", "K2CO3"]);
+
+        // Line → empty slot: phenol onto the arrow's empty below band.
+        let reaction = drag(false, center(0, SchemePart::Structure), right, center(3, BELOW));
+        assert!(band_draws(&reaction, 2, BELOW, demo::phenol()));
+        assert_values_follow(&reaction, &["benzene", "biphenyl", "phenol", "K2CO3"]);
+
+        // Line ↔ occupied slot: phenol onto biphenyl's band, biphenyl back onto the line.
+        let reaction = drag(true, center(0, SchemePart::Structure), right, center(3, ABOVE));
+        assert!(band_draws(&reaction, 3, ABOVE, demo::phenol()));
+        assert_values_follow(&reaction, &["biphenyl", "benzene", "phenol", "MeI", "K2CO3"]);
+
+        // Slot ↔ slot: biphenyl (above) dropped on MeI (below); the two trade bands.
+        let reaction = drag(true, center(3, ABOVE), left, center(3, BELOW));
+        assert!(band_draws(&reaction, 3, ABOVE, demo::methyl_iodide()));
+        assert_values_follow(&reaction, &["phenol", "benzene", "MeI", "biphenyl", "K2CO3"]);
+
+        // Slot → line: MeI off its band to the front of the line.
+        let reaction = drag(true, center(3, BELOW), left, front);
+        assert!(line_draws(&reaction, 0, demo::methyl_iodide()));
+        assert_values_follow(&reaction, &["MeI", "phenol", "benzene", "biphenyl", "K2CO3"]);
     }
 }

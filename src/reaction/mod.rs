@@ -52,12 +52,14 @@ pub use edit::{
     CellRef, EditTarget, Field, Hit, ParseError, ReactionEditor, SchemePart, StructureRef, Unit,
     arrow_slot_at, cell_rect, cleanup_scheme_structure, field_at, hit_test,
     move_arrow_structure_to_line, move_line_structure_to_arrow_slot, parse_value,
-    scheme_arrow_structure, scheme_drop_index, scheme_item_rect, set_scheme_arrow_structure,
-    swap_line_structure_with_arrow_slot, take_scheme_arrow_structure,
+    place_scheme_arrow_structure, scheme_arrow_structure, scheme_drop_index, scheme_item_rect,
+    set_scheme_arrow_structure, swap_line_structure_with_arrow_slot, take_scheme_arrow_structure,
 };
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
 pub use model::{Analysis, Mass, Product, Reactant, Reaction, StructureRole};
-pub use scheme::{Arrow, ArrowLabel, ReactionScheme, SchemeItem, SchemeLayout};
+pub use scheme::{
+    Arrow, ArrowLabel, ReactionScheme, SchemeItem, SchemeLayout, SchemeStructure, StructureId,
+};
 pub use stoich::{
     AnalysisResult, Formatted, Origin, ProductAnalysis, Quantity, ReactantAnalysis, format_mass,
     format_moles, format_number, format_percent,

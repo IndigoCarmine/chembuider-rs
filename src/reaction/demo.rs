@@ -144,5 +144,5 @@ pub fn williamson_ether_synthesis() -> crate::reaction::Reaction {
         .reactant(Reactant::new(potassium_carbonate()).equivalents(3.00))
         .product(Product::new(anisole()).measured_mass(Mass::milligrams(700.00)));
 
-    Reaction { scheme, analysis }
+    Reaction::new(scheme, analysis)
 }

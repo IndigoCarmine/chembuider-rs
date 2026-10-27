@@ -11,8 +11,9 @@
 //!
 //! Coordinate model: primitives are in *target pixels*. [`RenderTransform`] maps molecule
 //! coordinates to pixels (`coord_scale`, `offset`) and scales visual sizes — bond widths, label
-//! font size, offsets — by `visual_scale`. The editor passes `coord_scale = zoom * SCALE_FACTOR`,
-//! `visual_scale = zoom`; the exporter passes `coord_scale = SCALE_FACTOR`, `visual_scale = 1`.
+//! font size, offsets — by `visual_scale`. The editor passes `coord_scale` = its zoom times
+//! `SCALE_FACTOR` (see `ViewTransform::render_transform`), `visual_scale = zoom`; the exporter
+//! passes `coord_scale = SCALE_FACTOR`, `visual_scale = 1`.
 //! Both therefore agree exactly at the editor's zoom = 1 baseline.
 
 use std::collections::HashMap;
@@ -22,9 +23,10 @@ use egui::text::LayoutJob;
 use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
+use crate::molecule::lookup::{AtomLookup, MolIndex};
 use crate::molecule::{BondOrder, BondStereo, Molecule};
 
-use super::draw::{atom_label, is_folded_h, should_show_label};
+use crate::molecule::depict::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
 
 // Fixed internal detail (not user-tunable): hash-wedge line count and wavy-bond resolution.
@@ -95,6 +97,49 @@ pub struct MoleculeScene {
     pub label_bg_pad: f32,
 }
 
+impl MoleculeScene {
+    /// Lay out labels, then build the bonds (trimmed at those labels) and ring fills of `mol`
+    /// under `xf`. `layout` is the galley source, as for [`build_labels`].
+    pub fn build(
+        mol: &Molecule,
+        style: &StyleConfig,
+        xf: RenderTransform,
+        layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+    ) -> Self {
+        let labels = build_labels(mol, style, xf, layout);
+        let bonds = build_bonds(mol, style, xf, &labels);
+        let ring_fills = build_ring_fills(mol, xf);
+        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale }
+    }
+
+    /// The pixel rect covering everything drawn: every atom position of `mol` (under `xf`, the
+    /// transform this scene was built with — bare atoms have no primitive of their own), the ring
+    /// fills, bond strokes / wedge fills and label rects. `None` when there is nothing to cover.
+    pub fn bounds(&self, mol: &Molecule, xf: RenderTransform) -> Option<Rect> {
+        let mut r = Rect::NOTHING;
+        for a in &mol.atoms {
+            r.extend_with(xf.apply(a.pos));
+        }
+        for poly in &self.ring_fills {
+            poly.points.iter().for_each(|p| r.extend_with(*p));
+        }
+        for b in &self.bonds {
+            for s in &b.strokes {
+                r.extend_with(s.a);
+                r.extend_with(s.b);
+            }
+            for f in &b.fills {
+                f.iter().for_each(|p| r.extend_with(*p));
+            }
+        }
+        for l in self.labels.values() {
+            r.extend_with(l.rect.min);
+            r.extend_with(l.rect.max);
+        }
+        (r.min.x <= r.max.x && r.min.y <= r.max.y).then_some(r)
+    }
+}
+
 // ─── Label layout ─────────────────────────────────────────────────────────────
 
 /// Lay out every visible atom label. Shared by the bond pass (endpoint trimming), the white
@@ -107,12 +152,13 @@ pub fn build_labels(
     mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
 ) -> HashMap<u32, SceneLabel> {
     let text_style = RichTextStyle::new(style.label_size * xf.visual_scale, Color32::BLACK);
+    let index = MolIndex::new(mol);
     let mut map = HashMap::new();
     for atom in &mol.atoms {
-        if !should_show_label(mol, atom.id) {
+        if !should_show_label(&index, atom.id) {
             continue;
         }
-        let label = atom_label(mol, atom);
+        let label = atom_label(&index, atom);
         let galley = label.rich.layout_with(&text_style, |job| layout(job));
         let anchor = galley
             .char_range_rect(label.anchor_chars)
@@ -130,6 +176,7 @@ pub fn build_labels(
 /// The colored ring-interior polygons of `mol` in target-pixel coordinates. A fill referencing a
 /// removed atom, or with fewer than three vertices, is skipped.
 pub fn build_ring_fills(mol: &Molecule, xf: RenderTransform) -> Vec<ScenePolygon> {
+    let index = MolIndex::new(mol);
     mol.ring_fills
         .iter()
         .filter_map(|rf| {
@@ -138,7 +185,7 @@ pub fn build_ring_fills(mol: &Molecule, xf: RenderTransform) -> Vec<ScenePolygon
             }
             let mut points = Vec::with_capacity(rf.atoms.len());
             for &id in &rf.atoms {
-                points.push(xf.apply(mol.atom_by_id(id)?.pos));
+                points.push(xf.apply(index.atom_by_id(id)?.pos));
             }
             let [r, g, b, a] = rf.color;
             Some(ScenePolygon {
@@ -163,12 +210,13 @@ pub fn build_bonds(
 ) -> Vec<SceneBond> {
     let vs = xf.visual_scale;
     let width = style.bond_width * vs;
+    let index = MolIndex::new(mol);
     let mut out = Vec::new();
     for bond in &mol.bonds {
-        if is_folded_h(mol, bond.begin) || is_folded_h(mol, bond.end) {
+        if folded_h(&index, bond.begin) || folded_h(&index, bond.end) {
             continue;
         }
-        let (Some(a), Some(b)) = (mol.atom_by_id(bond.begin), mol.atom_by_id(bond.end)) else {
+        let (Some(a), Some(b)) = (index.atom_by_id(bond.begin), index.atom_by_id(bond.end)) else {
             continue;
         };
         let p1 = xf.apply(a.pos);
@@ -188,19 +236,19 @@ pub fn build_bonds(
                 let placement = if matches!(bond.order, BondOrder::Double) {
                     let (nx, ny) = perp_normal(p1, p2);
                     let mut neighbors: Vec<Pos2> = Vec::new();
-                    for nid in mol.neighbor_atom_ids(bond.begin) {
+                    for nid in index.neighbor_atom_ids(bond.begin) {
                         if nid == bond.end {
                             continue;
                         }
-                        if let Some(na) = mol.atom_by_id(nid) {
+                        if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
                         }
                     }
-                    for nid in mol.neighbor_atom_ids(bond.end) {
+                    for nid in index.neighbor_atom_ids(bond.end) {
                         if nid == bond.begin {
                             continue;
                         }
-                        if let Some(na) = mol.atom_by_id(nid) {
+                        if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
                         }
                     }
@@ -561,6 +609,36 @@ mod tests {
         assert!((strokes[0].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[1].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[0].width - style.bond_width * 2.0).abs() < 1e-4);
+    }
+
+    /// `bounds` covers the atoms, the bonds and the label rects, follows the transform's offset,
+    /// and is `None` for an empty molecule.
+    #[test]
+    fn scene_bounds_cover_labels_and_follow_offset() {
+        let m = sample();
+        let style = StyleConfig::default();
+        let mut fonts = fonts();
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 2.0 };
+        let scene = MoleculeScene::build(&m, &style, xf, |j| view.layout_job(j));
+        assert!((scene.label_bg_pad - style.label_bg_pad * 2.0).abs() < 1e-6);
+        let b = scene.bounds(&m, xf).expect("non-empty");
+        for a in &m.atoms {
+            assert!(b.contains(xf.apply(a.pos)));
+        }
+        let label = scene.labels.values().next().expect("the O label").rect;
+        assert!(b.contains_rect(label), "label rect {label:?} inside {b:?}");
+        assert!(b.min.x < xf.apply(m.atoms[3].pos).x, "the O label extends past its atom");
+
+        let pan = Vec2::new(30.0, -12.0);
+        let moved = RenderTransform { offset: pan, ..xf };
+        let moved_scene = MoleculeScene::build(&m, &style, moved, |j| view.layout_job(j));
+        let mb = moved_scene.bounds(&m, moved).unwrap();
+        assert!((mb.min - b.min - pan).length() < 1e-3 && (mb.max - b.max - pan).length() < 1e-3);
+
+        let empty = Molecule::default();
+        let es = MoleculeScene::build(&empty, &style, xf, |j| view.layout_job(j));
+        assert!(es.bounds(&empty, xf).is_none());
     }
 
     #[test]

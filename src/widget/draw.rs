@@ -1,8 +1,14 @@
 use super::ChemStructEditor;
-use super::rich_text::RichText;
 use super::scene::{self, RenderTransform};
-use crate::molecule::{max_valence, normal_valence, Molecule};
 use std::collections::HashMap;
+
+// Display rules (label text, folded hydrogens, valence warnings) live in `molecule::depict`;
+// re-exported so the old `widget::draw::*` paths keep compiling.
+pub use crate::molecule::depict::{is_folded_h, is_valence_invalid, AtomLabel};
+// The crate-internal rules are only read by this file's label oracle and tests now; every other
+// caller (CDX, images, scene, formula, label chain) takes them from `molecule::depict` directly.
+#[cfg(test)]
+use crate::molecule::depict::{atom_label, displayed_h_count, h_side, HSide};
 
 // Geometry helpers moved to `scene.rs` (the backend-neutral primitive builder). Re-exported so
 // draw.rs's own unit tests keep reaching them by their old names.
@@ -16,15 +22,20 @@ pub(crate) use scene::{
 /// [`SceneLabel`] so callers (the reaction figure, tests) keep the old type name.
 pub use scene::SceneLabel as AtomLabelLayout;
 
-/// The mapping from editor pan/zoom to the backend-neutral [`RenderTransform`]. Positions scale
-/// by `zoom * SCALE_FACTOR`; visual sizes (widths, font) scale by `zoom` alone — so at zoom = 1
-/// the editor and the image exporter (which uses `SCALE_FACTOR`, `visual_scale = 1`) agree exactly.
+/// The mapping from editor pan/zoom to the backend-neutral [`RenderTransform`], taken from the
+/// editor's [`ViewTransform`](super::ViewTransform) so drawing and hit-testing share one camera.
 fn editor_transform(editor: &ChemStructEditor, center: egui::Pos2) -> RenderTransform {
-    RenderTransform {
-        coord_scale: editor.zoom * super::SCALE_FACTOR,
-        offset: center.to_vec2() + editor.pan,
-        visual_scale: editor.zoom,
-    }
+    editor.view(center).render_transform()
+}
+
+/// Test-only window onto [`editor_transform`], so `widget::view_tests` can check that the
+/// draw-side transform agrees with `ChemStructEditor::mol_to_screen`.
+#[cfg(test)]
+pub(super) fn editor_transform_for_tests(
+    editor: &ChemStructEditor,
+    center: egui::Pos2,
+) -> RenderTransform {
+    editor_transform(editor, center)
 }
 
 // ─── Per-frame label layout pass ─────────────────────────────────────────────
@@ -164,109 +175,6 @@ pub fn draw_atom_labels(
     }
 }
 
-/// Which side of the element symbol the displayed hydrogens go on.
-/// `Right` is the normal reading order ("OH", "NH2"); `Left` mirrors it ("HO", "H2N")
-/// so the hydrogens point into free space when the bonds come from the right.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HSide {
-    Right,
-    Left,
-}
-
-/// Averages the unit directions from the atom toward its (non-folded) neighbors: when
-/// they point right (x-sum above a small deadzone) the free side is the left, so the
-/// hydrogens flip there. Near-vertical sums inside the deadzone and unbonded atoms keep
-/// the default `Right`. (Vertical H placement — H above/below for straight-up bonds, as
-/// ChemDraw does in crowded rings — is a possible future refinement.)
-pub(crate) fn h_side(mol: &crate::molecule::Molecule, atom_id: u32) -> HSide {
-    const H_FLIP_DEADZONE: f32 = 0.1;
-    let Some(atom) = mol.atom_by_id(atom_id) else { return HSide::Right };
-    let mut sum_x = 0.0_f32;
-    for nid in mol.neighbor_atom_ids(atom_id) {
-        if is_folded_h(mol, nid) {
-            continue;
-        }
-        let Some(n) = mol.atom_by_id(nid) else { continue };
-        let dx = n.pos[0] - atom.pos[0];
-        let dy = n.pos[1] - atom.pos[1];
-        let len = (dx * dx + dy * dy).sqrt();
-        if len > 1e-6 {
-            sum_x += dx / len;
-        }
-    }
-    if sum_x > H_FLIP_DEADZONE { HSide::Left } else { HSide::Right }
-}
-
-/// A styled atom label plus the char range (over the flattened text) of the element
-/// symbol — the part that gets centered on the atom position.
-pub struct AtomLabel {
-    pub rich: RichText,
-    pub anchor_chars: std::ops::Range<usize>,
-}
-
-/// Length in chars of the leading element token of a parsed label's flat text: the first
-/// `[A-Z][a-z]*` run ("CO2Et" → "C", "Cl" → "Cl", "OTf" → "O"), falling back to a single
-/// char for labels that start otherwise (e.g. italic "tBu").
-fn element_token_len(flat: &str) -> usize {
-    let mut chars = flat.chars();
-    let Some(first) = chars.next() else { return 0 };
-    if !first.is_ascii_uppercase() {
-        return 1;
-    }
-    1 + chars.take_while(|c| c.is_ascii_lowercase()).count()
-}
-
-/// Build the styled atom label: hydrogen count as a true subscript (CH₃, NH₂), the charge
-/// as a trailing superscript (N⁺, SO₄²⁻), and the hydrogens flipped to the atom's free
-/// side ("HO", "H₂N" when the bonds come from the right). The element text itself goes
-/// through the rich-text markup parser, so custom labels typed into the editor can use
-/// `_`/`^` scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
-pub(crate) fn atom_label(
-    mol: &crate::molecule::Molecule,
-    atom: &crate::molecule::Atom,
-) -> AtomLabel {
-    let element = RichText::parse(&atom.element);
-    let element_flat: String = element.spans.iter().map(|s| s.text.as_str()).collect();
-    let h = displayed_h_count(mol, atom.id);
-    let side = if h >= 1 { h_side(mol, atom.id) } else { HSide::Right };
-
-    let mut rich = RichText::new();
-    let mut anchor_start = 0usize;
-    if side == HSide::Left {
-        // Hydrogens first: "H", then the count subscript ("H₂N").
-        rich = rich.text("H");
-        anchor_start = 1;
-        if h > 1 {
-            let count = h.to_string();
-            anchor_start += count.chars().count();
-            rich = rich.subscript(count);
-        }
-    }
-    for span in element.spans {
-        rich = rich.span(span.text, span.style);
-    }
-    if side == HSide::Right && h >= 1 {
-        rich = rich.text("H");
-        if h > 1 {
-            rich = rich.subscript(h.to_string());
-        }
-    }
-    // The charge stays a trailing superscript in both orders (top-right, ChemDraw-style;
-    // the strict-ChemDraw leading variant "⁺H₃N" is a possible future refinement).
-    match atom.charge {
-        0 => {}
-        1 => rich = rich.superscript("+"),
-        -1 => rich = rich.superscript("-"),
-        c if c > 0 => rich = rich.superscript(format!("{c}+")),
-        c => rich = rich.superscript(format!("{}-", -c)),
-    }
-
-    // Anchor on the element token; degenerate labels fall back to the first char.
-    let token_len = element_token_len(&element_flat);
-    let (start, len) = if token_len == 0 { (0, 1) } else { (anchor_start, token_len) };
-    AtomLabel { rich, anchor_chars: start..start + len }
-}
-
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────
 
 pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
@@ -296,70 +204,6 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// A hydrogen that is drawn inside its heavy neighbour's label instead of on the canvas,
-/// so it gets no vertex of its own and its bond is suppressed (N–H renders as "NH2").
-///
-/// Three conditions, and the last two are what keep the folding honest:
-///
-/// - Exactly one bond, to a heavy (non-H) atom. Deuterium ("D") is a normal atom, never folded.
-/// - It came in with a group ([`Atom::group_h`](crate::molecule::Atom::group_h)) — `n` inserts
-///   NH₂, whose hydrogen is really just the "2" in the label. A hydrogen the user asked for by
-///   name is an atom like any other; folding it made it vanish outright.
-/// - Its neighbour's label still has room for it. [`displayed_h_count`] derives the label's
-///   hydrogens from the *heavy* bond sum, so once those fill the valence the label shows no
-///   hydrogen at all and there is nothing left to fold into. An invisible hydrogen was the
-///   sole cause of the over-valence ring on both nitrogens of a Ph–N=N–Ph drawn from two `n`
-///   keys: a warning the user could neither see the reason for nor delete.
-pub fn is_folded_h(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
-    let Some(atom) = mol.atom_by_id(atom_id) else { return false };
-    if atom.element != "H" || !atom.group_h { return false; }
-    let bonds = mol.bonds_for_atom(atom_id);
-    if bonds.len() != 1 { return false; }
-    let b = bonds[0];
-    let other = if b.begin == atom_id { b.end } else { b.begin };
-    let Some(heavy) = mol.atom_by_id(other) else { return false };
-    if heavy.element == "H" { return false; }
-    let Some(valence) = normal_valence(&heavy.element) else { return false };
-
-    // Room left on the neighbour: its valence, minus every bond that is not a group hydrogen,
-    // minus the group hydrogens folded ahead of this one. Ordering those by id makes the
-    // choice stable when a group brings more hydrogens than the atom can show (SiH₃ on a
-    // silicon that has since grown a second bond).
-    let used: i16 = mol.bonds_for_atom(other).iter().map(|nb| {
-        let n = if nb.begin == other { nb.end } else { nb.begin };
-        match mol.atom_by_id(n) {
-            Some(a) if a.element == "H" && a.group_h => (n < atom_id) as i16,
-            _ => nb.order.valence(),
-        }
-    }).sum();
-    used < valence as i16 + heavy.charge as i16
-}
-
-pub(crate) fn should_show_label(mol: &Molecule, atom_id: u32) -> bool {
-    let Some(atom) = mol.atom_by_id(atom_id) else { return false };
-    // Folded hydrogens are merged into their heavy neighbor's label.
-    if is_folded_h(mol, atom_id) { return false; }
-    if atom.element == "C" {
-        // Carbon: only show when completely isolated (no bonds) so the atom stays visible
-        return atom.charge != 0 || mol.bonds_for_atom(atom_id).is_empty();
-    }
-    true
-}
-
-/// True when an atom is over-bonded: its total bond order exceeds what its element/charge
-/// allows (e.g. a carbon with more than 4 bond-orders, an oxygen with more than 2). Such
-/// atoms are marked with a red dashed warning ring. Under-bonded atoms are valid — the
-/// missing valence is shown as implicit H — and elements with no standard valence aren't checked.
-///
-/// The warning threshold is the element's *highest* common valence (`max_valence`), so
-/// hypervalent-but-ordinary S and P (sulfones, sulfates, phosphates) are not flagged,
-/// while implicit-H counting keeps using the lowest (`normal_valence`).
-pub fn is_valence_invalid(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
-    let Some(atom) = mol.atom_by_id(atom_id) else { return false };
-    let Some(valence) = max_valence(&atom.element) else { return false };
-    mol.bond_order_sum(atom_id) > valence as i16 + atom.charge as i16
-}
-
 /// Draw a dashed circle (used as the over-valence warning ring).
 fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32, stroke_width: f32) {
     const SEGMENTS: usize = 20;
@@ -375,29 +219,6 @@ fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, 
             stroke,
         );
     }
-}
-
-/// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
-/// implicit H needed to satisfy valence. Computed as `valence + charge` minus the
-/// bond-order sum to *non-folded* neighbors, which naturally includes both.
-pub(crate) fn displayed_h_count(mol: &crate::molecule::Molecule, atom_id: u32) -> u8 {
-    let Some(atom) = mol.atom_by_id(atom_id) else { return 0 };
-    let Some(valence) = normal_valence(&atom.element) else { return 0 };
-    // A lone atom (no bonds yet) shows just its symbol — placing "O"/"N"/"S" at the cursor
-    // should read as O/N/S, not OH2/NH3/SH2. Implicit H appears once it gets a bond.
-    if mol.bonds_for_atom(atom_id).is_empty() {
-        return 0;
-    }
-    let bond_sum_heavy: i16 = mol.bonds_for_atom(atom_id).iter()
-        .filter(|b| {
-            let other = if b.begin == atom_id { b.end } else { b.begin };
-            !is_folded_h(mol, other)
-        })
-        .map(|b| b.order.valence())
-        .sum();
-    // Positive charge raises effective valence (e.g. N+ = 4), negative lowers it
-    let effective = valence as i16 + atom.charge as i16;
-    (effective - bond_sum_heavy).max(0) as u8
 }
 
 /// Plain-text label (scripts flattened) — the rendering path uses `atom_label`; this is
@@ -471,6 +292,34 @@ mod tests {
         assert_eq!(label(&m, o), "O", "C=O oxygen should render as 'O'");
     }
 
+    /// A charge changes how many hydrogens an atom takes by what it does to the atom's valence
+    /// electrons, not by adding itself to the valence: N⁺ and O⁺ gain a bond (onium), but C⁺
+    /// loses one (carbocation), C⁻ loses one too (carbanion, a lone pair), and B⁻ gains one
+    /// (borate). Each is drawn with one bond to a methyl carbon, so the label shows all the
+    /// hydrogens of the named ion but one.
+    #[test]
+    fn charge_changes_valence_by_the_atoms_electron_count() {
+        for (el, charge, want) in [
+            ("C", 1, "CH2+"),  // ethyl cation: CH3+ with one H traded for the bond
+            ("C", -1, "CH2-"), // CH3- carbanion
+            ("N", 1, "NH3+"),  // NH4+
+            ("N", -1, "NH-"),  // NH2- amide
+            ("O", 1, "OH2+"),  // H3O+
+            ("O", -1, "O-"),   // alkoxide
+            ("B", -1, "BH3-"), // BH4- borate
+            ("B", 1, "BH+"),   // BH2+ borinium
+            ("Si", 1, "SiH2+"),
+            ("P", 1, "PH3+"),  // PH4+ phosphonium
+            ("S", 1, "SH2+"),  // H3S+ sulfonium
+        ] {
+            let mut m = Molecule::default();
+            let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+            let x = m.add_atom(el.to_string(), [1.0, 0.0], charge);
+            m.add_bond(c, x, BondOrder::Single);
+            assert_eq!(label(&m, x), want, "C-{el}({charge:+}) should render as '{want}'");
+        }
+    }
+
     #[test]
     fn over_valence_is_flagged() {
         // Carbon with 5 single bonds → invalid; 4 → valid; 3 → valid (CH).
@@ -517,6 +366,75 @@ mod tests {
         let s = m.add_atom("S".to_string(), [1.0, 0.0], 0);
         m.add_bond(c, s, BondOrder::Single);
         assert_eq!(label(&m, s), "SH");
+    }
+
+    /// C–X with charge `charge` on X, and `n` group hydrogens on X (as a fragment brings them).
+    fn charged_with_group_h(el: &str, charge: i8, n: usize) -> (Molecule, u32, Vec<u32>) {
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let x = m.add_atom(el.to_string(), [1.0, 0.0], charge);
+        m.add_bond(c, x, BondOrder::Single);
+        let hs = (0..n)
+            .map(|i| {
+                let h = m.add_atom("H".to_string(), [2.0, i as f32], 0);
+                m.atom_by_id_mut(h).unwrap().group_h = true;
+                m.add_bond(x, h, BondOrder::Single);
+                h
+            })
+            .collect();
+        (m, x, hs)
+    }
+
+    /// The warning ring and the label agree on what a charge does: a bond the label has room
+    /// for is never flagged, and one it has no room for always is. Otherwise the ring would
+    /// appear on an atom whose hydrogens are all folded out of sight (a borate), or a
+    /// hydrogen would quietly drop out of the label with no ring at all (a silylium).
+    #[test]
+    fn over_valence_moves_with_the_charge_like_the_label() {
+        // Borate: C–BH2 made B⁻ has room for four, so both hydrogens fold into "BH3-" and
+        // nothing is over-bonded or taken.
+        let (mut m, b, hs) = charged_with_group_h("B", -1, 2);
+        assert_eq!(label(&m, b), "BH3-");
+        assert!(hs.iter().all(|&h| is_folded_h(&m, h)), "both hydrogens are in the label");
+        assert!(!is_valence_invalid(&m, b), "a borate with three bonds is not over-bonded");
+        assert!(m.consume_excess_group_h(b).is_empty(), "nothing is in excess");
+
+        // BF4⁻: four bonds on B⁻ is its full valence.
+        let mut m = Molecule::default();
+        let b = m.add_atom("B".to_string(), [0.0, 0.0], -1);
+        for i in 0..4 {
+            let f = m.add_atom("F".to_string(), [1.0, i as f32], 0);
+            m.add_bond(b, f, BondOrder::Single);
+        }
+        assert!(!is_valence_invalid(&m, b), "BF4- is not over-bonded");
+
+        // Cations of the carbon group have room for three: C–SiH3 or C–CH3 made X⁺ carries
+        // one bond too many, which is flagged and, being a group hydrogen, taken.
+        for el in ["Si", "C"] {
+            let (mut m, x, hs) = charged_with_group_h(el, 1, 3);
+            assert!(is_valence_invalid(&m, x), "{el}+ with four bonds is over-bonded");
+            assert_eq!(m.consume_excess_group_h(x), vec![hs[2]], "{el}+: one hydrogen goes");
+            assert!(!is_valence_invalid(&m, x), "{el}+ is back at its valence");
+            assert_eq!(label(&m, x), format!("{el}H2+"));
+            assert!(hs[..2].iter().all(|&h| is_folded_h(&m, h)), "{el}+: the rest are folded");
+        }
+        // Four heavy neighbours on C⁺ are flagged too — nothing there to take.
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 1);
+        for i in 0..4 {
+            let n = m.add_atom("C".to_string(), [1.0, i as f32], 0);
+            m.add_bond(c, n, BondOrder::Single);
+        }
+        assert!(is_valence_invalid(&m, c), "a carbocation with four bonds is over-bonded");
+
+        // B⁺ has room for two, so three bonds are one too many.
+        let mut m = Molecule::default();
+        let b = m.add_atom("B".to_string(), [0.0, 0.0], 1);
+        for i in 0..3 {
+            let n = m.add_atom("C".to_string(), [1.0, i as f32], 0);
+            m.add_bond(b, n, BondOrder::Single);
+        }
+        assert!(is_valence_invalid(&m, b), "B+ with three bonds is over-bonded");
     }
 
     /// The rich label carries the same characters as the plain-text oracle, with the H

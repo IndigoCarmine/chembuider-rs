@@ -7,6 +7,8 @@ pub mod smiles;
 pub mod cdx;
 pub mod cdx_codec;
 pub mod elements;
+pub mod depict;
+pub(crate) mod lookup;
 #[cfg(windows)]
 pub mod image;
 #[cfg(windows)]
@@ -91,6 +93,74 @@ pub fn max_valence(element: &str) -> Option<u8> {
         "P" => Some(5),
         other => normal_valence(other),
     }
+}
+
+/// Valence electrons of the neutral atom, for the elements [`normal_valence`] knows.
+fn valence_electrons(element: &str) -> Option<i16> {
+    match element {
+        "H" => Some(1),
+        "B" => Some(3),
+        "C" | "Si" => Some(4),
+        "N" | "P" => Some(5),
+        "O" | "S" => Some(6),
+        "F" | "Cl" | "Br" | "I" => Some(7),
+        _ => None,
+    }
+}
+
+/// The valence a charged atom fills with hydrogen: the number of bonds it makes once its
+/// charge has added or removed electrons — i.e. the valence of the element it is then
+/// isoelectronic with. `None` exactly where [`normal_valence`] is `None`.
+///
+/// With `e` = valence electrons − charge, the atom makes `min(e, 8 − e)` bonds (`min(e, 2 − e)`
+/// for hydrogen, whose shell holds two): up to four electrons each one pairs with a bond
+/// partner; past four the extra ones stay as lone pairs. Simply adding the charge to the
+/// valence is the same thing only while `e ≥ 4` on the far side of carbon, which is why it
+/// held for the onium ions and went wrong for carbon, silicon, boron and hydrogen:
+///
+/// | atom | e | like | valence | as ion      | `valence + charge` |
+/// |------|---|------|---------|-------------|--------------------|
+/// | C⁺   | 3 | B    | 3       | CH₃⁺        | 5 (wrong)          |
+/// | C⁻   | 5 | N    | 3       | CH₃⁻        | 3                  |
+/// | C²⁺  | 2 | Be   | 2       | CH₂²⁺       | 6 (wrong)          |
+/// | Si⁺  | 3 | Al   | 3       | SiH₃⁺       | 5 (wrong)          |
+/// | Si⁻  | 5 | P    | 3       | SiH₃⁻       | 3                  |
+/// | N⁺   | 4 | C    | 4       | NH₄⁺        | 4                  |
+/// | N⁻   | 6 | O    | 2       | NH₂⁻        | 2                  |
+/// | P⁺   | 4 | Si   | 4       | PH₄⁺        | 4                  |
+/// | O⁺   | 5 | N    | 3       | H₃O⁺        | 3                  |
+/// | O⁻   | 7 | F    | 1       | HO⁻         | 1                  |
+/// | S⁺   | 5 | P    | 3       | H₃S⁺        | 3                  |
+/// | F⁻   | 8 | Ne   | 0       | F⁻          | 0                  |
+/// | B⁻   | 4 | C    | 4       | BH₄⁻        | 2 (wrong)          |
+/// | B⁺   | 2 | Be   | 2       | BH₂⁺        | 4 (wrong)          |
+/// | H⁺   | 0 | —    | 0       | H⁺          | 2 (wrong)          |
+/// | H⁻   | 2 | He   | 0       | H⁻          | 0                  |
+///
+/// ChemDraw counts a charged atom's implicit hydrogens this way (a "+" on the end carbon
+/// of ethane gives CH₂⁺, on the nitrogen of methylamine NH₃⁺), as do RDKit and the
+/// OpenSMILES/MDL readers. It leaves out radicals and the expanded valences of S and P, as
+/// `normal_valence` does for the neutral atom. Charges that strip every valence electron or
+/// overfill the shell give 0, never a negative valence.
+pub(crate) fn charged_valence(element: &str, charge: i8) -> Option<i16> {
+    let e = valence_electrons(element)? - charge as i16;
+    let shell = if element == "H" { 2 } else { 8 };
+    Some(e.min(shell - e).max(0))
+}
+
+/// The over-valence threshold of a charged atom: [`charged_valence`] plus whatever expanded
+/// valence the element has on top of its lowest one ([`max_valence`] − [`normal_valence`]:
+/// +4 for S, +2 for P, 0 for everything else).
+///
+/// This is the limit the warning ring and [`Molecule::consume_excess_group_h`] measure
+/// against, so it moves with a charge exactly as the label's hydrogen count does: wherever
+/// the label has no room left for a hydrogen, a bond past this limit is an excess. For
+/// `e ≥ 4` (N⁺, O⁺, C⁻, S±, P±, halogens) it equals the old `max_valence + charge`; it differs
+/// only where `charged_valence` does — C⁺ and Si⁺ 3, C²⁺ 2, N²⁺ 3, B⁻ 4 (BF₄⁻ is not
+/// over-bonded), B⁺ 2, H⁺ 0.
+pub(crate) fn charged_max_valence(element: &str, charge: i8) -> Option<i16> {
+    let expanded = max_valence(element)? as i16 - normal_valence(element)? as i16;
+    Some(charged_valence(element, charge)? + expanded)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,20 +249,41 @@ impl Molecule {
         if self.bond_between(begin, end).is_some() {
             return 0;
         }
+        self.push_bond(begin, end, order, BondStereo::None)
+    }
+
+    /// Add a bond the caller knows is not there yet (a reader that tracks its own bonds, where
+    /// [`add_bond`](Self::add_bond)'s search through every bond would make reading quadratic).
+    fn push_bond(&mut self, begin: u32, end: u32, order: BondOrder, stereo: BondStereo) -> u32 {
         let id = self.alloc_id();
-        self.bonds.push(Bond { id, begin, end, order, stereo: BondStereo::None });
+        self.bonds.push(Bond { id, begin, end, order, stereo });
         id
     }
 
     pub fn remove_atom(&mut self, id: u32) {
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
-        // A ring fill whose cycle lost an atom no longer describes a ring — drop it.
-        self.ring_fills.retain(|rf| !rf.atoms.contains(&id));
+        self.drop_broken_ring_fills();
     }
 
     pub fn remove_bond(&mut self, id: u32) {
         self.bonds.retain(|b| b.id != id);
+        self.drop_broken_ring_fills();
+    }
+
+    /// Drop every ring fill whose cycle is no longer closed. A fill describes a ring only while
+    /// all of its atoms exist and each consecutive pair (wrapping around) is still bonded;
+    /// once an atom or a ring bond is deleted the polygon would shade an open chain.
+    fn drop_broken_ring_fills(&mut self) {
+        let mut fills = std::mem::take(&mut self.ring_fills);
+        fills.retain(|rf| self.ring_is_closed(&rf.atoms));
+        self.ring_fills = fills;
+    }
+
+    fn ring_is_closed(&self, cycle: &[u32]) -> bool {
+        let n = cycle.len();
+        cycle.iter().all(|&id| self.atom_by_id(id).is_some())
+            && (0..n).all(|k| self.bond_between(cycle[k], cycle[(k + 1) % n]).is_some())
     }
 
     pub fn atom_by_id(&self, id: u32) -> Option<&Atom> {
@@ -461,22 +552,21 @@ impl Molecule {
     ///   stays, and the over-valence warning it causes is correct and points at something the
     ///   user can see and delete.
     /// - **Only terminal ones**, so removing a hydrogen can never split the molecule.
-    /// - **Only the excess**, measured against [`max_valence`] — the same threshold the warning
-    ///   ring uses, so this removes exactly what would have been flagged and stops there. (The
-    ///   lower [`normal_valence`] would strip the hydrogen off every S the moment it picked up a
-    ///   second bond, which is wrong for sulfoxides and would break `s`+`Delete`, the app's only
-    ///   route to a bare sulfur.)
+    /// - **Only the excess**, measured against [`charged_max_valence`] ([`max_valence`] moved
+    ///   by the charge) — the same threshold the warning ring uses, so this removes exactly
+    ///   what would have been flagged and stops there. (The lower [`normal_valence`] would
+    ///   strip the hydrogen off every S the moment it picked up a second bond, which is wrong
+    ///   for sulfoxides and would break `s`+`Delete`, the app's only route to a bare sulfur.)
     ///
     /// Hydrogens go **highest id first**, i.e. most recently added first, which both makes the
     /// choice independent of iteration order and agrees with
-    /// [`is_folded_h`](crate::widget::draw::is_folded_h): that folds the *lowest* ids into the
+    /// [`is_folded_h`](crate::molecule::depict::is_folded_h): that folds the *lowest* ids into the
     /// label, so the one this removes is the one that had already stopped being folded.
     ///
     /// Returns the ids removed.
     pub fn consume_excess_group_h(&mut self, atom_id: u32) -> Vec<u32> {
         let Some(atom) = self.atom_by_id(atom_id) else { return Vec::new() };
-        let Some(valence) = max_valence(&atom.element) else { return Vec::new() };
-        let limit = valence as i16 + atom.charge as i16;
+        let Some(limit) = charged_max_valence(&atom.element, atom.charge) else { return Vec::new() };
         let mut sum = self.bond_order_sum(atom_id);
         if sum <= limit {
             return Vec::new();
@@ -656,6 +746,59 @@ mod tests {
         assert_eq!(m.connected_atoms(d), vec![d], "isolated atom is its own molecule");
     }
 
+    /// The valence a charged atom fills with hydrogen, for the elements the table in
+    /// [`charged_valence`] covers — including the doubly charged and the hydrogen ions.
+    #[test]
+    fn charged_valence_follows_the_isoelectronic_element() {
+        for (el, charge, want) in [
+            ("C", 0, Some(4)), ("C", 1, Some(3)), ("C", -1, Some(3)), ("C", 2, Some(2)),
+            ("N", 0, Some(3)), ("N", 1, Some(4)), ("N", -1, Some(2)), ("N", 2, Some(3)),
+            ("O", 0, Some(2)), ("O", 1, Some(3)), ("O", -1, Some(1)), ("O", 2, Some(4)),
+            ("B", 0, Some(3)), ("B", -1, Some(4)), ("B", 1, Some(2)),
+            ("F", 0, Some(1)), ("F", -1, Some(0)), ("Cl", 1, Some(2)),
+            ("H", 0, Some(1)), ("H", 1, Some(0)), ("H", -1, Some(0)),
+            ("Si", -1, Some(3)), ("S", -1, Some(1)), ("P", 1, Some(4)),
+            ("Fe", 2, None), ("Xx", 0, None),
+        ] {
+            assert_eq!(charged_valence(el, charge), want, "{el} with charge {charge:+}");
+        }
+        // Neutral, the table agrees with `normal_valence` element for element.
+        for el in ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Si", "H"] {
+            assert_eq!(
+                charged_valence(el, 0),
+                normal_valence(el).map(i16::from),
+                "{el}: the electron table disagrees with normal_valence",
+            );
+        }
+    }
+
+    /// The over-valence threshold moves with a charge exactly as the hydrogen count does, on
+    /// top of the expanded valence of S and P. Where the electron count stays at four or more
+    /// it is the old `max_valence + charge`; the seven ions listed last are where it is not.
+    #[test]
+    fn charged_max_valence_moves_with_the_label() {
+        for el in ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Si", "H"] {
+            assert_eq!(charged_max_valence(el, 0), max_valence(el).map(i16::from), "{el}");
+        }
+        for (el, charge) in [
+            ("N", 1), ("N", -1), ("O", 1), ("O", -1), ("C", -1), ("S", 1), ("S", -1), ("S", 2),
+            ("P", 1), ("P", -1), ("Cl", 1), ("Br", -1), ("Si", -1),
+        ] {
+            assert_eq!(
+                charged_max_valence(el, charge),
+                max_valence(el).map(|v| v as i16 + charge as i16),
+                "{el}{charge:+} keeps the old threshold",
+            );
+        }
+        for (el, charge, want) in [
+            ("C", 1, 3), ("Si", 1, 3), ("C", 2, 2), ("N", 2, 3), ("B", -1, 4), ("B", 1, 2),
+            ("H", 1, 0),
+        ] {
+            assert_eq!(charged_max_valence(el, charge), Some(want), "{el}{charge:+}");
+        }
+        assert_eq!(charged_max_valence("Fe", 2), None);
+    }
+
     /// A heavy atom carrying `n` group hydrogens, plus one heavy neighbour to bond onto.
     fn with_group_h(element: &str, n: usize) -> (Molecule, u32, u32, Vec<u32>) {
         let mut m = Molecule::default();
@@ -830,5 +973,43 @@ mod tests {
         // Deleting a ring atom drops the now-meaningless fill.
         m.remove_atom(ids[0]);
         assert!(m.ring_fills.is_empty(), "a fill whose ring lost an atom is removed");
+    }
+
+    #[test]
+    fn removing_a_ring_bond_drops_the_fill_but_other_bonds_do_not() {
+        let (mut m, ids) = carbon_ring(6);
+        let sub = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        let sub_bond = m.add_bond(ids[0], sub, BondOrder::Single);
+        let ring = m.smallest_ring_containing(ids[0]).unwrap();
+        m.set_ring_fill(ring, [1, 2, 3, 4]);
+
+        // A bond that is not on the filled cycle leaves the ring intact.
+        m.remove_bond(sub_bond);
+        assert_eq!(m.ring_fills.len(), 1, "an unrelated bond's removal keeps the fill");
+
+        // Opening the ring leaves a chain: the fill no longer describes a ring.
+        let ring_bond = m.bond_between(ids[2], ids[3]).unwrap().id;
+        m.remove_bond(ring_bond);
+        assert!(m.ring_fills.is_empty(), "a fill whose ring lost a bond is removed");
+    }
+
+    #[test]
+    fn removing_a_bond_of_the_other_fused_ring_keeps_the_fill() {
+        // A cyclohexane fused to a cyclopropane on the ids[0]-ids[1] edge; only the
+        // six-membered ring is filled.
+        let (mut m, ids) = carbon_ring(6);
+        let bridge = m.add_atom("C".to_string(), [2.0, 0.0], 0);
+        let b0 = m.add_bond(ids[0], bridge, BondOrder::Single);
+        m.add_bond(ids[1], bridge, BondOrder::Single);
+        m.set_ring_fill(ids.clone(), [1, 2, 3, 4]);
+
+        // Breaking the three-membered ring does not touch the filled six-ring.
+        m.remove_bond(b0);
+        assert_eq!(m.ring_fills.len(), 1);
+
+        // Removing the shared edge does open the six-ring.
+        let shared = m.bond_between(ids[0], ids[1]).unwrap().id;
+        m.remove_bond(shared);
+        assert!(m.ring_fills.is_empty(), "the shared edge was on the filled cycle");
     }
 }

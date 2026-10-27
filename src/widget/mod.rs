@@ -4,8 +4,13 @@ pub mod interact;
 mod keyboard_solver;
 #[cfg(test)]
 mod keyboard_tests;
+#[cfg(test)]
+mod render_tests;
 pub mod rich_text;
 pub mod scene;
+pub mod view;
+
+pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
 use crate::molecule::{BondOrder, BondStereo, Molecule};
@@ -145,6 +150,10 @@ pub struct ChemStructEditor {
     /// Active background cleanup computation, if any (None when idle).
     pub cleanup_job: Option<crate::molecule::cleanup::CleanupJob>,
 
+    /// Starts the runs behind [`toggle_cleanup`](Self::toggle_cleanup); the built-in cleanup
+    /// unless replaced with [`set_cleanup_engine`](Self::set_cleanup_engine).
+    cleanup_engine: Box<dyn crate::molecule::cleanup::CleanupEngine + Send + Sync>,
+
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
@@ -155,6 +164,9 @@ pub struct ChemStructEditor {
     /// like "CO2Et" should be clickable over their whole text, not just a small circle).
     /// One frame of lag is fine — hover runs before the draw pass.
     last_label_rects: std::collections::HashMap<u32, egui::Rect>,
+
+    /// Set by [`request_fit`](Self::request_fit); the next `ui()` fits the view and clears it.
+    fit_requested: bool,
 }
 
 impl Default for ChemStructEditor {
@@ -185,9 +197,11 @@ impl Default for ChemStructEditor {
             last_mouse_mol: [0.0; 2],
             pointer_active: false,
             cleanup_job: None,
+            cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
             rotate_last_angle: None,
             last_label_rects: std::collections::HashMap::new(),
+            fit_requested: false,
         }
     }
 }
@@ -278,9 +292,8 @@ impl ChemStructEditor {
         use crate::config::{FragAtomDef, FragBondDef, FragmentDef};
 
         let name = name.trim();
-        if name.is_empty() {
-            return Err("fragment name is empty".into());
-        }
+        // The name becomes `fragments/<name>.json`; refuse one that is not a plain file name.
+        crate::molecule::fragment::Fragment::validate_name(name)?;
         let mut ids: Vec<u32> = self.selected_atoms.iter().copied().collect();
         if ids.is_empty() {
             return Err("select the atoms to save first (Select tool)".into());
@@ -405,6 +418,8 @@ impl ChemStructEditor {
         if clip.atoms.is_empty() {
             return false;
         }
+        // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
+        self.cancel_cleanup();
         self.push_undo();
         const OFFSET: [f32; 2] = [DEFAULT_BOND_LENGTH, DEFAULT_BOND_LENGTH];
         let new_ids: Vec<u32> = clip.atoms.iter().map(|a| {
@@ -443,6 +458,8 @@ impl ChemStructEditor {
         if other.atoms.is_empty() {
             return false;
         }
+        // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
+        self.cancel_cleanup();
         self.push_undo();
         let n = other.atoms.len() as f32;
         let cx = other.atoms.iter().map(|a| a.pos[0]).sum::<f32>() / n;
@@ -532,7 +549,15 @@ impl ChemStructEditor {
     }
 
     /// Toggle the background cleanup: start it if idle, otherwise request it to stop.
-    /// Starting snapshots the current molecule into a worker thread so the UI never freezes.
+    /// Starting pushes an undo step and starts a run from the cleanup engine (see
+    /// [`set_cleanup_engine`](Self::set_cleanup_engine)). The built-in engine relaxes a snapshot
+    /// of the molecule in the background (a worker thread natively, one chunk per poll on
+    /// wasm32) so the UI never freezes.
+    ///
+    /// Stopping this way only asks the run to stop: the next [`poll_cleanup`](Self::poll_cleanup)
+    /// still copies in the positions the run ended on, so the layout reached so far is kept.
+    /// To drop a run without letting it write anything more, use
+    /// [`cancel_cleanup`](Self::cancel_cleanup).
     pub fn toggle_cleanup(&mut self) {
         match &self.cleanup_job {
             Some(job) => job.cancel(),
@@ -541,21 +566,57 @@ impl ChemStructEditor {
                     return;
                 }
                 self.push_undo();
-                self.cleanup_job = Some(crate::molecule::cleanup::CleanupJob::start(&self.molecule));
+                self.cleanup_job = Some(self.cleanup_engine.start(&self.molecule));
             }
         }
+    }
+
+    /// Stop a running cleanup at once and discard it: the run is cancelled and dropped, and no
+    /// more of its positions are written, so the molecule keeps whatever it holds now (the
+    /// last preview).  Returns whether a cleanup was running.
+    ///
+    /// Call this before replacing or restructuring the molecule (undo/redo, paste, a host's
+    /// Clear or load): the run works on a snapshot of the old molecule and would otherwise go
+    /// on writing its positions, by atom id, into the new one.
+    ///
+    /// A run that has already finished is joined.  One still going is dropped instead
+    /// (dropping must stop its background work, see
+    /// [`CleanupRun`](crate::molecule::cleanup::CleanupRun)): the built-in worker only sees the
+    /// cancel at its next chunk boundary, which for a few hundred atoms or more is a second
+    /// or more away, and joining would freeze the UI that long.  The worker then stops on its
+    /// own, writing only to its own buffer.
+    pub fn cancel_cleanup(&mut self) -> bool {
+        let Some(job) = self.cleanup_job.take() else { return false };
+        job.cancel();
+        if job.is_done() {
+            job.join();
+        }
+        true
+    }
+
+    /// Replace the engine that [`toggle_cleanup`](Self::toggle_cleanup) starts runs from.
+    /// A cleanup already running is unaffected; the next one uses `engine`.
+    pub fn set_cleanup_engine(
+        &mut self,
+        engine: impl crate::molecule::cleanup::CleanupEngine + Send + Sync + 'static,
+    ) {
+        self.cleanup_engine = Box::new(engine);
     }
 
     /// Pump the background cleanup once per frame: copy the latest positions in for a live
     /// preview, and finalize (join the worker) once it reports done. Returns true while active.
     pub fn poll_cleanup(&mut self) -> bool {
         let Some(job) = &self.cleanup_job else { return false };
+        // Read `is_done` before `latest`: only positions read after `is_done` returned true are
+        // guaranteed final.  Checked the other way round, a run finishing between the two
+        // calls would end the cleanup on the preview read just before its final positions.
+        let done = job.is_done();
         for (id, pos) in job.latest() {
             if let Some(atom) = self.molecule.atom_by_id_mut(id) {
                 atom.pos = pos;
             }
         }
-        if job.is_done() {
+        if done {
             self.cleanup_job.take().unwrap().join();
             false
         } else {
@@ -564,12 +625,23 @@ impl ChemStructEditor {
     }
 
     /// Restore the previous molecule state, pushing the current one onto the redo stack.
+    ///
+    /// While a cleanup runs, undo cancels it instead: the run is discarded
+    /// ([`cancel_cleanup`](Self::cancel_cleanup)) and the molecule goes back to the snapshot
+    /// Cleanup took when it started (the top of the undo stack).  The half-relaxed preview is
+    /// dropped rather than pushed onto the redo stack, so the redo history stays the one from
+    /// before Cleanup started.
     pub fn undo(&mut self) -> bool {
+        let cancelled_cleanup = self.cancel_cleanup();
         if let Some(prev) = self.undo_stack.pop_back() {
-            if self.redo_stack.len() >= 50 {
-                self.redo_stack.pop_front();
+            if cancelled_cleanup {
+                self.molecule = prev;
+            } else {
+                if self.redo_stack.len() >= 50 {
+                    self.redo_stack.pop_front();
+                }
+                self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
             }
-            self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
             self.selected_atoms.clear();
             self.hotspot_atom = None;
             self.label_edit = None;
@@ -580,7 +652,11 @@ impl ChemStructEditor {
     }
 
     /// Re-apply a state previously undone, pushing the current one back onto the undo stack.
+    ///
+    /// A running cleanup is stopped first ([`cancel_cleanup`](Self::cancel_cleanup)), keeping
+    /// the layout it reached as a Ctrl+K stop would, so it cannot overwrite the redone state.
     pub fn redo(&mut self) -> bool {
+        self.cancel_cleanup();
         if let Some(next) = self.redo_stack.pop_back() {
             if self.undo_stack.len() >= 50 {
                 self.undo_stack.pop_front();
@@ -595,19 +671,66 @@ impl ChemStructEditor {
         }
     }
 
-    pub fn mol_to_screen(&self, pos: [f32; 2], center: egui::Pos2) -> egui::Pos2 {
-        egui::Pos2 {
-            x: center.x + pos[0] * self.zoom * SCALE_FACTOR + self.pan.x,
-            y: center.y + pos[1] * self.zoom * SCALE_FACTOR + self.pan.y,
+    /// The current camera (zoom, pan) placed on a canvas centered at `center`.
+    pub fn view(&self, center: egui::Pos2) -> ViewTransform {
+        ViewTransform::new(self.zoom, self.pan, center)
+    }
+
+    /// Zoom and pan so the whole drawing — atoms, bonds, ring fills and atom labels — sits
+    /// centered on `canvas` (the rect [`ui`](Self::ui) draws into) with [`FitOptions::default`].
+    /// Does nothing when the molecule is empty. Labels are laid out with `ctx`'s fonts; before
+    /// the first frame, use [`request_fit`](Self::request_fit) instead.
+    ///
+    /// # Panics
+    ///
+    /// If `ctx` has never started a frame (egui creates its fonts then). Calling it during the
+    /// first frame, inside `run_ui`, is fine.
+    pub fn fit_view(&mut self, ctx: &egui::Context, canvas: egui::Rect) {
+        self.fit_view_with(ctx, canvas, FitOptions::default());
+    }
+
+    /// Fit the view (as [`fit_view`](Self::fit_view)) at the start of the next
+    /// [`ui`](Self::ui) call, on the canvas that frame draws into. Usable before any frame
+    /// has run and without knowing the canvas size, e.g. right after loading a drawing.
+    pub fn request_fit(&mut self) {
+        self.fit_requested = true;
+    }
+
+    /// [`fit_view`](Self::fit_view) with a chosen margin, zoom range, or zoom kept as is.
+    ///
+    /// # Panics
+    ///
+    /// If `ctx` has never started a frame, as for [`fit_view`](Self::fit_view).
+    pub fn fit_view_with(&mut self, ctx: &egui::Context, canvas: egui::Rect, opts: FitOptions) {
+        self.fit_with_layout(canvas, opts, |job| ctx.fonts_mut(|f| f.layout_job(job)));
+    }
+
+    fn fit_with_layout(
+        &mut self,
+        canvas: egui::Rect,
+        opts: FitOptions,
+        layout: impl FnMut(egui::text::LayoutJob) -> std::sync::Arc<egui::Galley>,
+    ) {
+        let style = &self.config.style;
+        if let Some(v) = view::fit_transform(&self.molecule, style, canvas, self.zoom, opts, layout) {
+            self.zoom = v.zoom;
+            self.pan = v.pan;
         }
     }
 
+    /// Zoom by `factor` about the screen point `anchor` (see [`ViewTransform::zoomed_about`]).
+    fn zoom_about(&mut self, factor: f32, anchor: egui::Pos2, center: egui::Pos2) {
+        let zoomed = self.view(center).zoomed_about(factor, anchor);
+        self.zoom = zoomed.zoom;
+        self.pan = zoomed.pan;
+    }
+
+    pub fn mol_to_screen(&self, pos: [f32; 2], center: egui::Pos2) -> egui::Pos2 {
+        self.view(center).mol_to_screen(pos)
+    }
+
     pub fn screen_to_mol(&self, screen: egui::Pos2, center: egui::Pos2) -> [f32; 2] {
-        let inv = 1.0 / (self.zoom * SCALE_FACTOR);
-        [
-            (screen.x - center.x - self.pan.x) * inv,
-            (screen.y - center.y - self.pan.y) * inv,
-        ]
+        self.view(center).screen_to_mol(screen)
     }
 
     /// Screen rects of the atom labels painted last frame (atom id → rect). Empty until
@@ -841,6 +964,21 @@ impl ChemStructEditor {
         let center = rect.center();
         let painter = ui.painter_at(rect);
 
+        // Ctrl+0: fit the whole drawing to the canvas. Read here, ahead of the request below, so
+        // the fit lands in this very frame. Not while a text field (the label editor, or a host
+        // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
+        // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
+        let text_input = self.label_edit.is_some() || ui.ctx().egui_wants_keyboard_input();
+        if !text_input && ui.input(|i| i.key_pressed(egui::Key::Num0) && i.modifiers.ctrl) {
+            self.request_fit();
+        }
+
+        // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
+        // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
+        if std::mem::take(&mut self.fit_requested) {
+            self.fit_with_layout(rect, FitOptions::default(), |job| painter.layout_job(job));
+        }
+
         painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
 
         // Update hover state and track mouse in mol coords.
@@ -883,18 +1021,11 @@ impl ChemStructEditor {
         if let Some(mouse_pos) = mouse_pos {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                let factor = (scroll * 0.002).exp();
-                let before = self.screen_to_mol(mouse_pos, center);
-                self.zoom = (self.zoom * factor).clamp(0.1, 20.0);
-                let after = self.mol_to_screen(before, center);
-                self.pan += mouse_pos - after;
+                self.zoom_about((scroll * 0.002).exp(), mouse_pos, center);
             }
             let zoom_delta = ui.input(|i| i.zoom_delta());
             if (zoom_delta - 1.0).abs() > f32::EPSILON {
-                let before = self.screen_to_mol(mouse_pos, center);
-                self.zoom = (self.zoom * zoom_delta).clamp(0.1, 20.0);
-                let after = self.mol_to_screen(before, center);
-                self.pan += mouse_pos - after;
+                self.zoom_about(zoom_delta, mouse_pos, center);
             }
         }
 
@@ -1049,15 +1180,23 @@ impl ChemStructEditor {
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let tool_modified = if label_editing || cleaning || ui.ctx().egui_wants_keyboard_input() {
-            false
-        } else {
+        let canvas_input = !(label_editing || cleaning || ui.ctx().egui_wants_keyboard_input());
+        let tool_modified = if canvas_input {
             match self.tool.clone() {
                 Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
                 Tool::Select => interact::process_select_tool(self, &response, center, ui),
                 Tool::Eraser => interact::process_eraser_tool(self, &response, center),
             }
+        } else {
+            false
         };
+
+        // Middle-button drag pans the camera, whatever the tool. It runs after the tool
+        // handler so the tool still sees this frame's pre-pan view, as the Bond tool did when
+        // the pan lived inside it.
+        if canvas_input && ui.input(|i| i.pointer.middle_down()) {
+            self.pan += ui.input(|i| i.pointer.delta());
+        }
         let modified = cleanup_toggle | label_confirmed | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
@@ -1332,5 +1471,615 @@ mod undo_redo_tests {
         let (events, modifiers) = crate::testkit::chord("Ctrl+Z");
         run_frame_with_modifiers(&ctx, screen_rect, &mut editor, events, modifiers);
         assert_eq!(editor.molecule.atoms.len(), 1, "Ctrl+Z should undo the second atom placement");
+    }
+}
+
+/// Characterization tests for the editor's view (camera): the mol <-> screen mapping, scroll
+/// zoom and middle-button pan. They pin today's behavior so the view code can be consolidated
+/// without changing what the user sees.
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    use crate::testkit::run_frame;
+
+    /// Several non-trivial cameras, including the zoom clamp bounds.
+    fn cameras() -> Vec<(f32, egui::Vec2)> {
+        vec![
+            (1.0, egui::Vec2::ZERO),
+            (0.1, egui::vec2(-40.0, 12.5)),
+            (2.75, egui::vec2(130.0, -77.0)),
+            (20.0, egui::vec2(3.0, 9000.0)),
+        ]
+    }
+
+    fn assert_close(a: egui::Pos2, b: egui::Pos2, what: &str) {
+        assert!(
+            (a.x - b.x).abs() <= 1e-3 && (a.y - b.y).abs() <= 1e-3,
+            "{what}: {a:?} != {b:?}"
+        );
+    }
+
+    #[test]
+    fn mol_to_screen_and_screen_to_mol_round_trip() {
+        let center = egui::pos2(321.0, 245.0);
+        for (zoom, pan) in cameras() {
+            let e = ChemStructEditor { zoom, pan, ..Default::default() };
+            for p in [[0.0, 0.0], [1.5, -2.25], [-7.0, 3.0]] {
+                let back = e.screen_to_mol(e.mol_to_screen(p, center), center);
+                assert!(
+                    (back[0] - p[0]).abs() <= 1e-4 && (back[1] - p[1]).abs() <= 1e-4,
+                    "zoom {zoom} pan {pan:?}: {p:?} round-tripped to {back:?}"
+                );
+            }
+            for s in [center, egui::pos2(0.0, 0.0), egui::pos2(800.0, 13.0)] {
+                let back = e.mol_to_screen(e.screen_to_mol(s, center), center);
+                assert_close(back, s, &format!("zoom {zoom} pan {pan:?}: screen round trip"));
+            }
+        }
+    }
+
+    #[test]
+    fn mol_to_screen_places_the_origin_at_center_plus_pan_and_scales_by_zoom() {
+        let center = egui::pos2(321.0, 245.0);
+        let e = ChemStructEditor { zoom: 2.0, pan: egui::vec2(10.0, -5.0), ..Default::default() };
+        assert_close(e.mol_to_screen([0.0, 0.0], center), center + e.pan, "origin");
+        assert_close(
+            e.mol_to_screen([1.0, 1.0], center),
+            center + e.pan + egui::vec2(2.0 * SCALE_FACTOR, 2.0 * SCALE_FACTOR),
+            "unit offset",
+        );
+    }
+
+    #[test]
+    fn draw_transform_agrees_with_mol_to_screen() {
+        let center = egui::pos2(321.0, 245.0);
+        for (zoom, pan) in cameras() {
+            let e = ChemStructEditor { zoom, pan, ..Default::default() };
+            let t = draw::editor_transform_for_tests(&e, center);
+            assert_eq!(t.visual_scale, zoom, "visual sizes scale by zoom alone");
+            for p in [[0.0, 0.0], [1.5, -2.25], [-7.0, 3.0]] {
+                assert_close(
+                    t.apply(p),
+                    e.mol_to_screen(p, center),
+                    &format!("zoom {zoom} pan {pan:?} point {p:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_zoom_keeps_the_point_under_the_cursor_fixed() {
+        let ctx = egui::Context::default();
+        let mut editor =
+            ChemStructEditor { zoom: 1.3, pan: egui::vec2(25.0, -15.0), ..Default::default() };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        // Off-center, so a zoom about the canvas center (rather than the cursor) would move it.
+        let cursor = egui::pos2(500.0, 120.0);
+
+        // Two frames: the canvas only reports hover once egui has laid it out a frame earlier.
+        for _ in 0..2 {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+        }
+        assert!(editor.pointer_active, "the cursor must be over the canvas");
+        // `last_mouse_mol` is `screen_to_mol(cursor, center)` taken at the start of each frame.
+        let before = editor.last_mouse_mol;
+        let zoom_before = editor.zoom;
+
+        for (i, dy) in [120.0_f32, -40.0].into_iter().enumerate() {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            }]);
+            // egui spreads one wheel event over several frames; let it play out.
+            for _ in 0..30 {
+                run_frame(&ctx, screen_rect, &mut editor, vec![]);
+            }
+            // One more frame so `last_mouse_mol` is re-sampled under the final camera.
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+            let after = editor.last_mouse_mol;
+            assert!(
+                (after[0] - before[0]).abs() <= 1e-3 && (after[1] - before[1]).abs() <= 1e-3,
+                "scroll #{i}: the molecule point under the cursor moved from {before:?} to {after:?}"
+            );
+        }
+        assert!(
+            (editor.zoom - zoom_before).abs() > 1e-3,
+            "the scroll must actually have zoomed (zoom stayed {})",
+            editor.zoom
+        );
+    }
+
+    #[test]
+    fn pinch_zoom_keeps_the_point_under_the_cursor_fixed_and_is_clamped() {
+        let ctx = egui::Context::default();
+        let mut editor =
+            ChemStructEditor { zoom: 1.3, pan: egui::vec2(25.0, -15.0), ..Default::default() };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let cursor = egui::pos2(500.0, 120.0);
+        for _ in 0..2 {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+        }
+        assert!(editor.pointer_active, "the cursor must be over the canvas");
+        let before = editor.last_mouse_mol;
+
+        for (factor, zoom) in [(1.5_f32, 1.3_f32 * 1.5), (0.5, 1.3 * 1.5 * 0.5)] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::Zoom(factor)]);
+            assert!((editor.zoom - zoom).abs() <= 1e-5, "pinch {factor}: zoom {}", editor.zoom);
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+            let after = editor.last_mouse_mol;
+            assert!(
+                (after[0] - before[0]).abs() <= 1e-3 && (after[1] - before[1]).abs() <= 1e-3,
+                "pinch {factor}: the molecule point under the cursor moved from {before:?} to {after:?}"
+            );
+        }
+        for (factor, bound) in [(1.0e4_f32, 20.0_f32), (1.0e-4, 0.1)] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::Zoom(factor)]);
+            assert_eq!(editor.zoom, bound, "pinch {factor} should end at the clamp bound");
+        }
+    }
+
+    #[test]
+    fn select_drag_moves_the_atom_by_the_pointer_delta_in_molecule_units() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor {
+            tool: Tool::Select,
+            zoom: 1.7,
+            pan: egui::vec2(-20.0, 30.0),
+            ..Default::default()
+        };
+        let id = editor.molecule.add_atom("C".to_string(), [0.5, -0.25], 0);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let center = screen_rect.center();
+        let p0 = editor.mol_to_screen([0.5, -0.25], center);
+
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p0,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        // The first 5 px step stays under egui's drag threshold, so it is not a drag yet and
+        // does not move the atom; the drag (and the atom) follows from the next step on.
+        let step = egui::vec2(4.0, -3.0);
+        let mut p = p0 + step;
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+        let drag_from = p;
+        for _ in 0..5 {
+            p += step;
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+        }
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        let moved = p - drag_from;
+        let s = 1.7 * SCALE_FACTOR;
+        let pos = editor.molecule.atom_by_id(id).unwrap().pos;
+        assert!(
+            (pos[0] - (0.5 + moved.x / s)).abs() <= 1e-4
+                && (pos[1] - (-0.25 + moved.y / s)).abs() <= 1e-4,
+            "atom ended at {pos:?} after a {moved:?} drag"
+        );
+    }
+
+    #[test]
+    fn scroll_up_zooms_in_and_zoom_is_clamped_to_0_1_through_20() {
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let cursor = egui::pos2(320.0, 240.0);
+        for (dy, bound) in [(1.0e5_f32, 20.0_f32), (-1.0e5, 0.1)] {
+            let mut editor = ChemStructEditor::default();
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(cursor)]);
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            }]);
+            for _ in 0..60 {
+                run_frame(&ctx, screen_rect, &mut editor, vec![]);
+            }
+            assert_eq!(editor.zoom, bound, "scroll delta {dy} should end at the clamp bound");
+        }
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_bond_tool() {
+        let editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, Tool::Bond);
+        assert_middle_drag_pans(editor);
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_select_tool() {
+        assert_middle_drag_pans(ChemStructEditor { tool: Tool::Select, ..Default::default() });
+    }
+
+    #[test]
+    fn middle_drag_pans_by_the_pointer_delta_in_the_eraser_tool() {
+        assert_middle_drag_pans(ChemStructEditor { tool: Tool::Eraser, ..Default::default() });
+    }
+
+    /// A focused text field keeps the canvas from reacting to input, the camera included.
+    #[test]
+    fn middle_drag_does_not_pan_while_a_text_field_has_focus() {
+        for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
+            let ctx = egui::Context::default();
+            let mut editor = ChemStructEditor { tool: tool.clone(), ..Default::default() };
+            let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+            let field = egui::Id::new("some_text_field");
+            let p0 = egui::pos2(300.0, 200.0);
+            let p1 = egui::pos2(340.0, 170.0);
+            let frame = |editor: &mut ChemStructEditor, events: Vec<egui::Event>| {
+                let raw = egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(raw, |ui| {
+                    ui.memory_mut(|m| m.request_focus(field));
+                    editor.ui(ui);
+                });
+            };
+            frame(&mut editor, vec![egui::Event::PointerMoved(p0)]);
+            frame(&mut editor, vec![egui::Event::PointerButton {
+                pos: p0,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: Default::default(),
+            }]);
+            let pan_start = editor.pan;
+            frame(&mut editor, vec![egui::Event::PointerMoved(p1)]);
+            assert_eq!(editor.pan, pan_start, "{tool:?}: no pan while a text field has focus");
+        }
+    }
+
+    fn assert_middle_drag_pans(mut editor: ChemStructEditor) {
+        let ctx = egui::Context::default();
+        let tool = editor.tool.clone();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p0 = egui::pos2(300.0, 200.0);
+        let p1 = egui::pos2(340.0, 170.0);
+        let p2 = egui::pos2(360.0, 230.0);
+
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p0,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        let pan_start = editor.pan;
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p1)]);
+        assert_eq!(editor.pan, pan_start + (p1 - p0), "{tool:?}: pan follows the middle-drag delta");
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p2)]);
+        assert_eq!(editor.pan, pan_start + (p2 - p0), "{tool:?}: pan accumulates over the drag");
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p2,
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        let pan_end = editor.pan;
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        assert_eq!(editor.pan, pan_end, "{tool:?}: moving after the release does not pan");
+    }
+
+    /// Middle-drag along `path` (press at the first point, release at the last), calling
+    /// `during` after every frame the button is held. Returns whether any frame's `ui()`
+    /// reported a modification.
+    fn middle_drag_along(
+        editor: &mut ChemStructEditor,
+        path: &[egui::Pos2],
+        mut during: impl FnMut(&ChemStructEditor),
+    ) -> bool {
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let frame = |editor: &mut ChemStructEditor, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut modified = false;
+            let _ = ctx.run_ui(raw, |ui| modified = editor.ui(ui));
+            modified
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let (first, last) = (path[0], path[path.len() - 1]);
+        let mut modified = frame(editor, vec![egui::Event::PointerMoved(first)]);
+        modified |= frame(editor, vec![button(first, true)]);
+        during(editor);
+        for &p in &path[1..] {
+            modified |= frame(editor, vec![egui::Event::PointerMoved(p)]);
+            during(editor);
+        }
+        modified |= frame(editor, vec![button(last, false)]);
+        modified
+    }
+
+    /// The canvas center of the 640x480 test screen, where mol (0, 0) sits at the default view.
+    const MID: egui::Pos2 = egui::pos2(320.0, 240.0);
+
+    #[test]
+    fn select_middle_drag_from_an_atom_only_pans() {
+        let mut editor = ChemStructEditor { tool: Tool::Select, ..Default::default() };
+        let atom = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let undo_len = editor.undo_stack.len();
+        let pan_start = editor.pan;
+
+        // Small first steps so the drag starts while the pointer is still over the atom (the
+        // Select tool picks the dragged atom from the hover at drag start).
+        let path = [
+            MID,
+            MID + egui::vec2(4.0, 2.0),
+            MID + egui::vec2(8.0, 4.0),
+            MID + egui::vec2(60.0, 30.0),
+            MID + egui::vec2(100.0, 50.0),
+        ];
+        let modified = middle_drag_along(&mut editor, &path, |_| {});
+
+        assert_ne!(editor.pan, pan_start, "the middle drag pans");
+        assert_eq!(editor.molecule.atom_by_id(atom).unwrap().pos, [0.0, 0.0], "atom not moved");
+        assert!(editor.selected_atoms.is_empty(), "selection unchanged");
+        assert_eq!(editor.undo_stack.len(), undo_len, "no undo snapshot");
+        assert!(!modified, "ui() reports no modification");
+    }
+
+    #[test]
+    fn select_middle_drag_around_an_atom_does_not_lasso() {
+        let mut editor = ChemStructEditor { tool: Tool::Select, ..Default::default() };
+        editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let pan_start = editor.pan;
+
+        // Starts in empty space and circles the atom at MID.
+        let path = [
+            MID + egui::vec2(-150.0, 0.0),
+            MID + egui::vec2(0.0, -150.0),
+            MID + egui::vec2(150.0, 0.0),
+            MID + egui::vec2(0.0, 150.0),
+            MID + egui::vec2(-150.0, 0.0),
+        ];
+        // The path is closed, so the pan ends where it began; check it moved along the way.
+        let mut panned = false;
+        middle_drag_along(&mut editor, &path, |e| {
+            assert!(e.lasso_path.is_empty(), "no lasso path during a middle drag");
+            panned |= e.pan != pan_start;
+        });
+
+        assert!(panned, "the middle drag pans");
+        assert!(editor.selected_atoms.is_empty(), "nothing lasso-selected");
+    }
+
+    /// Escape aborts an egui drag while the primary button is still held; the tool must still
+    /// see that as the end of its primary drag and tear the lasso down.
+    #[test]
+    fn select_primary_lasso_aborted_by_escape_is_torn_down() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor { tool: Tool::Select, ..Default::default() };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let p0 = MID + egui::vec2(-150.0, 0.0);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p0)]);
+        run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerButton {
+            pos: p0,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        for p in [p0 + egui::vec2(40.0, -40.0), p0 + egui::vec2(80.0, -60.0)] {
+            run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
+        }
+        assert!(!editor.lasso_path.is_empty(), "the primary drag draws a lasso");
+        assert!(editor.drag_origin_screen.is_some());
+
+        let (events, modifiers) = crate::testkit::chord("Escape");
+        crate::testkit::run_frame_with_modifiers(&ctx, screen_rect, &mut editor, events, modifiers);
+        assert!(editor.lasso_path.is_empty(), "the aborted lasso is cleared");
+        assert!(editor.drag_origin_screen.is_none(), "the aborted lasso is torn down");
+    }
+
+    #[test]
+    fn bond_middle_drag_from_an_atom_does_not_draw_a_bond() {
+        let mut editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, Tool::Bond);
+        editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let undo_len = editor.undo_stack.len();
+
+        let path = [MID, MID + egui::vec2(80.0, 40.0), MID + egui::vec2(150.0, 90.0)];
+        middle_drag_along(&mut editor, &path, |e| {
+            assert!(e.bond_start.is_none(), "no bond preview during a middle drag");
+        });
+
+        assert_eq!(editor.molecule.atoms.len(), 1, "no atom added");
+        assert!(editor.molecule.bonds.is_empty(), "no bond added");
+        assert_eq!(editor.undo_stack.len(), undo_len, "no undo snapshot");
+    }
+}
+
+/// `fit_view` frames the drawing the editor then actually paints.
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    /// A drawing far from the origin whose extremes are labels: H2N on the left, CO2Et on the
+    /// right, 45 units apart.
+    fn labeled_editor() -> ChemStructEditor {
+        let mut editor = ChemStructEditor::default();
+        let m = &mut editor.molecule;
+        for [(e1, p1), (e2, p2)] in [
+            [("N", [-20.0, 3.0]), ("C", [-18.5, 3.0])],
+            [("CO2Et", [25.0, 4.0]), ("C", [23.5, 4.0])],
+        ] {
+            let a = m.add_atom(e1.to_string(), p1, 0);
+            let b = m.add_atom(e2.to_string(), p2, 0);
+            m.add_bond(a, b, BondOrder::Single);
+        }
+        editor
+    }
+
+    /// Run one frame; returns the canvas rect the editor drew into.
+    fn frame(ctx: &egui::Context, editor: &mut ChemStructEditor) -> egui::Rect {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+        let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        let mut canvas = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            canvas = ui.available_rect_before_wrap();
+            editor.ui(ui);
+        });
+        canvas
+    }
+
+    /// Every atom and every label rect painted in the last frame lies inside the margin, and
+    /// the drawing's bounding rect is centered on the canvas.
+    fn assert_framed(editor: &ChemStructEditor, canvas: egui::Rect) {
+        let avail = canvas.shrink(FitOptions::default().margin).expand(0.01);
+        let center = canvas.center();
+        let mut bounds = egui::Rect::NOTHING;
+        for a in &editor.molecule.atoms {
+            let p = editor.mol_to_screen(a.pos, center);
+            assert!(avail.contains(p), "atom {p:?} outside {avail:?}");
+            bounds.extend_with(p);
+        }
+        assert_eq!(editor.label_rects().len(), 2, "both labels painted");
+        for r in editor.label_rects().values() {
+            assert!(avail.contains_rect(*r), "label {r:?} outside {avail:?}");
+            bounds = bounds.union(*r);
+        }
+        let off = bounds.center() - center;
+        assert!(off.x.abs() <= 1.0 && off.y.abs() <= 1.0, "drawing center off by {off:?}");
+    }
+
+    #[test]
+    fn fit_view_frames_the_painted_drawing() {
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        let canvas = frame(&ctx, &mut editor);
+        editor.fit_view(&ctx, canvas);
+        assert!(editor.zoom < 1.0, "45 units do not fit 600 px at zoom 1");
+        assert_eq!(frame(&ctx, &mut editor), canvas);
+        assert_framed(&editor, canvas);
+
+        let (zoom, pan) = (editor.zoom, editor.pan);
+        editor.fit_view_with(&ctx, canvas, FitOptions { keep_zoom: true, ..Default::default() });
+        assert_eq!(editor.zoom, zoom, "keep_zoom keeps the zoom");
+        assert!((editor.pan - pan).length() < 1e-3, "an already fitted view stays put");
+
+        let mut empty =
+            ChemStructEditor { zoom: 2.0, pan: egui::vec2(5.0, 6.0), ..Default::default() };
+        empty.fit_view(&ctx, canvas);
+        assert_eq!((empty.zoom, empty.pan), (2.0, egui::vec2(5.0, 6.0)), "nothing to fit");
+    }
+
+    #[test]
+    fn request_fit_applies_on_the_next_frame_with_its_canvas_once() {
+        // A fresh context: no frame has run, so `fit_view` could not lay labels out yet.
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        editor.request_fit();
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "nothing until ui()");
+        let canvas = frame(&ctx, &mut editor);
+        assert_framed(&editor, canvas);
+
+        // The request is used up: a later pan stays.
+        editor.pan += egui::vec2(40.0, -25.0);
+        let pan = editor.pan;
+        frame(&ctx, &mut editor);
+        assert_eq!(editor.pan, pan);
+    }
+
+    /// Run one frame delivering the chord `spec`; with `text_field`, a host text field that
+    /// holds keyboard focus is shown above the editor. Returns the editor's canvas rect.
+    fn chord_frame(
+        ctx: &egui::Context,
+        editor: &mut ChemStructEditor,
+        spec: &str,
+        mut text_field: Option<&mut String>,
+    ) -> egui::Rect {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+        let (events, modifiers) = crate::testkit::chord(spec);
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            modifiers,
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let mut canvas = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            if let Some(text) = text_field.as_deref_mut() {
+                ui.add(egui::TextEdit::singleline(text)).request_focus();
+            }
+            canvas = ui.available_rect_before_wrap();
+            editor.ui(ui);
+        });
+        canvas
+    }
+
+    #[test]
+    fn ctrl_0_fits_the_view_in_the_same_frame_in_every_tool() {
+        // A hotspot gives the plain `0` shortcut (extend by one carbon) a target, so a Ctrl+0
+        // that leaked into the drawing shortcuts would add an atom.
+        let with_hotspot = |tool: Tool| {
+            let mut editor = ChemStructEditor { tool, ..labeled_editor() };
+            editor.hotspot_atom = Some(editor.molecule.atoms[1].id);
+            editor
+        };
+
+        // Control: with that hotspot, plain `0` does draw in the Bond tool.
+        let mut plain = with_hotspot(Tool::Bond);
+        let atoms = plain.molecule.atoms.len();
+        chord_frame(&egui::Context::default(), &mut plain, "0", None);
+        assert!(plain.molecule.atoms.len() > atoms, "plain `0` extends the hotspot");
+
+        for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
+            let ctx = egui::Context::default();
+            let mut editor = with_hotspot(tool.clone());
+            let atoms = editor.molecule.atoms.len();
+            let undo_len = editor.undo_stack.len();
+            let canvas = chord_frame(&ctx, &mut editor, "Ctrl+0", None);
+            assert!(editor.zoom < 1.0, "{tool:?}: Ctrl+0 zooms out to fit");
+            assert_framed(&editor, canvas);
+            // Ctrl+0 only moves the view: it does not also run the plain `0` shortcut.
+            assert_eq!(editor.molecule.atoms.len(), atoms, "{tool:?}: nothing drawn");
+            assert_eq!(editor.undo_stack.len(), undo_len, "{tool:?}: no undo snapshot");
+        }
+    }
+
+    #[test]
+    fn ctrl_0_does_nothing_while_a_host_text_field_has_focus() {
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        let mut text = String::new();
+        // First frame: the field takes focus.
+        chord_frame(&ctx, &mut editor, "Escape", Some(&mut text));
+        assert!(ctx.egui_wants_keyboard_input());
+        chord_frame(&ctx, &mut editor, "Ctrl+0", Some(&mut text));
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "view unchanged");
+    }
+
+    #[test]
+    fn ctrl_0_does_nothing_while_the_label_editor_is_open() {
+        let ctx = egui::Context::default();
+        let mut editor = labeled_editor();
+        let id = editor.molecule.atoms[1].id;
+        editor.label_edit = Some((id, "C".to_string()));
+        // On its first frame the label box is not focused yet; Ctrl+0 is still text input.
+        chord_frame(&ctx, &mut editor, "Ctrl+0", None);
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "view unchanged");
+        chord_frame(&ctx, &mut editor, "Ctrl+0", None);
+        assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "view unchanged");
+        assert!(editor.label_edit.is_some(), "the label editor stays open");
     }
 }

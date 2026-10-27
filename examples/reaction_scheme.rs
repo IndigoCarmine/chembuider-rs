@@ -203,6 +203,14 @@ impl eframe::App for ReactionApp {
                 // figure is drawn, so the table below re-derives live as the structure changes.
                 self.sync_linked_structure();
                 let response = self.editor.show(ui, &mut self.reaction);
+                // A drag on the figure moved structures to other positions. The link names its
+                // slot by position, so it may now point at a different structure — drop it
+                // before the next frame's sync writes the canvas over that one (as `apply` does
+                // for the inspector's reorders).
+                if self.editor.take_scheme_rearranged() && self.linked_structure.take().is_some() {
+                    self.status =
+                        "The figure was rearranged — the canvas is no longer linked.".to_string();
+                }
                 // Right-click a scheme item for the same actions the inspector offers, so the
                 // figure is fully operable on its own — no side panel required (課題D).
                 self.scheme_context_menu(response);
@@ -244,7 +252,7 @@ impl ReactionApp {
         // The molecule currently in the linked slot, whichever kind of slot it is.
         let current = match target {
             StructureRef::Item(i) => match self.reaction.scheme.items.get(i) {
-                Some(SchemeItem::Structure(m)) => Some(m),
+                Some(SchemeItem::Structure(m)) => Some(m.molecule()),
                 _ => None,
             },
             StructureRef::ArrowLabel { index, part } => {
@@ -292,8 +300,15 @@ impl ReactionApp {
                 }
             }
             if ui.button("🗑 Clear").clicked() {
-                self.canvas.molecule = Molecule::default();
-                self.canvas.selected_atoms.clear();
+                // A running cleanup would go on writing into the cleared canvas.
+                self.canvas.cancel_cleanup();
+                // An empty canvas has nothing to clear: an undo step there would only wipe
+                // the redo history. Otherwise snapshot first so Ctrl+Z brings it back.
+                if !self.canvas.molecule.atoms.is_empty() {
+                    self.canvas.push_undo();
+                    self.canvas.molecule = Molecule::default();
+                    self.canvas.selected_atoms.clear();
+                }
             }
             if ui.button("📋 Paste").clicked() {
                 self.canvas.paste_clipboard();
@@ -317,7 +332,7 @@ impl ReactionApp {
             if ui.button("➕ To scheme").clicked()
                 && let Some(mol) = self.canvas_structure()
             {
-                self.reaction.scheme.add(SchemeItem::Structure(mol));
+                self.reaction.scheme.add(SchemeItem::Structure(mol.into()));
                 self.status = "Added the structure to the scheme.".to_string();
             }
 
@@ -355,9 +370,12 @@ impl ReactionApp {
             {
                 // The syncing setter carries the new structure into its analysis column, so
                 // the table's formula, MW and stoichiometry redraw with the scheme.
-                self.reaction.set_scheme_structure(index, mol);
-                self.status =
-                    "Replaced the selected structure — the table below followed it.".to_string();
+                self.status = if self.reaction.set_scheme_structure(index, mol) {
+                    "Replaced the selected structure — the table below followed it.".to_string()
+                } else {
+                    "The selection is not a structure on the reaction line — nothing replaced."
+                        .to_string()
+                };
             }
             if ui
                 .add_enabled(structure_selected, egui::Button::new("🧹 Clean up selected"))
@@ -609,9 +627,12 @@ impl ReactionApp {
             Action::ReplaceSchemeStructure(i) => {
                 if let Some(mol) = self.canvas_structure() {
                     // Redraw the structure and carry it into its table column in one step.
-                    self.reaction.set_scheme_structure(i, mol);
-                    self.status =
-                        "Replaced a scheme structure — the table column followed it.".to_string();
+                    self.status = if self.reaction.set_scheme_structure(i, mol) {
+                        "Replaced a scheme structure — the table column followed it.".to_string()
+                    } else {
+                        "That item is not a structure on the reaction line — nothing replaced."
+                            .to_string()
+                    };
                 }
             }
             Action::CleanupSchemeStructure(i) => {
@@ -625,7 +646,7 @@ impl ReactionApp {
                 let (mol, sel) = match target {
                     StructureRef::Item(i) => match self.reaction.scheme.items.get(i) {
                         Some(SchemeItem::Structure(m)) => (
-                            Some(m.clone()),
+                            Some(m.molecule().clone()),
                             Hit::Scheme { index: i, part: SchemePart::Structure },
                         ),
                         _ => (None, Hit::Scheme { index: i, part: SchemePart::Structure }),
@@ -636,6 +657,8 @@ impl ReactionApp {
                     ),
                 };
                 if let Some(mol) = mol {
+                    // A running cleanup would go on writing into the loaded structure.
+                    self.canvas.cancel_cleanup();
                     self.canvas.push_undo();
                     self.canvas.molecule = mol;
                     self.canvas.selected_atoms.clear();

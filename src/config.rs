@@ -120,6 +120,11 @@ impl FragmentDef {
             attach_idx: self.attach_idx,
         }
     }
+
+    /// [`Fragment::validate`] for this definition — the same check, not a second copy of it.
+    pub fn validate(&self) -> Result<(), String> {
+        self.to_fragment().validate()
+    }
 }
 
 // ─── Drawing style (user-tunable appearance) ──────────────────────────────────
@@ -269,12 +274,27 @@ impl Config {
         // ── Fragments ────────────────────────────────────────────────────────
         // Priority: fragments/ directory > inline fragments in JSON > embedded defaults
         let inline = std::mem::take(&mut cfg.fragments);
-        cfg.fragments = load_fragments(inline);
+        cfg.fragments = load_fragments(inline, std::path::Path::new("fragments"));
         cfg
     }
 
     /// Save shortcuts to `chembuilder_config.json` and each fragment to `fragments/<name>.json`.
+    ///
+    /// Fails with [`InvalidInput`](std::io::ErrorKind::InvalidInput), before writing anything,
+    /// if a fragment's name is not a plain file name ([`Fragment::validate_name`]): a name like
+    /// `../x` would otherwise write outside `fragments/`. Refusing the whole save (rather than
+    /// skipping that fragment) tells the caller, and leaves the files on disk as they were.
     pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(std::path::Path::new("."))
+    }
+
+    /// [`Config::save`] into `dir` instead of the current directory.
+    fn save_to(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        for frag in &self.fragments {
+            Fragment::validate_name(&frag.name)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        }
+
         // Shortcuts + style (fragments live in their own files)
         let shortcuts = Config {
             atom_shortcuts: self.atom_shortcuts.clone(),
@@ -284,14 +304,15 @@ impl Config {
             fragments: Vec::new(),
         };
         std::fs::write(
-            "chembuilder_config.json",
+            dir.join("chembuilder_config.json"),
             serde_json::to_string_pretty(&shortcuts)?,
         )?;
 
-        // Individual fragment files
-        std::fs::create_dir_all("fragments")?;
+        // Individual fragment files (names checked above)
+        let frag_dir = dir.join("fragments");
+        std::fs::create_dir_all(&frag_dir)?;
         for frag in &self.fragments {
-            let path = format!("fragments/{}.json", frag.name);
+            let path = frag_dir.join(format!("{}.json", frag.name));
             std::fs::write(path, serde_json::to_string_pretty(frag)?)?;
         }
         Ok(())
@@ -302,13 +323,12 @@ impl Config {
         if let Some(def) = self.fragments.iter().find(|f| f.name == name) {
             return Some(def.to_fragment());
         }
-        if let Some(size) = name
+        if let Some(ring) = name
             .strip_prefix("ring")
             .and_then(|s| s.parse::<usize>().ok())
+            .and_then(ring_of_size)
         {
-            if (3..=12).contains(&size) {
-                return Some(Fragment::ring(size));
-            }
+            return Some(ring);
         }
         if name == "benzene" {
             return Some(Fragment::benzene());
@@ -322,13 +342,23 @@ impl Config {
                 .resolve_fragment(fragment)
                 .map(ResolvedAtomAction::InsertFragment),
             AtomAction::Ring { ring } => {
-                Some(ResolvedAtomAction::InsertFragment(Fragment::ring(*ring)))
+                ring_of_size(*ring).map(ResolvedAtomAction::InsertFragment)
             }
             AtomAction::Chain { chain } => Some(ResolvedAtomAction::ExtendChain(*chain, false)),
             AtomAction::Zigzag { zigzag } => Some(ResolvedAtomAction::ExtendChain(*zigzag, true)),
             AtomAction::Charge { charge } => Some(ResolvedAtomAction::ModifyCharge(*charge)),
         }
     }
+}
+
+/// Ring sizes a config value may ask for, whether as a `"ringN"` fragment name or a
+/// `{"ring": N}` atom shortcut. Both come from user-editable files, so anything outside this
+/// range resolves to nothing instead of reaching [`Fragment::ring`], which asserts `n >= 3`.
+const RING_SIZES: std::ops::RangeInclusive<usize> = 3..=12;
+
+/// The n-membered carbocycle, if `n` is a ring size config values may ask for.
+fn ring_of_size(n: usize) -> Option<Fragment> {
+    RING_SIZES.contains(&n).then(|| Fragment::ring(n))
 }
 
 /// Resolved atom action ready for the editor to execute.
@@ -388,23 +418,48 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/Ph.json"),
 ];
 
+/// Parse one fragment's JSON and reject it if [`check_loaded`] fails. Used for the built-in
+/// strings and `fragments/*.json`; inline fragments arrive already parsed with the config and
+/// are checked in [`load_fragments`].
+fn parse_fragment_def(text: &str) -> Result<FragmentDef, String> {
+    let def = serde_json::from_str::<FragmentDef>(text).map_err(|e| format!("{e}"))?;
+    check_loaded(&def)?;
+    Ok(def)
+}
+
+/// What a loaded fragment must pass to enter the config: [`FragmentDef::validate`] (its
+/// indices fit), and a name that [`Config::save`] can write as `fragments/<name>.json`
+/// ([`Fragment::validate_name`]) — so a shared file with `"name": "../x"` is turned away here
+/// instead of being written back outside `fragments/` on the next save.
+fn check_loaded(def: &FragmentDef) -> Result<(), String> {
+    def.validate()?;
+    Fragment::validate_name(&def.name)
+}
+
 /// Parse the compile-time built-in fragments. No file I/O.
 fn builtin_fragments() -> Vec<FragmentDef> {
     BUILTIN_FRAGMENT_STRS
         .iter()
-        .filter_map(|s| serde_json::from_str::<FragmentDef>(s).ok())
+        .filter_map(|s| parse_fragment_def(s).ok())
         .collect()
 }
 
 /// Load fragments: embedded defaults as base, then merge inline + runtime dir (override by name).
 /// This ensures built-in fragments are always available even when a runtime `fragments/` dir exists.
-fn load_fragments(inline: Vec<FragmentDef>) -> Vec<FragmentDef> {
+fn load_fragments(inline: Vec<FragmentDef>, dir: &std::path::Path) -> Vec<FragmentDef> {
     let mut frags = builtin_fragments();
+    let inline = inline
+        .into_iter()
+        .filter(|f| match check_loaded(f) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("Warning: skip fragment {:?} in chembuilder_config.json: {e}", f.name);
+                false
+            }
+        })
+        .collect();
     merge_fragments(&mut frags, inline);
-    merge_fragments(
-        &mut frags,
-        load_fragments_from_dir(std::path::Path::new("fragments")),
-    );
+    merge_fragments(&mut frags, load_fragments_from_dir(dir));
     frags
 }
 
@@ -435,7 +490,7 @@ fn load_fragments_from_dir(dir: &std::path::Path) -> Vec<FragmentDef> {
     for path in paths {
         match std::fs::read_to_string(&path)
             .map_err(|e| format!("{e}"))
-            .and_then(|s| serde_json::from_str::<FragmentDef>(&s).map_err(|e| format!("{e}")))
+            .and_then(|s| parse_fragment_def(&s))
         {
             Ok(frag) => out.push(frag),
             Err(e) => eprintln!("Warning: skip {:?}: {e}", path),
@@ -473,5 +528,209 @@ pub fn ring_fragment_def(n: usize) -> FragmentDef {
         atoms,
         bonds,
         attach_idx: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        // Never `Config::load` — that reads the developer's own config and `fragments/`.
+        Config::embedded()
+    }
+
+    fn ring_action(ring: usize) -> Option<ResolvedAtomAction> {
+        cfg().atom_action_to_fragment(&AtomAction::Ring { ring })
+    }
+
+    /// `ring` comes from the user-editable `chembuilder_config.json`; an out-of-range size
+    /// must resolve to no action rather than reach `Fragment::ring`'s `assert!(n >= 3)`.
+    #[test]
+    fn ring_shortcut_outside_valid_sizes_resolves_to_none() {
+        for ring in [0, 1, 2, 13, 1000] {
+            assert!(ring_action(ring).is_none(), "ring {ring}");
+        }
+    }
+
+    /// The `{"ring": N}` shortcut and the `"ringN"` fragment name accept the same sizes.
+    #[test]
+    fn ring_shortcut_and_ring_name_accept_the_same_sizes() {
+        for n in 0..=20 {
+            let by_action = match ring_action(n) {
+                Some(ResolvedAtomAction::InsertFragment(f)) => Some(f.atoms.len()),
+                Some(_) => panic!("ring {n} must insert a fragment"),
+                None => None,
+            };
+            let by_name = cfg()
+                .resolve_fragment(&format!("ring{n}"))
+                .map(|f| f.atoms.len());
+            assert_eq!(by_action, by_name, "ring {n}");
+        }
+    }
+
+    /// A C–O fragment named `name` whose attach index and bond endpoints are the caller's.
+    fn two_atom_def(name: &str, attach_idx: usize, begin: usize, end: usize) -> FragmentDef {
+        let atom = |element: &str, x: f32| FragAtomDef { element: element.into(), pos: [x, 0.0], charge: 0 };
+        FragmentDef {
+            name: name.into(),
+            atoms: vec![atom("C", 0.0), atom("O", 1.5)],
+            bonds: vec![FragBondDef { begin, end, order: BondOrder::Single }],
+            attach_idx,
+        }
+    }
+
+    /// A fresh `fragments/`-style directory holding `defs`, one `<name>.json` each.
+    fn fragment_dir(tag: &str, defs: &[FragmentDef]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("chembuilder-fragments-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for def in defs {
+            let text = serde_json::to_string_pretty(def).unwrap();
+            std::fs::write(dir.join(format!("{}.json", def.name)), text).unwrap();
+        }
+        dir
+    }
+
+    /// A hand-edited `fragments/*.json` with an index past its atoms is skipped by the loader.
+    #[test]
+    fn fragment_dir_loader_skips_out_of_range_indices() {
+        let dir = fragment_dir(
+            "skip",
+            &[
+                two_atom_def("BadAttach", 5, 0, 1),
+                two_atom_def("BadBond", 0, 0, 99),
+                two_atom_def("Good", 0, 0, 1),
+                two_atom_def("SelfBond", 0, 1, 1),
+            ],
+        );
+        let names: Vec<String> = load_fragments_from_dir(&dir).into_iter().map(|f| f.name).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names, ["Good"]);
+    }
+
+    /// Whatever the user puts in `fragments/` or inline in `chembuilder_config.json`, every
+    /// fragment the config can hand out indexes safely — so `insert_fragment`, `to_molecule`
+    /// and the editor's `frag.atoms[frag.attach_idx]` never see an out-of-range index.
+    #[test]
+    fn invalid_user_fragments_never_reach_insertion() {
+        let dir = fragment_dir("insert", &[two_atom_def("BadBond", 0, 0, 99), two_atom_def("OH", 7, 0, 1)]);
+        let inline = vec![two_atom_def("InlineBad", 3, 0, 1), two_atom_def("Me", 0, 0, 42)];
+        let cfg = Config { fragments: load_fragments(inline, &dir), ..Config::embedded() };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        for name in ["BadBond", "InlineBad"] {
+            assert!(cfg.resolve_fragment(name).is_none(), "{name}");
+        }
+        // A bad override leaves the built-in of the same name in place.
+        for name in ["OH", "Me"] {
+            assert_eq!(cfg.resolve_fragment(name).unwrap().attach_idx, 0, "{name}");
+        }
+        for def in &cfg.fragments {
+            let action = AtomAction::Fragment { fragment: def.name.clone() };
+            let Some(ResolvedAtomAction::InsertFragment(frag)) = cfg.atom_action_to_fragment(&action) else {
+                panic!("{} must resolve to a fragment", def.name);
+            };
+            assert!(frag.atoms.get(frag.attach_idx).is_some(), "{}", def.name);
+            assert_eq!(frag.to_molecule().atoms.len(), frag.atoms.len(), "{}", def.name);
+            let mut mol = crate::molecule::Molecule::default();
+            let anchor = mol.add_atom("C".into(), [0.0, 0.0], 0);
+            mol.insert_fragment(&frag, anchor, 0.0, false);
+        }
+    }
+
+    /// A fragment named `../evil` (e.g. from a shared JSON file) must not make `save` write
+    /// `<dir>/evil.json`; the save is refused before anything is written.
+    #[test]
+    fn save_refuses_a_fragment_name_that_leaves_fragments_dir() {
+        let root = fragment_dir("save-escape", &[]);
+        let cfg = Config {
+            fragments: vec![two_atom_def("Good", 0, 0, 1), two_atom_def("../evil", 0, 0, 1)],
+            ..Config::embedded()
+        };
+        let result = cfg.save_to(&root);
+        let written = walk(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(written.is_empty(), "a refused save wrote {written:?}");
+    }
+
+    /// Every file under `dir`, recursively.
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// With valid names, `save` writes each fragment as `fragments/<name>.json` under `dir`,
+    /// and loading that directory back yields the same fragments.
+    #[test]
+    fn save_writes_each_fragment_into_fragments_dir() {
+        let root = fragment_dir("save-ok", &[]);
+        let cfg = Config { fragments: vec![two_atom_def("Good", 0, 0, 1)], ..Config::embedded() };
+        cfg.save_to(&root).unwrap();
+        let names: Vec<String> =
+            load_fragments_from_dir(&root.join("fragments")).into_iter().map(|f| f.name).collect();
+        let config_written = root.join("chembuilder_config.json").is_file();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(config_written);
+        assert_eq!(names, ["Good"]);
+    }
+
+    /// A fragment whose name `save` would refuse is skipped on load, from `fragments/*.json`
+    /// and inline alike, so it never enters the config.
+    #[test]
+    fn loader_skips_fragments_whose_name_is_not_a_file_name() {
+        let dir = fragment_dir("bad-name", &[two_atom_def("Good", 0, 0, 1)]);
+        let text = serde_json::to_string_pretty(&two_atom_def("../evil", 0, 0, 1)).unwrap();
+        std::fs::write(dir.join("shared.json"), text).unwrap();
+        let inline = vec![two_atom_def("a/b", 0, 0, 1), two_atom_def("NUL", 0, 0, 1)];
+        let frags = load_fragments(inline, &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let names: Vec<&str> = frags.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"Good"));
+        for bad in ["../evil", "a/b", "NUL"] {
+            assert!(!names.contains(&bad), "{bad} must be skipped");
+        }
+    }
+
+    /// Every compiled-in fragment survives the same parse-and-validate step as a user file.
+    #[test]
+    fn every_builtin_fragment_is_valid() {
+        for text in BUILTIN_FRAGMENT_STRS {
+            let def: FragmentDef = serde_json::from_str(text).unwrap();
+            def.validate().unwrap_or_else(|e| panic!("{}: {e}", def.name));
+        }
+        assert_eq!(builtin_fragments().len(), BUILTIN_FRAGMENT_STRS.len());
+    }
+
+    /// The element symbols the writers treat as group labels are exactly the built-in fragments
+    /// named by an element symbol that are not that element on its own ("Ac" is acetyl; "Br" is
+    /// bromine).
+    #[test]
+    fn group_labels_are_the_fragments_named_like_an_element() {
+        use crate::molecule::elements::{atomic_number, GROUP_LABELS};
+        let mut groups: Vec<String> = builtin_fragments()
+            .iter()
+            .filter(|def| atomic_number(&def.name).is_some())
+            .filter(|def| {
+                let frag = def.to_fragment();
+                !(frag.atoms.len() == 1 && frag.atoms[0].element == def.name)
+            })
+            .map(|def| def.name.clone())
+            .collect();
+        groups.sort();
+        assert_eq!(groups, GROUP_LABELS);
     }
 }

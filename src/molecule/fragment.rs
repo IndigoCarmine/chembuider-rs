@@ -115,9 +115,84 @@ impl Fragment {
 // ─── JSON I/O and Molecule interop ────────────────────────────────────────────
 
 impl Fragment {
+    /// Check that every index in the fragment points at one of its atoms: there is at least one
+    /// atom, `attach_idx` is one of them, and each bond joins two distinct atoms that exist.
+    ///
+    /// Fragment JSON is user-editable, and the code that places a fragment
+    /// ([`Molecule::insert_fragment`], [`Fragment::to_molecule`], the editor) indexes `atoms` by
+    /// these values directly. They are checked once, here, where the JSON is read
+    /// ([`Fragment::from_json`] and [`Config`](crate::Config)'s fragment loading), so that a
+    /// fragment which got past loading is safe to index.
+    pub fn validate(&self) -> Result<(), String> {
+        let n = self.atoms.len();
+        if n == 0 {
+            return Err("fragment has no atoms".into());
+        }
+        if self.attach_idx >= n {
+            return Err(format!("attach_idx {} is out of range for {n} atoms", self.attach_idx));
+        }
+        for (k, b) in self.bonds.iter().enumerate() {
+            if b.begin >= n || b.end >= n {
+                return Err(format!(
+                    "bond {k} ({} -> {}) refers to an atom out of range for {n} atoms",
+                    b.begin, b.end
+                ));
+            }
+            if b.begin == b.end {
+                return Err(format!("bond {k} joins atom {} to itself", b.begin));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check that `name` can be used as is for the file `fragments/<name>.json` on every
+    /// platform, so the file lands inside `fragments/` and nowhere else.
+    ///
+    /// The name is user data (typed into the editor, or the `"name"` field of a shared fragment
+    /// JSON), and the code that saves fragments builds their path from it. Refused: the empty
+    /// name; path separators (`/`, `\`), `:` (a Windows drive or stream) and `..`; control
+    /// characters; a trailing `.` or whitespace (Windows drops them, so the file would not be
+    /// the one named); and the Windows device names `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
+    /// `CONOUT$`, `COM1`–`COM9`, `COM¹`–`COM³`, `LPT1`–`LPT9`, `LPT¹`–`LPT³`, also with an
+    /// extension (`NUL.x`) or trailing spaces before it (`CON .x`), in any case.
+    ///
+    /// Every place that writes `fragments/<name>.json` calls this first, and fragments whose
+    /// name fails it are skipped when loading.
+    pub fn validate_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("fragment name is empty".into());
+        }
+        if let Some(c) = name.chars().find(|&c| matches!(c, '/' | '\\' | ':') || c.is_control()) {
+            return Err(format!("fragment name {name:?} contains {c:?}, which is not allowed in a file name"));
+        }
+        if name.contains("..") {
+            return Err(format!("fragment name {name:?} contains \"..\""));
+        }
+        if name.ends_with(|c: char| c == '.' || c.is_whitespace()) {
+            return Err(format!("fragment name {name:?} ends with a dot or whitespace"));
+        }
+        let device = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+        // Windows also reserves COM¹–COM³ / LPT¹–LPT³ (superscript digits).
+        let numbered = |prefix: &str| {
+            device.strip_prefix(prefix).is_some_and(|d| {
+                matches!(d, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            })
+        };
+        if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+            || numbered("COM")
+            || numbered("LPT")
+        {
+            return Err(format!("fragment name {name:?} is a reserved device name on Windows"));
+        }
+        Ok(())
+    }
+
     /// Parse a fragment from its JSON representation (the on-disk `fragments/<name>.json` format).
+    /// A fragment that parses but fails [`Fragment::validate`] is an error.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(s)
+        let frag: Self = serde_json::from_str(s)?;
+        frag.validate().map_err(<serde_json::Error as serde::de::Error>::custom)?;
+        Ok(frag)
     }
 
     /// Pretty-print the fragment as JSON, matching the on-disk fragment format.
@@ -252,6 +327,103 @@ impl BondOrder {
             "Double" => BondOrder::Double,
             "Triple" => BondOrder::Triple,
             _ => BondOrder::Single,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A C–O fragment whose attach index and single bond's endpoints are the caller's.
+    fn two_atom_json(attach_idx: usize, begin: usize, end: usize) -> String {
+        format!(
+            r#"{{"name":"bad","atoms":[{{"element":"C","pos":[0.0,0.0]}},{{"element":"O","pos":[1.5,0.0]}}],"bonds":[{{"begin":{begin},"end":{end},"order":"Single"}}],"attach_idx":{attach_idx}}}"#
+        )
+    }
+
+    /// Every index in fragment JSON is user data; one that points past `atoms` must be refused
+    /// when the JSON is read, not panic later in `to_molecule` / `insert_fragment`.
+    #[test]
+    fn from_json_rejects_indices_that_do_not_fit_the_atoms() {
+        let cases = [
+            ("bond end out of range", two_atom_json(0, 0, 99)),
+            ("bond begin out of range", two_atom_json(0, 99, 1)),
+            ("attach_idx out of range", two_atom_json(5, 0, 1)),
+            ("bond joins an atom to itself", two_atom_json(0, 1, 1)),
+            ("no atoms", r#"{"name":"empty","atoms":[],"bonds":[],"attach_idx":0}"#.to_string()),
+        ];
+        for (what, text) in cases {
+            assert!(Fragment::from_json(&text).is_err(), "{what}");
+        }
+        assert!(Fragment::from_json(&two_atom_json(1, 0, 1)).is_ok());
+    }
+
+    #[test]
+    fn load_reports_a_bad_fragment_file_as_invalid_data() {
+        let path = std::env::temp_dir()
+            .join(format!("chembuilder-bad-fragment-{}.json", std::process::id()));
+        std::fs::write(&path, two_atom_json(0, 0, 99)).unwrap();
+        let result = Fragment::load(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The validation must not turn away any fragment the crate ships.
+    #[test]
+    fn every_bundled_fragment_passes_validation() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fragments");
+        let mut count = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "json") {
+                let frag = Fragment::load(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                assert_eq!(frag.to_molecule().atoms.len(), frag.atoms.len(), "{path:?}");
+                count += 1;
+            }
+        }
+        assert!(count > 0, "no fragments found in {dir:?}");
+    }
+
+    #[test]
+    fn validate_name_refuses_names_that_are_not_a_plain_file_name() {
+        let bad = [
+            "", "../evil", "..", "a..b", "a/b", "/abs", "a\\b", "C:x", "x:stream", "tab\there",
+            "nl\n", "nul\0", "trailing.", "trailing ", "trailing\t", "CON", "con", "Prn", "AUX",
+            "NUL", "NUL.x", "nul.tar.gz", "CON .x", "COM1", "com9", "LPT1", "lpt9.json",
+            "COM¹", "lpt²", "COM³.json", "CONIN$", "conout$.x",
+        ];
+        for name in bad {
+            assert!(Fragment::validate_name(name).is_err(), "{name:?} must be refused");
+        }
+        let good = [
+            "OH", "CO2Me", "C12H25", "benzene", "ring6", "my group", "N-Boc", "a.b", "COM",
+            "COM0", "COM10", "LPT", "CONx", "Nul2", ".hidden", "Ph", "COM⁴", "CONIN", "CONOUT",
+        ];
+        for name in good {
+            assert!(Fragment::validate_name(name).is_ok(), "{name:?} must be accepted");
+        }
+    }
+
+    /// Every fragment the crate ships (and the parametric ones it builds) has a name that the
+    /// savers accept, so saving the config never refuses a built-in.
+    #[test]
+    fn every_shipped_fragment_name_is_a_valid_file_name() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut count = 0;
+        for dir in ["assets/fragments", "fragments"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|x| x == "json") {
+                    let frag = Fragment::load(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                    Fragment::validate_name(&frag.name).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 0, "no fragments found");
+        for frag in [Fragment::ring(3), Fragment::ring(12), Fragment::benzene(), Fragment::chain(4), Fragment::zigzag(4)] {
+            Fragment::validate_name(&frag.name).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 }
