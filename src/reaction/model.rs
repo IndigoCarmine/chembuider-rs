@@ -675,4 +675,127 @@ mod tests {
             Some(StructureRole::Reactant(3))
         );
     }
+
+    // ── Characterization (G-005) ─────────────────────────────────────────────
+    //
+    // The scheme ↔ table link is about to move from position to a stable structure ID. These
+    // pin the parts of today's behaviour that the ID-based link keeps. They deliberately do
+    // *not* pin which column an entered value stays in after a reorder or a removal: that is
+    // exactly what changes (values will follow their compound instead of the column index).
+
+    /// The entered numbers of every column, for comparing a table before and after an edit.
+    #[derive(Debug, PartialEq)]
+    struct EnteredValues {
+        /// `(limiting, equivalents, sample_mass)` per reactant column.
+        reactants: Vec<(bool, Option<f64>, Option<Mass>)>,
+        /// `measured_mass` per product column.
+        products: Vec<Option<Mass>>,
+    }
+
+    fn entered_values(a: &Analysis) -> EnteredValues {
+        EnteredValues {
+            reactants: a.reactants.iter().map(|r| (r.limiting, r.equivalents, r.sample_mass)).collect(),
+            products: a.products.iter().map(|p| p.measured_mass).collect(),
+        }
+    }
+
+    fn reactant_formulas(reaction: &Reaction) -> Vec<String> {
+        reaction.analysis.compute().reactants.iter().map(|r| r.formula.plain()).collect()
+    }
+
+    fn product_formulas(reaction: &Reaction) -> Vec<String> {
+        reaction.analysis.compute().products.iter().map(|p| p.formula.plain()).collect()
+    }
+
+    /// After a reorder and a resync, the linked columns read in scheme order, and the number of
+    /// columns does not change.
+    #[test]
+    fn resync_after_a_reorder_follows_scheme_order() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::methyl_iodide())
+            .arrow(Arrow::new())
+            .structure(demo::anisole());
+        let analysis = Analysis::new()
+            .reactant(Reactant::new(demo::phenol()).limiting().sample_mass(Mass::grams(1.0)))
+            .reactant(Reactant::new(demo::methyl_iodide()).equivalents(1.1))
+            .product(Product::new(demo::anisole()));
+        let mut reaction = Reaction::new(scheme, analysis);
+
+        // MeI to the front: [MeI, phenol, +, →, anisole].
+        assert_eq!(reaction.scheme.move_item(2, -2), Some(0));
+        reaction.sync_structures_from_scheme();
+
+        assert_eq!(reactant_formulas(&reaction), ["CH3I", "C6H6O"], "table follows the scheme");
+        assert_eq!(product_formulas(&reaction), ["C7H8O"]);
+        assert_eq!(reaction.analysis.reactants.len(), 2);
+        assert_eq!(reaction.analysis.products.len(), 1);
+    }
+
+    /// A resync of an unchanged figure changes nothing: no column moves, appears or loses a
+    /// value, however often it runs.
+    #[test]
+    fn resync_of_an_unchanged_figure_is_a_no_op() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let formulas = (reactant_formulas(&reaction), product_formulas(&reaction));
+        let values = entered_values(&reaction.analysis);
+
+        reaction.sync_structures_from_scheme();
+        reaction.sync_structures_from_scheme();
+
+        assert_eq!((reactant_formulas(&reaction), product_formulas(&reaction)), formulas);
+        assert_eq!(entered_values(&reaction.analysis), values);
+    }
+
+    /// Redrawing a structure in place keeps every entered value of its column, and leaves the
+    /// columns no structure stands for (MeI, K₂CO₃ — arrow text in the demo) untouched.
+    #[test]
+    fn redrawing_keeps_entered_values_and_leaves_unlinked_columns_alone() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let values = entered_values(&reaction.analysis);
+
+        assert!(reaction.set_scheme_structure(0, demo::anisole()));
+        assert!(reaction.set_scheme_structure(2, demo::phenol()));
+        reaction.sync_structures_from_scheme();
+
+        assert_eq!(entered_values(&reaction.analysis), values, "limiting/masses/eq kept");
+        assert_eq!(reactant_formulas(&reaction), ["C7H8O", "CH3I", "CK2O3"]);
+        assert_eq!(product_formulas(&reaction), ["C6H6O"]);
+    }
+
+    /// Removing a drawn structure keeps its column — molecule and entered values — so nothing
+    /// typed into the table is lost.
+    #[test]
+    fn removing_a_structure_keeps_its_column() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let values = entered_values(&reaction.analysis);
+
+        // Drop the product (item 2), then the reactant (item 0), resyncing after each.
+        assert!(reaction.scheme.remove(2).is_some());
+        reaction.sync_structures_from_scheme();
+        assert!(reaction.scheme.remove(0).is_some());
+        reaction.sync_structures_from_scheme();
+
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CH3I", "CK2O3"]);
+        assert_eq!(product_formulas(&reaction), ["C7H8O"]);
+        assert_eq!(entered_values(&reaction.analysis), values);
+    }
+
+    /// Adding a structure straight to the scheme does not create a column, and a resync does
+    /// not either; existing columns are untouched.
+    #[test]
+    fn a_raw_scheme_add_creates_no_column() {
+        let mut reaction = demo::williamson_ether_synthesis();
+        let values = entered_values(&reaction.analysis);
+
+        // A second product structure after the anisole, added through the raw scheme API.
+        reaction.scheme.add(SchemeItem::Structure(demo::benzene()));
+        reaction.sync_structures_from_scheme();
+
+        assert_eq!(reaction.analysis.reactants.len(), 3);
+        assert_eq!(reaction.analysis.products.len(), 1);
+        assert_eq!(product_formulas(&reaction), ["C7H8O"]);
+        assert_eq!(entered_values(&reaction.analysis), values);
+    }
 }
