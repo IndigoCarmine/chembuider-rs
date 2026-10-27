@@ -8,7 +8,7 @@
 use crate::molecule::Molecule;
 
 use super::edit::SchemePart;
-use super::scheme::{ReactionScheme, SchemeItem};
+use super::scheme::{ArrowLabel, ReactionScheme, SchemeItem, StructureId};
 
 /// A mass. Stored in grams; the constructors say which unit the caller had in mind.
 ///
@@ -66,6 +66,10 @@ pub struct Reactant {
     pub volume: Option<f64>,
     /// Stoichiometric coefficient in the balanced equation (default 1).
     pub coefficient: f64,
+    /// The scheme structure this column stands for, or `None` when no drawn structure does
+    /// (a reagent written as arrow text, say). [`Reaction::new`] fills it in for columns
+    /// built without one.
+    pub structure: Option<StructureId>,
 }
 
 impl Reactant {
@@ -81,6 +85,7 @@ impl Reactant {
             density: None,
             volume: None,
             coefficient: 1.0,
+            structure: None,
         }
     }
 
@@ -143,6 +148,9 @@ pub struct Product {
     pub measured_mass: Option<Mass>,
     /// Purity of the isolated material, in percent. Absent means 100 %.
     pub purity: Option<f64>,
+    /// The scheme structure this column stands for, or `None` when no drawn structure does.
+    /// [`Reaction::new`] fills it in for columns built without one.
+    pub structure: Option<StructureId>,
 }
 
 impl Product {
@@ -155,6 +163,7 @@ impl Product {
             percent_completion: None,
             measured_mass: None,
             purity: None,
+            structure: None,
         }
     }
 
@@ -296,8 +305,66 @@ pub struct Reaction {
 }
 
 impl Reaction {
+    /// Put a scheme and its table together, linking each column that has no
+    /// [`structure`](Reactant::structure) yet to the scheme structure at its position.
+    ///
+    /// This is the only place the positional rule decides a link: the n-th reactant structure
+    /// before the first arrow is reactant column n, the n-th structure after it product
+    /// column n, and arrow-label structures take the reactant columns after the main-line
+    /// ones (see [`structure_role`](Reaction::structure_role) and
+    /// [`arrow_structure_role`](Reaction::arrow_structure_role)). A column that already
+    /// names a structure is left as it is, and a structure some column already names is not
+    /// linked a second time. Columns past the drawn structures (reagents written as arrow
+    /// text) stay `None`.
     pub fn new(scheme: ReactionScheme, analysis: Analysis) -> Self {
-        Self { scheme, analysis }
+        let mut reaction = Self { scheme, analysis };
+        reaction.link_columns_by_position();
+        reaction
+    }
+
+    /// Link every unlinked column to the structure at its position; see [`Reaction::new`].
+    fn link_columns_by_position(&mut self) {
+        let mut links: Vec<(StructureRole, StructureId)> = Vec::new();
+        for (i, item) in self.scheme.items.iter().enumerate() {
+            match item {
+                SchemeItem::Structure(s) => {
+                    if let Some(role) = self.positional_structure_role(i) {
+                        links.push((role, s.id()));
+                    }
+                }
+                SchemeItem::Arrow(arrow) => {
+                    for (part, label) in [
+                        (SchemePart::ArrowAbove, &arrow.above),
+                        (SchemePart::ArrowBelow, &arrow.below),
+                    ] {
+                        if let ArrowLabel::Structure(s) = label
+                            && let Some(role) = self.positional_arrow_structure_role(i, part)
+                        {
+                            links.push((role, s.id()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (role, id) in links {
+            let claimed = self.analysis.reactants.iter().any(|r| r.structure == Some(id))
+                || self.analysis.products.iter().any(|p| p.structure == Some(id));
+            if claimed {
+                continue;
+            }
+            let slot = match role {
+                StructureRole::Reactant(n) => {
+                    self.analysis.reactants.get_mut(n).map(|r| &mut r.structure)
+                }
+                StructureRole::Product(n) => {
+                    self.analysis.products.get_mut(n).map(|p| &mut p.structure)
+                }
+            };
+            if let Some(slot @ None) = slot {
+                *slot = Some(id);
+            }
+        }
     }
 
     /// Which analysis column the structure drawn at scheme item `scheme_index` stands for, or
@@ -307,6 +374,12 @@ impl Reaction {
     /// counts structures of that role left to right, so it indexes straight into
     /// [`Analysis::reactants`] or [`Analysis::products`].
     pub fn structure_role(&self, scheme_index: usize) -> Option<StructureRole> {
+        self.positional_structure_role(scheme_index)
+    }
+
+    /// The positional rule behind [`structure_role`](Reaction::structure_role): the ordinal of
+    /// the structure at `scheme_index` among the structures on its side of the first arrow.
+    fn positional_structure_role(&self, scheme_index: usize) -> Option<StructureRole> {
         if !matches!(self.scheme.items.get(scheme_index), Some(SchemeItem::Structure(_))) {
             return None;
         }
@@ -429,6 +502,15 @@ impl Reaction {
     /// This keeps the positional main-line mapping untouched: a scheme with no arrow-label
     /// structures numbers its reactants exactly as before.
     pub fn arrow_structure_role(&self, index: usize, part: SchemePart) -> Option<StructureRole> {
+        self.positional_arrow_structure_role(index, part)
+    }
+
+    /// The positional rule behind [`arrow_structure_role`](Reaction::arrow_structure_role).
+    fn positional_arrow_structure_role(
+        &self,
+        index: usize,
+        part: SchemePart,
+    ) -> Option<StructureRole> {
         let base = self.main_line_reactant_count();
         let mut k = 0usize;
         for (i, item) in self.scheme.items.iter().enumerate() {
@@ -797,5 +879,95 @@ mod tests {
         assert_eq!(reaction.analysis.products.len(), 1);
         assert_eq!(product_formulas(&reaction), ["C7H8O"]);
         assert_eq!(entered_values(&reaction.analysis), values);
+    }
+
+    // ── Column ↔ structure ids (G-005) ───────────────────────────────────────
+
+    fn line_id(reaction: &Reaction, index: usize) -> StructureId {
+        match &reaction.scheme.items[index] {
+            SchemeItem::Structure(s) => s.id(),
+            other => panic!("item {index} is not a structure: {other:?}"),
+        }
+    }
+
+    fn arrow_label_id(reaction: &Reaction, index: usize, part: SchemePart) -> StructureId {
+        let SchemeItem::Arrow(arrow) = &reaction.scheme.items[index] else {
+            panic!("item {index} is not an arrow");
+        };
+        let label = if part == SchemePart::ArrowAbove { &arrow.above } else { &arrow.below };
+        match label {
+            ArrowLabel::Structure(s) => s.id(),
+            other => panic!("the {part:?} band carries no structure: {other:?}"),
+        }
+    }
+
+    /// `Reaction::new` links the demo's drawn phenol and anisole to their columns; MeI and
+    /// K₂CO₃, written as arrow text, stand for no structure.
+    #[test]
+    fn new_links_demo_columns_by_position() {
+        let reaction = demo::williamson_ether_synthesis();
+        let a = &reaction.analysis;
+        assert_eq!(a.reactants[0].structure, Some(line_id(&reaction, 0)), "phenol");
+        assert_eq!(a.reactants[1].structure, None, "MeI is arrow text");
+        assert_eq!(a.reactants[2].structure, None, "K2CO3 is arrow text");
+        assert_eq!(a.products[0].structure, Some(line_id(&reaction, 2)), "anisole");
+    }
+
+    /// An arrow-label structure is linked to the reactant column after the main-line ones.
+    #[test]
+    fn new_links_arrow_label_structures_after_main_line_reactants() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above_structure(demo::biphenyl()).below("cat."))
+            .structure(demo::anisole());
+        let analysis = Analysis::new()
+            .reactant(Reactant::new(demo::phenol()).limiting().sample_mass(Mass::grams(1.0)))
+            .reactant(Reactant::new(demo::benzene()).equivalents(1.0))
+            .reactant(Reactant::new(demo::methyl_iodide()).equivalents(1.0))
+            .product(Product::new(demo::anisole()));
+        let reaction = Reaction::new(scheme, analysis);
+        let a = &reaction.analysis;
+        assert_eq!(a.reactants[0].structure, Some(line_id(&reaction, 0)));
+        assert_eq!(
+            a.reactants[1].structure,
+            Some(arrow_label_id(&reaction, 1, SchemePart::ArrowAbove)),
+            "the biphenyl above the arrow"
+        );
+        assert_eq!(a.reactants[2].structure, None, "no structure is left for it");
+        assert_eq!(a.products[0].structure, Some(line_id(&reaction, 2)));
+    }
+
+    /// A column that already names a structure keeps it, and a structure some column already
+    /// names is not linked to a second column.
+    #[test]
+    fn new_keeps_existing_links() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::methyl_iodide())
+            .arrow(Arrow::new())
+            .structure(demo::anisole());
+        let SchemeItem::Structure(mei) = &scheme.items[2] else {
+            panic!("item 2 is the MeI structure");
+        };
+        let mei = mei.id();
+        let elsewhere = StructureId::fresh();
+        // Column 0 is linked to the MeI drawn at item 2; column 1 to an id the scheme lacks.
+        let mut first = Reactant::new(demo::methyl_iodide());
+        first.structure = Some(mei);
+        let mut second = Reactant::new(demo::phenol());
+        second.structure = Some(elsewhere);
+        let analysis = Analysis::new()
+            .reactant(first)
+            .reactant(second)
+            .product(Product::new(demo::anisole()));
+        let reaction = Reaction::new(scheme, analysis);
+        let a = &reaction.analysis;
+        assert_eq!(a.reactants[0].structure, Some(mei), "not overwritten by phenol's id");
+        assert_eq!(a.reactants[1].structure, Some(elsewhere), "not overwritten by MeI's id");
+        // The phenol at item 0 had no free column at its position, so nothing names it.
+        let phenol = line_id(&reaction, 0);
+        assert!(a.reactants.iter().all(|r| r.structure != Some(phenol)));
+        assert_eq!(a.products[0].structure, Some(line_id(&reaction, 4)));
     }
 }
