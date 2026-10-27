@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE CDXML SYSTEM "http://www.cambridgesoft.com/xml/cdxml.dtd" >
+<CDXML BondLength="14.399986">
+ <fonttable>
+  <font id="3" charset="iso-8859-1" name="Arial"/>
+ </fonttable>
+ <page>
+  <fragment>
+   <n id="1" p="14.399986 0"/>
+   <n id="2" p="76.799927 0" Element="7" NumHydrogens="3" Charge="1"><t p="79.719927 3.9" BoundingBox="53.879927 -3.3 79.719927 6" LabelAlignment="Right"><s font="3" size="10" face="96">H3N+</s></t></n>
+   <n id="3" p="7.199993 12.470755"/>
+   <n id="4" p="-7.199994 12.470753"/>
+   <n id="5" p="95.999908 0"/>
+   <n id="6" p="-14.399986 -0.000001"/>
+   <n id="7" p="-7.199992 -12.470755"/>
+   <n id="8" p="115.19989 0" Element="16" NumHydrogens="0" Charge="-1"><t p="111.86489 3.9" BoundingBox="111.86489 -3.3 121.86489 6" LabelAlignment="Left"><s font="3" size="10" face="96">S-</s></t></n>
+   <n id="9" p="7.199998 -12.470751"/>
+   <n id="18" p="28.799973 0" Element="7" NumHydrogens="2"><t p="25.189973 3.9" BoundingBox="25.189973 -3.3 45.189973 6" LabelAlignment="Left"><s font="3" size="10" face="96">NH2</s></t></n>
+   <n id="30" p="-28.799973 0" Element="8" NumHydrogens="0" Charge="-1"><t p="-32.689973 3.9" BoundingBox="-32.689973 -3.3 -21.579973 6" LabelAlignment="Left"><s font="3" size="10" face="96">O-</s></t></n>
+   <n id="32" p="7.199993 28.799973" NodeType="Unspecified"><t p="3.589993 32.699973" BoundingBox="3.589993 25.499973 33.599993 34.799973" LabelAlignment="Left"><s font="3" size="10">CO</s><s font="3" size="10" face="32">2</s><s font="3" size="10">Et</s></t></n>
+   <n id="34" p="-7.199993 28.799973" NodeType="Unspecified"><t p="-10.534993 32.699973" BoundingBox="-10.534993 25.499973 1.695007 34.799973" LabelAlignment="Left"><s font="3" size="10">Ph</s></t></n>
+   <n id="36" p="-7.199993 -28.799973" NodeType="Unspecified"><t p="-8.589993 -24.899973" BoundingBox="-8.589993 -32.099973 6.420007 -22.799973" LabelAlignment="Left"><s font="3" size="10" face="2">t</s><s font="3" size="10">Bu</s></t></n>
+   <n id="38" p="7.199993 -28.799973" NodeType="Unspecified"><t p="3.589993 -24.899973" BoundingBox="3.589993 -32.099973 10.809993 -22.799973" LabelAlignment="Left"><s font="3" size="10">D</s></t></n>
+   <n id="40" p="-9.599991 47.999954" Element="1" NumHydrogens="0"><t p="-13.209991 51.899954" BoundingBox="-13.209991 44.699954 -5.989991 53.999954" LabelAlignment="Left"><s font="3" size="10" face="96">H</s></t></n>
+   <n id="42" p="115.19989 19.199982" NumHydrogens="2" Charge="-1"><t p="111.58989 23.099982" BoundingBox="111.58989 15.899982 134.91989 25.199982" LabelAlignment="Left"><s font="3" size="10" face="96">CH2-</s></t></n>
+   <n id="44" p="-47.999954 -47.999954" Element="17" NumHydrogens="0" Charge="-1"><t p="-51.609954 -44.099954" BoundingBox="-51.609954 -51.299954 -38.839954 -41.999954" LabelAlignment="Left"><s font="3" size="10" face="96">Cl-</s></t></n>
+   <b B="1" E="3" Order="2"/>
+   <b B="3" E="4" Order="1"/>
+   <b B="2" E="5" Order="1"/>
+   <b B="4" E="6" Order="2"/>
+   <b B="6" E="7" Order="1"/>
+   <b B="7" E="9" Order="2"/>
+   <b B="9" E="1" Order="1"/>
+   <b B="5" E="8" Order="3"/>
+   <b B="1" E="18" Order="1"/>
+   <b B="6" E="30" Order="1" Display="Bold"/>
+   <b B="3" E="32" Order="1" Display="WedgeBegin"/>
+   <b B="4" E="34" Order="1" Display="WedgedHashBegin"/>
+   <b B="7" E="36" Order="1" Display="Dash"/>
+   <b B="9" E="38" Order="1" Display="Wavy"/>
+   <b B="34" E="40" Order="1"/>
+   <b B="8" E="42" Order="1"/>
+  </fragment>
+ </page>
+</CDXML>

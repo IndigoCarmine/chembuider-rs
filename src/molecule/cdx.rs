@@ -15,6 +15,7 @@
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
+use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, Molecule};
 use crate::widget::draw;
 use crate::widget::rich_text::{RichSpan, RichText, Script, SpanStyle};
@@ -247,12 +248,13 @@ pub(super) struct NodeRules {
 
 /// Whether `atom_id` is a node of its own: a hydrogen folded into its neighbour's label ("NH2")
 /// is only that label's hydrogen count, and its bond is not written either.
-pub(super) fn is_node(mol: &Molecule, atom_id: u32) -> bool {
-    !draw::is_folded_h(mol, atom_id)
+pub(super) fn is_node(mol: &impl AtomLookup, atom_id: u32) -> bool {
+    !draw::folded_h(mol, atom_id)
 }
 
-/// The node `atom` is written as (see [`NodeRules`]).
-pub(super) fn node_rules(mol: &Molecule, atom: &super::Atom) -> NodeRules {
+/// The node `atom` is written as (see [`NodeRules`]). A writer asks this of every atom, so it
+/// passes a [`MolIndex`] built once rather than the molecule, whose lookups scan.
+pub(super) fn node_rules(mol: &impl AtomLookup, atom: &super::Atom) -> NodeRules {
     let z = elements::element_of_label(&atom.element);
     let kind = match z {
         Some(6) => NodeKind::Carbon,
@@ -383,26 +385,54 @@ fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject
         *next += 1;
         *next
     };
-    let visible: Vec<&super::Atom> = mol.atoms.iter().filter(|a| is_node(mol, a.id)).collect();
-    let mut placed: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for start in &visible {
-        if placed.contains(&start.id) {
-            continue;
+    // Every atom is looked up here, and its neighbours with it: from an index built once, as
+    // the molecule's own lookups scan all atoms and bonds each time.
+    let index = MolIndex::new(mol);
+    let visible: Vec<&super::Atom> = mol.atoms.iter().filter(|a| is_node(&index, a.id)).collect();
+    // The structures, in the order of their first node: each one's nodes in atom order and its
+    // bonds in bond order. A structure is everything bonded to its first node, through any atom.
+    let mut structure_of: HashMap<u32, usize> = HashMap::new();
+    let mut structures: Vec<(Vec<&super::Atom>, Vec<&super::Bond>)> = Vec::new();
+    for &atom in &visible {
+        let k = match structure_of.get(&atom.id) {
+            Some(&k) => k,
+            None => {
+                let k = structures.len();
+                structures.push((Vec::new(), Vec::new()));
+                structure_of.insert(atom.id, k);
+                let mut queue = vec![atom.id];
+                while let Some(a) = queue.pop() {
+                    for n in index.neighbor_atom_ids(a) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = structure_of.entry(n) {
+                            e.insert(k);
+                            queue.push(n);
+                        }
+                    }
+                }
+                k
+            }
+        };
+        structures[k].0.push(atom);
+    }
+    let visible_ids: HashSet<u32> = visible.iter().map(|a| a.id).collect();
+    for bond in &mol.bonds {
+        if visible_ids.contains(&bond.begin) && visible_ids.contains(&bond.end) {
+            structures[structure_of[&bond.begin]].1.push(bond);
         }
-        let members: Vec<u32> = mol.connected_atoms(start.id).into_iter().filter(|a| is_node(mol, *a)).collect();
-        placed.extend(&members);
+    }
+    let mut out = Vec::new();
+    for (members, bonds) in structures {
         let mut frag = CdxObject::new(OBJ_FRAGMENT, id());
         let mut bbox = None;
         let mut nodes: HashMap<u32, u32> = HashMap::new();
-        for atom in visible.iter().filter(|a| members.contains(&a.id)) {
+        for atom in members {
             let node_id = id();
             nodes.insert(atom.id, node_id);
             let at = (atom.pos[0] as f64 * SCALE + shift.0, atom.pos[1] as f64 * SCALE + shift.1);
             bbox = Some(union(bbox, [at.0, at.1, at.0, at.1]));
             let mut node = CdxObject::new(OBJ_NODE, node_id);
             node.set(PROP_2D_POSITION, point(at.0, at.1));
-            let rules = node_rules(mol, atom);
+            let rules = node_rules(&index, atom);
             match rules.kind {
                 NodeKind::Carbon => {}
                 NodeKind::Element(z) => node.set(PROP_NODE_ELEMENT, (z as i16).to_le_bytes().to_vec()),
@@ -419,7 +449,7 @@ fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject
             }
             frag.children.push(node);
         }
-        for bond in &mol.bonds {
+        for bond in bonds {
             let (Some(&begin), Some(&end)) = (nodes.get(&bond.begin), nodes.get(&bond.end)) else { continue };
             let mut b = CdxObject::new(OBJ_BOND, id());
             b.set(PROP_BOND_BEGIN, begin.to_le_bytes().to_vec());
@@ -1077,6 +1107,129 @@ mod tests {
         for markup in ["CO_2Et", "//t//Bu", "**Bn**", "SO_{42}", "N_3"] {
             let rich = RichText::parse(markup);
             assert_eq!(compact_markup(&rich), markup);
+        }
+    }
+
+    /// A molecule touching every rule the writers have: labels (elements, abbreviations with
+    /// markup, deuterium), charges, hydrogens folded into a label and one drawn on purpose, every
+    /// bond order and display, a ring fill, a lone ion, and structures whose atoms and bonds are
+    /// interleaved in the lists.
+    fn writer_fixture() -> Molecule {
+        let mut m = Molecule::default();
+        let group_h = |m: &mut Molecule, heavy: u32, pos: [f32; 2]| {
+            let h = m.add_atom("H".to_string(), pos, 0);
+            m.atom_by_id_mut(h).unwrap().group_h = true;
+            m.add_bond(heavy, h, BondOrder::Single);
+        };
+        let bond = |m: &mut Molecule, a: u32, b: u32, stereo: BondStereo| {
+            let id = m.add_bond(a, b, BondOrder::Single);
+            m.bond_by_id_mut(id).unwrap().stereo = stereo;
+        };
+        // A filled benzene ring, its atoms and bonds interleaved with a second structure's.
+        let mut ring = Vec::new();
+        let mut other = Vec::new();
+        for i in 0..6 {
+            let t = i as f32 * std::f32::consts::PI / 3.0;
+            ring.push(m.add_atom("C".to_string(), [1.5 * t.cos(), 1.5 * t.sin()], 0));
+            if i % 2 == 0 {
+                let k = i / 2;
+                other.push(m.add_atom(["N", "C", "S"][k].to_string(), [8.0 + i as f32, 0.0], [1, 0, -1][k]));
+            }
+        }
+        for i in 0..6 {
+            let order = if i % 2 == 0 { BondOrder::Double } else { BondOrder::Single };
+            m.add_bond(ring[i], ring[(i + 1) % 6], order);
+            if i == 1 {
+                m.add_bond(other[0], other[1], BondOrder::Single);
+            }
+        }
+        m.add_bond(other[1], other[2], BondOrder::Triple);
+        m.set_ring_fill(ring.clone(), [255, 200, 0, 128]);
+        // NH2 on the ring's right, and H3N+ (its hydrogens before the N) on the second structure.
+        let n = m.add_atom("N".to_string(), [3.0, 0.0], 0);
+        m.add_bond(ring[0], n, BondOrder::Single);
+        group_h(&mut m, n, [3.8, 0.5]);
+        group_h(&mut m, n, [3.8, -0.5]);
+        for k in 0..3 {
+            group_h(&mut m, other[0], [7.0, k as f32]);
+        }
+        // An alkoxide on a bold bond, a wedge to an ester label, a hash to Ph, dashed and wavy bonds.
+        let o = m.add_atom("O".to_string(), [-3.0, 0.0], -1);
+        bond(&mut m, ring[3], o, BondStereo::Bold);
+        let ester = m.add_atom("CO_2Et".to_string(), [0.75, 3.0], 0);
+        bond(&mut m, ring[1], ester, BondStereo::WedgeUp);
+        let ph = m.add_atom("Ph".to_string(), [-0.75, 3.0], 0);
+        bond(&mut m, ring[2], ph, BondStereo::WedgeDown);
+        let tbu = m.add_atom("//t//Bu".to_string(), [-0.75, -3.0], 0);
+        bond(&mut m, ring[4], tbu, BondStereo::Dashed);
+        let d = m.add_atom("D".to_string(), [0.75, -3.0], 0);
+        bond(&mut m, ring[5], d, BondStereo::Wavy);
+        // A hydrogen drawn on purpose stays an atom; a carbanion; a lone chloride.
+        let h = m.add_atom("H".to_string(), [-1.0, 5.0], 0);
+        m.add_bond(ph, h, BondOrder::Single);
+        let anion = m.add_atom("C".to_string(), [12.0, 2.0], -1);
+        m.add_bond(other[2], anion, BondOrder::Single);
+        m.add_atom("Cl".to_string(), [-5.0, -5.0], -1);
+        m
+    }
+
+    /// `molecule_to_cdx_document` without its creation program (which names the version).
+    fn cdx_without_version(mol: &Molecule) -> Vec<u8> {
+        let mut bytes = molecule_to_cdx_document(mol);
+        let program = cdx_string(&[], &format!("ChemBuilder {}", env!("CARGO_PKG_VERSION")));
+        let mut prop = PROP_CREATION_PROGRAM.to_le_bytes().to_vec();
+        prop.extend_from_slice(&(program.len() as u16).to_le_bytes());
+        prop.extend_from_slice(&program);
+        let at = bytes.windows(prop.len()).position(|w| w == prop).expect("a creation program");
+        bytes.drain(at..at + prop.len());
+        bytes
+    }
+
+    /// Both writers write [`writer_fixture`] byte for byte as they did when the golden files were
+    /// saved (before the writers looked atoms up from an index), so a change to how they find
+    /// their way around the molecule changes nothing they write.
+    #[test]
+    fn writers_keep_their_output() {
+        let m = writer_fixture();
+        assert_eq!(cdx_without_version(&m), include_bytes!("../../tests/fixtures/writer_golden.cdx"));
+        let golden = include_str!("../../tests/fixtures/writer_golden.cdxml").replace("\r\n", "\n");
+        assert_eq!(super::super::cdxml::to_cdxml(&m), golden);
+    }
+
+    /// A zigzag chain of `n` atoms, every tenth an NH whose hydrogen is folded into its label.
+    fn chain(n: usize) -> Molecule {
+        let mut m = Molecule::default();
+        let mut prev = None;
+        for i in 0..n {
+            let at = [i as f32 * 1.3, if i % 2 == 0 { 0.0 } else { 0.75 }];
+            let element = if i % 10 == 5 { "N" } else { "C" };
+            let a = m.add_atom(element.to_string(), at, 0);
+            if element == "N" {
+                let h = m.add_atom("H".to_string(), [at[0], at[1] + 1.0], 0);
+                m.atom_by_id_mut(h).unwrap().group_h = true;
+                m.add_bond(a, h, BondOrder::Single);
+            }
+            if let Some(p) = prev {
+                m.add_bond(p, a, BondOrder::Single);
+            }
+            prev = Some(a);
+        }
+        m
+    }
+
+    /// How long both writers take on long chains: run in release with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn writer_time_on_long_chains() {
+        for n in [25_000, 50_000, 100_000] {
+            let m = chain(n);
+            let t = std::time::Instant::now();
+            let cdx = molecule_to_cdx_document(&m);
+            let t_cdx = t.elapsed();
+            let t = std::time::Instant::now();
+            let xml = super::super::cdxml::to_cdxml(&m);
+            let t_xml = t.elapsed();
+            println!("{n:>7} atoms: cdx {t_cdx:?} ({} bytes), cdxml {t_xml:?} ({} bytes)", cdx.len(), xml.len());
         }
     }
 }

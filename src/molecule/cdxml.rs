@@ -21,6 +21,7 @@
 //!   `Bold`, `Dash`, `Wavy`).
 
 use super::cdx::{self, NodeKind, NodeLabel, NodeRules};
+use super::lookup::{AtomLookup, MolIndex};
 use super::{Atom, BondOrder, BondStereo, Molecule};
 
 /// Points per molecular unit. Equals the binary writer's `SCALE` (629_145 units of 1/65536 point)
@@ -44,8 +45,10 @@ pub fn to_cdxml(mol: &Molecule) -> String {
     ));
     // The nodes, as the binary writer writes them (one set of rules, `cdx::node_rules`). A
     // hydrogen folded into its neighbour's label is not one of them, only that label's count.
+    // Every atom is looked up, so from an index built once (the molecule's own lookups scan).
+    let index = MolIndex::new(mol);
     let nodes: Vec<(&Atom, NodeRules)> =
-        mol.atoms.iter().filter(|a| cdx::is_node(mol, a.id)).map(|a| (a, cdx::node_rules(mol, a))).collect();
+        mol.atoms.iter().filter(|a| cdx::is_node(&index, a.id)).map(|a| (a, cdx::node_rules(&index, a))).collect();
 
     // The font the labels name (the binary writer's document font table has the same).
     if nodes.iter().any(|(_, rules)| rules.label.is_some()) {
@@ -92,7 +95,7 @@ pub fn to_cdxml(mol: &Molecule) -> String {
 
     // Bonds. Skip any that reference an atom that isn't a node (missing, or a folded hydrogen).
     for bond in &mol.bonds {
-        let is_node = |id: u32| mol.atom_by_id(id).is_some() && cdx::is_node(mol, id);
+        let is_node = |id: u32| index.atom_by_id(id).is_some() && cdx::is_node(&index, id);
         if !(is_node(bond.begin) && is_node(bond.end)) {
             continue;
         }
