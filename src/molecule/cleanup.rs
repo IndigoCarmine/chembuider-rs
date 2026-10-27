@@ -519,9 +519,8 @@ impl CleanupState {
     }
 
     /// Write the current relaxed positions back to the molecule.
-    /// Used by the synchronous `cleanup_2d`; the interactive path streams positions through
-    /// `CleanupJob` instead.
-    #[allow(dead_code)]
+    /// Used through `CleanupSchedule::apply` by the synchronous `cleanup_2d`; the interactive
+    /// path streams positions through `CleanupJob` instead.
     pub fn apply(&self, mol: &mut Molecule) {
         for (&id, &p) in &self.pos {
             if let Some(atom) = mol.atom_by_id_mut(id) {
@@ -617,12 +616,13 @@ impl CleanupSchedule {
     /// Run at most `max_steps` relaxation steps (never past the end of the current pass) and
     /// take any phase transition that follows.  Returns `true` once the schedule is finished.
     ///
-    /// `max_steps` must be positive: `advance(0)` runs no step and so never makes progress.
+    /// On a finished schedule this does nothing and returns `true`.  Otherwise `max_steps`
+    /// must be positive: `advance(0)` runs no step and so never makes progress.
     pub fn advance(&mut self, max_steps: usize) -> bool {
-        debug_assert!(max_steps > 0, "advance(0) never makes progress");
         if self.stage == Stage::Done {
             return true;
         }
+        debug_assert!(max_steps > 0, "advance(0) never makes progress");
         let chunk = max_steps.min(self.pass_budget - self.steps_in_pass);
         let converged = self.state.step(chunk);
         self.steps_in_pass += chunk;
@@ -759,53 +759,28 @@ pub use job_native::CleanupJob;
 // wasm32-unknown-unknown has no `std::thread::spawn` (it always returns an "unsupported"
 // error, and `thread::spawn` panics on that) — there's no Web Worker / SharedArrayBuffer
 // setup here for real background threads. Instead, `latest()` — already polled once per UI
-// frame by `ChemStructEditor::poll_cleanup` — advances the same chunked relaxation by one
-// `JOB_CHUNK` on each call, so the tab still repaints between chunks instead of blocking on
-// one huge synchronous relaxation. `Cell`/`RefCell` stand in for the native version's atomics
-// and mutex since wasm32-unknown-unknown is single-threaded.
+// frame by `ChemStructEditor::poll_cleanup` — advances the same `CleanupSchedule` as
+// `cleanup_2d` and the native worker by one `JOB_CHUNK` on each call, so the tab still
+// repaints between chunks instead of blocking on one huge synchronous relaxation.
+// `Cell`/`RefCell` stand in for the native version's atomics and mutex since
+// wasm32-unknown-unknown is single-threaded.
 #[cfg(target_arch = "wasm32")]
 mod job_wasm {
-    use super::{CleanupState, Molecule, JOB_CHUNK, JOB_PHASE_BUDGET};
+    use super::{CleanupSchedule, Molecule, JOB_CHUNK};
     use std::cell::{Cell, RefCell};
 
     pub struct CleanupJob {
-        state: RefCell<Option<CleanupState>>,
-        phase: Cell<u8>,
-        steps_done_in_phase: Cell<usize>,
+        schedule: RefCell<CleanupSchedule>,
+        /// Set by `cancel`; the next `latest` call stops the schedule, as the native worker
+        /// does at its next chunk boundary.
         cancelled: Cell<bool>,
-        done: Cell<bool>,
-        positions: RefCell<Vec<(u32, [f32; 2])>>,
-        // Phase-2 (ring rescue) bookkeeping: the phase-1 result to fall back to, and the
-        // crossing count it has to beat.  See `ring_rescue` for why the retry is scored.
-        rescue_snapshot: RefCell<Vec<(u32, [f32; 2])>>,
-        crossings_before: Cell<usize>,
     }
 
     impl CleanupJob {
         pub fn start(mol: &Molecule) -> Self {
-            if mol.atoms.is_empty() {
-                return Self {
-                    state: RefCell::new(None),
-                    phase: Cell::new(1),
-                    steps_done_in_phase: Cell::new(0),
-                    cancelled: Cell::new(false),
-                    done: Cell::new(true),
-                    positions: RefCell::new(Vec::new()),
-                    rescue_snapshot: RefCell::new(Vec::new()),
-                    crossings_before: Cell::new(0),
-                };
-            }
-            let state = CleanupState::new(mol);
-            let positions = state.positions();
-            Self {
-                state: RefCell::new(Some(state)),
-                phase: Cell::new(1),
-                steps_done_in_phase: Cell::new(0),
+            CleanupJob {
+                schedule: RefCell::new(CleanupSchedule::new(mol)),
                 cancelled: Cell::new(false),
-                done: Cell::new(false),
-                positions: RefCell::new(positions),
-                rescue_snapshot: RefCell::new(Vec::new()),
-                crossings_before: Cell::new(0),
             }
         }
 
@@ -814,49 +789,20 @@ mod job_wasm {
         }
 
         pub fn is_done(&self) -> bool {
-            self.done.get()
+            self.schedule.borrow().is_done()
         }
 
-        /// Advance one chunk of the relaxation (mirrors `run_phase`'s two-phase logic, just
-        /// spread across polls instead of a background-thread loop), then return positions.
+        /// Advance the schedule by one chunk (or stop it, once cancelled), then return the
+        /// positions.  On a finished schedule both `advance` and `cancel` do nothing, so this
+        /// then just returns the final positions.
         pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
-            if !self.done.get() {
-                if self.cancelled.get() {
-                    self.done.set(true);
-                } else if let Some(state) = self.state.borrow_mut().as_mut() {
-                    let budget_left = JOB_PHASE_BUDGET - self.steps_done_in_phase.get();
-                    let chunk = JOB_CHUNK.min(budget_left);
-                    let converged = state.step(chunk);
-                    self.steps_done_in_phase.set(self.steps_done_in_phase.get() + chunk);
-                    *self.positions.borrow_mut() = state.positions();
-
-                    let phase_exhausted = self.steps_done_in_phase.get() >= JOB_PHASE_BUDGET;
-                    if converged || phase_exhausted {
-                        // Same schedule as `cleanup_2d` / `ring_rescue`, unrolled across polls:
-                        // retry the ring-crossing rescue while each pass keeps removing
-                        // crossings, and roll back the first pass that does not.
-                        let rejected = self.phase.get() == 2
-                            && state.ring_crossing_count() >= self.crossings_before.get();
-                        if rejected {
-                            state.restore(&self.rescue_snapshot.borrow());
-                            *self.positions.borrow_mut() = state.positions();
-                            self.done.set(true);
-                        } else {
-                            let crossings = state.ring_crossing_count();
-                            if crossings > 0 {
-                                self.crossings_before.set(crossings);
-                                *self.rescue_snapshot.borrow_mut() = state.positions();
-                                state.apply_ring_fix();
-                                self.phase.set(2);
-                                self.steps_done_in_phase.set(0);
-                            } else {
-                                self.done.set(true);
-                            }
-                        }
-                    }
-                }
+            let mut schedule = self.schedule.borrow_mut();
+            if self.cancelled.get() {
+                schedule.cancel();
+            } else {
+                schedule.advance(JOB_CHUNK);
             }
-            self.positions.borrow().clone()
+            schedule.positions()
         }
 
         /// Nothing to join — there is no worker thread on wasm32.
@@ -1482,7 +1428,7 @@ mod tests {
     // difference, so they were recorded on x86_64-pc-windows-msvc; if they disagree on another
     // platform without any code change, that is the libm, not a regression.
 
-    /// What phase 2 (`ring_rescue`) ended up doing for a fixture.
+    /// What phase 2 (the ring rescue in `CleanupSchedule`) ended up doing for a fixture.
     #[derive(Debug, PartialEq, Clone, Copy)]
     enum Rescue {
         /// Phase 1 left no crossed ring, so `apply_ring_fix` was never called.
@@ -1717,6 +1663,18 @@ mod tests {
         schedule.cancel();
         assert!(schedule.is_done());
         assert!(schedule.advance(10));
+        assert_eq!(position_bits(&schedule.positions()), before);
+    }
+
+    /// A finished schedule answers `advance` with `true` whatever the step count, including 0
+    /// (the positive-step requirement only guards an unfinished schedule against stalling).
+    #[test]
+    fn advance_on_a_finished_schedule_is_a_no_op() {
+        let mut schedule = CleanupSchedule::new(&fixture("toluene_distorted"));
+        schedule.cancel();
+        let before = position_bits(&schedule.positions());
+        assert!(schedule.advance(0));
+        assert!(schedule.advance(JOB_CHUNK));
         assert_eq!(position_bits(&schedule.positions()), before);
     }
 
