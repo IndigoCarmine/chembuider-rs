@@ -1479,6 +1479,8 @@ impl ChemStructEditor {
 
     /// [`ui`](Self::ui), also returning the canvas response.
     pub fn show(&mut self, ui: &mut egui::Ui) -> EditorResponse {
+        // Named fonts in texts are drawn with the system's fonts.
+        fonts::install(ui.ctx());
         let (rect, response) = ui.allocate_exact_size(
             ui.available_size(),
             egui::Sense::click_and_drag(),
