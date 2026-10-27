@@ -25,7 +25,7 @@ for a complete one.
 - **Templates** — rings (3–10 membered), zig-zag chains, benzene, and a library of built-in
   functional-group **fragments** (Boc, Cbz, CF₃, CO₂Me, TMS, BPin, …) you can extend.
 - **Edit gestures** — lasso / double-click selection, drag to move, `Alt`-drag to rotate,
-  drag-onto-atom to merge, `Delete` to remove.
+  drag onto an atom to bond, `Delete` to remove.
 - **2D clean-up** — force-directed layout relaxation that runs on a background thread (never
   freezes the UI) and can be cancelled.
 - **Valence hints** — over-bonded atoms are flagged with a red dashed circle.
@@ -87,6 +87,10 @@ fragments (`Config::embedded()`). To load user shortcuts/fragments from disk ins
 | **Bond** | Click an atom to extend a chain · drag atom→atom to draw a bond · click a bond to cycle single/double/triple |
 | **Eraser** | Click an atom or bond to remove it |
 
+In every tool, the mouse wheel (or a pinch) zooms about the cursor and a middle-button drag
+pans the view. The tools' drags above use the left button, so a middle-button drag in the
+Select tool only pans: it neither lassoes nor moves atoms.
+
 ### Keyboard
 
 While hovering the canvas, single keys place elements, fragments, and templates. A few examples:
@@ -105,6 +109,15 @@ While hovering the canvas, single keys place elements, fragments, and templates.
 | `Ctrl`+`Y` / `Ctrl`+`Shift`+`Z` | redo |
 | `Ctrl`+`C` / `Ctrl`+`V` | copy / paste (Windows) |
 | `Ctrl`+`0` | fit the whole structure to the view |
+| `Ctrl`+`1` / `2` / `3` | switch to the Select / Bond / Eraser tool |
+
+While a text field has focus (the label editor or a toolbar field), the canvas ignores the
+tools' keys, mouse gestures, and middle-button pan, as well as `Ctrl`+`C` / `Ctrl`+`V` and
+`Ctrl`+`0`; undo/redo, `Ctrl`+`K`, and `Ctrl`+`1`/`2`/`3` still act on the canvas. While a
+clean-up runs, the tools' keys and mouse gestures and the middle-button pan are off;
+`Ctrl`+`K` (stop), `Ctrl`+`0`, zoom, `Ctrl`+`1`/`2`/`3`, and copy/paste still work, and an
+undo/redo is accepted but the running clean-up keeps overwriting the restored positions. See
+[docs/MANUAL.ja.md](docs/MANUAL.ja.md) §2 for the full table.
 
 Selected atoms can be nudged with `Shift`+arrows (or `Ctrl`+arrows) and rotated with
 `Alt`+arrows. The full, user-editable key map lives in
