@@ -279,7 +279,22 @@ impl Config {
     }
 
     /// Save shortcuts to `chembuilder_config.json` and each fragment to `fragments/<name>.json`.
+    ///
+    /// Fails with [`InvalidInput`](std::io::ErrorKind::InvalidInput), before writing anything,
+    /// if a fragment's name is not a plain file name ([`Fragment::validate_name`]): a name like
+    /// `../x` would otherwise write outside `fragments/`. Refusing the whole save (rather than
+    /// skipping that fragment) tells the caller, and leaves the files on disk as they were.
     pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(std::path::Path::new("."))
+    }
+
+    /// [`Config::save`] into `dir` instead of the current directory.
+    fn save_to(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        for frag in &self.fragments {
+            Fragment::validate_name(&frag.name)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        }
+
         // Shortcuts + style (fragments live in their own files)
         let shortcuts = Config {
             atom_shortcuts: self.atom_shortcuts.clone(),
@@ -289,14 +304,15 @@ impl Config {
             fragments: Vec::new(),
         };
         std::fs::write(
-            "chembuilder_config.json",
+            dir.join("chembuilder_config.json"),
             serde_json::to_string_pretty(&shortcuts)?,
         )?;
 
-        // Individual fragment files
-        std::fs::create_dir_all("fragments")?;
+        // Individual fragment files (names checked above)
+        let frag_dir = dir.join("fragments");
+        std::fs::create_dir_all(&frag_dir)?;
         for frag in &self.fragments {
-            let path = format!("fragments/{}.json", frag.name);
+            let path = frag_dir.join(format!("{}.json", frag.name));
             std::fs::write(path, serde_json::to_string_pretty(frag)?)?;
         }
         Ok(())
@@ -402,13 +418,22 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/Ph.json"),
 ];
 
-/// Parse one fragment's JSON and reject it if [`FragmentDef::validate`] fails. Used for the
-/// built-in strings and `fragments/*.json`; inline fragments arrive already parsed with the
-/// config and are checked in [`load_fragments`].
+/// Parse one fragment's JSON and reject it if [`check_loaded`] fails. Used for the built-in
+/// strings and `fragments/*.json`; inline fragments arrive already parsed with the config and
+/// are checked in [`load_fragments`].
 fn parse_fragment_def(text: &str) -> Result<FragmentDef, String> {
     let def = serde_json::from_str::<FragmentDef>(text).map_err(|e| format!("{e}"))?;
-    def.validate()?;
+    check_loaded(&def)?;
     Ok(def)
+}
+
+/// What a loaded fragment must pass to enter the config: [`FragmentDef::validate`] (its
+/// indices fit), and a name that [`Config::save`] can write as `fragments/<name>.json`
+/// ([`Fragment::validate_name`]) — so a shared file with `"name": "../x"` is turned away here
+/// instead of being written back outside `fragments/` on the next save.
+fn check_loaded(def: &FragmentDef) -> Result<(), String> {
+    def.validate()?;
+    Fragment::validate_name(&def.name)
 }
 
 /// Parse the compile-time built-in fragments. No file I/O.
@@ -425,7 +450,7 @@ fn load_fragments(inline: Vec<FragmentDef>, dir: &std::path::Path) -> Vec<Fragme
     let mut frags = builtin_fragments();
     let inline = inline
         .into_iter()
-        .filter(|f| match f.validate() {
+        .filter(|f| match check_loaded(f) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("Warning: skip fragment {:?} in chembuilder_config.json: {e}", f.name);
@@ -612,6 +637,71 @@ mod tests {
             let mut mol = crate::molecule::Molecule::default();
             let anchor = mol.add_atom("C".into(), [0.0, 0.0], 0);
             mol.insert_fragment(&frag, anchor, 0.0, false);
+        }
+    }
+
+    /// A fragment named `../evil` (e.g. from a shared JSON file) must not make `save` write
+    /// `<dir>/evil.json`; the save is refused before anything is written.
+    #[test]
+    fn save_refuses_a_fragment_name_that_leaves_fragments_dir() {
+        let root = fragment_dir("save-escape", &[]);
+        let cfg = Config {
+            fragments: vec![two_atom_def("Good", 0, 0, 1), two_atom_def("../evil", 0, 0, 1)],
+            ..Config::embedded()
+        };
+        let result = cfg.save_to(&root);
+        let written = walk(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(written.is_empty(), "a refused save wrote {written:?}");
+    }
+
+    /// Every file under `dir`, recursively.
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// With valid names, `save` writes each fragment as `fragments/<name>.json` under `dir`,
+    /// and loading that directory back yields the same fragments.
+    #[test]
+    fn save_writes_each_fragment_into_fragments_dir() {
+        let root = fragment_dir("save-ok", &[]);
+        let cfg = Config { fragments: vec![two_atom_def("Good", 0, 0, 1)], ..Config::embedded() };
+        cfg.save_to(&root).unwrap();
+        let names: Vec<String> =
+            load_fragments_from_dir(&root.join("fragments")).into_iter().map(|f| f.name).collect();
+        let config_written = root.join("chembuilder_config.json").is_file();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(config_written);
+        assert_eq!(names, ["Good"]);
+    }
+
+    /// A fragment whose name `save` would refuse is skipped on load, from `fragments/*.json`
+    /// and inline alike, so it never enters the config.
+    #[test]
+    fn loader_skips_fragments_whose_name_is_not_a_file_name() {
+        let dir = fragment_dir("bad-name", &[two_atom_def("Good", 0, 0, 1)]);
+        let text = serde_json::to_string_pretty(&two_atom_def("../evil", 0, 0, 1)).unwrap();
+        std::fs::write(dir.join("shared.json"), text).unwrap();
+        let inline = vec![two_atom_def("a/b", 0, 0, 1), two_atom_def("NUL", 0, 0, 1)];
+        let frags = load_fragments(inline, &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let names: Vec<&str> = frags.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"Good"));
+        for bad in ["../evil", "a/b", "NUL"] {
+            assert!(!names.contains(&bad), "{bad} must be skipped");
         }
     }
 

@@ -290,9 +290,8 @@ impl ChemStructEditor {
         use crate::config::{FragAtomDef, FragBondDef, FragmentDef};
 
         let name = name.trim();
-        if name.is_empty() {
-            return Err("fragment name is empty".into());
-        }
+        // The name becomes `fragments/<name>.json`; refuse one that is not a plain file name.
+        crate::molecule::fragment::Fragment::validate_name(name)?;
         let mut ids: Vec<u32> = self.selected_atoms.iter().copied().collect();
         if ids.is_empty() {
             return Err("select the atoms to save first (Select tool)".into());

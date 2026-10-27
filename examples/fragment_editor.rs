@@ -259,6 +259,8 @@ impl FragmentEditorApp {
         if name.is_empty() {
             return Err("name the fragment first".into());
         }
+        // The name becomes `fragments/<name>.json`; refuse one that is not a plain file name.
+        Fragment::validate_name(&name)?;
         if self.editor.molecule.atoms.is_empty() {
             return Err("draw a structure first".into());
         }
