@@ -140,7 +140,12 @@ impl MolecularFormula {
                 *counts.entry("H".to_string()).or_default() += h;
             }
         }
+        Self::from_counts(counts)
+    }
 
+    /// A formula from per-element counts, put into Hill order. Zero counts are dropped.
+    pub fn from_counts(mut counts: BTreeMap<String, usize>) -> Self {
+        counts.retain(|_, n| *n > 0);
         // Hill order: C, H, then the rest alphabetically — unless there is no carbon, in
         // which case everything (hydrogen included) goes alphabetically.
         let mut out: Vec<(String, usize)> = Vec::with_capacity(counts.len());
