@@ -686,24 +686,109 @@ impl CleanupSchedule {
 const JOB_CHUNK: usize = 500;
 const JOB_PHASE_BUDGET: usize = 100_000;
 
+/// One running cleanup computation, as the editor drives it: once per UI frame
+/// `ChemStructEditor::poll_cleanup` copies `latest()` into the molecule for a live preview and
+/// checks `is_done()`; once that is `true` it calls `join()`.  `cancel()` may come at any time.
+///
+/// Contract for implementors:
+///   * `latest` returns `(atom id, position)` pairs for atoms of the molecule the run was
+///     started from.  It may also advance the computation (the wasm run does all its work
+///     there, one chunk per call).
+///   * Once `is_done` returns `true`, `latest` returns the final positions.
+///   * After `cancel`, the run must still reach `is_done` (soon), so the editor can finish.
+///
+/// Methods take `&self` because the editor holds the job behind a shared reference while it
+/// polls; a run that needs to mutate uses interior mutability.
+pub trait CleanupRun {
+    /// Ask the run to stop early.  Must not block.
+    fn cancel(&self);
+    /// Whether the run has finished (normally or after `cancel`).
+    fn is_done(&self) -> bool;
+    /// The current positions, for the live preview (final once `is_done`).
+    fn latest(&self) -> Vec<(u32, [f32; 2])>;
+    /// Release the run's resources; called once, after `is_done` returned `true`.
+    fn join(self: Box<Self>);
+}
+
+/// Starts cleanup runs: the swappable part behind the editor's Cleanup command.
+pub trait CleanupEngine {
+    fn start(&self, mol: &Molecule) -> CleanupJob;
+}
+
+/// The built-in cleanup: the force-field relaxation plus ring rescue of `CleanupSchedule`,
+/// on a background thread natively and one chunk per poll on wasm32 (`CleanupJob::start`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultCleanupEngine;
+
+impl CleanupEngine for DefaultCleanupEngine {
+    fn start(&self, mol: &Molecule) -> CleanupJob {
+        CleanupJob::start(mol)
+    }
+}
+
+/// A running cleanup computation: a thin wrapper around any [`CleanupRun`], so the editor's
+/// `cleanup_job: Option<CleanupJob>` can hold the built-in run or another engine's.
+///
+/// The run must be `Send + Sync` so that `CleanupJob` — and with it `ChemStructEditor` —
+/// stays `Send + Sync` as it was when `CleanupJob` was the concrete threaded job.
+pub struct CleanupJob {
+    run: Box<dyn CleanupRun + Send + Sync>,
+}
+
+impl CleanupJob {
+    /// Start the built-in cleanup of a snapshot of `mol` (see [`DefaultCleanupEngine`]).
+    pub fn start(mol: &Molecule) -> Self {
+        Self::from_run(DefaultRun::start(mol))
+    }
+
+    /// Wrap another engine's run.
+    pub fn from_run(run: impl CleanupRun + Send + Sync + 'static) -> Self {
+        CleanupJob { run: Box::new(run) }
+    }
+
+    /// Request the run to stop early.
+    pub fn cancel(&self) {
+        self.run.cancel();
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.run.is_done()
+    }
+
+    /// Latest relaxed positions (for live preview each frame).
+    pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+        self.run.latest()
+    }
+
+    /// Finish the run (call once `is_done`).
+    pub fn join(self) {
+        self.run.join();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+use job_native::ThreadedRun as DefaultRun;
+#[cfg(target_arch = "wasm32")]
+use job_wasm::PolledRun as DefaultRun;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod job_native {
-    use super::{run_cleanup_job, Molecule};
+    use super::{run_cleanup_job, CleanupRun, Molecule};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
-    /// A cleanup computation running on a background thread. The UI thread polls
+    /// The built-in cleanup running on a background thread. The UI thread polls
     /// `latest()` for a live preview and `is_done()` for completion, and may `cancel()`
-    /// at any time. Created with `CleanupJob::start`.
-    pub struct CleanupJob {
+    /// at any time.
+    pub struct ThreadedRun {
         cancel: Arc<AtomicBool>,
         done: Arc<AtomicBool>,
         shared: Arc<Mutex<Vec<(u32, [f32; 2])>>>,
         handle: Option<JoinHandle<()>>,
     }
 
-    impl CleanupJob {
+    impl ThreadedRun {
         /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread.
         pub fn start(mol: &Molecule) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
@@ -718,34 +803,36 @@ mod job_native {
                 run_cleanup_job(&snapshot, &c, &d, &s);
             });
 
-            CleanupJob { cancel, done, shared, handle: Some(handle) }
+            ThreadedRun { cancel, done, shared, handle: Some(handle) }
         }
+    }
 
+    impl CleanupRun for ThreadedRun {
         /// Request the worker to stop at the next chunk boundary.
-        pub fn cancel(&self) {
+        fn cancel(&self) {
             self.cancel.store(true, Ordering::Relaxed);
         }
 
-        pub fn is_done(&self) -> bool {
+        fn is_done(&self) -> bool {
             // Acquire pairs with the worker's Release store, so once this reads `true` the
             // final positions it published are what `latest()` returns.
             self.done.load(Ordering::Acquire)
         }
 
         /// Latest relaxed positions (for live preview each frame).
-        pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
             self.shared.lock().unwrap().clone()
         }
 
         /// Join the worker thread (call once `is_done`).
-        pub fn join(mut self) {
+        fn join(mut self: Box<Self>) {
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
             }
         }
     }
 
-    impl Drop for CleanupJob {
+    impl Drop for ThreadedRun {
         fn drop(&mut self) {
             // Make sure a still-running worker stops if the job is dropped without joining.
             self.cancel.store(true, Ordering::Relaxed);
@@ -753,51 +840,52 @@ mod job_native {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use job_native::CleanupJob;
-
 // wasm32-unknown-unknown has no `std::thread::spawn` (it always returns an "unsupported"
 // error, and `thread::spawn` panics on that) — there's no Web Worker / SharedArrayBuffer
 // setup here for real background threads. Instead, `latest()` — already polled once per UI
 // frame by `ChemStructEditor::poll_cleanup` — advances the same `CleanupSchedule` as
 // `cleanup_2d` and the native worker by one `JOB_CHUNK` on each call, so the tab still
 // repaints between chunks instead of blocking on one huge synchronous relaxation.
-// `Cell`/`RefCell` stand in for the native version's atomics and mutex since
-// wasm32-unknown-unknown is single-threaded.
+// wasm32-unknown-unknown is single-threaded, so the `Mutex` here is never contended; it (and
+// the `AtomicBool`) are used instead of `RefCell`/`Cell` only because `CleanupJob` requires its
+// run to be `Sync`, and a `RefCell` is not.
 #[cfg(target_arch = "wasm32")]
 mod job_wasm {
-    use super::{CleanupSchedule, Molecule, JOB_CHUNK};
-    use std::cell::{Cell, RefCell};
+    use super::{CleanupRun, CleanupSchedule, Molecule, JOB_CHUNK};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
-    pub struct CleanupJob {
-        schedule: RefCell<CleanupSchedule>,
+    pub struct PolledRun {
+        schedule: Mutex<CleanupSchedule>,
         /// Set by `cancel`; the next `latest` call stops the schedule, as the native worker
         /// does at its next chunk boundary.
-        cancelled: Cell<bool>,
+        cancelled: AtomicBool,
     }
 
-    impl CleanupJob {
+    impl PolledRun {
         pub fn start(mol: &Molecule) -> Self {
-            CleanupJob {
-                schedule: RefCell::new(CleanupSchedule::new(mol)),
-                cancelled: Cell::new(false),
+            PolledRun {
+                schedule: Mutex::new(CleanupSchedule::new(mol)),
+                cancelled: AtomicBool::new(false),
             }
         }
+    }
 
-        pub fn cancel(&self) {
-            self.cancelled.set(true);
+    impl CleanupRun for PolledRun {
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Relaxed);
         }
 
-        pub fn is_done(&self) -> bool {
-            self.schedule.borrow().is_done()
+        fn is_done(&self) -> bool {
+            self.schedule.lock().unwrap().is_done()
         }
 
         /// Advance the schedule by one chunk (or stop it, once cancelled), then return the
         /// positions.  On a finished schedule both `advance` and `cancel` do nothing, so this
         /// then just returns the final positions.
-        pub fn latest(&self) -> Vec<(u32, [f32; 2])> {
-            let mut schedule = self.schedule.borrow_mut();
-            if self.cancelled.get() {
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            let mut schedule = self.schedule.lock().unwrap();
+            if self.cancelled.load(Ordering::Relaxed) {
                 schedule.cancel();
             } else {
                 schedule.advance(JOB_CHUNK);
@@ -806,12 +894,9 @@ mod job_wasm {
         }
 
         /// Nothing to join — there is no worker thread on wasm32.
-        pub fn join(self) {}
+        fn join(self: Box<Self>) {}
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-pub use job_wasm::CleanupJob;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1625,6 +1710,87 @@ mod tests {
             let from_job = position_bits(&run_native_job(&fx.mol));
             assert_eq!(from_job, coord_bits(&mol), "{}: CleanupJob differs from cleanup_2d", fx.name);
         }
+    }
+
+    /// Drive a job the way `poll_cleanup` does (call `latest` until `is_done`), on any target.
+    fn run_polled(job: CleanupJob) -> Vec<(u32, [f32; 2])> {
+        while !job.is_done() {
+            job.latest();
+            std::thread::yield_now();
+        }
+        let positions = job.latest();
+        job.join();
+        positions
+    }
+
+    /// `DefaultCleanupEngine` is the built-in cleanup: same coordinates as `cleanup_2d`.
+    #[test]
+    fn default_engine_matches_cleanup_2d() {
+        for fx in characterization_fixtures() {
+            let mut mol = fx.mol.clone();
+            cleanup_2d(&mut mol);
+            let from_engine = position_bits(&run_polled(DefaultCleanupEngine.start(&fx.mol)));
+            assert_eq!(from_engine, coord_bits(&mol), "{}: DefaultCleanupEngine differs from cleanup_2d", fx.name);
+        }
+    }
+
+    /// A run that records what was forwarded to it.
+    struct FakeRun {
+        positions: Vec<(u32, [f32; 2])>,
+        done: bool,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CleanupRun for FakeRun {
+        fn cancel(&self) {
+            self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn is_done(&self) -> bool {
+            self.done
+        }
+        fn latest(&self) -> Vec<(u32, [f32; 2])> {
+            self.positions.clone()
+        }
+        fn join(self: Box<Self>) {
+            self.joined.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// `CleanupJob::from_run` wraps any run and forwards every call to it.
+    #[test]
+    fn from_run_forwards_to_the_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        for done in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let joined = Arc::new(AtomicBool::new(false));
+            let positions = vec![(3, [1.5, -2.0]), (7, [0.25, 4.0])];
+            let job = CleanupJob::from_run(FakeRun {
+                positions: positions.clone(),
+                done,
+                cancelled: cancelled.clone(),
+                joined: joined.clone(),
+            });
+
+            assert_eq!(job.latest(), positions);
+            assert_eq!(job.is_done(), done);
+            assert!(!cancelled.load(Ordering::Relaxed));
+            job.cancel();
+            assert!(cancelled.load(Ordering::Relaxed));
+            assert!(!joined.load(Ordering::Relaxed));
+            job.join();
+            assert!(joined.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Wrapping the run in a trait object must not cost `CleanupJob` (and so the editor that
+    /// holds one) the `Send + Sync` it had as a concrete threaded job.
+    #[test]
+    fn cleanup_job_and_editor_stay_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CleanupJob>();
+        assert_send_sync::<crate::widget::ChemStructEditor>();
     }
 
     /// `CleanupSchedule` advanced in small chunks (as a worker or a per-frame poll would) lands
