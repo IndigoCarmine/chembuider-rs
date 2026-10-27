@@ -1216,7 +1216,7 @@ mod tests {
         mol(&vec![("C", 0); n], &bonds)
     }
 
-    /// Every structure whose output [`output_is_pinned_across_many_structures`] holds fixed.
+    /// Every structure whose output [`output_is_pinned`] holds fixed.
     fn characterization_cases() -> Vec<(String, Molecule)> {
         let mut cases: Vec<(String, Molecule)> = all_fixtures()
             .into_iter()
@@ -1233,9 +1233,10 @@ mod tests {
             let bonds: Vec<_> = (1..=k).map(|j| (0, j, BondOrder::Single)).collect();
             cases.push((format!("star:{k}"), mol(&atoms[..=k], &bonds)));
         }
-        // Complete graphs: every DFS is a Hamiltonian path, so K_n costs n! traversals and K9
-        // (362 880) runs out of the budget — which pins where the budget cuts the search off.
-        for n in 4..=9 {
+        // Complete graphs: every DFS is a Hamiltonian path, so K_n costs n! traversals, and K7
+        // and K8 keep more than nine rings open at once. Where the budget cuts the search off
+        // is pinned by `random:81`, which runs out of it.
+        for n in 4..=8 {
             let bonds: Vec<_> = (0..n)
                 .flat_map(|i| ((i + 1)..n).map(move |j| (i, j, BondOrder::Single)))
                 .collect();
@@ -1252,21 +1253,45 @@ mod tests {
         format!("{name}\t{}\t{}\t{}", g.traversals, g.exhausted, g.smiles)
     }
 
+    /// How many tests [`output_is_pinned`] is split across, so the cases run in parallel.
+    const CHARACTERIZATION_SHARES: usize = 4;
+
     /// The exact output — and the traversal count and budget flag, which pin the search order
     /// and its pruning — for every fixture, a set of chains, rings, stars and complete graphs,
     /// and a seeded batch of random structures. The expected lines were produced by the
     /// recursive writer before it was made iterative; regenerate them with
     /// `cargo test --lib smiles::tests::dump_characterization -- --ignored --nocapture` only
     /// when the canonical form is meant to change.
-    #[test]
-    fn output_is_pinned_across_many_structures() {
+    ///
+    /// Checks the cases whose index is `share` modulo [`CHARACTERIZATION_SHARES`].
+    fn output_is_pinned(share: usize) {
         let expected = include_str!("smiles/characterization.txt");
         let cases = characterization_cases();
         let want: Vec<&str> = expected.lines().collect();
         assert_eq!(want.len(), cases.len(), "characterization.txt is out of step with the cases");
-        for ((name, m), want) in cases.iter().zip(want) {
+        for ((name, m), want) in cases.iter().zip(want).skip(share).step_by(CHARACTERIZATION_SHARES) {
             assert_eq!(characterization_line(name, m), want, "{name}");
         }
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_0() {
+        output_is_pinned(0);
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_1() {
+        output_is_pinned(1);
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_2() {
+        output_is_pinned(2);
+    }
+
+    #[test]
+    fn output_is_pinned_across_many_structures_share_3() {
+        output_is_pinned(3);
     }
 
     /// [`to_smiles`] runs on the UI thread, on whatever came in off the clipboard, so the depth
