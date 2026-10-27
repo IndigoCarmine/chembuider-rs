@@ -30,6 +30,11 @@ const FIT: FitOptions = FitOptions {
     max_zoom: 1.3,
     keep_zoom: false,
 };
+/// Height of the strip at the top of each cell that the editor's canvas leaves out, so the
+/// drawing stays below the caption (drawn at y = 4 in a 13 px font; its glyphs end by
+/// y = 18). The fitted drawing starts `FIT.margin` below the canvas top, at y = 24, and
+/// bond strokes reach a pixel or two above that, still clear of the caption rows.
+const CAPTION_BAND_H: f32 = 10.0;
 
 fn main() {
     // Args: `--single` picks the compact one-cell-per-fixture mode; the first
@@ -133,10 +138,15 @@ impl CellRenderer {
             screen_rect: Some(cell),
             ..Default::default()
         };
+        // The editor draws below the caption band; the fit uses that same rect, so the
+        // drawing is centered in it and its margin keeps it clear of the caption.
+        let canvas = egui::Rect::from_min_max(egui::pos2(0.0, CAPTION_BAND_H), cell.max);
         let frame = |editor: &mut ChemStructEditor, ui: &mut egui::Ui| {
-            // Fit the whole drawing, labels included, into the cell before drawing it.
-            editor.fit_view_with(ui.ctx(), cell, FIT);
-            editor.ui(ui);
+            // Fit the whole drawing, labels included, into the canvas before drawing it.
+            editor.fit_view_with(ui.ctx(), canvas, FIT);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(canvas), |ui| {
+                editor.ui(ui);
+            });
             // Caption + cell border on top of the editor's white canvas.
             let painter = ui.painter();
             painter.text(
