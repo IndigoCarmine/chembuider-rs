@@ -6,12 +6,14 @@
 //! `examples/editor_web/README.md` for the build steps.
 //!
 //! This wraps the library's [`ChemStructEditor`] widget in an eframe window with a toolbar
-//! (tools, stereo, paste, clean-up, fragments, config, MOL2 export) and a status bar. The
+//! (tools, stereo, paste, clean-up, fragments, config, MOL2 export), a status bar and an
+//! Analysis side panel (formula, exact mass, MW, ESI m/z, elemental analysis). The
 //! widget itself is library code; everything here is host-app glue you'd write per application.
 
 use chembuider_rs::molecule::cdxml::to_cdxml;
 use chembuider_rs::molecule::mol2::to_mol2_string;
 use chembuider_rs::molecule::smiles::to_smiles;
+use chembuider_rs::widget::analysis::AnalysisPanel;
 use chembuider_rs::{bond_menu, BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use eframe::{egui, App};
 
@@ -79,6 +81,9 @@ struct EditorApp {
     fragment_name: String,
     /// Color for the "Fill Ring" feature.
     ring_color: egui::Color32,
+    /// The Analysis side panel (formula, masses, m/z) and whether it is shown.
+    analysis: AnalysisPanel,
+    show_analysis: bool,
 }
 
 impl Default for EditorApp {
@@ -91,6 +96,8 @@ impl Default for EditorApp {
             status: "Ready — Bond tool active. Click to place atoms, drag between atoms to draw bonds.".to_string(),
             fragment_name: String::new(),
             ring_color: egui::Color32::from_rgb(120, 200, 255),
+            analysis: AnalysisPanel::default(),
+            show_analysis: true,
         }
     }
 }
@@ -242,6 +249,10 @@ impl App for EditorApp {
                 if ui.button("💾 Export CDXML").clicked() {
                     self.save_cdxml();
                 }
+
+                ui.separator();
+
+                ui.toggle_value(&mut self.show_analysis, "🔬 Analysis");
             });
         });
 
@@ -257,6 +268,16 @@ impl App for EditorApp {
                 ));
             });
         });
+
+        if self.show_analysis {
+            egui::Panel::right("analysis").resizable(true).default_size(230.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if self.analysis.ui(ui, &self.editor.molecule, &self.editor.selected_atoms) {
+                        self.status = "Copied the analysis to the clipboard.".to_string();
+                    }
+                });
+            });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             // Refresh the status line once a canvas edit makes the last toolbar message (e.g.

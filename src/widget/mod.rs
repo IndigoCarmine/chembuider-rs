@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod bond_menu;
 pub mod draw;
 pub mod interact;
