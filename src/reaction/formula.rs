@@ -22,6 +22,8 @@ use crate::widget::rich_text::{RichText, SpanStyle};
 /// editor also allows.
 ///
 /// `D` (deuterium) is included because the editor treats it as its own element symbol.
+/// Elements with no standard atomic weight (Tc, Pm, Po–Ac, …) are absent; `Ac` and `Ts` would
+/// clash with the acetyl and tosyl group labels anyway.
 pub fn atomic_weight(element: &str) -> Option<f64> {
     Some(match element {
         "H" => 1.008,
@@ -82,11 +84,18 @@ pub fn atomic_weight(element: &str) -> Option<f64> {
         "Ba" => 137.33,
         "La" => 138.91,
         "Ce" => 140.12,
+        "Pr" => 140.91,
         "Nd" => 144.24,
         "Sm" => 150.36,
         "Eu" => 151.96,
         "Gd" => 157.25,
+        "Tb" => 158.93,
+        "Dy" => 162.50,
+        "Ho" => 164.93,
+        "Er" => 167.26,
+        "Tm" => 168.93,
         "Yb" => 173.05,
+        "Lu" => 174.97,
         "Hf" => 178.49,
         "Ta" => 180.95,
         "W" => 183.84,
@@ -100,6 +109,7 @@ pub fn atomic_weight(element: &str) -> Option<f64> {
         "Pb" => 207.2,
         "Bi" => 208.98,
         "Th" => 232.04,
+        "Pa" => 231.04,
         "U" => 238.03,
         _ => return None,
     })
@@ -364,5 +374,24 @@ mod tests {
         let f = MolecularFormula::of(&m);
         assert_eq!(f.weight(), None);
         assert_eq!(f.unknown_elements(), vec!["OMe"]);
+    }
+
+    /// Every element up to uranium that has an IUPAC standard atomic weight has one in the
+    /// table — the lanthanides of Lewis acids such as Er(OTf)3 or Dy(OTf)3 included. The
+    /// elements skipped here have no standard atomic weight (no stable isotope).
+    #[test]
+    fn every_element_with_a_standard_weight_has_one() {
+        const NO_STANDARD_WEIGHT: [&str; 8] = ["Tc", "Pm", "Po", "At", "Rn", "Fr", "Ra", "Ac"];
+        for z in 1..=92 {
+            let el = crate::molecule::elements::symbol(z).unwrap();
+            if NO_STANDARD_WEIGHT.contains(&el) {
+                continue;
+            }
+            assert!(atomic_weight(el).is_some(), "no atomic weight for {el} (Z = {z})");
+        }
+        assert_eq!(atomic_weight("Er").map(|w| format!("{w:.2}")).as_deref(), Some("167.26"));
+        // `Ac` is the acetyl group label in this editor, `Ts` the tosyl one: never an element.
+        assert_eq!(atomic_weight("Ac"), None);
+        assert_eq!(atomic_weight("Ts"), None);
     }
 }
