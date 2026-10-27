@@ -159,17 +159,17 @@ impl<'a> Writer<'a> {
                     let frags = self.structure(s.molecule(), *origin);
                     w.fragments = frags.iter().map(|f| f.0).collect();
                     if let Some(label) = label {
-                        let text = self.text(s.label(), label.rect, true);
+                        let text = self.text(s.label(), label.rect);
                         self.bind_label(text, &frags);
                     }
                 }
                 (SchemeItem::Plus, PlacedKind::Text(t)) => {
                     let rect = Rect::from_center_size(Pos2::new(placed.rect.center().x, line), t.size);
-                    self.text(&RichText::plain("+"), rect, true);
+                    self.text(&RichText::plain("+"), rect);
                 }
                 (SchemeItem::Text(text), PlacedKind::Text(t)) => {
                     let rect = Rect::from_center_size(Pos2::new(placed.rect.center().x, line), t.size);
-                    self.text(text, rect, true);
+                    self.text(text, rect);
                 }
                 (SchemeItem::Arrow(arrow), PlacedKind::Arrow { length, above, below }) => {
                     let tail = page_at(Pos2::new(placed.rect.min.x, line));
@@ -193,7 +193,7 @@ impl<'a> Writer<'a> {
                                     line + half_shaft + self.style.arrow_text_gap
                                 };
                                 let rect = Rect::from_min_size(Pos2::new(centre_x - t.size.x * 0.5, top), t.size);
-                                vec![self.text(text, rect, true)]
+                                vec![self.text(text, rect)]
                             }
                             (ArrowLabel::Structure(s), PlacedArrowLabel::Structure { origin }) => {
                                 self.structure(s.molecule(), *origin).iter().map(|f| f.0).collect()
@@ -236,22 +236,19 @@ impl<'a> Writer<'a> {
         out
     }
 
-    /// A text filling `rect` (figure points): centred on it, or from its left edge.
-    fn text(&mut self, text: &RichText, rect: Rect, centred: bool) -> u32 {
+    /// A text filling `rect` (figure points), centred in it.
+    fn text(&mut self, text: &RichText, rect: Rect) -> u32 {
         let (runs, chars) = cdx::runs_of(text);
         let chars = chars.replace('\n', "\r");
-        let x = if centred { rect.center().x } else { rect.min.x };
         let at = |x: f32, y: f32| ((x + PAGE_MARGIN_PT) as f64 * PT, (y + PAGE_MARGIN_PT) as f64 * PT);
-        let (px, py) = at(x, rect.min.y + ASCENT_PT);
+        let (px, py) = at(rect.center().x, rect.min.y + ASCENT_PT);
         let (l, t) = at(rect.min.x, rect.min.y);
         let (r, b) = at(rect.max.x, rect.max.y);
         let id = self.id();
         let mut t_obj = CdxObject::new(OBJ_TEXT, id);
         t_obj.set(PROP_2D_POSITION, cdx::point(px, py));
         t_obj.set(PROP_BOUNDING_BOX, cdx::rect([l, t, r, b]));
-        if centred {
-            t_obj.set(PROP_JUSTIFICATION, vec![JUSTIFY_CENTER]);
-        }
+        t_obj.set(PROP_JUSTIFICATION, vec![JUSTIFY_CENTER]);
         t_obj.set(PROP_TEXT, cdx::cdx_string(&runs, &chars));
         if chars.chars().any(|c| c as u32 >= 0x100) {
             t_obj.set(PROP_UTF8_TEXT, utf8_string(&runs, &chars));

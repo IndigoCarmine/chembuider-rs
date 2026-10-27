@@ -31,7 +31,7 @@ pub(crate) const OBJ_BOND: u16 = 0x8005;
 pub(crate) const OBJ_TEXT: u16 = 0x8006;
 
 // Properties (kCDXProp_*).
-pub(crate) const PROP_CREATION_PROGRAM: u16 = 0x0003;
+const PROP_CREATION_PROGRAM: u16 = 0x0003;
 pub(crate) const PROP_2D_POSITION: u16 = 0x0200;
 pub(crate) const PROP_BOUNDING_BOX: u16 = 0x0204;
 const PROP_NODE_TYPE: u16 = 0x0400;
