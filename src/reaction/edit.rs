@@ -457,7 +457,7 @@ pub fn take_scheme_arrow_structure(
 ///
 /// The caller is expected to follow up with
 /// [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the table columns
-/// re-derive from the structures that remain on the line.
+/// follow the moved structure (by its id) back into scheme order.
 pub fn move_line_structure_to_arrow_slot(
     scheme: &mut ReactionScheme,
     from: usize,
@@ -488,7 +488,7 @@ pub fn move_line_structure_to_arrow_slot(
 /// Returns `false` (changing nothing) unless `from` is a main-line structure **and** the slot
 /// holds a structure; a text- or empty-occupied slot is not swappable. The caller should follow
 /// up with [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme) so the
-/// reactant columns re-derive from the structures that now sit at each position.
+/// columns, which follow their structures by id, are put back in scheme order.
 pub fn swap_line_structure_with_arrow_slot(
     scheme: &mut ReactionScheme,
     from: usize,
@@ -1197,10 +1197,8 @@ impl ReactionEditor {
                                 if drag.insert_at > from { drag.insert_at - 1 } else { drag.insert_at };
                             let delta = target as isize - from as isize;
                             if let Some(landed) = reaction.scheme.move_item(from, delta) {
-                                // Reordering shifts the structure→column mapping, which is
-                                // positional (reactants before the arrow, products after).
-                                // Re-derive every table column from whatever structure now sits
-                                // at its position.
+                                // The columns follow their structures by id; resync so they
+                                // are put back in the scheme's new order, values and all.
                                 reaction.sync_structures_from_scheme();
                                 // Dropped back in place moves nothing; any other landing does.
                                 self.scheme_rearranged |= landed != from;
