@@ -7,13 +7,16 @@ use super::session::{self, Args, Sender};
 use crate::molecule::cdx;
 use crate::widget::SCALE_FACTOR;
 use crate::{BondStereo, ChemStructEditor, Config, Molecule, Tool};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long after the last change (with no button held) the object is sent back: one undo
 /// step in the document per gesture, not per frame.
 const SETTLE: Duration = Duration::from_millis(400);
+
+/// Where a drawing started without a file is saved.
+const UNTITLED: &str = "untitled.cdx";
 
 /// What the connection threads tell the window.
 pub enum Event {
@@ -74,9 +77,25 @@ impl Tab {
 
     /// A CDX file opened by hand.
     fn open_file(path: PathBuf, ja: bool) -> Tab {
-        let bytes = std::fs::read(&path).ok();
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Tab::new(0, title, Source::File { path, original: bytes.clone() }, bytes.as_deref(), ja)
+        match std::fs::read(&path) {
+            Ok(bytes) => Tab::new(0, title, Source::File { path, original: Some(bytes.clone()) }, Some(&bytes), ja),
+            // Nothing there yet: a new drawing, written on the first edit.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tab::new(0, title, Source::File { path, original: None }, None, ja),
+            // There but not readable (locked, no access, …): shown as such and never written
+            // over, or the first edit would replace the file with a drawing that is not it.
+            Err(e) => {
+                let mut tab = Tab::new(0, title, Source::File { path, original: None }, None, ja);
+                tab.unreadable = Some(if ja { format!("ファイルを読めません: {e}") } else { format!("Cannot read the file: {e}") });
+                tab
+            }
+        }
+    }
+
+    /// The drawing started without a file: `untitled.cdx` in `dir`. One left by an earlier
+    /// session is opened, so its drawing is shown and edited rather than silently replaced.
+    fn untitled(dir: &Path, ja: bool) -> Tab {
+        Tab::open_file(dir.join(UNTITLED), ja)
     }
 
     fn original_cdx(&self) -> Option<&[u8]> {
@@ -198,7 +217,8 @@ impl OfficeApp {
         if let Some(path) = file {
             app.tabs.push(Tab::open_file(path, app.ja));
         } else if !office {
-            app.tabs.push(Tab::new(0, "untitled.cdx".into(), Source::File { path: PathBuf::from("untitled.cdx"), original: None }, None, app.ja));
+            // In the current directory, as `untitled.cdx` always was.
+            app.tabs.push(Tab::untitled(Path::new(""), app.ja));
         }
         app
     }
@@ -461,5 +481,68 @@ mod tests {
             assert_eq!(cdx_codec::parse(&saved).unwrap().prop(PROP_CREATION_PROGRAM), doc.prop(PROP_CREATION_PROGRAM));
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A directory under the temp dir for one test, removed when the test ends (passed or not).
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("chembuilder-office-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn add_oxygen(tab: &mut Tab) {
+        let pos = tab.editor.molecule.atoms.first().map_or([0.0, 0.0], |a| a.pos);
+        tab.editor.molecule.add_atom("O".to_string(), [pos[0] + 1.5, pos[1]], 0);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_never_written_over() {
+        // A directory stands in for a file that is there but cannot be read (locked, no access).
+        let dir = TempDir::new("unreadable");
+        let path = dir.0.join("drawing.cdx");
+        std::fs::create_dir(&path).unwrap();
+
+        let mut tab = Tab::open_file(path.clone(), false);
+        assert!(tab.unreadable.is_some(), "the read error is shown, not an empty new drawing");
+        add_oxygen(&mut tab);
+        assert_eq!(tab.flush(), Ok(()), "nothing is written");
+        assert!(path.is_dir(), "what was there is left alone");
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_yet_is_a_new_drawing() {
+        let dir = TempDir::new("missing");
+        let path = dir.0.join("new.cdx");
+
+        let mut tab = Tab::open_file(path.clone(), false);
+        assert!(tab.unreadable.is_none());
+        assert!(tab.editor.molecule.atoms.is_empty());
+        add_oxygen(&mut tab);
+        tab.flush().unwrap();
+        assert_eq!(cdx::read_cdx(&std::fs::read(&path).unwrap()).unwrap().molecule.atoms.len(), 1, "written on the first edit");
+    }
+
+    #[test]
+    fn an_earlier_untitled_drawing_is_opened_not_replaced() {
+        let dir = TempDir::new("untitled");
+        let original = include_bytes!("../../tests/fixtures/chemdraw26_benzene.cdx");
+        std::fs::write(dir.0.join(UNTITLED), original).unwrap();
+
+        let mut tab = Tab::untitled(&dir.0, false);
+        assert_eq!(tab.title, UNTITLED);
+        assert_eq!(tab.editor.molecule.atoms.len(), 6, "the earlier drawing is shown");
+        add_oxygen(&mut tab);
+        tab.flush().unwrap();
+        let saved = cdx::read_cdx(&std::fs::read(dir.0.join(UNTITLED)).unwrap()).unwrap();
+        assert_eq!(saved.molecule.atoms.len(), 7, "the edit goes onto the earlier drawing");
     }
 }
