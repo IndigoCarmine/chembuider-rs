@@ -221,10 +221,13 @@ impl App for EditorApp {
                 ui.separator();
 
                 if ui.button("🗑 Clear").clicked() {
-                    // Snapshot first so Ctrl+Z brings the cleared structure back.
-                    self.editor.push_undo();
-                    self.editor.molecule = Molecule::default();
-                    self.editor.selected_atoms.clear();
+                    // An empty canvas has nothing to clear: an undo step there would only wipe
+                    // the redo history. Otherwise snapshot first so Ctrl+Z brings it back.
+                    if !self.editor.molecule.atoms.is_empty() {
+                        self.editor.push_undo();
+                        self.editor.molecule = Molecule::default();
+                        self.editor.selected_atoms.clear();
+                    }
                     self.status = "Canvas cleared.".to_string();
                 }
 
