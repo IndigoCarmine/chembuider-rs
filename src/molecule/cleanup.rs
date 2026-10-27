@@ -1804,10 +1804,19 @@ mod tests {
         }
     }
 
+    /// An editor set up by [`editor_with_fake_engine`], and what the tests check it against.
+    struct FakeEngineFixture {
+        editor: crate::widget::ChemStructEditor,
+        /// The molecule before any cleanup.
+        before: Molecule,
+        /// The positions the fake engine's runs report.
+        positions: Vec<(u32, [f32; 2])>,
+        /// Set once the run is joined.
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
     /// An editor with two atoms, cleaned up by a `FakeEngine` that moves both of them.
-    fn editor_with_fake_engine(
-        done: bool,
-    ) -> (crate::widget::ChemStructEditor, Molecule, Vec<(u32, [f32; 2])>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    fn editor_with_fake_engine(done: bool) -> FakeEngineFixture {
         let mut editor = crate::widget::ChemStructEditor::default();
         let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
         let b = editor.molecule.add_atom("C".to_string(), [5.0, 5.0], 0);
@@ -1815,7 +1824,7 @@ mod tests {
         let positions = vec![(a, [1.25, -0.5]), (b, [2.5, 0.75])];
         let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         editor.set_cleanup_engine(FakeEngine { positions: positions.clone(), done, joined: joined.clone() });
-        (editor, before, positions, joined)
+        FakeEngineFixture { editor, before, positions, joined }
     }
 
     fn atom_positions(mol: &Molecule) -> Vec<(u32, [f32; 2])> {
@@ -1828,7 +1837,7 @@ mod tests {
     #[test]
     fn set_cleanup_engine_drives_toggle_and_poll() {
         use std::sync::atomic::Ordering;
-        let (mut editor, before, positions, joined) = editor_with_fake_engine(true);
+        let FakeEngineFixture { mut editor, before, positions, joined } = editor_with_fake_engine(true);
 
         editor.toggle_cleanup();
         assert!(editor.cleanup_job.is_some());
@@ -1850,7 +1859,7 @@ mod tests {
     #[test]
     fn unfinished_engine_run_keeps_the_job() {
         use std::sync::atomic::Ordering;
-        let (mut editor, _before, positions, joined) = editor_with_fake_engine(false);
+        let FakeEngineFixture { mut editor, positions, joined, .. } = editor_with_fake_engine(false);
 
         editor.toggle_cleanup();
         assert!(editor.poll_cleanup(), "an unfinished run keeps the cleanup active");

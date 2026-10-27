@@ -544,7 +544,10 @@ impl ChemStructEditor {
     }
 
     /// Toggle the background cleanup: start it if idle, otherwise request it to stop.
-    /// Starting snapshots the current molecule into a worker thread so the UI never freezes.
+    /// Starting pushes an undo step and starts a run from the cleanup engine (see
+    /// [`set_cleanup_engine`](Self::set_cleanup_engine)). The built-in engine relaxes a snapshot
+    /// of the molecule in the background (a worker thread natively, one chunk per poll on
+    /// wasm32) so the UI never freezes.
     pub fn toggle_cleanup(&mut self) {
         match &self.cleanup_job {
             Some(job) => job.cancel(),
