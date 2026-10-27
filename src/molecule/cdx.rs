@@ -253,7 +253,7 @@ pub(super) fn is_node(mol: &Molecule, atom_id: u32) -> bool {
 
 /// The node `atom` is written as (see [`NodeRules`]).
 pub(super) fn node_rules(mol: &Molecule, atom: &super::Atom) -> NodeRules {
-    let z = elements::atomic_number(&atom.element);
+    let z = elements::element_of_label(&atom.element);
     let kind = match z {
         Some(6) => NodeKind::Carbon,
         Some(z) => NodeKind::Element(z),
@@ -846,6 +846,53 @@ mod tests {
         assert_eq!(bonds.len(), 4, "no bond to the folded hydrogen");
         let ids: std::collections::HashSet<u32> = nodes.iter().map(|n| n.id).collect();
         assert!(bonds.iter().all(|b| ids.contains(&b.prop_u32(PROP_BOND_BEGIN).unwrap()) && ids.contains(&b.prop_u32(PROP_BOND_END).unwrap())));
+    }
+
+    /// "Ac" and "Ts" on an atom are the acetyl and tosyl labels (`assets/fragments/Ac.json`,
+    /// `Ts.json`), not actinium and tennessine: they are written as labels, as "Ph" is, and
+    /// come back as the same labels.
+    #[test]
+    fn acetyl_and_tosyl_labels_are_written_as_labels_not_elements() {
+        let mut mol = Molecule::default();
+        let n = mol.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let ac = mol.add_atom("Ac".to_string(), [1.3, 0.75], 0);
+        let ts = mol.add_atom("Ts".to_string(), [-1.3, 0.75], 0);
+        mol.add_bond(n, ac, BondOrder::Single);
+        mol.add_bond(n, ts, BondOrder::Single);
+
+        let doc = cdx_codec::parse(&molecule_to_cdx_document(&mol)).unwrap();
+        let mut nodes = Vec::new();
+        find(&doc, OBJ_NODE, &mut nodes);
+        for text in ["Ac", "Ts"] {
+            let node = nodes
+                .iter()
+                .find(|n| n.children.first().and_then(|t| t.prop(PROP_TEXT)).and_then(parse_cdx_string).is_some_and(|(_, l)| l == text))
+                .unwrap_or_else(|| panic!("{text} has its label"));
+            assert_eq!(node.prop_i16(PROP_NODE_TYPE), Some(NODE_UNSPECIFIED), "{text}");
+            assert_eq!(node.prop_i16(PROP_NODE_ELEMENT), None, "{text} is no element");
+            assert_eq!(node.prop_i16(PROP_ATOM_NUM_HYDROGENS), None, "{text}");
+        }
+        let back = cdx_bytes_to_molecule(&molecule_to_cdx_document(&mol)).expect("reads back");
+        assert_eq!(elements_of(&back), ["Ac", "N", "Ts"]);
+    }
+
+    /// Actinium from ChemDraw (a node of element 89) still reads as "Ac".
+    #[test]
+    fn reads_an_actinium_node_as_ac() {
+        let mut mol = Molecule::default();
+        mol.add_atom("Pt".to_string(), [0.0, 0.0], 0);
+        let mut doc = cdx_codec::parse(&molecule_to_cdx_document(&mol)).unwrap();
+        fn set_element(obj: &mut CdxObject) {
+            for c in &mut obj.children {
+                if c.tag == OBJ_NODE && c.prop_i16(PROP_NODE_ELEMENT) == Some(78) {
+                    c.set(PROP_NODE_ELEMENT, 89i16.to_le_bytes().to_vec());
+                }
+                set_element(c);
+            }
+        }
+        set_element(&mut doc);
+        let back = cdx_bytes_to_molecule(&cdx_codec::write(&doc)).expect("reads");
+        assert_eq!(elements_of(&back), ["Ac"]);
     }
 
     #[test]

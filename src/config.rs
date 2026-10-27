@@ -624,4 +624,23 @@ mod tests {
         }
         assert_eq!(builtin_fragments().len(), BUILTIN_FRAGMENT_STRS.len());
     }
+
+    /// The element symbols the writers treat as group labels are exactly the built-in fragments
+    /// named by an element symbol that are not that element on its own ("Ac" is acetyl; "Br" is
+    /// bromine).
+    #[test]
+    fn group_labels_are_the_fragments_named_like_an_element() {
+        use crate::molecule::elements::{atomic_number, GROUP_LABELS};
+        let mut groups: Vec<String> = builtin_fragments()
+            .iter()
+            .filter(|def| atomic_number(&def.name).is_some())
+            .filter(|def| {
+                let frag = def.to_fragment();
+                !(frag.atoms.len() == 1 && frag.atoms[0].element == def.name)
+            })
+            .map(|def| def.name.clone())
+            .collect();
+        groups.sort();
+        assert_eq!(groups, GROUP_LABELS);
+    }
 }
