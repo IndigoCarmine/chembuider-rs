@@ -2,7 +2,7 @@ use super::ChemStructEditor;
 use super::rich_text::RichText;
 use super::scene::{self, RenderTransform};
 use crate::molecule::lookup::AtomLookup;
-use crate::molecule::max_valence;
+use crate::molecule::{charged_max_valence, charged_valence};
 use std::collections::HashMap;
 
 // Geometry helpers moved to `scene.rs` (the backend-neutral primitive builder). Re-exported so
@@ -363,13 +363,15 @@ pub(crate) fn should_show_label(mol: &impl AtomLookup, atom_id: u32) -> bool {
 /// atoms are marked with a red dashed warning ring. Under-bonded atoms are valid — the
 /// missing valence is shown as implicit H — and elements with no standard valence aren't checked.
 ///
-/// The warning threshold is the element's *highest* common valence (`max_valence`), so
-/// hypervalent-but-ordinary S and P (sulfones, sulfates, phosphates) are not flagged,
-/// while implicit-H counting keeps using the lowest (`normal_valence`).
+/// The warning threshold is the element's *highest* common valence, moved by its charge the
+/// same way the label's hydrogens are ([`charged_max_valence`]), so hypervalent-but-ordinary
+/// S and P (sulfones, sulfates, phosphates) are not flagged, a borate's four bonds are not
+/// either, and a carbocation's fourth bond is; implicit-H counting keeps using the lowest
+/// ([`charged_valence`]).
 pub fn is_valence_invalid(mol: &crate::molecule::Molecule, atom_id: u32) -> bool {
     let Some(atom) = mol.atom_by_id(atom_id) else { return false };
-    let Some(valence) = max_valence(&atom.element) else { return false };
-    mol.bond_order_sum(atom_id) > valence as i16 + atom.charge as i16
+    let Some(limit) = charged_max_valence(&atom.element, atom.charge) else { return false };
+    mol.bond_order_sum(atom_id) > limit
 }
 
 /// Draw a dashed circle (used as the over-valence warning ring).
@@ -387,63 +389,6 @@ fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, 
             stroke,
         );
     }
-}
-
-/// Valence electrons of the neutral atom, for the elements [`normal_valence`] knows.
-///
-/// [`normal_valence`]: crate::molecule::normal_valence
-fn valence_electrons(element: &str) -> Option<i16> {
-    match element {
-        "H" => Some(1),
-        "B" => Some(3),
-        "C" | "Si" => Some(4),
-        "N" | "P" => Some(5),
-        "O" | "S" => Some(6),
-        "F" | "Cl" | "Br" | "I" => Some(7),
-        _ => None,
-    }
-}
-
-/// The valence a charged atom fills with hydrogen: the number of bonds it makes once its
-/// charge has added or removed electrons — i.e. the valence of the element it is then
-/// isoelectronic with. `None` exactly where [`normal_valence`] is `None`.
-///
-/// With `e` = valence electrons − charge, the atom makes `min(e, 8 − e)` bonds (`min(e, 2 − e)`
-/// for hydrogen, whose shell holds two): up to four electrons each one pairs with a bond
-/// partner; past four the extra ones stay as lone pairs. Simply adding the charge to the
-/// valence is the same thing only while `e ≥ 4` on the far side of carbon, which is why it
-/// held for the onium ions and went wrong for carbon, silicon, boron and hydrogen:
-///
-/// | atom | e | like | valence | as ion      | `valence + charge` |
-/// |------|---|------|---------|-------------|--------------------|
-/// | C⁺   | 3 | B    | 3       | CH₃⁺        | 5 (wrong)          |
-/// | C⁻   | 5 | N    | 3       | CH₃⁻        | 3                  |
-/// | C²⁺  | 2 | Be   | 2       | CH₂²⁺       | 6 (wrong)          |
-/// | Si⁺  | 3 | Al   | 3       | SiH₃⁺       | 5 (wrong)          |
-/// | Si⁻  | 5 | P    | 3       | SiH₃⁻       | 3                  |
-/// | N⁺   | 4 | C    | 4       | NH₄⁺        | 4                  |
-/// | N⁻   | 6 | O    | 2       | NH₂⁻        | 2                  |
-/// | P⁺   | 4 | Si   | 4       | PH₄⁺        | 4                  |
-/// | O⁺   | 5 | N    | 3       | H₃O⁺        | 3                  |
-/// | O⁻   | 7 | F    | 1       | HO⁻         | 1                  |
-/// | S⁺   | 5 | P    | 3       | H₃S⁺        | 3                  |
-/// | F⁻   | 8 | Ne   | 0       | F⁻          | 0                  |
-/// | B⁻   | 4 | C    | 4       | BH₄⁻        | 2 (wrong)          |
-/// | B⁺   | 2 | Be   | 2       | BH₂⁺        | 4 (wrong)          |
-/// | H⁺   | 0 | —    | 0       | H⁺          | 2 (wrong)          |
-/// | H⁻   | 2 | He   | 0       | H⁻          | 0                  |
-///
-/// ChemDraw counts a charged atom's implicit hydrogens this way (a "+" on the end carbon
-/// of ethane gives CH₂⁺, on the nitrogen of methylamine NH₃⁺), as do RDKit and the
-/// OpenSMILES/MDL readers. It leaves out radicals and the expanded valences of S and P, as
-/// `normal_valence` does for the neutral atom. Charges that strip every valence electron or
-/// overfill the shell give 0, never a negative valence.
-///
-/// [`normal_valence`]: crate::molecule::normal_valence
-pub(crate) fn charged_valence(element: &str, charge: i8) -> Option<i16> {
-    let e = valence_electrons(element)? - charge as i16;
-    let shell = if element == "H" { 2 } else { 8 };
-    Some(e.min(shell - e).max(0))
 }
 
 /// Total hydrogens to display on a heavy atom = explicit folded-H neighbors +
@@ -495,7 +440,7 @@ fn atom_label_text(mol: &crate::molecule::Molecule, atom: &crate::molecule::Atom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::molecule::{normal_valence, BondOrder, Molecule};
+    use crate::molecule::{BondOrder, Molecule};
 
     fn label(mol: &Molecule, id: u32) -> String {
         atom_label_text(mol, mol.atom_by_id(id).unwrap())
@@ -566,32 +511,6 @@ mod tests {
         }
     }
 
-    /// The valence a charged atom fills with hydrogen, for the elements the table in
-    /// [`charged_valence`] covers — including the doubly charged and the hydrogen ions.
-    #[test]
-    fn charged_valence_follows_the_isoelectronic_element() {
-        for (el, charge, want) in [
-            ("C", 0, Some(4)), ("C", 1, Some(3)), ("C", -1, Some(3)), ("C", 2, Some(2)),
-            ("N", 0, Some(3)), ("N", 1, Some(4)), ("N", -1, Some(2)), ("N", 2, Some(3)),
-            ("O", 0, Some(2)), ("O", 1, Some(3)), ("O", -1, Some(1)), ("O", 2, Some(4)),
-            ("B", 0, Some(3)), ("B", -1, Some(4)), ("B", 1, Some(2)),
-            ("F", 0, Some(1)), ("F", -1, Some(0)), ("Cl", 1, Some(2)),
-            ("H", 0, Some(1)), ("H", 1, Some(0)), ("H", -1, Some(0)),
-            ("Si", -1, Some(3)), ("S", -1, Some(1)), ("P", 1, Some(4)),
-            ("Fe", 2, None), ("Xx", 0, None),
-        ] {
-            assert_eq!(charged_valence(el, charge), want, "{el} with charge {charge:+}");
-        }
-        // Neutral, the table agrees with `normal_valence` element for element.
-        for el in ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "B", "Si", "H"] {
-            assert_eq!(
-                charged_valence(el, 0),
-                normal_valence(el).map(i16::from),
-                "{el}: the electron table disagrees with normal_valence",
-            );
-        }
-    }
-
     #[test]
     fn over_valence_is_flagged() {
         // Carbon with 5 single bonds → invalid; 4 → valid; 3 → valid (CH).
@@ -638,6 +557,75 @@ mod tests {
         let s = m.add_atom("S".to_string(), [1.0, 0.0], 0);
         m.add_bond(c, s, BondOrder::Single);
         assert_eq!(label(&m, s), "SH");
+    }
+
+    /// C–X with charge `charge` on X, and `n` group hydrogens on X (as a fragment brings them).
+    fn charged_with_group_h(el: &str, charge: i8, n: usize) -> (Molecule, u32, Vec<u32>) {
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let x = m.add_atom(el.to_string(), [1.0, 0.0], charge);
+        m.add_bond(c, x, BondOrder::Single);
+        let hs = (0..n)
+            .map(|i| {
+                let h = m.add_atom("H".to_string(), [2.0, i as f32], 0);
+                m.atom_by_id_mut(h).unwrap().group_h = true;
+                m.add_bond(x, h, BondOrder::Single);
+                h
+            })
+            .collect();
+        (m, x, hs)
+    }
+
+    /// The warning ring and the label agree on what a charge does: a bond the label has room
+    /// for is never flagged, and one it has no room for always is. Otherwise the ring would
+    /// appear on an atom whose hydrogens are all folded out of sight (a borate), or a
+    /// hydrogen would quietly drop out of the label with no ring at all (a silylium).
+    #[test]
+    fn over_valence_moves_with_the_charge_like_the_label() {
+        // Borate: C–BH2 made B⁻ has room for four, so both hydrogens fold into "BH3-" and
+        // nothing is over-bonded or taken.
+        let (mut m, b, hs) = charged_with_group_h("B", -1, 2);
+        assert_eq!(label(&m, b), "BH3-");
+        assert!(hs.iter().all(|&h| is_folded_h(&m, h)), "both hydrogens are in the label");
+        assert!(!is_valence_invalid(&m, b), "a borate with three bonds is not over-bonded");
+        assert!(m.consume_excess_group_h(b).is_empty(), "nothing is in excess");
+
+        // BF4⁻: four bonds on B⁻ is its full valence.
+        let mut m = Molecule::default();
+        let b = m.add_atom("B".to_string(), [0.0, 0.0], -1);
+        for i in 0..4 {
+            let f = m.add_atom("F".to_string(), [1.0, i as f32], 0);
+            m.add_bond(b, f, BondOrder::Single);
+        }
+        assert!(!is_valence_invalid(&m, b), "BF4- is not over-bonded");
+
+        // Cations of the carbon group have room for three: C–SiH3 or C–CH3 made X⁺ carries
+        // one bond too many, which is flagged and, being a group hydrogen, taken.
+        for el in ["Si", "C"] {
+            let (mut m, x, hs) = charged_with_group_h(el, 1, 3);
+            assert!(is_valence_invalid(&m, x), "{el}+ with four bonds is over-bonded");
+            assert_eq!(m.consume_excess_group_h(x), vec![hs[2]], "{el}+: one hydrogen goes");
+            assert!(!is_valence_invalid(&m, x), "{el}+ is back at its valence");
+            assert_eq!(label(&m, x), format!("{el}H2+"));
+            assert!(hs[..2].iter().all(|&h| is_folded_h(&m, h)), "{el}+: the rest are folded");
+        }
+        // Four heavy neighbours on C⁺ are flagged too — nothing there to take.
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 1);
+        for i in 0..4 {
+            let n = m.add_atom("C".to_string(), [1.0, i as f32], 0);
+            m.add_bond(c, n, BondOrder::Single);
+        }
+        assert!(is_valence_invalid(&m, c), "a carbocation with four bonds is over-bonded");
+
+        // B⁺ has room for two, so three bonds are one too many.
+        let mut m = Molecule::default();
+        let b = m.add_atom("B".to_string(), [0.0, 0.0], 1);
+        for i in 0..3 {
+            let n = m.add_atom("C".to_string(), [1.0, i as f32], 0);
+            m.add_bond(b, n, BondOrder::Single);
+        }
+        assert!(is_valence_invalid(&m, b), "B+ with three bonds is over-bonded");
     }
 
     /// The rich label carries the same characters as the plain-text oracle, with the H

@@ -325,7 +325,7 @@ impl Skeleton {
                 0
             } else {
                 // The label's own rule for what a charge does to the valence, so the two agree.
-                crate::widget::draw::charged_valence(&a.element, a.charge)
+                super::charged_valence(&a.element, a.charge)
                     .map(|v| (v - bond_sum_all).max(0) as u32)
                     .unwrap_or(0)
             };
@@ -805,7 +805,7 @@ mod tests {
     /// 1. **Skeleton** — [`is_isomorphic`] against the original (minus folded hydrogens).
     /// 2. **Hydrogens** — the formula the *parser* derives, applying SMILES' own valence rules
     ///    to what was written, must equal the formula the *model* derives from
-    ///    [`charged_valence`](crate::widget::draw::charged_valence). The two arrive at the
+    ///    [`charged_valence`](super::charged_valence). The two arrive at the
     ///    count by different routes and different valence tables, so agreement on all 125
     ///    structures is real evidence rather than a tautology.
     /// 3. **Idempotence** — re-writing the parsed molecule reproduces the string, so the
