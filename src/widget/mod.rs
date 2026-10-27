@@ -317,8 +317,9 @@ impl ChemStructEditor {
     ///
     /// A selection of two or more atoms *is* the ring the user means, so it wins over the
     /// hotspot (which only follows the cursor and, on a fused ring, may sit on the wrong cycle):
-    /// the ring confined to the selected atoms is filled — the four-membered ring for the four
-    /// atoms of a square fused onto benzene, the hexagon for benzene's six. When the selection
+    /// every ring confined to the selected atoms is filled — the four-membered ring for the four
+    /// atoms of a square fused onto benzene, the hexagon for benzene's six, both for a selection
+    /// spanning several rings — under a single undo step. When the selection
     /// encloses no ring of its own we fall back to a single seed, still preferring an explicit
     /// selection over the hotspot; a lone selected atom or a bare hotspot keeps the old
     /// smallest-ring-through-the-seed behavior. Returns false when nothing is selected/hovered
@@ -326,9 +327,12 @@ impl ChemStructEditor {
     pub fn fill_selected_ring(&mut self, color: [u8; 4]) -> bool {
         if self.selected_atoms.len() >= 2 {
             let sel: Vec<u32> = self.selected_atoms.iter().copied().collect();
-            if let Some(ring) = self.molecule.ring_from_atoms(&sel) {
+            let rings = self.molecule.rings_from_atoms(&sel);
+            if !rings.is_empty() {
                 self.push_undo();
-                self.molecule.set_ring_fill(ring, color);
+                for ring in rings {
+                    self.molecule.set_ring_fill(ring, color);
+                }
                 return true;
             }
         }
@@ -1482,6 +1486,81 @@ mod clipboard_tests {
             b.iter().copied().collect(),
             "the six selected atoms — benzene — are filled, not the square"
         );
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_every_ring_of_a_fused_selection() {
+        // Bug repro: selecting both fused rings whole must fill both, not just the smaller one.
+        let (mut e, b, s0, s1) = fused_benzene_and_square();
+        e.selected_atoms = b.iter().copied().chain([s0, s1]).collect();
+
+        assert!(e.fill_selected_ring([255, 0, 0, 255]));
+        let mut sizes: Vec<usize> = e.molecule.ring_fills.iter().map(|rf| rf.atoms.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![4, 6], "square and hexagon filled, no envelope ring");
+        // One undo step reverts all of them.
+        assert!(e.undo());
+        assert!(e.molecule.ring_fills.is_empty());
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_separate_selected_rings() {
+        // Two disconnected hexagons selected together: both are filled.
+        use std::f32::consts::TAU;
+        let mut e = ChemStructEditor::default();
+        for cx in [0.0f32, 5.0] {
+            let ids: Vec<u32> = (0..6)
+                .map(|k| {
+                    let a = (k as f32) * TAU / 6.0;
+                    e.molecule.add_atom("C".to_string(), [cx + a.cos(), a.sin()], 0)
+                })
+                .collect();
+            for k in 0..6 {
+                e.molecule.add_bond(ids[k], ids[(k + 1) % 6], BondOrder::Single);
+            }
+            e.selected_atoms.extend(ids);
+        }
+        assert!(e.fill_selected_ring([0, 0, 255, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 2);
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_a_ring_whose_atoms_are_all_shared() {
+        // Triphenylene-like: a central hexagon c0..c5 with a hexagon fused on c0—c1, c2—c3 and
+        // c4—c5. Every central atom also lies on an outer ring, yet the central ring is filled.
+        use std::f32::consts::TAU;
+        let mut e = ChemStructEditor::default();
+        let c: Vec<u32> = (0..6)
+            .map(|k| {
+                let a = (k as f32) * TAU / 6.0;
+                e.molecule.add_atom("C".to_string(), [a.cos(), a.sin()], 0)
+            })
+            .collect();
+        for k in 0..6 {
+            e.molecule.add_bond(c[k], c[(k + 1) % 6], BondOrder::Single);
+        }
+        let mut all = c.clone();
+        for k in [0usize, 2, 4] {
+            // Outer ring: c[k]—o0—o1—o2—o3—c[k+1].
+            let o: Vec<u32> = (0..4)
+                .map(|j| e.molecule.add_atom("C".to_string(), [10.0 + k as f32, j as f32], 0))
+                .collect();
+            e.molecule.add_bond(c[k], o[0], BondOrder::Single);
+            for j in 0..3 {
+                e.molecule.add_bond(o[j], o[j + 1], BondOrder::Single);
+            }
+            e.molecule.add_bond(o[3], c[k + 1], BondOrder::Single);
+            all.extend(o);
+        }
+        e.selected_atoms = all.into_iter().collect();
+        assert!(e.fill_selected_ring([0, 200, 0, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 4, "three outer rings plus the central one");
+        let central: std::collections::HashSet<u32> = c.iter().copied().collect();
+        assert!(e
+            .molecule
+            .ring_fills
+            .iter()
+            .any(|rf| rf.atoms.iter().copied().collect::<std::collections::HashSet<_>>() == central));
     }
 
     #[test]

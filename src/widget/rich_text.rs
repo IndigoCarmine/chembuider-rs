@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, Color32, FontFamily, FontId, Pos2, Rect, Vec2};
+use serde::{Deserialize, Serialize};
 
 /// Size of sub/superscript glyphs relative to the base font size.
 pub const SCRIPT_SCALE: f32 = 0.7;
@@ -43,7 +44,7 @@ pub const SUBSCRIPT_DROP: f32 = 0.16;
 const BOLD_STRIKE: f32 = 0.04;
 
 /// Vertical placement of a span relative to the main baseline.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Script {
     #[default]
     Normal,
@@ -54,24 +55,41 @@ pub enum Script {
 }
 
 /// Style of one contiguous run of text.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpanStyle {
     pub bold: bool,
     pub italic: bool,
     pub script: Script,
     /// `None` inherits the color given at paint time.
+    #[serde(default, with = "color_rgba")]
     pub color: Option<Color32>,
 }
 
+/// (De)serialize an optional [`Color32`] as `[r, g, b, a]` (straight alpha), so styled text
+/// can be saved without depending on egui's own serde support.
+mod color_rgba {
+    use egui::Color32;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(color: &Option<Color32>, s: S) -> Result<S::Ok, S::Error> {
+        color.map(|c| c.to_srgba_unmultiplied()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Color32>, D::Error> {
+        let rgba = Option::<[u8; 4]>::deserialize(d)?;
+        Ok(rgba.map(|[r, g, b, a]| Color32::from_rgba_unmultiplied(r, g, b, a)))
+    }
+}
+
 /// A run of text with a single [`SpanStyle`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RichSpan {
     pub text: String,
     pub style: SpanStyle,
 }
 
 /// Styled text as a list of spans. See the [module docs](self) for the markup syntax.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RichText {
     pub spans: Vec<RichSpan>,
 }

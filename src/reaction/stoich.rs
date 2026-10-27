@@ -116,7 +116,7 @@ impl Analysis {
         let mws: Vec<Option<f64>> = self
             .reactants
             .iter()
-            .map(|r| MolecularFormula::of(&r.molecule).weight())
+            .map(|r| r.formula().weight())
             .collect();
 
         // The limiting reagent: the one flagged, else the first whose amount is known
@@ -221,7 +221,7 @@ fn analyse_reactant(
 
     ReactantAnalysis {
         name: r.name.clone(),
-        formula: MolecularFormula::of(&r.molecule),
+        formula: r.formula(),
         mw,
         limiting: is_limiting,
         limiting_origin,

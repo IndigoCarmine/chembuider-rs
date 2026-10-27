@@ -5,9 +5,13 @@
 //! `Option`s: whatever is left `None` is either computed from the rest (see
 //! [`Analysis::compute`](crate::reaction::stoich)) or drawn as an empty cell.
 
+use serde::{Deserialize, Serialize};
+
 use crate::molecule::Molecule;
 
 use super::edit::SchemePart;
+use super::formula::MolecularFormula;
+use crate::widget::rich_text::{RichText, Script};
 use super::scheme::{ArrowLabel, ReactionScheme, SchemeItem, SchemeStructure, StructureId};
 
 /// A mass. Stored in grams; the constructors say which unit the caller had in mind.
@@ -15,7 +19,7 @@ use super::scheme::{ArrowLabel, ReactionScheme, SchemeItem, SchemeStructure, Str
 /// Display picks the unit back automatically (`< 1 g` prints as mg), which is what the
 /// reference figure does: an entered `700.00 mg` prints as `700.00mg`, a computed `1.1491 g`
 /// prints as `1.15g`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Mass(f64);
 
 impl Mass {
@@ -38,9 +42,10 @@ impl Mass {
 
 /// One reactant column of the *Reactants* block.
 ///
-/// The molecule is the source of truth for `Formula` and `MW`; everything else is either
-/// entered here or derived from the limiting reagent.
-#[derive(Clone, Debug)]
+/// The molecule is the source of truth for `Formula` and `MW` — or, for a reagent written as
+/// arrow text, the formula read from that text ([`text_formula`](Self::text_formula));
+/// everything else is either entered here or derived from the limiting reagent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reactant {
     /// Structure the formula and molecular weight are computed from.
     pub molecule: Molecule,
@@ -70,6 +75,12 @@ pub struct Reactant {
     /// (a reagent written as arrow text, say). [`Reaction::new`] fills it in for columns
     /// built without one.
     pub structure: Option<StructureId>,
+    /// The formula of the arrow-text reagent this column stands for (`K_2CO_3` under the
+    /// arrow → `CK2O3`), or `None`. When set it is the column's `Formula` and `MW`, and the
+    /// column lives as long as that text is written over an arrow; see
+    /// [`Reaction::sync_structures_from_scheme`].
+    #[serde(default)]
+    pub text_formula: Option<MolecularFormula>,
 }
 
 impl Reactant {
@@ -86,6 +97,15 @@ impl Reactant {
             volume: None,
             coefficient: 1.0,
             structure: None,
+            text_formula: None,
+        }
+    }
+
+    /// The column's formula: the arrow text's when it stands for one, else the molecule's.
+    pub fn formula(&self) -> MolecularFormula {
+        match &self.text_formula {
+            Some(f) => f.clone(),
+            None => MolecularFormula::of(&self.molecule),
         }
     }
 
@@ -133,7 +153,7 @@ impl Reactant {
 }
 
 /// One product column of the *Products* block.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Product {
     /// Structure the formula and molecular weight are computed from.
     pub molecule: Molecule,
@@ -194,7 +214,7 @@ impl Product {
 }
 
 /// The inputs of the stoichiometry table: reactants and products, in column order.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Analysis {
     pub reactants: Vec<Reactant>,
     pub products: Vec<Product>,
@@ -291,15 +311,17 @@ pub enum StructureRole {
 /// [`Reaction::new`] links by position, once, for columns built without an id.
 ///
 /// The [`set_scheme_structure`] / [`sync_structures_from_scheme`] methods carry the change
-/// from the scheme into the linked [`Analysis`] column so the table redraws in step; the bulk
-/// sync also unlinks columns whose structure left the scheme, turns a column whose structure
-/// crossed the arrow into a column of the other kind (Reactant ↔ Product), and puts the linked
-/// columns back in scheme order.
+/// from the scheme into the linked [`Analysis`] column so the table redraws in step. The bulk
+/// sync goes further and generates the table from the scheme: it gives every drawn structure
+/// and every formula written over an arrow a column, removes the columns whose compound left
+/// the scheme, turns a column whose structure crossed the arrow into a column of the other kind
+/// (Reactant ↔ Product), and puts the linked columns back in scheme order.
+/// [`Reaction::from_scheme`] builds a whole table that way from a bare scheme.
 ///
 /// [`structure_role`]: Reaction::structure_role
 /// [`set_scheme_structure`]: Reaction::set_scheme_structure
 /// [`sync_structures_from_scheme`]: Reaction::sync_structures_from_scheme
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Reaction {
     pub scheme: ReactionScheme,
     pub analysis: Analysis,
@@ -321,6 +343,78 @@ impl Reaction {
         let mut reaction = Self { scheme, analysis };
         reaction.link_columns_by_position();
         reaction
+    }
+
+    /// A reaction whose table is generated entirely from `scheme`: one column per drawn
+    /// structure and per formula written over an arrow, in scheme order, with nothing entered
+    /// yet. See [`sync_structures_from_scheme`](Reaction::sync_structures_from_scheme).
+    pub fn from_scheme(scheme: ReactionScheme) -> Self {
+        let mut reaction = Self { scheme, analysis: Analysis::new() };
+        reaction.sync_structures_from_scheme();
+        reaction
+    }
+
+    /// The whole figure — scheme and table, every entered value included — as a JSON
+    /// document, tagged with [`FILE_FORMAT`] and [`FILE_VERSION`]. Read it back with
+    /// [`from_json`](Reaction::from_json).
+    pub fn to_json(&self) -> String {
+        let file = ReactionFileRef { format: FILE_FORMAT, version: FILE_VERSION, reaction: self };
+        serde_json::to_string_pretty(&file).expect("a reaction always serializes")
+    }
+
+    /// Read a figure saved by [`to_json`](Reaction::to_json).
+    ///
+    /// The structure ids in the file were handed out by the process that saved it, so they
+    /// could collide with ids this process has already given out; every drawn structure gets
+    /// a fresh one, and the columns linked to it follow. A column naming an id the file does
+    /// not draw is unlinked.
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        // The header first, so a foreign or newer file is refused for what it is rather than
+        // for whichever field it happens to lack.
+        let header: FileHeader = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if header.format != FILE_FORMAT {
+            return Err(format!("not a reaction file (format \"{}\")", header.format));
+        }
+        if header.version > FILE_VERSION {
+            return Err(format!(
+                "reaction file version {} is newer than this program reads ({FILE_VERSION})",
+                header.version
+            ));
+        }
+        let file: ReactionFile = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let mut reaction = file.reaction;
+        reaction.renew_structure_ids();
+        Ok(reaction)
+    }
+
+    /// Give every drawn structure a fresh [`StructureId`], relinking the columns.
+    fn renew_structure_ids(&mut self) {
+        let mut renamed: std::collections::HashMap<StructureId, StructureId> =
+            std::collections::HashMap::new();
+        let mut renew = |s: &mut SchemeStructure| {
+            let (old, new) = s.renew_id();
+            renamed.entry(old).or_insert(new);
+        };
+        for item in &mut self.scheme.items {
+            match item {
+                SchemeItem::Structure(s) => renew(s),
+                SchemeItem::Arrow(a) => {
+                    for label in [&mut a.above, &mut a.below] {
+                        if let ArrowLabel::Structure(s) = label {
+                            renew(s);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let relink = |link: &mut Option<StructureId>| *link = link.and_then(|id| renamed.get(&id).copied());
+        for r in &mut self.analysis.reactants {
+            relink(&mut r.structure);
+        }
+        for p in &mut self.analysis.products {
+            relink(&mut p.structure);
+        }
     }
 
     /// Link every unlinked column to the structure at its position; see [`Reaction::new`].
@@ -474,65 +568,96 @@ impl Reaction {
         true
     }
 
-    /// Bring the table back in line with the scheme after any change to it — a redraw, a
-    /// reorder, a move onto or off an arrow band, a removal. Use after a bulk change, when
-    /// individual [`sync_structure_from_scheme`](Reaction::sync_structure_from_scheme) calls
-    /// were not made. Columns follow their structure by [`StructureId`]:
+    /// Bring the table back in line with the scheme after any change to it — a structure
+    /// added, redrawn, reordered, moved onto or off an arrow band or removed, or the text over
+    /// an arrow rewritten. The table is **generated from the scheme**: every compound the
+    /// scheme shows has exactly one column, and a column the scheme stops showing goes.
     ///
-    /// * every linked column takes the molecule its structure now draws (main-line structures
-    ///   and structures on arrow bands alike);
-    /// * a column whose structure is no longer anywhere in the scheme is **unlinked**
-    ///   (`structure = None`) but kept, with its molecule and every entered value — removing a
-    ///   drawing never deletes what was typed into the table;
-    /// * the positions the linked columns occupy are refilled with those same columns in
-    ///   scheme order (item by item, an arrow's above band before its below band), so the
-    ///   table reads like the scheme again after a reorder. Unlinked columns keep their
-    ///   positions. A column moves whole, so its limiting flag, masses and equivalents stay
-    ///   with its compound;
+    /// What the scheme shows, in scheme order (item by item, an arrow's above band before its
+    /// below band):
+    ///
+    /// * every drawn structure, on the line or on an arrow band, linked to its column by
+    ///   [`StructureId`];
+    /// * every reagent *written* over or under an arrow whose text reads as a formula
+    ///   (`K_2CO_3`, `NaHCO_3, H_2O` — see [`MolecularFormula::parse`]), linked to its column by
+    ///   that formula ([`Reactant::text_formula`]). Conditions and abbreviations (`rt`, `THF`,
+    ///   `MeOH`, `cat.`) are not formulas and get no column.
+    ///
+    /// The columns then follow it:
+    ///
+    /// * every linked column takes the molecule its structure now draws;
+    /// * a linked column whose structure or formula is no longer in the scheme is **removed**,
+    ///   with what was entered in it. Removing the limiting reagent leaves the reaction without
+    ///   one, as [`Analysis::remove_reactant`] does;
+    /// * a compound with no column gets one. An unlinked column showing the same formula on the
+    ///   same side (one added by hand before it was drawn) is adopted rather than duplicated;
+    ///   otherwise a fresh column is made, named after the molecule or the written text;
     /// * a linked column whose structure now sits on the **other side of the arrow** is
-    ///   converted, Reactant ↔ Product (see below).
+    ///   converted, Reactant ↔ Product (see below);
+    /// * the positions the linked columns occupy are refilled with those same columns in
+    ///   scheme order, so the table reads like the scheme. A column moves whole, so its limiting
+    ///   flag, masses and equivalents stay with its compound. Unlinked columns (added by hand,
+    ///   standing for nothing drawn) keep their positions and are never removed.
     ///
     /// **Crossing the arrow.** A structure's side is where it is drawn now: a main-line
     /// structure before the first arrow is a reactant, one after it a product, and a structure
-    /// on an arrow band is a reagent, so a reactant — the same split [`Reaction::new`] links by.
-    /// With no arrow at all, every structure is a reactant. Dragging a structure across the
-    /// arrow, moving the arrow past structures or removing the arrow can therefore leave a
-    /// linked column on the wrong side; it is then converted:
+    /// or formula on an arrow band is a reagent, so a reactant — the same split
+    /// [`Reaction::new`] links by. With no arrow at all, every structure is a reactant.
+    /// Dragging a structure across the arrow or moving the arrow past structures can therefore
+    /// leave a linked column on the wrong side; it is then converted:
     ///
     /// * carried over: molecule, name, coefficient, equivalents and the [`StructureId`] link;
     /// * dropped: whatever the other side has no field for — a reactant's limiting flag,
     ///   sample mass, percent weight, molarity, density and volume, or a product's percent
     ///   completion, measured mass and purity. A converted limiting reagent leaves the
-    ///   reaction **without** a limiting reagent (no neighbour is promoted, as with
-    ///   [`Analysis::remove_reactant`]); a product turned into a reactant is not limiting;
+    ///   reaction **without** a limiting reagent; a product turned into a reactant is not
+    ///   limiting;
     /// * dropped values are not brought back if the structure later crosses back;
     /// * the converted column joins its new side right after that side's last linked column
     ///   still drawn (at the front when there is none), then takes its scheme-order place
-    ///   among the linked columns like any other. Unlinked columns keep their relative order.
+    ///   among the linked columns like any other.
     ///
-    /// A structure added straight to the scheme gets no column, and an unchanged figure is
-    /// left exactly as it was.
+    /// An unchanged figure is left exactly as it was.
     pub fn sync_structures_from_scheme(&mut self) {
-        // Every drawn structure, in scheme order, with the side it is drawn on. A cloned
-        // structure keeps its id, so one id can be drawn twice; its first appearance decides
-        // where its column goes.
+        // Everything the scheme shows, in scheme order. A cloned structure keeps its id, so
+        // one id can be drawn twice; its first appearance decides where its column goes. The
+        // same formula written twice is one reagent.
         let mut drawn: Vec<(StructureId, &Molecule, Side)> = Vec::new();
+        let mut written: Vec<(MolecularFormula, String)> = Vec::new();
+        let mut order: Vec<Source> = Vec::new();
         let mut line_side = Side::Reactant;
         for item in &self.scheme.items {
-            let labels = match item {
-                SchemeItem::Structure(s) => [Some((s, line_side)), None],
+            let labels: [(&ArrowLabel, Side); 2] = match item {
+                SchemeItem::Structure(s) => {
+                    if !drawn.iter().any(|(id, _, _)| *id == s.id()) {
+                        drawn.push((s.id(), s.molecule(), line_side));
+                        order.push(Source::Structure(s.id()));
+                    }
+                    continue;
+                }
                 SchemeItem::Arrow(a) => {
                     line_side = Side::Product;
-                    [
-                        band_structure(&a.above).map(|s| (s, Side::Reactant)),
-                        band_structure(&a.below).map(|s| (s, Side::Reactant)),
-                    ]
+                    [(&a.above, Side::Reactant), (&a.below, Side::Reactant)]
                 }
-                _ => [None, None],
+                _ => continue,
             };
-            for (s, side) in labels.into_iter().flatten() {
-                if !drawn.iter().any(|(id, _, _)| *id == s.id()) {
-                    drawn.push((s.id(), s.molecule(), side));
+            for (label, side) in labels {
+                match label {
+                    ArrowLabel::Structure(s) => {
+                        if !drawn.iter().any(|(id, _, _)| *id == s.id()) {
+                            drawn.push((s.id(), s.molecule(), side));
+                            order.push(Source::Structure(s.id()));
+                        }
+                    }
+                    ArrowLabel::Text(text) => {
+                        for (formula, word) in written_reagents(text) {
+                            if !written.iter().any(|(f, _)| *f == formula) {
+                                order.push(Source::Text(formula.clone()));
+                                written.push((formula, word));
+                            }
+                        }
+                    }
+                    ArrowLabel::Empty => {}
                 }
             }
         }
@@ -540,6 +665,8 @@ impl Reaction {
             let id = link?;
             drawn.iter().find(|(d, _, _)| *d == id).map(|(_, _, side)| *side)
         };
+        let is_drawn = |link: Option<StructureId>| side_of(link).is_some();
+        let is_written = |f: &MolecularFormula| written.iter().any(|(w, _)| w == f);
 
         // Columns now on the wrong side of the arrow move across, converted.
         let analysis = &mut self.analysis;
@@ -553,30 +680,126 @@ impl Reaction {
         analysis.products = products;
         insert_after_last_linked(
             &mut analysis.reactants,
-            |r| side_of(r.structure).is_some(),
+            |r| is_drawn(r.structure),
             to_reactants.into_iter().map(product_to_reactant),
         );
         insert_after_last_linked(
             &mut analysis.products,
-            |p| side_of(p.structure).is_some(),
+            |p| is_drawn(p.structure),
             to_products.into_iter().map(reactant_to_product),
         );
 
-        // Each column's place in scheme order, re-deriving the linked ones and unlinking those
-        // whose structure left the scheme.
-        let rank = |link: &mut Option<StructureId>, molecule: &mut Molecule| -> Option<usize> {
-            let id = (*link)?;
-            let found = drawn.iter().position(|(d, _, _)| *d == id);
-            match found {
-                Some(rank) => *molecule = drawn[rank].1.clone(),
-                None => *link = None,
-            }
-            found
+        // Columns whose compound left the scheme go with it.
+        analysis.reactants.retain(|r| match (r.structure, &r.text_formula) {
+            (Some(_), _) => is_drawn(r.structure),
+            (None, Some(f)) => is_written(f),
+            (None, None) => true,
+        });
+        analysis.products.retain(|p| p.structure.is_none() || is_drawn(p.structure));
+
+        // Compounds the scheme shows without a column get one, adopting an unlinked column of
+        // the same formula when there is one. A fresh column goes in right before the column of
+        // the first compound drawn after it (at the end when there is none).
+        let rank_of = |source: Source| order.iter().position(|s| *s == source);
+        let reactant_rank = |r: &Reactant| match (r.structure, &r.text_formula) {
+            (Some(id), _) => rank_of(Source::Structure(id)),
+            (None, Some(f)) => rank_of(Source::Text(f.clone())),
+            (None, None) => None,
         };
-        let reactant_ranks: Vec<_> =
-            analysis.reactants.iter_mut().map(|r| rank(&mut r.structure, &mut r.molecule)).collect();
-        let product_ranks: Vec<_> =
-            analysis.products.iter_mut().map(|p| rank(&mut p.structure, &mut p.molecule)).collect();
+        let product_rank = |p: &Product| rank_of(Source::Structure(p.structure?));
+        let unlinked = |r: &Reactant| r.structure.is_none() && r.text_formula.is_none();
+        for &(id, molecule, side) in &drawn {
+            let formula = MolecularFormula::of(molecule);
+            let same = |f: MolecularFormula| !formula.is_empty() && f == formula;
+            match side {
+                Side::Reactant => {
+                    if analysis.reactants.iter().any(|r| r.structure == Some(id)) {
+                        continue;
+                    }
+                    match analysis.reactants.iter_mut().find(|r| unlinked(r) && same(r.formula())) {
+                        Some(r) => r.structure = Some(id),
+                        None => insert_in_scheme_order(
+                            &mut analysis.reactants,
+                            reactant_rank,
+                            rank_of(Source::Structure(id)),
+                            Reactant {
+                                name: molecule_name(molecule),
+                                structure: Some(id),
+                                ..Reactant::new(molecule.clone())
+                            },
+                        ),
+                    }
+                }
+                Side::Product => {
+                    if analysis.products.iter().any(|p| p.structure == Some(id)) {
+                        continue;
+                    }
+                    let adoptable =
+                        |p: &Product| p.structure.is_none() && same(MolecularFormula::of(&p.molecule));
+                    match analysis.products.iter_mut().find(|p| adoptable(p)) {
+                        Some(p) => p.structure = Some(id),
+                        None => insert_in_scheme_order(
+                            &mut analysis.products,
+                            product_rank,
+                            rank_of(Source::Structure(id)),
+                            Product {
+                                name: molecule_name(molecule),
+                                structure: Some(id),
+                                ..Product::new(molecule.clone())
+                            },
+                        ),
+                    }
+                }
+            }
+        }
+        for (formula, word) in &written {
+            if analysis.reactants.iter().any(|r| r.text_formula.as_ref() == Some(formula)) {
+                continue;
+            }
+            match analysis.reactants.iter_mut().find(|r| unlinked(r) && r.formula() == *formula) {
+                Some(r) => r.text_formula = Some(formula.clone()),
+                None => insert_in_scheme_order(
+                    &mut analysis.reactants,
+                    reactant_rank,
+                    rank_of(Source::Text(formula.clone())),
+                    Reactant {
+                        name: Some(word.clone()),
+                        text_formula: Some(formula.clone()),
+                        ..Reactant::new(Molecule::default())
+                    },
+                ),
+            }
+        }
+
+        // Each linked column's place in scheme order; structure columns re-derive their
+        // molecule from the drawing.
+        let drawn_molecule =
+            |id: StructureId| drawn.iter().find(|(d, _, _)| *d == id).map(|(_, m, _)| (*m).clone());
+        let reactant_ranks: Vec<_> = analysis
+            .reactants
+            .iter_mut()
+            .map(|r| match (r.structure, &r.text_formula) {
+                (Some(id), _) => {
+                    if let Some(m) = drawn_molecule(id) {
+                        r.molecule = m;
+                    }
+                    rank_of(Source::Structure(id))
+                }
+                (None, Some(f)) => rank_of(Source::Text(f.clone())),
+                (None, None) => None,
+            })
+            .collect();
+        let product_ranks: Vec<_> = analysis
+            .products
+            .iter_mut()
+            .map(|p| {
+                let id = p.structure?;
+                if let Some(m) = drawn_molecule(id) {
+                    p.molecule = m;
+                }
+                rank_of(Source::Structure(id))
+            })
+            .collect();
         reorder_linked(&mut analysis.reactants, &reactant_ranks);
         reorder_linked(&mut analysis.products, &product_ranks);
     }
@@ -701,6 +924,64 @@ enum Side {
     Product,
 }
 
+/// The `format` tag of a saved reaction ([`Reaction::to_json`]).
+pub const FILE_FORMAT: &str = "chembuilder-reaction";
+/// The newest file version [`Reaction::from_json`] reads; [`Reaction::to_json`] writes it.
+pub const FILE_VERSION: u32 = 1;
+
+/// The tag of a saved reaction, read before the rest.
+#[derive(Deserialize)]
+struct FileHeader {
+    format: String,
+    version: u32,
+}
+
+/// A saved reaction, as read.
+#[derive(Deserialize)]
+struct ReactionFile {
+    reaction: Reaction,
+}
+
+/// A saved reaction, as written (borrowing the reaction instead of cloning it).
+#[derive(Serialize)]
+struct ReactionFileRef<'a> {
+    format: &'static str,
+    version: u32,
+    reaction: &'a Reaction,
+}
+
+/// One compound the scheme shows, as [`Reaction::sync_structures_from_scheme`] orders them.
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    Structure(StructureId),
+    Text(MolecularFormula),
+}
+
+/// A drawn molecule's name, for the column generated for it.
+fn molecule_name(molecule: &Molecule) -> Option<String> {
+    (!molecule.name.is_empty()).then(|| molecule.name.clone())
+}
+
+/// The reagents written in an arrow label that read as formulas, each with the word it was
+/// read from: `Cs_2CO_3, DMF` → `[CCs2O3 ("Cs2CO3")]`. Words are split on whitespace and
+/// punctuation; a word carrying a superscript is an ion (`Na^+`) and is skipped, and `/` and
+/// `°` stay inside their word, so `Pd/C` and `60 °C` are not read as palladium or carbon.
+fn written_reagents(text: &RichText) -> Vec<(MolecularFormula, String)> {
+    let mut plain = String::new();
+    for span in &text.spans {
+        if span.style.script == Script::Super {
+            plain.push('^');
+        } else {
+            plain.push_str(&span.text);
+        }
+    }
+    plain
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '(' | ')' | '^' | '/' | '°')))
+        .filter(|word| !word.contains('^'))
+        .filter_map(|word| MolecularFormula::parse(word).map(|f| (f, word.to_string())))
+        .collect()
+}
+
 /// A reactant column whose structure crossed to the product side. Keeps what a product column
 /// can hold (molecule, name, coefficient, equivalents, link); the reactant-only entries — the
 /// limiting flag among them — are dropped.
@@ -735,6 +1016,22 @@ fn insert_after_last_linked<T>(
 ) {
     let at = columns.iter().rposition(is_linked).map_or(0, |i| i + 1);
     columns.splice(at..at, incoming);
+}
+
+/// Insert `item` (whose scheme-order rank is `rank`) right before the first column ranked after
+/// it, or at the end when none is — so a generated column lands in scheme order without jumping
+/// ahead of the hand-made columns that already follow its scheme predecessor.
+fn insert_in_scheme_order<T>(
+    columns: &mut Vec<T>,
+    rank_of: impl Fn(&T) -> Option<usize>,
+    rank: Option<usize>,
+    item: T,
+) {
+    let at = columns
+        .iter()
+        .position(|c| matches!((rank_of(c), rank), (Some(r), Some(new)) if r > new))
+        .unwrap_or(columns.len());
+    columns.insert(at, item);
 }
 
 /// Refill the positions of the linked columns (`ranks[i]` is `Some`) with those same columns
@@ -1048,39 +1345,144 @@ mod tests {
         assert_eq!(product_formulas(&reaction), ["C6H6O"]);
     }
 
-    /// Removing a drawn structure keeps its column — molecule and entered values — so nothing
-    /// typed into the table is lost.
+    /// Removing a drawn structure removes its column, so the table keeps matching the scheme.
+    /// Columns no structure stands for (MeI, written as arrow text) keep their values.
     #[test]
-    fn removing_a_structure_keeps_its_column() {
+    fn removing_demo_structures_removes_their_columns() {
         let mut reaction = demo::williamson_ether_synthesis();
-        let values = entered_values(&reaction.analysis);
 
-        // Drop the product (item 2), then the reactant (item 0), resyncing after each.
+        // Drop the product (item 2), then the limiting phenol (item 0), resyncing after each.
         assert!(reaction.scheme.remove(2).is_some());
         reaction.sync_structures_from_scheme();
+        assert!(reaction.analysis.products.is_empty(), "the anisole column went with it");
         assert!(reaction.scheme.remove(0).is_some());
         reaction.sync_structures_from_scheme();
 
-        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CH3I", "CK2O3"]);
-        assert_eq!(product_formulas(&reaction), ["C7H8O"]);
-        assert_eq!(entered_values(&reaction.analysis), values);
+        assert_eq!(reactant_formulas(&reaction), ["CH3I", "CK2O3"]);
+        assert_eq!(reaction.analysis.limiting(), None, "no neighbour is promoted");
+        let eq: Vec<_> = reaction.analysis.reactants.iter().map(|r| r.equivalents).collect();
+        assert_eq!(eq, [Some(1.1), Some(3.0)]);
     }
 
-    /// Adding a structure straight to the scheme does not create a column, and a resync does
-    /// not either; existing columns are untouched.
+    /// Adding a structure to the scheme generates its column on the side it is drawn on,
+    /// linked to it; existing columns are untouched.
     #[test]
-    fn a_raw_scheme_add_creates_no_column() {
+    fn adding_a_structure_to_the_scheme_creates_its_column() {
         let mut reaction = demo::williamson_ether_synthesis();
-        let values = entered_values(&reaction.analysis);
+        let before = entered_values(&reaction.analysis);
 
         // A second product structure after the anisole, added through the raw scheme API.
-        reaction.scheme.add(SchemeItem::Structure(demo::benzene().into()));
+        let i = reaction.scheme.add(SchemeItem::Structure(demo::benzene().into()));
         reaction.sync_structures_from_scheme();
 
         assert_eq!(reaction.analysis.reactants.len(), 3);
-        assert_eq!(reaction.analysis.products.len(), 1);
+        assert_eq!(product_formulas(&reaction), ["C7H8O", "C6H6"]);
+        assert_eq!(reaction.structure_role(i), Some(StructureRole::Product(1)));
+        let after = entered_values(&reaction.analysis);
+        assert_eq!(after.reactants, before.reactants);
+        assert_eq!(after.products, [before.products[0], None], "the new column is blank");
+
+        // A reactant drawn in front of everything gets a reactant column, in scheme order.
+        reaction.scheme.items.insert(0, SchemeItem::Structure(demo::benzene().into()));
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["C6H6", "C6H6O", "CH3I", "CK2O3"]);
+        assert_eq!(reaction.structure_role(0), Some(StructureRole::Reactant(0)));
+    }
+
+    /// A table generated from nothing but the scheme: one column per structure and per formula
+    /// written over the arrow, in scheme order; conditions that are not formulas get none.
+    #[test]
+    fn from_scheme_generates_every_column() {
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .plus()
+            .structure(demo::methyl_iodide())
+            .arrow(Arrow::new().above("K_2CO_3, H_2O").below("DMF, 60 °C, Na^+, Pd/C"))
+            .structure(demo::anisole());
+        let reaction = Reaction::from_scheme(scheme);
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CH3I", "CK2O3", "H2O"]);
         assert_eq!(product_formulas(&reaction), ["C7H8O"]);
-        assert_eq!(entered_values(&reaction.analysis), values);
+        let a = reaction.analysis.compute();
+        assert_eq!(format!("{:.2}", a.reactants[2].mw.unwrap()), "138.20", "MW from the text");
+        assert_eq!(reaction.analysis.reactants[2].name.as_deref(), Some("K2CO3"));
+        assert_eq!(reaction.structure_role(0), Some(StructureRole::Reactant(0)));
+        assert_eq!(reaction.structure_role(4), Some(StructureRole::Product(0)));
+    }
+
+    /// A saved figure reads back as the same figure: scheme, columns, entered values, the
+    /// links between them, styled text — under fresh structure ids, so it can sit beside the
+    /// figure it was saved from without the two sharing an id.
+    #[test]
+    fn a_saved_reaction_reads_back_whole() {
+        let mut reaction = id_fixture();
+        reaction.sync_structures_from_scheme();
+        let json = reaction.to_json();
+        let loaded = Reaction::from_json(&json).expect("reads back");
+
+        assert_eq!(reactant_formulas(&loaded), reactant_formulas(&reaction));
+        assert_eq!(product_formulas(&loaded), product_formulas(&reaction));
+        assert_eq!(entered_values(&loaded.analysis), entered_values(&reaction.analysis));
+        assert_eq!(loaded.scheme.items.len(), reaction.scheme.items.len());
+        // Same columns linked to the same drawn positions, under new ids.
+        for i in 0..reaction.scheme.items.len() {
+            assert_eq!(loaded.structure_role(i), reaction.structure_role(i), "item {i}");
+        }
+        assert_eq!(
+            loaded.arrow_structure_role(3, SchemePart::ArrowAbove),
+            reaction.arrow_structure_role(3, SchemePart::ArrowAbove)
+        );
+        assert_ne!(line_id(&loaded, 0), line_id(&reaction, 0), "fresh ids");
+        // Resyncing the loaded figure changes nothing.
+        let mut again = Reaction::from_json(&json).unwrap();
+        again.sync_structures_from_scheme();
+        assert_eq!(entered_values(&again.analysis), entered_values(&reaction.analysis));
+
+        // Arrow text keeps its styling; a molecule keeps allocating ids past the saved ones.
+        let demo = demo::williamson_ether_synthesis();
+        let loaded = Reaction::from_json(&demo.to_json()).unwrap();
+        let (SchemeItem::Arrow(a), SchemeItem::Arrow(b)) = (&demo.scheme.items[1], &loaded.scheme.items[1])
+        else {
+            panic!("item 1 is the arrow")
+        };
+        assert_eq!(a.below.as_text(), b.below.as_text(), "K_2CO_3 keeps its subscripts");
+        let SchemeItem::Structure(s) = &loaded.scheme.items[0] else { panic!("phenol") };
+        let mut m = s.molecule().clone();
+        let fresh = m.add_atom("C".into(), [0.0, 0.0], 0);
+        assert!(s.molecule().atoms.iter().all(|a| a.id != fresh), "no id reused");
+    }
+
+    /// Files that are not reactions, or come from a newer version, are refused with a reason.
+    #[test]
+    fn foreign_reaction_files_are_refused() {
+        assert!(Reaction::from_json("not json").is_err());
+        let other = r#"{"format":"something-else","version":1,"reaction":{}}"#;
+        assert!(Reaction::from_json(other).unwrap_err().contains("not a reaction file"));
+        let newer = demo::williamson_ether_synthesis()
+            .to_json()
+            .replace(&format!("\"version\": {FILE_VERSION}"), "\"version\": 999");
+        assert!(Reaction::from_json(&newer).unwrap_err().contains("newer"));
+    }
+
+    /// A formula written over the arrow follows the text: rewriting it replaces its column,
+    /// erasing it removes the column, and a hand-made column of the same formula is adopted
+    /// rather than duplicated (the demo's K₂CO₃ keeps its 3.00 eq).
+    #[test]
+    fn written_reagents_follow_the_arrow_text() {
+        use crate::reaction::edit::set_scheme_text;
+        let mut reaction = demo::williamson_ether_synthesis();
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CH3I", "CK2O3"], "no duplicate");
+        assert!(reaction.analysis.reactants[2].text_formula.is_some(), "K2CO3 adopted");
+        assert_eq!(reaction.analysis.reactants[2].equivalents, Some(3.0));
+
+        assert!(set_scheme_text(&mut reaction.scheme, 1, SchemePart::ArrowBelow, "Cs_2CO_3"));
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CH3I", "CCs2O3"]);
+        assert_eq!(reaction.analysis.reactants[2].equivalents, None, "a new, blank column");
+
+        assert!(set_scheme_text(&mut reaction.scheme, 1, SchemePart::ArrowBelow, "rt"));
+        reaction.sync_structures_from_scheme();
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CH3I"]);
     }
 
     // ── Column ↔ structure ids (G-005) ───────────────────────────────────────
@@ -1325,29 +1727,34 @@ mod tests {
         assert_eq!(reaction.structure_role(5), None);
     }
 
-    /// Removing a structure keeps its column — molecule and values — and only clears the link.
+    /// Removing a structure removes the column linked to it; the others keep their values, and
+    /// unlinked columns (K₂CO₃, the benzene product) stay.
     #[test]
-    fn removing_a_structure_unlinks_its_column() {
+    fn removing_a_structure_removes_its_column() {
         let mut reaction = id_fixture();
+        let values = |reaction: &Reaction| -> Vec<_> {
+            reaction.analysis.reactants.iter().map(|r| (r.limiting, r.equivalents, r.sample_mass)).collect()
+        };
         assert!(reaction.scheme.remove(2).is_some()); // MeI
         reaction.sync_structures_from_scheme();
-        let mei = &reaction.analysis.reactants[2];
-        assert_eq!(mei.structure, None, "the link is gone");
-        assert_columns_follow_compounds(&reaction, ["C6H6O", "CK2O3", "CH3I", "C12H10"]);
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "C12H10"]);
+        let expected: Vec<_> =
+            ["C6H6O", "CK2O3", "C12H10"].into_iter().map(fixture_reactant_values).collect();
+        assert_eq!(values(&reaction), expected);
         assert_links_by_id(&reaction);
 
-        // The arrow reagent too; then a reorder of what is left steps around both.
+        // The arrow reagent too.
         let SchemeItem::Arrow(arrow) = &mut reaction.scheme.items[2] else { panic!("the arrow") };
         arrow.above = ArrowLabel::Empty;
         reaction.sync_structures_from_scheme();
-        assert_eq!(reaction.analysis.reactants[3].structure, None);
-        assert_columns_follow_compounds(&reaction, ["C6H6O", "CK2O3", "CH3I", "C12H10"]);
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3"]);
+        assert_eq!(product_formulas(&reaction), ["C7H8O", "C6H6"]);
 
-        // Removing the product unlinks its column the same way.
+        // Removing the product removes its column the same way; the unlinked one stays.
         assert!(reaction.scheme.remove(3).is_some());
         reaction.sync_structures_from_scheme();
-        assert_eq!(reaction.analysis.products[0].structure, None);
-        assert_columns_follow_compounds(&reaction, ["C6H6O", "CK2O3", "CH3I", "C12H10"]);
+        assert_eq!(product_formulas(&reaction), ["C6H6"]);
+        assert_eq!(reaction.analysis.products[0].measured_mass, Some(Mass::milligrams(20.0)));
     }
 
     /// Redrawing a structure (on the line or on an arrow band) carries the new molecule into
@@ -1493,7 +1900,7 @@ mod tests {
     }
 
     /// Removing the arrow leaves no product side: the anisole becomes a reactant column (its
-    /// measured mass dropped), the biphenyl that rode on the arrow is unlinked, and phenol
+    /// measured mass dropped), the biphenyl that rode on the arrow loses its column, and phenol
     /// stays the limiting reagent.
     #[test]
     fn removing_the_arrow_makes_every_structure_a_reactant() {
@@ -1502,14 +1909,16 @@ mod tests {
         // [phenol, +, MeI, anisole]
         assert!(reaction.scheme.remove(3).is_some());
         reaction.sync_structures_from_scheme();
-        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "CH3I", "C7H8O", "C12H10"]);
+        assert_eq!(
+            reactant_formulas(&reaction),
+            ["C6H6O", "CK2O3", "CH3I", "C7H8O"],
+            "the biphenyl left with the arrow"
+        );
         assert_eq!(product_formulas(&reaction), ["C6H6"]);
         assert_eq!(linked(&reaction, anisole), StructureRole::Reactant(3));
         let a = &reaction.analysis;
         assert!(!a.reactants[3].limiting);
         assert_eq!(a.reactants[3].sample_mass, None);
-        assert_eq!(a.reactants[4].structure, None, "the biphenyl left with the arrow");
-        assert_eq!(a.reactants[4].sample_mass, Some(Mass::milligrams(150.0)));
         assert_eq!(a.limiting(), Some(0));
         assert_eq!(a.reactants[0].sample_mass, Some(Mass::grams(1.0)));
         assert_eq!(a.products[0].measured_mass, Some(Mass::milligrams(20.0)));
@@ -1538,7 +1947,7 @@ mod tests {
         assert_eq!(reaction.analysis.limiting(), Some(3));
         assert_eq!(product_formulas(&reaction), ["C7H8O", "C6H6"]);
 
-        // The anisole onto the band above, emptied by dropping the biphenyl (now unlinked).
+        // The anisole onto the band above, emptied by dropping the biphenyl (its column goes).
         let mut reaction = id_fixture();
         let anisole = line_id(&reaction, 4);
         let SchemeItem::Arrow(arrow) = &mut reaction.scheme.items[3] else { panic!("the arrow") };
@@ -1550,7 +1959,7 @@ mod tests {
         reaction.sync_structures_from_scheme();
         assert_eq!(linked(&reaction, anisole), StructureRole::Reactant(3));
         assert_eq!(reaction.arrow_structure_role(3, SchemePart::ArrowAbove), Some(StructureRole::Reactant(3)));
-        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "CH3I", "C7H8O", "C12H10"]);
+        assert_eq!(reactant_formulas(&reaction), ["C6H6O", "CK2O3", "CH3I", "C7H8O"]);
         assert_eq!(product_formulas(&reaction), ["C6H6"]);
         assert_eq!(reaction.analysis.limiting(), Some(0));
     }

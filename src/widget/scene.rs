@@ -233,11 +233,10 @@ pub fn build_bonds(
         let mut fills = Vec::new();
         match &bond.stereo {
             BondStereo::None => {
-                let placement = if !matches!(bond.order, BondOrder::Double) {
-                    DoubleBondPlacement::Symmetric
-                } else if let Some(chosen) = chosen_double_placement(bond.double_position) {
-                    chosen
-                } else {
+                // Whether each end carries other bonds: a bare terminal end (vinyl CH₂) has
+                // nothing to make room for, so the inner line runs to the end there.
+                let mut inset_ends = (false, false);
+                let placement = if matches!(bond.order, BondOrder::Double) {
                     let (nx, ny) = perp_normal(p1, p2);
                     let mut neighbors: Vec<Pos2> = Vec::new();
                     for nid in index.neighbor_atom_ids(bond.begin) {
@@ -246,6 +245,7 @@ pub fn build_bonds(
                         }
                         if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
+                            inset_ends.0 = true;
                         }
                     }
                     for nid in index.neighbor_atom_ids(bond.end) {
@@ -254,11 +254,25 @@ pub fn build_bonds(
                         }
                         if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
+                            inset_ends.1 = true;
                         }
                     }
-                    double_bond_placement(p1, p2, (nx, ny), &neighbors)
+                    // A side the user chose wins over the one the substituents suggest.
+                    chosen_double_placement(bond.double_position)
+                        .unwrap_or_else(|| double_bond_placement(p1, p2, (nx, ny), &neighbors))
+                } else {
+                    DoubleBondPlacement::Symmetric
                 };
-                push_bond_order(&mut strokes, tp1, tp2, &bond.order, width, style.double_bond_offset * vs, placement);
+                push_bond_order(
+                    &mut strokes,
+                    tp1,
+                    tp2,
+                    &bond.order,
+                    width,
+                    style.double_bond_offset * vs,
+                    placement,
+                    inset_ends,
+                );
             }
             BondStereo::WedgeUp => push_wedge_solid(&mut fills, tp1, tp2, style.wedge_width * vs),
             BondStereo::WedgeDown => push_wedge_hash(
@@ -360,6 +374,7 @@ fn push_bond_order(
     width: f32,
     double_bond_offset: f32,
     placement: DoubleBondPlacement,
+    inset_ends: (bool, bool),
 ) {
     let stroke = |a: Pos2, b: Pos2| SceneStroke { a, b, width };
     match order {
@@ -384,11 +399,15 @@ fn push_bond_order(
                 let dy = p2.y - p1.y;
                 let len = (dx * dx + dy * dy).sqrt();
                 let (ox, oy) = (nx * double_bond_offset * side, ny * double_bond_offset * side);
+                // Shorten the inner line only at ends that carry other bonds, so it stays clear
+                // of them; at a bare terminal end it lines up with the main line.
                 let inset = 0.15 * len;
+                let in1 = if inset_ends.0 { inset } else { 0.0 };
+                let in2 = if inset_ends.1 { inset } else { 0.0 };
                 let (ux, uy) = if len > 0.001 { (dx / len, dy / len) } else { (0.0, 0.0) };
                 strokes.push(stroke(
-                    Pos2::new(p1.x + ux * inset + ox, p1.y + uy * inset + oy),
-                    Pos2::new(p2.x - ux * inset + ox, p2.y - uy * inset + oy),
+                    Pos2::new(p1.x + ux * in1 + ox, p1.y + uy * in1 + oy),
+                    Pos2::new(p2.x - ux * in2 + ox, p2.y - uy * in2 + oy),
                 ));
             }
         },
@@ -690,6 +709,27 @@ mod tests {
         assert!((strokes[0].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[1].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[0].width - style.bond_width * 2.0).abs() < 1e-4);
+    }
+
+    /// Vinyl (R–CH=CH₂): the inner line of the offset double bond is shortened only at the end
+    /// that carries another bond; at the bare terminal CH₂ it reaches as far as the main line.
+    #[test]
+    fn double_bond_inner_line_reaches_bare_terminal_end() {
+        let mut m = Molecule::default();
+        let r = m.add_atom("C".to_string(), [-0.5, 0.87], 0);
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let t = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        m.add_bond(r, c, BondOrder::Single);
+        m.add_bond(c, t, BondOrder::Double);
+        let style = StyleConfig::default();
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let bonds = build_bonds(&m, &style, xf, &HashMap::new());
+        let strokes = &bonds[1].strokes;
+        assert_eq!(strokes.len(), 2, "main line + inner line");
+        let (main, inner) = (&strokes[0], &strokes[1]);
+        // Bond runs along +x from c (x=0) to t (x=SCALE_FACTOR).
+        assert!((inner.b.x - main.b.x).abs() < 1e-3, "inner line ends flush at the terminal CH₂");
+        assert!(inner.a.x > main.a.x + 1.0, "inner line is still inset at the substituted end");
     }
 
     /// `bounds` covers the atoms, the bonds and the label rects, follows the transform's offset,

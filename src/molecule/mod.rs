@@ -196,7 +196,7 @@ pub(crate) fn charged_max_valence(element: &str, charge: i8) -> Option<i16> {
     Some(charged_valence(element, charge)? + expanded)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Atom {
     pub id: u32,
     pub element: String,
@@ -207,15 +207,17 @@ pub struct Atom {
     /// heavy neighbour's text ("NH2") instead of getting a vertex of its own, and the label
     /// re-derives it from valence. A hydrogen the user placed is an ordinary atom and is
     /// always drawn. Meaningless on anything that is not a hydrogen.
+    #[serde(default)]
     pub group_h: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bond {
     pub id: u32,
     pub begin: u32,
     pub end: u32,
     pub order: BondOrder,
+    #[serde(default)]
     pub stereo: BondStereo,
     /// Where a double bond's second line goes; meaningless on any other order.
     pub double_position: DoublePosition,
@@ -236,7 +238,8 @@ pub struct RingFill {
     pub color: [u8; 4],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "MoleculeData", into = "MoleculeData")]
 pub struct Molecule {
     pub name: String,
     pub atoms: Vec<Atom>,
@@ -244,6 +247,36 @@ pub struct Molecule {
     /// Colored ring interiors (drawn behind bonds). Empty for a plain structure.
     pub ring_fills: Vec<RingFill>,
     next_id: u32,
+}
+
+/// What a saved [`Molecule`] holds: everything but the id allocator, which is re-derived on
+/// load so a new atom or bond never reuses an id already in the file.
+#[derive(Serialize, Deserialize)]
+struct MoleculeData {
+    name: String,
+    atoms: Vec<Atom>,
+    bonds: Vec<Bond>,
+    #[serde(default)]
+    ring_fills: Vec<RingFill>,
+}
+
+impl From<MoleculeData> for Molecule {
+    fn from(d: MoleculeData) -> Self {
+        let max_id = d.atoms.iter().map(|a| a.id).chain(d.bonds.iter().map(|b| b.id)).max();
+        Self {
+            name: d.name,
+            atoms: d.atoms,
+            bonds: d.bonds,
+            ring_fills: d.ring_fills,
+            next_id: max_id.map_or(1, |m| m + 1),
+        }
+    }
+}
+
+impl From<Molecule> for MoleculeData {
+    fn from(m: Molecule) -> Self {
+        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills }
+    }
 }
 
 impl Default for Molecule {
@@ -498,57 +531,52 @@ impl Molecule {
         None
     }
 
-    /// The smallest ring through `atom_id` whose every vertex lies within `allowed`, in cyclic
-    /// order — [`smallest_ring_containing`](Self::smallest_ring_containing) restricted to a
-    /// vertex set. `None` when no such ring stays inside the set.
-    fn smallest_ring_within(
-        &self,
-        atom_id: u32,
-        allowed: &std::collections::HashSet<u32>,
-    ) -> Option<Vec<u32>> {
-        self.atom_by_id(atom_id)?;
-        let mut best: Option<Vec<u32>> = None;
-        for n in self.neighbor_atom_ids(atom_id) {
-            if !allowed.contains(&n) {
-                continue;
-            }
-            if let Some(path) = self.shortest_path_within(n, atom_id, (atom_id, n), allowed) {
-                if path.len() >= 3 {
-                    let mut ring = Vec::with_capacity(path.len());
-                    ring.push(atom_id);
-                    ring.extend_from_slice(&path[..path.len() - 1]);
-                    if best.as_ref().map_or(true, |b| ring.len() < b.len()) {
-                        best = Some(ring);
-                    }
-                }
-            }
-        }
-        best
-    }
-
-    /// The ring a *selection* of atoms means, in cyclic (polygon) order, or `None` if the
+    /// The rings a *selection* of atoms means, each in cyclic (polygon) order; empty if the
     /// selected atoms enclose no ring.
     ///
     /// The search is confined to `atoms`, so on a fused ring the caller's selection — not a
-    /// shared vertex's globally smallest ring — decides which cycle is filled: selecting exactly
-    /// the four atoms of a square fused onto benzene yields the square, and selecting benzene's
-    /// six yields the hexagon, even though the two share an edge. When the selection encloses
-    /// more than one ring (e.g. both fused rings selected whole) the smallest enclosed ring
-    /// wins. Returns the smallest ring found over all selected atoms as seeds.
-    pub fn ring_from_atoms(&self, atoms: &[u32]) -> Option<Vec<u32>> {
+    /// shared vertex's globally smallest ring — decides which cycles are filled: selecting
+    /// exactly the four atoms of a square fused onto benzene yields the square, and selecting
+    /// benzene's six yields the hexagon, even though the two share an edge. When the selection
+    /// encloses several rings (two separate rings, or a fused system selected whole) every one
+    /// of them is returned: for each bond inside the selection, the smallest ring through that
+    /// bond is collected, deduplicated by atom set. Seeding per bond rather than per atom keeps
+    /// rings whose atoms are all shared with other rings (triphenylene's central ring), and never
+    /// yields an envelope ring around a fused system, since each of its bonds lies on a smaller
+    /// ring. Rings are ordered by their smallest atom id for determinism.
+    pub fn rings_from_atoms(&self, atoms: &[u32]) -> Vec<Vec<u32>> {
         let allowed: std::collections::HashSet<u32> = atoms.iter().copied().collect();
         if allowed.len() < 3 {
-            return None;
+            return Vec::new();
         }
-        let mut best: Option<Vec<u32>> = None;
-        for &start in &allowed {
-            if let Some(ring) = self.smallest_ring_within(start, &allowed) {
-                if best.as_ref().map_or(true, |b| ring.len() < b.len()) {
-                    best = Some(ring);
+        let mut seeds: Vec<u32> = allowed.iter().copied().collect();
+        seeds.sort_unstable();
+        let mut seen: std::collections::HashSet<Vec<u32>> = std::collections::HashSet::new();
+        let mut rings: Vec<Vec<u32>> = Vec::new();
+        for &u in &seeds {
+            for n in self.neighbor_atom_ids(u) {
+                if n <= u || !allowed.contains(&n) {
+                    continue;
+                }
+                // path = [n, …, u] avoiding the direct u—n bond; ring = [u, n, …].
+                let Some(path) = self.shortest_path_within(n, u, (u, n), &allowed) else {
+                    continue;
+                };
+                if path.len() < 3 {
+                    continue;
+                }
+                let mut ring = Vec::with_capacity(path.len());
+                ring.push(u);
+                ring.extend_from_slice(&path[..path.len() - 1]);
+                let mut key = ring.clone();
+                key.sort_unstable();
+                if seen.insert(key) {
+                    rings.push(ring);
                 }
             }
         }
-        best
+        rings.sort_by_key(|r| r.iter().copied().min());
+        rings
     }
 
     /// Add (or replace) a ring fill on the given cyclic atom-id list with `color` (straight
