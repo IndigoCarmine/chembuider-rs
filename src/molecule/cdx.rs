@@ -17,7 +17,7 @@
 use super::cdx_codec::{self, CdxObject};
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, Molecule};
-use crate::widget::draw;
+use super::depict;
 use crate::widget::rich_text::{RichSpan, RichText, Script, SpanStyle};
 use std::collections::{HashMap, HashSet};
 
@@ -249,7 +249,7 @@ pub(super) struct NodeRules {
 /// Whether `atom_id` is a node of its own: a hydrogen folded into its neighbour's label ("NH2")
 /// is only that label's hydrogen count, and its bond is not written either.
 pub(super) fn is_node(mol: &impl AtomLookup, atom_id: u32) -> bool {
-    !draw::folded_h(mol, atom_id)
+    !depict::folded_h(mol, atom_id)
 }
 
 /// The node `atom` is written as (see [`NodeRules`]). A writer asks this of every atom, so it
@@ -261,15 +261,15 @@ pub(super) fn node_rules(mol: &impl AtomLookup, atom: &super::Atom) -> NodeRules
         Some(z) => NodeKind::Element(z),
         None => NodeKind::Unspecified,
     };
-    let shown = draw::should_show_label(mol, atom.id);
-    let num_hydrogens = (z.is_some() && shown).then(|| draw::displayed_h_count(mol, atom.id) as i16);
+    let shown = depict::should_show_label(mol, atom.id);
+    let num_hydrogens = (z.is_some() && shown).then(|| depict::displayed_h_count(mol, atom.id) as i16);
     let label = shown.then(|| {
-        let (mut runs, text) = runs_of(&draw::atom_label(mol, atom).rich);
+        let (mut runs, text) = runs_of(&depict::atom_label(mol, atom).rich);
         // An element's label is a formula, written the way ChemDraw writes its own.
         if z.is_some() {
             runs = vec![(0, FACE_FORMULA)];
         }
-        let right = draw::displayed_h_count(mol, atom.id) > 0 && draw::h_side(mol, atom.id) == draw::HSide::Left;
+        let right = depict::displayed_h_count(mol, atom.id) > 0 && depict::h_side(mol, atom.id) == depict::HSide::Left;
         NodeLabel { runs, text, right }
     });
     NodeRules { kind, num_hydrogens, charge: atom.charge, label }
@@ -787,8 +787,8 @@ mod tests {
         assert_eq!(elements_of(&heavy), ["C", "C", "C", "N", "N", "O", "O"]);
         // The ammonium on its own keeps its four hydrogens (in its label, "NH4+").
         let ammonium = mol.atoms.iter().find(|a| a.element == "N" && a.charge == 1).unwrap();
-        assert_eq!(crate::widget::draw::displayed_h_count(&mol, ammonium.id), 4);
-        assert!(mol.atoms.iter().filter(|a| a.element == "H").all(|h| h.group_h && draw::is_folded_h(&mol, h.id)));
+        assert_eq!(depict::displayed_h_count(&mol, ammonium.id), 4);
+        assert!(mol.atoms.iter().filter(|a| a.element == "H").all(|h| h.group_h && depict::is_folded_h(&mol, h.id)));
         // And they go back to ChemDraw as its hydrogen count, not as atoms.
         let doc = cdx_codec::parse(&molecule_to_cdx_document(&mol)).unwrap();
         let mut nodes = Vec::new();

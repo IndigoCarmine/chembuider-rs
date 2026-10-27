@@ -878,11 +878,11 @@ mod tests {
 
     /// SMILES must agree with what the canvas shows. For every bonded atom of every fixture —
     /// none of which contain hydrogen atoms — the count written into the SMILES is exactly the
-    /// count [`displayed_h_count`](crate::widget::draw::displayed_h_count) puts in the label,
+    /// count [`displayed_h_count`](crate::molecule::depict::displayed_h_count) puts in the label,
     /// so `CH₃` on screen and `C` with three implicit hydrogens are the same statement.
     #[test]
     fn implicit_hydrogen_matches_the_drawn_label() {
-        use crate::widget::draw::displayed_h_count;
+        use crate::molecule::depict::displayed_h_count;
         for (name, m) in all_fixtures() {
             let sk = Skeleton::build(&m);
             for (k, &id) in sk.ids.iter().enumerate() {
@@ -905,7 +905,7 @@ mod tests {
     /// hydrogens the label had no room to show.
     #[test]
     fn drawn_hydrogens_fold_into_their_neighbours_count() {
-        use crate::widget::draw::{displayed_h_count, is_folded_h};
+        use crate::molecule::depict::{displayed_h_count, is_folded_h};
 
         // Ethanol, written CCO, with the hydroxyl hydrogen drawn by hand.
         let implied = mol(&[("C", 0), ("C", 0), ("O", 0)], &[(0, 1, BondOrder::Single), (1, 2, BondOrder::Single)]);
@@ -952,12 +952,12 @@ mod tests {
 
     /// An atom with no bonds is a molecule, not a cursor decoration. The label deliberately
     /// shows a lone O as "O" rather than "OH₂" — see
-    /// [`displayed_h_count`](crate::widget::draw::displayed_h_count) — but SMILES has no such
+    /// [`displayed_h_count`](crate::molecule::depict::displayed_h_count) — but SMILES has no such
     /// thing as an unfinished drawing, and the counter-ion in the `ammonium_acetate` fixture is
     /// a real ammonium. This is the one place the two counts part company, on purpose.
     #[test]
     fn a_lone_atom_still_gets_its_hydrogens() {
-        use crate::widget::draw::displayed_h_count;
+        use crate::molecule::depict::displayed_h_count;
         let m = mol(&[("N", 1)], &[]);
         assert_eq!(displayed_h_count(&m, m.atoms[0].id), 0, "the label shows a bare N⁺");
         assert_eq!(to_smiles(&m), "[NH4+]", "the chemistry is ammonium");
@@ -995,7 +995,7 @@ mod tests {
             let k = sk.ids.iter().position(|&i| i == id).expect("the ion is written");
             assert_eq!(
                 sk.h[k],
-                crate::widget::draw::displayed_h_count(&m, id) as u32,
+                crate::molecule::depict::displayed_h_count(&m, id) as u32,
                 "{el}{charge:+}: SMILES and the label agree",
             );
         }
