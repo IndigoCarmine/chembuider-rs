@@ -1040,9 +1040,11 @@ impl ReactionEditor {
                     DragSource::Item(i) => i,
                     DragSource::ArrowLabel { index, .. } => index,
                 };
+                // Picking an item up is moving on from the open box, just like clicking away.
+                // Settle it now, while the indices it names still point where they did.
+                self.leave_edit(ui, reaction);
                 self.drag =
                     Some(DragReorder { source, insert_at, to_slot: None, over_band: false });
-                self.edit = None;
             }
         }
         if response.dragged() {
@@ -1281,6 +1283,28 @@ impl ReactionEditor {
         }
     }
 
+    /// The edit box's widget id, fixed (rather than left to egui) so its keyboard focus can be
+    /// handed back from outside the overlay — see [`leave_edit`](Self::leave_edit).
+    fn edit_box_id(ui: &egui::Ui) -> egui::Id {
+        ui.id().with("reaction_cell_edit_text")
+    }
+
+    /// The user moved on from the open box — clicked away from it, or picked up a scheme item
+    /// to drag. What was typed is committed. Moving on must never trap the user in a box it
+    /// refuses to close, so a bad value is dropped rather than kept — [`error`](Self::error)
+    /// says what happened. Either way the box closes and gives up the keyboard. No-op when no
+    /// box is open.
+    fn leave_edit(&mut self, ui: &egui::Ui, reaction: &mut Reaction) {
+        if self.edit.is_none() {
+            return;
+        }
+        if self.commit_edit(reaction).is_err() {
+            self.edit = None;
+        }
+        let id = Self::edit_box_id(ui);
+        ui.ctx().memory_mut(|m| m.surrender_focus(id));
+    }
+
     /// The floating text box, in the style of the structure editor's own label editor: an
     /// [`egui::Area`] over the cell, Enter to commit, Escape to abandon, and a commit on
     /// focus loss so clicking away is not a trap.
@@ -1332,6 +1356,7 @@ impl ReactionEditor {
         };
 
         let width = anchor.width().max(88.0);
+        let box_id = Self::edit_box_id(ui);
         let area = egui::Area::new(ui.id().with("reaction_cell_edit"))
             .order(egui::Order::Foreground)
             // egui sizes a new Area with `spacing.default_area_size` (600 x 400) for its
@@ -1344,6 +1369,7 @@ impl ReactionEditor {
                 egui::Frame::popup(ui.style())
                     .show(ui, |ui| {
                         let mut output = egui::TextEdit::singleline(&mut text)
+                            .id(box_id)
                             .desired_width(width)
                             .hint_text(hint)
                             .show(ui);
@@ -1380,11 +1406,7 @@ impl ReactionEditor {
             // A rejected Enter keeps the box open with the offending text.
             let _ = self.commit_edit(reaction);
         } else if lost {
-            // Clicking away must never trap the user in a box it refuses to close, so a bad
-            // value is dropped here rather than kept — the message says what happened.
-            if self.commit_edit(reaction).is_err() {
-                self.edit = None;
-            }
+            self.leave_edit(ui, reaction);
         }
         if self.edit.is_none() {
             // Hand the keyboard back the moment the box closes; a TextEdit that simply stops
@@ -2508,6 +2530,94 @@ mod tests {
         );
         assert!(editor.take_scheme_rearranged(), "the reorder is reported");
         assert!(!editor.take_scheme_rearranged(), "and only once");
+    }
+
+    /// Through the widget, with a real pointer and keyboard: picking up a scheme item while the
+    /// edit box is open leaves the box the same way clicking away does — what was typed is
+    /// committed (a bad value is dropped with its message kept), the box closes and hands the
+    /// keyboard back. Nothing typed is silently thrown away.
+    #[test]
+    fn dragging_a_scheme_item_commits_the_open_box() {
+        fn frame(
+            ctx: &egui::Context,
+            editor: &mut ReactionEditor,
+            reaction: &mut Reaction,
+            events: Vec<egui::Event>,
+        ) -> (FigureLayout, Pos2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut view = ReactionView::new();
+            let mut figure = None;
+            let _ = ctx.run_ui(raw, |ui| {
+                let layout = view.measure(ui.painter(), reaction);
+                let origin = editor.show(ui, reaction).rect.min;
+                figure = Some((layout, origin));
+            });
+            figure.expect("the closure runs exactly once")
+        }
+
+        /// On a fresh demo reaction: click `cell`, type `typed` into the box that opens, then
+        /// drag the product to the front of the line.
+        fn type_then_drag(cell: CellRef, typed: &str) -> (Reaction, ReactionEditor, egui::Context) {
+            let mut reaction = demo::williamson_ether_synthesis();
+            let mut editor = ReactionEditor::new();
+            let ctx = egui::Context::default();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+
+            let (layout, origin) = frame(&ctx, &mut editor, &mut reaction, Vec::new());
+            let at = cell_rect(&layout, origin, cell).unwrap().center();
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(at)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![button(at, true), button(at, false)]);
+            assert_eq!(editor.editing().map(|(t, _)| t), Some(EditTarget::Cell(cell)));
+            // A frame for the box to take focus (and select its seeded text), then type over it.
+            frame(&ctx, &mut editor, &mut reaction, Vec::new());
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::Text(typed.to_string())]);
+            assert_eq!(editor.editing().map(|(_, t)| t), Some(typed), "the typing landed");
+            assert!(ctx.memory(|m| m.focused()).is_some(), "the box has the keyboard");
+
+            let first = scheme_item_rect(&layout, origin, 0, SchemePart::Structure).unwrap();
+            let last = scheme_item_rect(&layout, origin, 2, SchemePart::Structure).unwrap();
+            let start = last.center();
+            let nudge = start + Vec2::new(-12.0, 0.0);
+            let end = Pos2::new(first.min.x + 2.0, first.center().y);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(start)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![button(start, true)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(nudge)]);
+            frame(&ctx, &mut editor, &mut reaction, vec![egui::Event::PointerMoved(end)]);
+            assert!(editor.is_dragging(), "the press-and-move picked the product up");
+            frame(&ctx, &mut editor, &mut reaction, vec![button(end, false)]);
+            assert!(!editor.is_dragging());
+            assert!(editor.take_scheme_rearranged(), "the drag reordered the line");
+            (reaction, editor, ctx)
+        }
+
+        // A good value is written, exactly as clicking away would write it.
+        let sample_mass = CellRef::new(BlockKind::Reactants, 0, 4);
+        let (reaction, editor, ctx) = type_then_drag(sample_mass, "2.5g");
+        assert_eq!(
+            reaction.analysis.reactants[0].sample_mass.map(Mass::as_grams),
+            Some(2.5),
+            "the typed Sample Mass reached the analysis"
+        );
+        assert!(editor.editing().is_none(), "the box closed");
+        assert_eq!(editor.error(), None);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "the box handed the keyboard back");
+
+        // A value that does not parse closes the box too, leaving the old value and saying why.
+        let (reaction, editor, ctx) = type_then_drag(sample_mass, "two grams");
+        assert_eq!(reaction.analysis.reactants[0].sample_mass.map(Mass::as_grams), Some(1.0));
+        assert!(editor.editing().is_none(), "a drag never leaves the box open behind it");
+        assert_eq!(editor.error(), Some("not a number"));
+        assert_eq!(ctx.memory(|m| m.focused()), None);
     }
 
     /// Through the widget: the interactive path allocates and paints exactly what the plain
