@@ -24,10 +24,24 @@ use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
-use crate::molecule::{BondOrder, BondStereo, DoublePosition, Molecule};
+use crate::molecule::{ArrowKind, BondOrder, BondStereo, DoublePosition, Molecule, PageObject, PageText, TextAlign};
 
 use crate::molecule::depict::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
+
+/// Arrowhead proportions, in line widths: what ChemDraw 25 writes for a new reaction arrow
+/// (`HeadSize="2250" ArrowheadCenterSize="1969" ArrowheadWidth="563"`, hundredths of the line
+/// width). The head is `ARROW_HEAD_LENGTH` long, `2 × ARROW_HEAD_HALF_WIDTH` wide, and its back
+/// is notched: the shaft meets it `ARROW_HEAD_CENTER` behind the tip.
+pub const ARROW_HEAD_LENGTH: f32 = 22.5;
+/// See [`ARROW_HEAD_LENGTH`].
+pub const ARROW_HEAD_CENTER: f32 = 19.69;
+/// See [`ARROW_HEAD_LENGTH`].
+pub const ARROW_HEAD_HALF_WIDTH: f32 = 5.63;
+/// Distance between the two shafts of an equilibrium arrow, in line widths.
+pub const ARROW_SHAFT_SPACING: f32 = 6.0;
+/// Baseline-to-baseline distance of a page text's lines, in font sizes.
+pub const TEXT_LINE_HEIGHT: f32 = 1.2;
 
 // Fixed internal detail (not user-tunable): hash-wedge line count and wavy-bond resolution.
 const HASH_COUNT: usize = 6;
@@ -95,6 +109,25 @@ pub struct MoleculeScene {
     pub labels: HashMap<u32, SceneLabel>,
     /// Padding of the white rectangle painted behind an atom label (already scaled).
     pub label_bg_pad: f32,
+    /// Arrows and texts on the page ([`Molecule::objects`]), drawn over the structures.
+    pub objects: Vec<SceneObject>,
+}
+
+/// One laid-out line of a page text: the galley and the rect it is painted in.
+pub struct SceneText {
+    pub galley: RichGalley,
+    pub rect: Rect,
+}
+
+/// The drawing primitives of one page object: strokes and filled polygons (an arrow's shafts
+/// and heads), laid-out text lines, and the rect covering all of it (for hit testing and
+/// bounds). Color is up to the backend, as for [`SceneBond`].
+pub struct SceneObject {
+    pub object_id: u32,
+    pub strokes: Vec<SceneStroke>,
+    pub fills: Vec<Vec<Pos2>>,
+    pub texts: Vec<SceneText>,
+    pub rect: Rect,
 }
 
 impl MoleculeScene {
@@ -106,10 +139,12 @@ impl MoleculeScene {
         xf: RenderTransform,
         layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
     ) -> Self {
-        let labels = build_labels(mol, style, xf, layout);
+        let mut layout = layout;
+        let labels = build_labels(mol, style, xf, &mut layout);
         let bonds = build_bonds(mol, style, xf, &labels);
         let ring_fills = build_ring_fills(mol, xf);
-        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale }
+        let objects = build_objects(mol, style, xf, &mut layout);
+        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale, objects }
     }
 
     /// The pixel rect covering everything drawn: every atom position of `mol` (under `xf`, the
@@ -135,6 +170,10 @@ impl MoleculeScene {
         for l in self.labels.values() {
             r.extend_with(l.rect.min);
             r.extend_with(l.rect.max);
+        }
+        for o in &self.objects {
+            r.extend_with(o.rect.min);
+            r.extend_with(o.rect.max);
         }
         (r.min.x <= r.max.x && r.min.y <= r.max.y).then_some(r)
     }
@@ -169,6 +208,123 @@ pub fn build_labels(
         map.insert(atom.id, SceneLabel { galley, rect });
     }
     map
+}
+
+// ─── Page objects ─────────────────────────────────────────────────────────────
+
+/// Primitives for every page object of `mol` (arrows and texts), in their order. Arrow lines are
+/// as wide as bonds and their heads are sized in line widths, as ChemDraw sizes them; text is set
+/// at the atom-label size. `layout` is the galley source, as for [`build_labels`].
+pub fn build_objects(
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> Vec<SceneObject> {
+    mol.objects.iter().map(|o| build_object(o, style, xf, &mut layout)).collect()
+}
+
+/// Primitives of one page object; see [`build_objects`].
+pub fn build_object(
+    object: &PageObject,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> SceneObject {
+    match object {
+        PageObject::Arrow(a) => {
+            let width = style.bond_width * xf.visual_scale;
+            let (strokes, fills) = arrow_primitives(xf.apply(a.tail), xf.apply(a.head), a.kind, width);
+            let mut rect = Rect::NOTHING;
+            for st in &strokes {
+                rect.extend_with(st.a);
+                rect.extend_with(st.b);
+            }
+            fills.iter().flatten().for_each(|p| rect.extend_with(*p));
+            if strokes.is_empty() {
+                rect = Rect::from_center_size(xf.apply(a.tail), Vec2::splat(width));
+            }
+            SceneObject { object_id: a.id, strokes, fills, texts: Vec::new(), rect: rect.expand(width * 0.5) }
+        }
+        PageObject::Text(t) => {
+            let texts = text_lines(t, style, xf, layout);
+            let rect = texts.iter().map(|l| l.rect).reduce(|a, b| a.union(b)).unwrap_or_else(|| {
+                let size = style.label_size * xf.visual_scale;
+                Rect::from_min_size(xf.apply(t.pos) - Vec2::new(0.0, size * 0.8), Vec2::new(1.0, size))
+            });
+            SceneObject { object_id: t.id, strokes: Vec::new(), fills: Vec::new(), texts, rect }
+        }
+    }
+}
+
+/// The lines of a page text laid out and placed: line `k`'s baseline is `k` line heights below
+/// the anchor, and each line sits right of, around or left of the anchor by its alignment.
+fn text_lines(
+    t: &PageText,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> Vec<SceneText> {
+    let size = style.label_size * xf.visual_scale;
+    let text_style = RichTextStyle::new(size, Color32::BLACK);
+    let anchor = xf.apply(t.pos);
+    let mut out = Vec::new();
+    for (k, line) in t.lines().iter().enumerate() {
+        let galley = line.layout_with(&text_style, &mut layout);
+        if galley.parts.is_empty() {
+            continue;
+        }
+        let w = galley.size().x;
+        let x = match t.align {
+            TextAlign::Left => anchor.x,
+            TextAlign::Center => anchor.x - w * 0.5,
+            TextAlign::Right => anchor.x - w,
+        };
+        let y = anchor.y + k as f32 * size * TEXT_LINE_HEIGHT - galley.baseline();
+        let rect = Rect::from_min_size(Pos2::new(x, y), galley.size());
+        out.push(SceneText { galley, rect });
+    }
+    out
+}
+
+/// Shafts and heads of an arrow from `tail` to `head` (pixels), lines `width` wide. A head never
+/// takes more than half the arrow, so a short arrow still shows a shaft. Each head is filled as
+/// two triangles (tip, barb, notch), since the notched head is not convex.
+pub fn arrow_primitives(tail: Pos2, head: Pos2, kind: ArrowKind, width: f32) -> (Vec<SceneStroke>, Vec<Vec<Pos2>>) {
+    let mut strokes = Vec::new();
+    let mut fills = Vec::new();
+    let d = head - tail;
+    let len = d.length();
+    if len < 1e-3 {
+        return (strokes, fills);
+    }
+    let u = d / len;
+    // Left of the direction of travel, on a y-down screen.
+    let left = Vec2::new(u.y, -u.x);
+    let scale = (len * 0.5 / (ARROW_HEAD_LENGTH * width)).min(1.0);
+    let head_len = ARROW_HEAD_LENGTH * width * scale;
+    let center = ARROW_HEAD_CENTER * width * scale;
+    let half = ARROW_HEAD_HALF_WIDTH * width * scale;
+    // One shaft from `a` to `b` with a head at `b`: whole, or only its half on `side`.
+    let mut one = |a: Pos2, b: Pos2, dir: Vec2, side: Vec2, half_head: bool| {
+        let base = b - dir * head_len;
+        let notch = b - dir * center;
+        strokes.push(SceneStroke { a, b: notch, width });
+        fills.push(vec![b, base + side * half, notch]);
+        if !half_head {
+            fills.push(vec![b, notch, base - side * half]);
+        }
+    };
+    match kind {
+        ArrowKind::Reaction => one(tail, head, u, left, false),
+        ArrowKind::Equilibrium => {
+            let off = left * (ARROW_SHAFT_SPACING * width * 0.5);
+            // Forward on the left, back on the right; each half head points outward.
+            one(tail + off, head + off, u, left, true);
+            one(head - off, tail - off, -u, -left, true);
+        }
+    }
+    (strokes, fills)
 }
 
 // ─── Ring fills ───────────────────────────────────────────────────────────────

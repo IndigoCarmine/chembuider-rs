@@ -15,6 +15,7 @@
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
+use super::cdx_page;
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule};
 use super::depict;
@@ -117,7 +118,8 @@ const LABEL_BASELINE: f64 = 3.9 * PT;
 #[derive(Debug, Clone)]
 pub struct CdxImport {
     pub molecule: Molecule,
-    /// Objects on the page other than structures (arrows, captions, shapes, …): kept by
+    /// Objects on the page other than structures and the arrows and texts read into
+    /// [`Molecule::objects`] (shapes, brackets, curved arrows, reaction schemes, …): kept by
     /// [`merge_into_cdx`] but not shown in the editor.
     pub other_objects: usize,
 }
@@ -174,7 +176,7 @@ pub(crate) fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> [f64; 4] {
 
 /// Approximate advance of a character of 10 pt Arial, in CDX units (enough to centre a label's
 /// first or last letter on its atom the way ChemDraw does).
-fn arial_width(c: char) -> f64 {
+pub(crate) fn arial_width(c: char) -> f64 {
     let per_mille = match c {
         'i' | 'j' | 'l' => 222,
         'I' | 'f' | 't' | '/' => 278,
@@ -339,7 +341,7 @@ pub(crate) fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
 
 /// Markup for `rich` as someone would type it: a one-character script without braces
 /// (`CO_2Et`, `NH_4^+`), longer ones braced.
-fn compact_markup(rich: &RichText) -> String {
+pub(crate) fn compact_markup(rich: &RichText) -> String {
     let mut out = String::new();
     let (mut bold, mut italic) = (false, false);
     let reserved = |c: char| matches!(c, '\\' | '*' | '/' | '^' | '_' | '{' | '}');
@@ -505,10 +507,18 @@ pub(crate) fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Ve
     out
 }
 
-/// How far to move `mol` so it does not start above or left of the page.
+/// How far to move `mol` (its atoms and page objects) so it does not start above or left of
+/// the page.
 fn page_shift(mol: &Molecule) -> (f64, f64) {
-    let min = |i: usize| mol.atoms.iter().map(|a| a.pos[i] as f64 * SCALE).fold(f64::INFINITY, f64::min);
-    let fix = |m: f64| if m.is_finite() && m < PAGE_MARGIN { (PAGE_MARGIN - m).ceil() } else { 0.0 };
+    shift_onto_page(mol, PAGE_MARGIN)
+}
+
+/// How far to move `mol` so that nothing is closer to the page's top or left edge than `limit`
+/// (CDX units); whatever is moved ends up [`PAGE_MARGIN`] from the edge.
+fn shift_onto_page(mol: &Molecule, limit: f64) -> (f64, f64) {
+    let points = || mol.atoms.iter().map(|a| a.pos).chain(mol.objects.iter().flat_map(|o| o.key_points()));
+    let min = |i: usize| points().map(|p| p[i] as f64 * SCALE).fold(f64::INFINITY, f64::min);
+    let fix = |m: f64| if m.is_finite() && m < limit { (PAGE_MARGIN - m).ceil() } else { 0.0 };
     (fix(min(0)), fix(min(1)))
 }
 
@@ -548,7 +558,9 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
         next += 1;
         next
     });
-    page.children = fragments(mol, page_shift(mol), &mut next);
+    let shift = page_shift(mol);
+    page.children = fragments(mol, shift, &mut next);
+    page.children.extend(cdx_page::write_objects(&mol.objects, &mut cdx_page::Owned::new(), shift, &mut next));
     if let Some(bbox) = page.children.iter().filter_map(bounding_box).reduce(|a, b| union(Some(a), b)) {
         doc.props.insert(1, (PROP_BOUNDING_BOX, rect(bbox)));
     }
@@ -556,9 +568,9 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
     doc
 }
 
-/// Serialize `mol` to CDX bytes, or None if empty (nothing to put on the clipboard).
+/// Serialize `mol` to CDX bytes, or None if nothing is drawn (nothing to put on the clipboard).
 pub fn molecule_to_cdx_bytes(mol: &Molecule) -> Option<Vec<u8>> {
-    (!mol.atoms.is_empty()).then(|| molecule_to_cdx_document(mol))
+    (!mol.is_blank()).then(|| molecule_to_cdx_document(mol))
 }
 
 /// Drop every fragment inside `obj` (and groups left empty), counting what else stays.
@@ -573,23 +585,34 @@ fn strip_structures(obj: &mut CdxObject) {
     });
 }
 
-/// `original` (a ChemDraw document) with its structures replaced by `mol`. The document's
-/// settings and everything on the page that is not a structure — arrows, captions, shapes —
-/// stay as they were, so editing an object made in ChemDraw loses nothing the editor cannot
-/// show. Not a CDX document: a new one, as [`molecule_to_cdx_document`].
+/// `original` (a ChemDraw document) with its structures and the arrows and texts the editor
+/// reads ([`read_cdx`]) replaced by `mol`'s. An arrow or text that came from the document goes
+/// back as its own ChemDraw object, under its id, with only what was edited rewritten; one
+/// deleted in the editor is gone. The document's settings and everything else on the page —
+/// shapes, brackets, curved arrows, reaction schemes — stay as they were, so editing an object
+/// made in ChemDraw loses nothing the editor cannot show. Not a CDX document: a new one, as
+/// [`molecule_to_cdx_document`].
 pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     let Some(mut doc) = cdx_codec::parse(original).filter(|d| d.tag == OBJ_DOCUMENT) else {
         return molecule_to_cdx_document(mol);
     };
+    // New ids start past every id the document had, so none is reused for something else.
+    let mut next = doc.max_id();
+    let mut owned = cdx_page::Owned::new();
     for page in doc.children.iter_mut().filter(|c| c.tag == OBJ_PAGE) {
+        cdx_page::take_owned(page, &mut owned);
         strip_structures(page);
     }
-    let mut next = doc.max_id();
     if !doc.children.iter().any(|c| c.tag == OBJ_PAGE) {
         next += 1;
         doc.children.push(CdxObject::new(OBJ_PAGE, next));
     }
-    let new = fragments(mol, page_shift(mol), &mut next);
+    // A drawing still on the page stays where it is, beside the objects kept from the file
+    // (ChemDraw's own drawings often come within the margin a new document keeps); only one
+    // dragged off the page's top or left edge is moved back onto it.
+    let shift = shift_onto_page(mol, 0.0);
+    let mut new = fragments(mol, shift, &mut next);
+    new.extend(cdx_page::write_objects(&mol.objects, &mut owned, shift, &mut next));
     let page = doc.children.iter_mut().find(|c| c.tag == OBJ_PAGE).expect("a page");
     page.children.extend(new);
     let bbox = doc
@@ -754,11 +777,14 @@ pub(crate) fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut u
     }
 }
 
-fn read_container(obj: &CdxObject, mol: &mut Molecule, others: &mut usize) {
+/// Read `obj`'s structures into `mol`, counting in `others` the objects that are neither a
+/// structure nor one of `taken` (the arrows and texts read as page objects).
+fn read_container(obj: &CdxObject, mol: &mut Molecule, others: &mut usize, taken: &HashSet<u32>) {
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => read_fragment(child, mol),
-            OBJ_GROUP => read_container(child, mol, others),
+            OBJ_GROUP => read_container(child, mol, others, taken),
+            _ if taken.contains(&child.id) => {}
             _ => *others += 1,
         }
     }
@@ -805,7 +831,12 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     let mut molecule = Molecule::default();
     let mut other_objects = 0;
     for page in pages() {
-        read_container(page, &mut molecule, &mut other_objects);
+        let converted = cdx_page::convert_page(page);
+        let taken: HashSet<u32> = converted.iter().flat_map(|c| c.ids.iter().copied()).collect();
+        read_container(page, &mut molecule, &mut other_objects, &taken);
+        for c in converted {
+            molecule.push_object(c.object);
+        }
     }
     Some(CdxImport { molecule, other_objects })
 }

@@ -443,6 +443,17 @@ impl RichGalley {
         self.size
     }
 
+    /// Distance from the top of the laid-out text to its main (normal-size) baseline; 0 for
+    /// empty text. Lets a caller put the baseline where it wants it, as a page text does.
+    pub fn baseline(&self) -> f32 {
+        // Normal-size spans sit on the main baseline, so the largest part's own glyph
+        // baseline gives it away.
+        self.parts
+            .iter()
+            .max_by(|a, b| a.size.total_cmp(&b.size))
+            .map_or(0.0, |p| p.offset.y + galley_baseline(&p.galley))
+    }
+
     /// Paint with the text's top-left corner at `top_left`.
     pub fn paint(&self, painter: &egui::Painter, top_left: Pos2) {
         for part in &self.parts {
