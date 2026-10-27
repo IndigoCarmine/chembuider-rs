@@ -24,7 +24,7 @@ use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
-use crate::molecule::{BondOrder, BondStereo, Molecule};
+use crate::molecule::{BondOrder, BondStereo, DoublePosition, Molecule};
 
 use crate::molecule::depict::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
@@ -233,6 +233,9 @@ pub fn build_bonds(
         let mut fills = Vec::new();
         match &bond.stereo {
             BondStereo::None => {
+                // Whether each end carries other bonds: a bare terminal end (vinyl CH₂) has
+                // nothing to make room for, so the inner line runs to the end there.
+                let mut inset_ends = (false, false);
                 let placement = if matches!(bond.order, BondOrder::Double) {
                     let (nx, ny) = perp_normal(p1, p2);
                     let mut neighbors: Vec<Pos2> = Vec::new();
@@ -242,6 +245,7 @@ pub fn build_bonds(
                         }
                         if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
+                            inset_ends.0 = true;
                         }
                     }
                     for nid in index.neighbor_atom_ids(bond.end) {
@@ -250,13 +254,25 @@ pub fn build_bonds(
                         }
                         if let Some(na) = index.atom_by_id(nid) {
                             neighbors.push(xf.apply(na.pos));
+                            inset_ends.1 = true;
                         }
                     }
-                    double_bond_placement(p1, p2, (nx, ny), &neighbors)
+                    // A side the user chose wins over the one the substituents suggest.
+                    chosen_double_placement(bond.double_position)
+                        .unwrap_or_else(|| double_bond_placement(p1, p2, (nx, ny), &neighbors))
                 } else {
                     DoubleBondPlacement::Symmetric
                 };
-                push_bond_order(&mut strokes, tp1, tp2, &bond.order, width, style.double_bond_offset * vs, placement);
+                push_bond_order(
+                    &mut strokes,
+                    tp1,
+                    tp2,
+                    &bond.order,
+                    width,
+                    style.double_bond_offset * vs,
+                    placement,
+                    inset_ends,
+                );
             }
             BondStereo::WedgeUp => push_wedge_solid(&mut fills, tp1, tp2, style.wedge_width * vs),
             BondStereo::WedgeDown => push_wedge_hash(
@@ -269,6 +285,9 @@ pub fn build_bonds(
             BondStereo::Bold => strokes.push(SceneStroke { a: tp1, b: tp2, width: style.bold_width * vs }),
             BondStereo::Dashed => push_dashed(&mut strokes, tp1, tp2, width, style.dash_len * vs, style.dash_gap * vs),
             BondStereo::Wavy => push_wavy(&mut strokes, tp1, tp2, width, style.wavy_amplitude * vs),
+            BondStereo::Hashed => push_hashed(&mut strokes, tp1, tp2, style.wedge_width * vs * 0.6, width),
+            BondStereo::HollowWedge => push_wedge_hollow(&mut strokes, tp1, tp2, style.wedge_width * vs, width),
+            BondStereo::Dative => push_dative(&mut strokes, &mut fills, tp1, tp2, style.wedge_width * vs, width),
         }
         out.push(SceneBond { bond_id: bond.id, strokes, fills });
     }
@@ -325,6 +344,19 @@ pub(crate) fn trimmed_bond_endpoints(
     Some((at(t1), at(t2)))
 }
 
+/// The placement a user-chosen [`DoublePosition`] asks for, or `None` for `Auto`.
+///
+/// `perp_normal` points to the right of the begin→end direction on screen (y grows downward),
+/// so the inset line goes to `+1` for `Right` and `-1` for `Left`.
+pub(crate) fn chosen_double_placement(position: DoublePosition) -> Option<DoubleBondPlacement> {
+    match position {
+        DoublePosition::Auto => None,
+        DoublePosition::Center => Some(DoubleBondPlacement::Symmetric),
+        DoublePosition::Right => Some(DoubleBondPlacement::Centered(1.0)),
+        DoublePosition::Left => Some(DoubleBondPlacement::Centered(-1.0)),
+    }
+}
+
 /// Where to place the two lines of a plain (non-stereo) double bond.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum DoubleBondPlacement {
@@ -342,6 +374,7 @@ fn push_bond_order(
     width: f32,
     double_bond_offset: f32,
     placement: DoubleBondPlacement,
+    inset_ends: (bool, bool),
 ) {
     let stroke = |a: Pos2, b: Pos2| SceneStroke { a, b, width };
     match order {
@@ -366,11 +399,15 @@ fn push_bond_order(
                 let dy = p2.y - p1.y;
                 let len = (dx * dx + dy * dy).sqrt();
                 let (ox, oy) = (nx * double_bond_offset * side, ny * double_bond_offset * side);
+                // Shorten the inner line only at ends that carry other bonds, so it stays clear
+                // of them; at a bare terminal end it lines up with the main line.
                 let inset = 0.15 * len;
+                let in1 = if inset_ends.0 { inset } else { 0.0 };
+                let in2 = if inset_ends.1 { inset } else { 0.0 };
                 let (ux, uy) = if len > 0.001 { (dx / len, dy / len) } else { (0.0, 0.0) };
                 strokes.push(stroke(
-                    Pos2::new(p1.x + ux * inset + ox, p1.y + uy * inset + oy),
-                    Pos2::new(p2.x - ux * inset + ox, p2.y - uy * inset + oy),
+                    Pos2::new(p1.x + ux * in1 + ox, p1.y + uy * in1 + oy),
+                    Pos2::new(p2.x - ux * in2 + ox, p2.y - uy * in2 + oy),
                 ));
             }
         },
@@ -386,6 +423,17 @@ fn push_bond_order(
                 Pos2::new(p1.x - nx * off, p1.y - ny * off),
                 Pos2::new(p2.x - nx * off, p2.y - ny * off),
             ));
+        }
+        BondOrder::Quadruple => {
+            // Four evenly spaced lines, symmetric about the axis.
+            let (nx, ny) = perp_normal(p1, p2);
+            for k in [-1.5_f32, -0.5, 0.5, 1.5] {
+                let off = double_bond_offset * k;
+                strokes.push(stroke(
+                    Pos2::new(p1.x + nx * off, p1.y + ny * off),
+                    Pos2::new(p2.x + nx * off, p2.y + ny * off),
+                ));
+            }
         }
     }
 }
@@ -425,6 +473,58 @@ fn push_wedge_hash(
             width: line_width,
         });
     }
+}
+
+/// Plain hashed bond: crosswise ticks of one constant half-width, as many and as far apart as
+/// the hashed wedge's (one more, since its first tick has no width at the narrow end).
+fn push_hashed(strokes: &mut Vec<SceneStroke>, p1: Pos2, p2: Pos2, half_width: f32, line_width: f32) {
+    let (nx, ny) = perp_normal(p1, p2);
+    for i in 0..=HASH_COUNT {
+        let t = i as f32 / HASH_COUNT as f32;
+        let px = p1.x + (p2.x - p1.x) * t;
+        let py = p1.y + (p2.y - p1.y) * t;
+        strokes.push(SceneStroke {
+            a: Pos2::new(px + nx * half_width, py + ny * half_width),
+            b: Pos2::new(px - nx * half_width, py - ny * half_width),
+            width: line_width,
+        });
+    }
+}
+
+/// Hollow wedge: the outline of the solid wedge's triangle, narrow at p1 (begin).
+fn push_wedge_hollow(strokes: &mut Vec<SceneStroke>, p1: Pos2, p2: Pos2, wedge_width: f32, line_width: f32) {
+    let (nx, ny) = perp_normal(p1, p2);
+    let left = Pos2::new(p2.x + nx * wedge_width, p2.y + ny * wedge_width);
+    let right = Pos2::new(p2.x - nx * wedge_width, p2.y - ny * wedge_width);
+    for (a, b) in [(p1, left), (left, right), (right, p1)] {
+        strokes.push(SceneStroke { a, b, width: line_width });
+    }
+}
+
+/// Dative bond: a line from p1 (begin) with a filled arrowhead at p2 (end).
+fn push_dative(
+    strokes: &mut Vec<SceneStroke>,
+    fills: &mut Vec<Vec<Pos2>>,
+    p1: Pos2,
+    p2: Pos2,
+    head_width: f32,
+    line_width: f32,
+) {
+    let len = (p2 - p1).length();
+    if len < 0.001 {
+        return;
+    }
+    let dir = (p2 - p1) / len;
+    let (nx, ny) = perp_normal(p1, p2);
+    // The head is at most a third of the bond, so a short bond still shows its shaft.
+    let head_len = (head_width * 2.5).min(len / 3.0);
+    let base = p2 - dir * head_len;
+    strokes.push(SceneStroke { a: p1, b: base, width: line_width });
+    fills.push(vec![
+        p2,
+        Pos2::new(base.x + nx * head_width, base.y + ny * head_width),
+        Pos2::new(base.x - nx * head_width, base.y - ny * head_width),
+    ]);
 }
 
 /// Dashed line.
@@ -611,6 +711,27 @@ mod tests {
         assert!((strokes[0].width - style.bond_width * 2.0).abs() < 1e-4);
     }
 
+    /// Vinyl (R–CH=CH₂): the inner line of the offset double bond is shortened only at the end
+    /// that carries another bond; at the bare terminal CH₂ it reaches as far as the main line.
+    #[test]
+    fn double_bond_inner_line_reaches_bare_terminal_end() {
+        let mut m = Molecule::default();
+        let r = m.add_atom("C".to_string(), [-0.5, 0.87], 0);
+        let c = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let t = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        m.add_bond(r, c, BondOrder::Single);
+        m.add_bond(c, t, BondOrder::Double);
+        let style = StyleConfig::default();
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let bonds = build_bonds(&m, &style, xf, &HashMap::new());
+        let strokes = &bonds[1].strokes;
+        assert_eq!(strokes.len(), 2, "main line + inner line");
+        let (main, inner) = (&strokes[0], &strokes[1]);
+        // Bond runs along +x from c (x=0) to t (x=SCALE_FACTOR).
+        assert!((inner.b.x - main.b.x).abs() < 1e-3, "inner line ends flush at the terminal CH₂");
+        assert!(inner.a.x > main.a.x + 1.0, "inner line is still inset at the substituted end");
+    }
+
     /// `bounds` covers the atoms, the bonds and the label rects, follows the transform's offset,
     /// and is `None` for an empty molecule.
     #[test]
@@ -654,5 +775,107 @@ mod tests {
         assert_eq!(polys[0].points.len(), 3);
         assert_eq!(polys[0].points[1], Pos2::new(2.0 * SCALE_FACTOR, 0.0));
         assert_eq!(polys[0].color, Color32::from_rgba_unmultiplied(10, 20, 30, 200));
+    }
+
+    /// The one bond of `begin → end` drawn with `order`/`stereo`/`position`, at scale 1 with
+    /// no labels (so nothing is trimmed): its scene primitives.
+    fn lone_bond(order: BondOrder, stereo: BondStereo, position: DoublePosition) -> SceneBond {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let id = m.add_bond(a, b, order);
+        let bond = m.bond_by_id_mut(id).unwrap();
+        bond.stereo = stereo;
+        bond.double_position = position;
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        build_bonds(&m, &StyleConfig::default(), xf, &HashMap::new()).remove(0)
+    }
+
+    #[test]
+    fn a_quadruple_bond_is_four_parallel_lines_symmetric_about_the_axis() {
+        let bond = lone_bond(BondOrder::Quadruple, BondStereo::None, DoublePosition::Auto);
+        assert_eq!(bond.strokes.len(), 4);
+        let mut ys: Vec<f32> = bond.strokes.iter().map(|s| s.a.y).collect();
+        ys.sort_by(f32::total_cmp);
+        for s in &bond.strokes {
+            assert!((s.a.y - s.b.y).abs() < 1e-4, "parallel to the (horizontal) bond");
+        }
+        assert!((ys[0] + ys[3]).abs() < 1e-4 && (ys[1] + ys[2]).abs() < 1e-4, "symmetric: {ys:?}");
+        assert!(((ys[1] - ys[0]) - (ys[2] - ys[1])).abs() < 1e-4, "evenly spaced: {ys:?}");
+    }
+
+    #[test]
+    fn a_hashed_bond_has_ticks_of_one_width_unlike_the_hashed_wedge() {
+        let len = |s: &SceneStroke| (s.b - s.a).length();
+        let hashed = lone_bond(BondOrder::Single, BondStereo::Hashed, DoublePosition::Auto);
+        assert!(hashed.strokes.len() >= 3 && hashed.fills.is_empty());
+        let first = len(&hashed.strokes[0]);
+        assert!(first > 1.0);
+        assert!(hashed.strokes.iter().all(|s| (len(s) - first).abs() < 1e-3));
+
+        let wedge = lone_bond(BondOrder::Single, BondStereo::WedgeDown, DoublePosition::Auto);
+        assert!(len(wedge.strokes.last().unwrap()) > len(&wedge.strokes[0]) + 1.0, "the wedge widens");
+    }
+
+    #[test]
+    fn a_hollow_wedge_is_the_outline_of_the_solid_one() {
+        let solid = lone_bond(BondOrder::Single, BondStereo::WedgeUp, DoublePosition::Auto);
+        let hollow = lone_bond(BondOrder::Single, BondStereo::HollowWedge, DoublePosition::Auto);
+        assert!(hollow.fills.is_empty());
+        assert_eq!(hollow.strokes.len(), 3);
+        // Each corner of the solid wedge's triangle is a corner of the outline.
+        for corner in &solid.fills[0] {
+            assert!(hollow.strokes.iter().any(|s| s.a == *corner || s.b == *corner), "{corner:?}");
+        }
+    }
+
+    #[test]
+    fn a_dative_bond_is_a_line_with_an_arrowhead_at_its_end() {
+        let bond = lone_bond(BondOrder::Single, BondStereo::Dative, DoublePosition::Auto);
+        let end = Pos2::new(SCALE_FACTOR, 0.0);
+        assert_eq!(bond.strokes.len(), 1);
+        assert_eq!(bond.strokes[0].a, Pos2::ZERO, "the shaft leaves the begin atom");
+        assert_eq!(bond.fills.len(), 1);
+        assert_eq!(bond.fills[0][0], end, "the arrow points at the end atom");
+        assert!(bond.fills[0][1..].iter().all(|p| p.x < end.x && p.x > SCALE_FACTOR * 0.5));
+    }
+
+    /// A chosen double-bond side beats the automatic one, and `Left`/`Right` are as seen
+    /// looking from the begin atom to the end atom on screen (y grows downward): for a bond
+    /// drawn left to right, Right is below the axis.
+    #[test]
+    fn a_chosen_double_bond_position_places_the_inset_line_on_that_side() {
+        let inset_y = |position| {
+            let bond = lone_bond(BondOrder::Double, BondStereo::None, position);
+            assert_eq!(bond.strokes.len(), 2);
+            assert!(bond.strokes.iter().any(|s| s.a.y == 0.0 && s.b.y == 0.0), "{position:?} keeps the axis line");
+            bond.strokes.iter().find(|s| s.a.y != 0.0).unwrap().a.y
+        };
+        assert!(inset_y(DoublePosition::Right) > 0.0);
+        assert!(inset_y(DoublePosition::Left) < 0.0);
+
+        let center = lone_bond(BondOrder::Double, BondStereo::None, DoublePosition::Center);
+        assert!((center.strokes[0].a.y + center.strokes[1].a.y).abs() < 1e-4, "symmetric");
+        assert!(center.strokes.iter().all(|s| s.a.y != 0.0));
+    }
+
+    #[test]
+    fn a_chosen_side_wins_over_the_substituents() {
+        // A neighbour above the axis would pull the inset line up; Right puts it below anyway.
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [1.5, -0.8], 0);
+        let id = m.add_bond(a, b, BondOrder::Double);
+        m.add_bond(b, c, BondOrder::Single);
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let inset = |m: &Molecule| {
+            let bonds = build_bonds(m, &StyleConfig::default(), xf, &HashMap::new());
+            let double = bonds.into_iter().find(|sb| sb.bond_id == id).unwrap();
+            double.strokes.iter().find(|s| s.a.y != 0.0).unwrap().a.y
+        };
+        assert!(inset(&m) < 0.0, "automatic: toward the substituent");
+        m.bond_by_id_mut(id).unwrap().double_position = DoublePosition::Right;
+        assert!(inset(&m) > 0.0, "chosen: Right");
     }
 }

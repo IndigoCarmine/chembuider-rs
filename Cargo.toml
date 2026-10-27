@@ -21,6 +21,8 @@ office = ["dep:eframe", "dep:interprocess", "dep:base64"]
 egui = "0.35.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# ChemDraw CDXML (and the CDX object model) without its renderer/viewer.
+cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "87ebf5d2b3bb19e148d6f142638ee47a5fd3d67d", default-features = false }
 
 # Only the example host app needs a windowing backend / file dialogs.
 # Native: glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12

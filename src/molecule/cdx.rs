@@ -16,35 +16,39 @@
 
 use super::cdx_codec::{self, CdxObject};
 use super::lookup::{AtomLookup, MolIndex};
-use super::{elements, BondOrder, BondStereo, Molecule};
+use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule};
 use super::depict;
 use crate::widget::rich_text::{RichSpan, RichText, Script, SpanStyle};
 use std::collections::{HashMap, HashSet};
 
 // Objects (kCDXObj_*).
-const OBJ_DOCUMENT: u16 = 0x8000;
-const OBJ_PAGE: u16 = 0x8001;
-const OBJ_GROUP: u16 = 0x8002;
-const OBJ_FRAGMENT: u16 = 0x8003;
-const OBJ_NODE: u16 = 0x8004;
-const OBJ_BOND: u16 = 0x8005;
-const OBJ_TEXT: u16 = 0x8006;
+pub(crate) const OBJ_DOCUMENT: u16 = 0x8000;
+pub(crate) const OBJ_PAGE: u16 = 0x8001;
+pub(crate) const OBJ_GROUP: u16 = 0x8002;
+pub(crate) const OBJ_FRAGMENT: u16 = 0x8003;
+pub(crate) const OBJ_NODE: u16 = 0x8004;
+pub(crate) const OBJ_BOND: u16 = 0x8005;
+pub(crate) const OBJ_TEXT: u16 = 0x8006;
 
 // Properties (kCDXProp_*).
 const PROP_CREATION_PROGRAM: u16 = 0x0003;
-const PROP_2D_POSITION: u16 = 0x0200;
-const PROP_BOUNDING_BOX: u16 = 0x0204;
+pub(crate) const PROP_2D_POSITION: u16 = 0x0200;
+pub(crate) const PROP_BOUNDING_BOX: u16 = 0x0204;
 const PROP_NODE_TYPE: u16 = 0x0400;
 const PROP_NODE_ELEMENT: u16 = 0x0402;
 const PROP_ATOM_CHARGE: u16 = 0x0421;
 const PROP_ATOM_NUM_HYDROGENS: u16 = 0x042B;
-const PROP_TEXT: u16 = 0x0700;
+pub(crate) const PROP_TEXT: u16 = 0x0700;
 const PROP_LABEL_ALIGNMENT: u16 = 0x0705;
-const PROP_UTF8_TEXT: u16 = 0x0709;
+pub(crate) const PROP_UTF8_TEXT: u16 = 0x0709;
 const PROP_BOND_ORDER: u16 = 0x0600;
 const PROP_BOND_DISPLAY: u16 = 0x0601;
+const PROP_BOND_DOUBLE_POSITION: u16 = 0x0603;
 const PROP_BOND_BEGIN: u16 = 0x0604;
 const PROP_BOND_END: u16 = 0x0605;
+
+/// kCDXBondOrder_Dative: a dative bond is an order of its own in CDX.
+const ORDER_DATIVE: i16 = 0x1000;
 
 /// Node types (kCDXNodeType_*) this module writes or reads specially.
 const NODE_UNSPECIFIED: i16 = 0;
@@ -64,9 +68,9 @@ const ALIGN_RIGHT: u8 = 3;
 /// bond take about 30 bytes, so a pipe frame of 256 MiB could hold millions), and the editor's
 /// own work on a molecule (drawing, looking atoms and bonds up) is not made for such sizes
 /// either.
-const MAX_READ_ATOMS: usize = 100_000;
+pub(crate) const MAX_READ_ATOMS: usize = 100_000;
 /// See [`MAX_READ_ATOMS`].
-const MAX_READ_BONDS: usize = 100_000;
+pub(crate) const MAX_READ_BONDS: usize = 100_000;
 
 /// ChemDraw's document style, as ChemDraw 26 writes it: bond length (14.4 pt), spacing and line
 /// widths, the label and caption styles (Arial 10 pt, formula face), the colour and font tables.
@@ -89,7 +93,7 @@ const DOCUMENT_STYLE: [(u16, &str); 14] = [
 ];
 
 /// Font id of Arial in [`DOCUMENT_STYLE`]'s font table.
-pub(super) const LABEL_FONT: u16 = 3;
+pub(crate) const LABEL_FONT: u16 = 3;
 /// Label size in 1/20 pt (10 pt).
 pub(super) const LABEL_SIZE: u16 = 200;
 /// Formula face: digits become subscripts and a trailing charge a superscript.
@@ -103,7 +107,7 @@ const FACE_SUPERSCRIPT: u16 = 0x40;
 pub const SCALE: f64 = 14.4 / 1.5 * 65536.0;
 
 /// One point in CDX units.
-pub(super) const PT: f64 = 65536.0;
+pub(crate) const PT: f64 = 65536.0;
 /// A structure starting above or left of the page edge is moved to this margin.
 const PAGE_MARGIN: f64 = 36.0 * PT;
 /// From an atom to its label's baseline, as ChemDraw places it (half the cap height of 10 pt Arial).
@@ -123,7 +127,7 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 /// A CDXString: its style runs (start, font, face, size, colour), then the characters.
-fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
+pub(crate) fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(runs.len() as u16).to_le_bytes());
     for &(start, face) in runs {
@@ -136,7 +140,7 @@ fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
 }
 
 /// The text and style runs (start, face) of a CDXString.
-fn parse_cdx_string(v: &[u8]) -> Option<(Vec<(usize, u16)>, String)> {
+pub(crate) fn parse_cdx_string(v: &[u8]) -> Option<(Vec<(usize, u16)>, String)> {
     let n = u16::from_le_bytes([*v.first()?, *v.get(1)?]) as usize;
     let mut runs = Vec::with_capacity(n);
     for i in 0..n {
@@ -148,7 +152,7 @@ fn parse_cdx_string(v: &[u8]) -> Option<(Vec<(usize, u16)>, String)> {
     Some((runs, text))
 }
 
-fn point(x: f64, y: f64) -> Vec<u8> {
+pub(crate) fn point(x: f64, y: f64) -> Vec<u8> {
     let mut v = Vec::with_capacity(8);
     v.extend_from_slice(&(y.round() as i32).to_le_bytes());
     v.extend_from_slice(&(x.round() as i32).to_le_bytes());
@@ -156,12 +160,12 @@ fn point(x: f64, y: f64) -> Vec<u8> {
 }
 
 /// A CDXRectangle: top, left, bottom, right.
-fn rect(r: [f64; 4]) -> Vec<u8> {
+pub(crate) fn rect(r: [f64; 4]) -> Vec<u8> {
     let [left, top, right, bottom] = r;
     [top, left, bottom, right].iter().flat_map(|v| (v.round() as i32).to_le_bytes()).collect()
 }
 
-fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> [f64; 4] {
+pub(crate) fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> [f64; 4] {
     match a {
         None => b,
         Some(a) => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
@@ -235,7 +239,7 @@ pub(super) struct NodeLabel {
 }
 
 /// How an atom is written as a node of a ChemDraw document. One set of rules for both of
-/// ChemDraw's formats, the binary CDX here and its XML form ([`super::cdxml`]), so the two
+/// ChemDraw's formats, the binary CDX here and its XML form ([`molecule_to_cdxml`]), so the two
 /// describe the same structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NodeRules {
@@ -276,7 +280,7 @@ pub(super) fn node_rules(mol: &impl AtomLookup, atom: &super::Atom) -> NodeRules
 }
 
 /// Style runs (start char, face) for rich text, and its characters.
-fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
+pub(crate) fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
     let mut runs: Vec<(u16, u16)> = Vec::new();
     let mut text = String::new();
     for span in &rich.spans {
@@ -301,7 +305,7 @@ fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
 
 /// Rich text from a CDXString's runs: formula face turns digits into subscripts and the
 /// trailing charge into a superscript, as ChemDraw draws it.
-fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
+pub(crate) fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
     let chars: Vec<char> = text.chars().collect();
     let mut rich = RichText::new();
     let runs: Vec<(usize, u16)> = if runs.is_empty() { vec![(0, 0)] } else { runs.to_vec() };
@@ -380,7 +384,7 @@ fn compact_markup(rich: &RichText) -> String {
 
 /// The structures of `mol` as fragments (one per connected structure), with ids from `next`.
 /// Positions are moved by `shift` (CDX units).
-fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
+pub(crate) fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
     let mut id = || {
         *next += 1;
         *next
@@ -454,21 +458,42 @@ fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject
             let mut b = CdxObject::new(OBJ_BOND, id());
             b.set(PROP_BOND_BEGIN, begin.to_le_bytes().to_vec());
             b.set(PROP_BOND_END, end.to_le_bytes().to_vec());
-            match bond.order {
-                BondOrder::Single => {}
-                BondOrder::Double => b.set(PROP_BOND_ORDER, 2i16.to_le_bytes().to_vec()),
-                BondOrder::Triple => b.set(PROP_BOND_ORDER, 4i16.to_le_bytes().to_vec()),
+            // kCDXBondOrder flags. ChemDraw keeps a dative bond as an order of its own (0x1000),
+            // not as a display.
+            let order: i16 = match (&bond.order, &bond.stereo) {
+                (_, BondStereo::Dative) => ORDER_DATIVE,
+                (BondOrder::Single, _) => 1,
+                (BondOrder::Double, _) => 2,
+                (BondOrder::Triple, _) => 4,
+                (BondOrder::Quadruple, _) => 8,
+            };
+            if order != 1 {
+                b.set(PROP_BOND_ORDER, order.to_le_bytes().to_vec());
             }
             let display: i16 = match bond.stereo {
-                BondStereo::None => 0,
+                BondStereo::None | BondStereo::Dative => 0,
                 BondStereo::Dashed => 1,
+                BondStereo::Hashed => 2,
                 BondStereo::WedgeDown => 3,
                 BondStereo::Bold => 5,
                 BondStereo::WedgeUp => 6,
                 BondStereo::Wavy => 8,
+                BondStereo::HollowWedge => 9,
             };
             if display != 0 {
                 b.set(PROP_BOND_DISPLAY, display.to_le_bytes().to_vec());
+            }
+            // kCDXBondDoublePosition: only a side the user chose (the "User…" values); an
+            // automatic one is ChemDraw's default and left unwritten.
+            let position: Option<i16> = match bond.double_position {
+                _ if bond.order != BondOrder::Double => None,
+                DoublePosition::Auto => None,
+                DoublePosition::Center => Some(0x0100),
+                DoublePosition::Right => Some(0x0101),
+                DoublePosition::Left => Some(0x0102),
+            };
+            if let Some(position) = position {
+                b.set(PROP_BOND_DOUBLE_POSITION, position.to_le_bytes().to_vec());
             }
             frag.children.push(b);
         }
@@ -487,19 +512,37 @@ fn page_shift(mol: &Molecule) -> (f64, f64) {
     (fix(min(0)), fix(min(1)))
 }
 
-fn bounding_box(obj: &CdxObject) -> Option<[f64; 4]> {
+pub(crate) fn bounding_box(obj: &CdxObject) -> Option<[f64; 4]> {
     let v = obj.prop(PROP_BOUNDING_BOX).filter(|v| v.len() >= 16)?;
     let n = |i: usize| i32::from_le_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]) as f64;
     Some([n(4), n(0), n(12), n(8)])
 }
 
-/// A new ChemDraw document holding `mol` (an empty page when it has no atoms).
-pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
+/// An empty ChemDraw document in ChemDraw's own style ([`DOCUMENT_STYLE`]), naming this
+/// program as its creator.
+pub(crate) fn new_document() -> CdxObject {
     let mut doc = CdxObject::new(OBJ_DOCUMENT, 0);
     doc.set(PROP_CREATION_PROGRAM, cdx_string(&[], &format!("ChemBuilder {}", env!("CARGO_PKG_VERSION"))));
     for (tag, value) in DOCUMENT_STYLE {
         doc.set(tag, hex(value));
     }
+    doc
+}
+
+/// A new ChemDraw document holding `mol` (an empty page when it has no atoms), as CDX bytes.
+pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
+    cdx_codec::write(&molecule_document(mol))
+}
+
+/// The same document as [`molecule_to_cdx_document`], written as CDXML: one object tree, two
+/// encodings, so both formats describe the same structure.
+pub fn molecule_to_cdxml(mol: &Molecule) -> String {
+    cdxml_of_document(&molecule_document(mol))
+}
+
+/// A new ChemDraw document holding `mol`, as its object tree.
+fn molecule_document(mol: &Molecule) -> CdxObject {
+    let mut doc = new_document();
     let mut next = 0;
     let mut page = CdxObject::new(OBJ_PAGE, {
         next += 1;
@@ -510,7 +553,7 @@ pub fn molecule_to_cdx_document(mol: &Molecule) -> Vec<u8> {
         doc.props.insert(1, (PROP_BOUNDING_BOX, rect(bbox)));
     }
     doc.children.push(page);
-    cdx_codec::write(&doc)
+    doc
 }
 
 /// Serialize `mol` to CDX bytes, or None if empty (nothing to put on the clipboard).
@@ -565,7 +608,7 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
 
 /// Read one fragment's own nodes and bonds into `mol` (not the hidden insides of an
 /// abbreviation, which ChemDraw keeps as a fragment inside its node).
-fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
+pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
     let mut atoms: HashMap<u32, u32> = HashMap::new();
     // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own), with their position.
     let mut hydrogens: Vec<(u32, [f32; 2], usize)> = Vec::new();
@@ -625,25 +668,40 @@ fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
     for bond in frag.children.iter().filter(|c| c.tag == OBJ_BOND) {
         let (Some(begin), Some(end)) = (bond.prop_u32(PROP_BOND_BEGIN), bond.prop_u32(PROP_BOND_END)) else { continue };
         let (Some(&a), Some(&b)) = (atoms.get(&begin), atoms.get(&end)) else { continue };
-        let order = match bond.prop_i16(PROP_BOND_ORDER) {
+        let order_flags = bond.prop_i16(PROP_BOND_ORDER);
+        let order = match order_flags {
             Some(2) => BondOrder::Double,
             Some(4) => BondOrder::Triple,
+            Some(8) => BondOrder::Quadruple,
             _ => BondOrder::Single,
         };
         // The "…End" displays have the narrow end at the bond's end: turned around.
         let (stereo, a, b) = match bond.prop_i16(PROP_BOND_DISPLAY).unwrap_or(0) {
-            1 | 2 => (BondStereo::Dashed, a, b),
+            1 => (BondStereo::Dashed, a, b),
+            2 => (BondStereo::Hashed, a, b),
             3 => (BondStereo::WedgeDown, a, b),
             4 => (BondStereo::WedgeDown, b, a),
             5 => (BondStereo::Bold, a, b),
             6 => (BondStereo::WedgeUp, a, b),
             7 => (BondStereo::WedgeUp, b, a),
             8 => (BondStereo::Wavy, a, b),
+            9 => (BondStereo::HollowWedge, a, b),
+            10 => (BondStereo::HollowWedge, b, a),
+            _ if order_flags == Some(ORDER_DATIVE) => (BondStereo::Dative, a, b),
             _ => (BondStereo::None, a, b),
+        };
+        let double_position = match bond.prop_i16(PROP_BOND_DOUBLE_POSITION) {
+            Some(0x0100) => DoublePosition::Center,
+            Some(0x0101) => DoublePosition::Right,
+            Some(0x0102) => DoublePosition::Left,
+            _ => DoublePosition::Auto,
         };
         // A bond given twice is one bond, the first, as `Molecule::add_bond` has it.
         if bonds.insert((a.min(b), a.max(b))) {
             mol.push_bond(a, b, order, stereo);
+            if let Some(last) = mol.bonds.last_mut() {
+                last.double_position = double_position;
+            }
             bonded.extend([a, b]);
         }
     }
@@ -674,7 +732,7 @@ fn hydrogen_count(node: &CdxObject) -> Option<usize> {
 /// Add up the most atoms and bonds [`read_container`] can make of `obj`'s structures: a node
 /// and a bond each, and each node's hydrogens with their bonds, whether or not the node ends up
 /// with bonds of its own (which would leave its hydrogens out).
-fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut usize) {
+pub(crate) fn count_structures(obj: &CdxObject, atoms: &mut usize, bonds: &mut usize) {
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => {
@@ -709,7 +767,31 @@ fn read_container(obj: &CdxObject, mol: &mut Molecule, others: &mut usize) {
 /// The structures of a CDX document (empty when it has none), or `None` when the bytes are
 /// not CDX, or its structures are larger than [`MAX_READ_ATOMS`] / [`MAX_READ_BONDS`] allow.
 pub fn read_cdx(bytes: &[u8]) -> Option<CdxImport> {
-    let doc = cdx_codec::parse(bytes).filter(|d| d.tag == OBJ_DOCUMENT)?;
+    read_document(&cdx_codec::parse(bytes)?)
+}
+
+/// The structures of a CDXML document, read as [`read_cdx`] reads CDX: both are the same
+/// object tree, written as XML. `None` when the text is not CDXML, or its structures are too
+/// large.
+pub fn read_cdxml(xml: &str) -> Option<CdxImport> {
+    read_document(&cdxml_document(xml)?)
+}
+
+/// A CDXML document as the object tree a CDX file holds.
+pub fn cdxml_document(xml: &str) -> Option<CdxObject> {
+    cdx_file_rs::cdxml::parse_cdxml(xml).ok().map(CdxObject::from)
+}
+
+/// A CDX object tree written as CDXML.
+pub fn cdxml_of_document(doc: &CdxObject) -> String {
+    cdx_file_rs::cdxml::write_cdxml(&doc.clone().into())
+}
+
+/// The structures of a document object tree; see [`read_cdx`].
+fn read_document(doc: &CdxObject) -> Option<CdxImport> {
+    if doc.tag != OBJ_DOCUMENT {
+        return None;
+    }
     let pages = || doc.children.iter().filter(|c| c.tag == OBJ_PAGE);
     let (mut atoms, mut bonds) = (0, 0);
     for page in pages() {
@@ -941,6 +1023,64 @@ mod tests {
         set_element(&mut doc);
         let back = cdx_bytes_to_molecule(&cdx_codec::write(&doc)).expect("reads");
         assert_eq!(elements_of(&back), ["Ac"]);
+    }
+
+    /// A chain of carbons `C0–C1–…`, bond k from Ck to Ck+1 with the given order and stereo.
+    fn chain_of(bonds: &[(BondOrder, BondStereo, DoublePosition)]) -> Molecule {
+        let mut mol = Molecule::default();
+        let atoms: Vec<u32> = (0..=bonds.len())
+            .map(|k| mol.add_atom("C".to_string(), [k as f32 * 1.5, (k % 2) as f32], 0))
+            .collect();
+        for (k, (order, stereo, position)) in bonds.iter().enumerate() {
+            let id = mol.add_bond(atoms[k], atoms[k + 1], order.clone());
+            let bond = mol.bond_by_id_mut(id).unwrap();
+            bond.stereo = stereo.clone();
+            bond.double_position = *position;
+        }
+        mol
+    }
+
+    /// The bond styles of the bond context menu that the first CDX writer had no value for —
+    /// quadruple, plain hashed, hollow wedge, dative — and a chosen double-bond side all
+    /// survive a write and read, with each bond's direction kept.
+    #[test]
+    fn round_trips_the_bond_menus_orders_styles_and_double_positions() {
+        use DoublePosition::*;
+        let bonds = [
+            (BondOrder::Quadruple, BondStereo::None, Auto),
+            (BondOrder::Single, BondStereo::Hashed, Auto),
+            (BondOrder::Single, BondStereo::HollowWedge, Auto),
+            (BondOrder::Single, BondStereo::Dative, Auto),
+            (BondOrder::Double, BondStereo::None, Left),
+            (BondOrder::Double, BondStereo::None, Right),
+            (BondOrder::Double, BondStereo::None, Center),
+            (BondOrder::Double, BondStereo::None, Auto),
+        ];
+        let mol = chain_of(&bonds);
+        let back = cdx_bytes_to_molecule(&molecule_to_cdx_document(&mol)).expect("reads back");
+        assert_eq!(back.bonds.len(), bonds.len());
+        for (k, (bond, (order, stereo, position))) in back.bonds.iter().zip(&bonds).enumerate() {
+            assert_eq!((&bond.order, &bond.stereo, bond.double_position), (order, stereo, *position), "bond {k}");
+            assert_eq!((bond.begin, bond.end), (back.atoms[k].id, back.atoms[k + 1].id), "bond {k} keeps its direction");
+        }
+    }
+
+    /// ChemDraw's "…End" hollow wedge has its narrow end at the bond's end atom: read turned around.
+    #[test]
+    fn a_hollow_wedge_drawn_from_the_end_is_read_from_its_narrow_end() {
+        let mol = chain_of(&[(BondOrder::Single, BondStereo::HollowWedge, DoublePosition::Auto)]);
+        let mut doc = cdx_codec::parse(&molecule_to_cdx_document(&mol)).unwrap();
+        fn flip(obj: &mut CdxObject) {
+            if obj.tag == OBJ_BOND {
+                obj.set(PROP_BOND_DISPLAY, 10i16.to_le_bytes().to_vec());
+            }
+            obj.children.iter_mut().for_each(flip);
+        }
+        flip(&mut doc);
+        let back = cdx_bytes_to_molecule(&cdx_codec::write(&doc)).unwrap();
+        let bond = &back.bonds[0];
+        assert_eq!(bond.stereo, BondStereo::HollowWedge);
+        assert_eq!((bond.begin, bond.end), (back.atoms[1].id, back.atoms[0].id));
     }
 
     #[test]
@@ -1203,15 +1343,13 @@ mod tests {
         bytes
     }
 
-    /// Both writers write [`writer_fixture`] byte for byte as they did when the golden files were
+    /// The writer writes [`writer_fixture`] byte for byte as they did when the golden files were
     /// saved (before the writers looked atoms up from an index), so a change to how they find
     /// their way around the molecule changes nothing they write.
     #[test]
     fn writers_keep_their_output() {
         let m = writer_fixture();
         assert_eq!(cdx_without_version(&m), include_bytes!("../../tests/fixtures/writer_golden.cdx"));
-        let golden = include_str!("../../tests/fixtures/writer_golden.cdxml").replace("\r\n", "\n");
-        assert_eq!(super::super::cdxml::to_cdxml(&m), golden);
     }
 
     /// A zigzag chain of `n` atoms, every tenth an NH whose hydrogen is folded into its label.
@@ -1245,9 +1383,109 @@ mod tests {
             let cdx = molecule_to_cdx_document(&m);
             let t_cdx = t.elapsed();
             let t = std::time::Instant::now();
-            let xml = super::super::cdxml::to_cdxml(&m);
+            let xml = molecule_to_cdxml(&m);
             let t_xml = t.elapsed();
             println!("{n:>7} atoms: cdx {t_cdx:?} ({} bytes), cdxml {t_xml:?} ({} bytes)", cdx.len(), xml.len());
         }
+    }
+
+    // ── CDXML: the same document, written as XML ────────────────────────────
+
+    fn count(hay: &str, needle: &str) -> usize {
+        hay.matches(needle).count()
+    }
+
+    /// A CDXML document reads back to the molecule the CDX one does.
+    fn assert_cdxml_reads_like_cdx(m: &Molecule) -> String {
+        let xml = molecule_to_cdxml(m);
+        let from_xml = read_cdxml(&xml).expect("CDXML reads").molecule;
+        let from_cdx = read_cdx(&molecule_to_cdx_document(m)).expect("CDX reads").molecule;
+        assert_eq!(from_xml, from_cdx, "{xml}");
+        let read = cdx_file_rs::cdxml::parse_cdxml_with_warnings(&xml).unwrap();
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        xml
+    }
+
+    #[test]
+    fn cdxml_is_the_cdx_document_written_as_xml() {
+        let xml = assert_cdxml_reads_like_cdx(&writer_fixture());
+        assert!(xml.starts_with("<?xml ") && xml.contains("<!DOCTYPE CDXML"));
+        // ChemDraw's own style: 14.4 pt, as ChemDraw stores it.
+        assert!(xml.contains("BondLength=\"14.399994\""), "{xml}");
+        assert!(xml.contains("<font id=\"3\" charset=\"iso-8859-1\" name=\"Arial\"/>"), "{xml}");
+    }
+
+    #[test]
+    fn cdxml_names_elements_charges_and_bond_styles() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let o = mol.add_atom("O".to_string(), [1.5, 0.0], -1);
+        let n = mol.add_atom("N".to_string(), [0.0, 1.5], 0);
+        let up = mol.add_bond(c, o, BondOrder::Single);
+        mol.bond_by_id_mut(up).unwrap().stereo = BondStereo::WedgeUp;
+        let down = mol.add_bond(c, n, BondOrder::Single);
+        mol.bond_by_id_mut(down).unwrap().stereo = BondStereo::WedgeDown;
+        let xml = assert_cdxml_reads_like_cdx(&mol);
+        assert_eq!(count(&xml, "Element="), 2, "carbon is the default node: {xml}");
+        assert!(xml.contains("Element=\"8\"") && xml.contains("Element=\"7\""), "{xml}");
+        assert!(xml.contains("Charge=\"-1\""), "{xml}");
+        assert!(xml.contains("Display=\"WedgeBegin\"") && xml.contains("Display=\"WedgedHashBegin\""), "{xml}");
+    }
+
+    #[test]
+    fn cdxml_keeps_the_bond_menus_orders_styles_and_double_positions() {
+        let mut mol = Molecule::default();
+        let atoms: Vec<u32> = (0..6).map(|k| mol.add_atom("C".to_string(), [k as f32, 0.0], 0)).collect();
+        let mut bond = |k: usize, order: BondOrder, stereo: BondStereo, position: DoublePosition| {
+            let id = mol.add_bond(atoms[k], atoms[k + 1], order);
+            let b = mol.bond_by_id_mut(id).unwrap();
+            b.stereo = stereo;
+            b.double_position = position;
+        };
+        bond(0, BondOrder::Quadruple, BondStereo::None, DoublePosition::Auto);
+        bond(1, BondOrder::Single, BondStereo::Hashed, DoublePosition::Auto);
+        bond(2, BondOrder::Single, BondStereo::HollowWedge, DoublePosition::Auto);
+        bond(3, BondOrder::Single, BondStereo::Dative, DoublePosition::Auto);
+        bond(4, BondOrder::Double, BondStereo::None, DoublePosition::Left);
+        let xml = assert_cdxml_reads_like_cdx(&mol);
+        assert_eq!(count(&xml, "Order=\"4\""), 1, "{xml}");
+        assert_eq!(count(&xml, "Display=\"Hash\""), 1, "{xml}");
+        assert_eq!(count(&xml, "Display=\"HollowWedgeBegin\""), 1, "{xml}");
+        assert_eq!(count(&xml, "Order=\"dative\""), 1, "{xml}");
+        assert_eq!(count(&xml, "DoublePosition=\"Left\""), 1, "{xml}");
+        assert!(!xml.contains("Display2"), "the double bond's side is its own property: {xml}");
+        // And back: the side the user chose survives CDX.
+        let read = read_cdx(&molecule_to_cdx_document(&mol)).unwrap().molecule;
+        assert!(read.bonds.iter().any(|b| b.double_position == DoublePosition::Left));
+    }
+
+    #[test]
+    fn cdxml_labels_are_unspecified_nodes_with_their_text() {
+        let mut mol = Molecule::default();
+        let c = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let ester = mol.add_atom("CO_2Et".to_string(), [0.0, -1.5], 0);
+        let odd = mol.add_atom("R&D<1>".to_string(), [1.5, 0.0], 0);
+        mol.add_bond(c, ester, BondOrder::Single);
+        mol.add_bond(c, odd, BondOrder::Single);
+        let xml = assert_cdxml_reads_like_cdx(&mol);
+        assert_eq!(count(&xml, "NodeType=\"Unspecified\""), 2, "{xml}");
+        assert!(xml.contains(">CO</s><s font=\"3\" size=\"10\" face=\"32\" color=\"0\">2</s>"), "{xml}");
+        assert!(xml.contains("R&amp;D&lt;1&gt;") && !xml.contains("R&D"), "{xml}");
+    }
+
+    #[test]
+    fn cdxml_folds_group_hydrogens_into_the_label() {
+        // H2N–CH3, with one hydrogen of the NH2 an atom brought in by the group.
+        let mut mol = Molecule::default();
+        let n = mol.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let c = mol.add_atom("C".to_string(), [1.3, 0.75], 0);
+        mol.add_bond(n, c, BondOrder::Single);
+        let h = mol.add_atom("H".to_string(), [-1.0, 0.5], 0);
+        mol.atom_by_id_mut(h).unwrap().group_h = true;
+        mol.add_bond(n, h, BondOrder::Single);
+        let xml = molecule_to_cdxml(&mol);
+        assert_eq!(count(&xml, "<n "), 2, "the group's hydrogen is not a node: {xml}");
+        assert_eq!(count(&xml, "<b "), 1, "nor is its bond: {xml}");
+        assert!(xml.contains("NumHydrogens=\"2\"") && xml.contains("LabelAlignment=\"Right\""), "{xml}");
     }
 }

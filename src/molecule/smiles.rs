@@ -218,6 +218,7 @@ fn bond_symbol(order: u8) -> &'static str {
     match order {
         2 => "=",
         3 => "#",
+        4 => "$",
         _ => "",
     }
 }
@@ -227,6 +228,7 @@ fn order_code(o: &BondOrder) -> u8 {
         BondOrder::Single => 1,
         BondOrder::Double => 2,
         BondOrder::Triple => 3,
+        BondOrder::Quadruple => 4,
     }
 }
 

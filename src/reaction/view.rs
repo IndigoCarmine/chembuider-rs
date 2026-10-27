@@ -22,10 +22,11 @@
 use egui::{Color32, Painter, Pos2, Rect, Sense, Vec2};
 
 use crate::config::StyleConfig;
+use crate::molecule::cdx_codec::CdxObject;
 use crate::widget::ChemStructEditor;
 
 use super::model::Reaction;
-use super::scheme::{SchemeLayout, measure_scheme, paint_scheme};
+use super::scheme::{ReactionScheme, SchemeLayout, measure_scheme, paint_scheme};
 use super::style::ReactionStyle;
 use super::table::{AnalysisTable, TableLayout, measure_table, paint_table};
 
@@ -87,7 +88,12 @@ impl ReactionView {
             &self.structure_style,
             &mut self.scratch,
         );
-        let table = AnalysisTable::from_result(&reaction.analysis.compute());
+        // A multi-step scheme is a drawing only: its table would describe one step of several.
+        let table = if reaction.is_multi_step() {
+            AnalysisTable::default()
+        } else {
+            AnalysisTable::from_result(&reaction.analysis.compute())
+        };
         let table_layout = measure_table(&table, painter, &self.style);
 
         let m = self.style.margin;
@@ -149,6 +155,23 @@ impl ReactionView {
             top_left + layout.table_offset,
             &self.style,
         );
+    }
+
+    /// The figure's scheme as a ChemDraw document, laid out in ChemDraw's units with this
+    /// view's style (see [`cdxml`](super::cdxml)). Write it with [`ReactionView::scheme_cdxml`]
+    /// or [`ReactionView::scheme_cdx`]; the table is not part of it.
+    pub fn scheme_document(&mut self, painter: &Painter, scheme: &ReactionScheme) -> CdxObject {
+        super::cdxml::scheme_document(scheme, painter, &self.style, &self.structure_style, &mut self.scratch)
+    }
+
+    /// The figure's scheme as CDXML text.
+    pub fn scheme_cdxml(&mut self, painter: &Painter, scheme: &ReactionScheme) -> String {
+        crate::molecule::cdx::cdxml_of_document(&self.scheme_document(painter, scheme))
+    }
+
+    /// The figure's scheme as a binary CDX file.
+    pub fn scheme_cdx(&mut self, painter: &Painter, scheme: &ReactionScheme) -> Vec<u8> {
+        crate::molecule::cdx_codec::write(&self.scheme_document(painter, scheme))
     }
 
     /// Measure and paint in one call; returns the rect the figure occupies.
@@ -321,8 +344,12 @@ mod tests {
         ];
         for item in &layout.scheme.items {
             let kind = match &item.kind {
-                PlacedKind::Structure { origin } => format!("structure origin={}", fp_vec(*origin)),
+                PlacedKind::Structure { origin, label: None } => format!("structure origin={}", fp_vec(*origin)),
+                PlacedKind::Structure { origin, label: Some(l) } => {
+                    format!("structure origin={} label={}", fp_vec(*origin), fp_rect(l.rect))
+                }
                 PlacedKind::Text(t) => format!("text size={}", fp_vec(t.size)),
+                PlacedKind::LineBreak => "line break".to_string(),
                 PlacedKind::Arrow { length, above, below } => format!(
                     "arrow length={} above=[{}] below=[{}]",
                     fp_num(*length),

@@ -7,6 +7,9 @@
 //! Everything in the table is derived from the drawn structures. `Formula` and `MW` come
 //! from counting the atoms the renderer displays (implicit hydrogens included, see
 //! [`formula`]), and the amounts fall out of the limiting reagent (see [`stoich`]).
+//! The per-structure "Analysis" values — exact mass, isotope pattern (m/z) and elemental
+//! analysis — are in [`properties`] ([`FormulaAnalysis`]), with the ESI ion to show the m/z
+//! for (`[M+H]+`, `[M+Na]+`, `[M-H]-`, …) chosen in [`ion`].
 //!
 //! A figure can be built from code, as below, or edited from the UI with
 //! [`ReactionEditor`] — the same figure, with the entered cells and the arrow labels
@@ -37,10 +40,14 @@
 //!
 //! See `examples/reaction_scheme.rs` for a complete host application.
 
+pub mod cdxml;
 pub mod demo;
 pub mod edit;
 pub mod formula;
+pub mod ion;
+pub mod isotopes;
 pub mod model;
+pub mod properties;
 pub mod scheme;
 pub mod stoich;
 pub mod style;
@@ -56,7 +63,12 @@ pub use edit::{
     set_scheme_arrow_structure, swap_line_structure_with_arrow_slot, take_scheme_arrow_structure,
 };
 pub use formula::{MolecularFormula, atomic_weight, formula_of, molecular_weight};
-pub use model::{Analysis, Mass, Product, Reactant, Reaction, StructureRole};
+pub use ion::{Adduct, ELECTRON_MASS, Ion, IonError};
+pub use isotopes::isotopes;
+pub use model::{
+    Analysis, FILE_FORMAT, FILE_VERSION, Mass, Product, Reactant, Reaction, StructureRole,
+};
+pub use properties::{FormulaAnalysis, IsotopePeak, REPORT_MIN_RELATIVE};
 pub use scheme::{
     Arrow, ArrowLabel, ReactionScheme, SchemeItem, SchemeLayout, SchemeStructure, StructureId,
 };

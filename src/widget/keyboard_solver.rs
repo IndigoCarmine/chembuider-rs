@@ -144,6 +144,7 @@ fn order_code(o: &BondOrder) -> u8 {
         BondOrder::Single => 1,
         BondOrder::Double => 2,
         BondOrder::Triple => 3,
+        BondOrder::Quadruple => 4,
     }
 }
 

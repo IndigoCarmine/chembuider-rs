@@ -1,3 +1,5 @@
+pub mod analysis;
+pub mod bond_menu;
 pub mod draw;
 pub mod interact;
 #[cfg(test)]
@@ -13,7 +15,7 @@ pub mod view;
 pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
-use crate::molecule::{BondOrder, BondStereo, Molecule};
+use crate::molecule::{BondOrder, BondStereo, DoublePosition, Molecule};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
@@ -42,6 +44,8 @@ struct ClipBond {
     order: BondOrder,
     #[serde(default)]
     stereo: BondStereo,
+    #[serde(default)]
+    double_position: DoublePosition,
 }
 
 /// A ring fill on the clipboard: atom *indices* (positions within `ClipMol::atoms`, not ids,
@@ -167,6 +171,17 @@ pub struct ChemStructEditor {
 
     /// Set by [`request_fit`](Self::request_fit); the next `ui()` fits the view and clears it.
     fit_requested: bool,
+
+    /// The bond under the pointer when the canvas was last right-clicked: what the host's
+    /// context menu acts on. Kept until [`clear_context_bond`](Self::clear_context_bond).
+    context_bond: Option<u32>,
+}
+
+/// What [`ChemStructEditor::show`] hands back: the canvas response, for a host to attach a
+/// [`context_menu`](egui::Response::context_menu) to, and whether the molecule was modified.
+pub struct EditorResponse {
+    pub response: egui::Response,
+    pub modified: bool,
 }
 
 impl Default for ChemStructEditor {
@@ -202,6 +217,7 @@ impl Default for ChemStructEditor {
             rotate_last_angle: None,
             last_label_rects: std::collections::HashMap::new(),
             fit_requested: false,
+            context_bond: None,
         }
     }
 }
@@ -218,6 +234,70 @@ impl ChemStructEditor {
             self.undo_stack.push_back(self.molecule.clone());
             self.redo_stack.clear();
         }
+    }
+
+    /// The bond the canvas was right-clicked on, for the host's context menu. The pointer is
+    /// over the menu while it is open, so the hover cannot say this; read it inside the
+    /// [`context_menu`](egui::Response::context_menu) closure of [`show`](Self::show)'s response.
+    pub fn context_bond(&self) -> Option<u32> {
+        self.context_bond
+    }
+
+    /// Forget the context-menu bond (once the menu has closed).
+    pub fn clear_context_bond(&mut self) {
+        self.context_bond = None;
+    }
+
+    /// Give bond `bond_id` an order and line style in one undo step — what a ChemDraw-style
+    /// bond menu's "Single ▸ Hashed Wedged" or "Double" does. Raising the order consumes the
+    /// group hydrogens it leaves no room for, as the order keys do. A style is drawn only on a
+    /// single bond, so it is dropped for any higher order. Returns false when the bond does
+    /// not exist or already looks like this.
+    pub fn set_bond_type(&mut self, bond_id: u32, order: BondOrder, stereo: BondStereo) -> bool {
+        let stereo = if order == BondOrder::Single { stereo } else { BondStereo::None };
+        let Some(bond) = self.molecule.bond_by_id(bond_id) else { return false };
+        if bond.order == order && bond.stereo == stereo {
+            return false;
+        }
+        self.push_undo();
+        let Some(bond) = self.molecule.bond_by_id_mut(bond_id) else { return false };
+        let grew = order.valence() > bond.order.valence();
+        bond.order = order;
+        bond.stereo = stereo;
+        let (begin, end) = (bond.begin, bond.end);
+        if grew {
+            interact::consume_group_h(self, &[begin, end]);
+        }
+        true
+    }
+
+    /// Choose which side of bond `bond_id` its double-bond line goes on ([`DoublePosition`]).
+    /// One undo step; false when the bond does not exist or already has this position.
+    pub fn set_bond_double_position(&mut self, bond_id: u32, position: DoublePosition) -> bool {
+        match self.molecule.bond_by_id(bond_id) {
+            Some(bond) if bond.double_position != position => {}
+            _ => return false,
+        }
+        self.push_undo();
+        if let Some(bond) = self.molecule.bond_by_id_mut(bond_id) {
+            bond.double_position = position;
+        }
+        true
+    }
+
+    /// Delete bond `bond_id` (its atoms stay). One undo step; false when there is no such bond.
+    pub fn delete_bond(&mut self, bond_id: u32) -> bool {
+        if self.molecule.bond_by_id(bond_id).is_none() {
+            return false;
+        }
+        self.push_undo();
+        self.molecule.remove_bond(bond_id);
+        for slot in [&mut self.hovered_bond, &mut self.hotspot_bond, &mut self.context_bond] {
+            if *slot == Some(bond_id) {
+                *slot = None;
+            }
+        }
+        true
     }
 
     /// Fill the smallest ring passing through `atom_id` with `color` (straight RGBA), drawn
@@ -238,8 +318,9 @@ impl ChemStructEditor {
     ///
     /// A selection of two or more atoms *is* the ring the user means, so it wins over the
     /// hotspot (which only follows the cursor and, on a fused ring, may sit on the wrong cycle):
-    /// the ring confined to the selected atoms is filled — the four-membered ring for the four
-    /// atoms of a square fused onto benzene, the hexagon for benzene's six. When the selection
+    /// every ring confined to the selected atoms is filled — the four-membered ring for the four
+    /// atoms of a square fused onto benzene, the hexagon for benzene's six, both for a selection
+    /// spanning several rings — under a single undo step. When the selection
     /// encloses no ring of its own we fall back to a single seed, still preferring an explicit
     /// selection over the hotspot; a lone selected atom or a bare hotspot keeps the old
     /// smallest-ring-through-the-seed behavior. Returns false when nothing is selected/hovered
@@ -247,9 +328,12 @@ impl ChemStructEditor {
     pub fn fill_selected_ring(&mut self, color: [u8; 4]) -> bool {
         if self.selected_atoms.len() >= 2 {
             let sel: Vec<u32> = self.selected_atoms.iter().copied().collect();
-            if let Some(ring) = self.molecule.ring_from_atoms(&sel) {
+            let rings = self.molecule.rings_from_atoms(&sel);
+            if !rings.is_empty() {
                 self.push_undo();
-                self.molecule.set_ring_fill(ring, color);
+                for ring in rings {
+                    self.molecule.set_ring_fill(ring, color);
+                }
                 return true;
             }
         }
@@ -360,6 +444,7 @@ impl ChemStructEditor {
                 end: *index.get(&b.end)?,
                 order: b.order.clone(),
                 stereo: b.stereo.clone(),
+                double_position: b.double_position,
             })
         }).collect();
 
@@ -436,6 +521,7 @@ impl ChemStructEditor {
                 if bid != 0 {
                     if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
                         bond.stereo = b.stereo.clone();
+                        bond.double_position = b.double_position;
                     }
                 }
             }
@@ -480,6 +566,7 @@ impl ChemStructEditor {
                 if bid != 0 {
                     if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
                         bond.stereo = b.stereo.clone();
+                        bond.double_position = b.double_position;
                     }
                 }
             }
@@ -956,7 +1043,15 @@ impl ChemStructEditor {
     }
 
     /// Main entry point called from the app each frame. Returns true if molecule was modified.
+    ///
+    /// A host that wants the canvas [`Response`](egui::Response) — to attach a context menu,
+    /// say — calls [`show`](Self::show) instead.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+        self.show(ui).modified
+    }
+
+    /// [`ui`](Self::ui), also returning the canvas response.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> EditorResponse {
         let (rect, response) = ui.allocate_exact_size(
             ui.available_size(),
             egui::Sense::click_and_drag(),
@@ -1011,6 +1106,17 @@ impl ChemStructEditor {
             if !self.molecule.bonds.iter().any(|b| b.id == bid) {
                 self.hotspot_bond = None;
             }
+        }
+        if let Some(bid) = self.context_bond {
+            if !self.molecule.bonds.iter().any(|b| b.id == bid) {
+                self.context_bond = None;
+            }
+        }
+
+        // A right-click remembers the bond under the pointer (or none) for the host's context
+        // menu: once the menu opens the pointer is over it, and the hover is gone.
+        if response.secondary_clicked() {
+            self.context_bond = self.hovered_bond;
         }
 
         // Zoom via scroll wheel. `smooth_scroll_delta` is egui's *smoothed* delta — one wheel
@@ -1212,7 +1318,7 @@ impl ChemStructEditor {
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
         draw::draw_overlays(self, &painter, center);
 
-        modified
+        EditorResponse { response, modified }
     }
 }
 
@@ -1381,6 +1487,81 @@ mod clipboard_tests {
             b.iter().copied().collect(),
             "the six selected atoms — benzene — are filled, not the square"
         );
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_every_ring_of_a_fused_selection() {
+        // Bug repro: selecting both fused rings whole must fill both, not just the smaller one.
+        let (mut e, b, s0, s1) = fused_benzene_and_square();
+        e.selected_atoms = b.iter().copied().chain([s0, s1]).collect();
+
+        assert!(e.fill_selected_ring([255, 0, 0, 255]));
+        let mut sizes: Vec<usize> = e.molecule.ring_fills.iter().map(|rf| rf.atoms.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![4, 6], "square and hexagon filled, no envelope ring");
+        // One undo step reverts all of them.
+        assert!(e.undo());
+        assert!(e.molecule.ring_fills.is_empty());
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_separate_selected_rings() {
+        // Two disconnected hexagons selected together: both are filled.
+        use std::f32::consts::TAU;
+        let mut e = ChemStructEditor::default();
+        for cx in [0.0f32, 5.0] {
+            let ids: Vec<u32> = (0..6)
+                .map(|k| {
+                    let a = (k as f32) * TAU / 6.0;
+                    e.molecule.add_atom("C".to_string(), [cx + a.cos(), a.sin()], 0)
+                })
+                .collect();
+            for k in 0..6 {
+                e.molecule.add_bond(ids[k], ids[(k + 1) % 6], BondOrder::Single);
+            }
+            e.selected_atoms.extend(ids);
+        }
+        assert!(e.fill_selected_ring([0, 0, 255, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 2);
+    }
+
+    #[test]
+    fn fill_selected_ring_fills_a_ring_whose_atoms_are_all_shared() {
+        // Triphenylene-like: a central hexagon c0..c5 with a hexagon fused on c0—c1, c2—c3 and
+        // c4—c5. Every central atom also lies on an outer ring, yet the central ring is filled.
+        use std::f32::consts::TAU;
+        let mut e = ChemStructEditor::default();
+        let c: Vec<u32> = (0..6)
+            .map(|k| {
+                let a = (k as f32) * TAU / 6.0;
+                e.molecule.add_atom("C".to_string(), [a.cos(), a.sin()], 0)
+            })
+            .collect();
+        for k in 0..6 {
+            e.molecule.add_bond(c[k], c[(k + 1) % 6], BondOrder::Single);
+        }
+        let mut all = c.clone();
+        for k in [0usize, 2, 4] {
+            // Outer ring: c[k]—o0—o1—o2—o3—c[k+1].
+            let o: Vec<u32> = (0..4)
+                .map(|j| e.molecule.add_atom("C".to_string(), [10.0 + k as f32, j as f32], 0))
+                .collect();
+            e.molecule.add_bond(c[k], o[0], BondOrder::Single);
+            for j in 0..3 {
+                e.molecule.add_bond(o[j], o[j + 1], BondOrder::Single);
+            }
+            e.molecule.add_bond(o[3], c[k + 1], BondOrder::Single);
+            all.extend(o);
+        }
+        e.selected_atoms = all.into_iter().collect();
+        assert!(e.fill_selected_ring([0, 200, 0, 255]));
+        assert_eq!(e.molecule.ring_fills.len(), 4, "three outer rings plus the central one");
+        let central: std::collections::HashSet<u32> = c.iter().copied().collect();
+        assert!(e
+            .molecule
+            .ring_fills
+            .iter()
+            .any(|rf| rf.atoms.iter().copied().collect::<std::collections::HashSet<_>>() == central));
     }
 
     #[test]

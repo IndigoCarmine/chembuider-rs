@@ -323,7 +323,7 @@ const HOVERED_BOND: &str = r#"
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 line (407.500,390.000) (520.000,446.250) stroke=2.250/#32b432ff
-line (429.071,389.046) (507.821,428.421) stroke=2.250/#32b432ff
+line (412.196,380.609) (507.821,428.421) stroke=2.250/#32b432ff
 line (520.000,446.250) (610.263,401.119) stroke=2.250/#000000ff
 rect (611.763,362.500)-(653.638,417.500) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "Cl" at=(613.263,364.000) sections=["Cl":#000000ff@45.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000

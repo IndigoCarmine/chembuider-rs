@@ -4,7 +4,7 @@
 use super::content;
 use super::message::{EditorMsg, HostMsg};
 use super::session::{Receiver, Sender};
-use crate::molecule::{cdx, cdxml, mol2};
+use crate::molecule::{cdx, mol2};
 use crate::Molecule;
 
 /// The answer to one request.
@@ -39,7 +39,7 @@ fn reply(request: HostMsg) -> EditorMsg {
             };
             let data = match extension.to_ascii_lowercase().as_str() {
                 "cdx" => content.stream(content::CONTENTS).unwrap_or_default().to_vec(),
-                "cdxml" => cdxml::to_cdxml(&import.molecule).into_bytes(),
+                "cdxml" => cdx::molecule_to_cdxml(&import.molecule).into_bytes(),
                 "mol2" => mol2::to_mol2_string(&import.molecule).into_bytes(),
                 other => return error(format!("ChemBuilder cannot write .{other} files")),
             };
