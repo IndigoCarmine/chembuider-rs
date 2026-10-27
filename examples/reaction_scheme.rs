@@ -203,6 +203,14 @@ impl eframe::App for ReactionApp {
                 // figure is drawn, so the table below re-derives live as the structure changes.
                 self.sync_linked_structure();
                 let response = self.editor.show(ui, &mut self.reaction);
+                // A drag on the figure moved structures to other positions. The link names its
+                // slot by position, so it may now point at a different structure — drop it
+                // before the next frame's sync writes the canvas over that one (as `apply` does
+                // for the inspector's reorders).
+                if self.editor.take_scheme_rearranged() && self.linked_structure.take().is_some() {
+                    self.status =
+                        "The figure was rearranged — the canvas is no longer linked.".to_string();
+                }
                 // Right-click a scheme item for the same actions the inspector offers, so the
                 // figure is fully operable on its own — no side panel required (課題D).
                 self.scheme_context_menu(response);
