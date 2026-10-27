@@ -1421,10 +1421,12 @@ mod tests {
     enum Rescue {
         /// Phase 1 left no crossed ring, so `apply_ring_fix` was never called.
         NotNeeded,
-        /// At least one rescue pass reduced the crossing count and was kept.
-        Accepted,
         /// The first rescue pass did not help and was rolled back to the phase-1 result.
         Rejected,
+        /// The first pass reduced the crossing count and was kept; nothing further was kept.
+        KeptOnePass,
+        /// The repeat loop kept a second (or later) pass as well.
+        KeptSeveralPasses,
     }
 
     struct Fixture {
@@ -1502,7 +1504,7 @@ mod tests {
         let methyl = toluene.add_atom("C".to_string(), [0.3, 2.0], 0);
         toluene.add_bond(ring[0], methyl, BondOrder::Single);
 
-        let mut random = random_trials(&[1, 2, 5, 22, 42]).into_iter();
+        let mut random = random_trials(&[1, 2, 5, 10, 22, 42]).into_iter();
         let mut next = || random.next().unwrap();
 
         vec![
@@ -1510,14 +1512,13 @@ mod tests {
             Fixture { name: "single_atom", mol: single, rescue: Rescue::NotNeeded, fingerprint: 0x5f24_2d39_c242_2be4 },
             Fixture { name: "propyne_bent", mol: propyne, rescue: Rescue::NotNeeded, fingerprint: 0x0dcf_aa10_fc30_b7e9 },
             Fixture { name: "toluene_distorted", mol: toluene, rescue: Rescue::NotNeeded, fingerprint: 0x1d45_d142_bb29_38ca },
-            // Random trials: 1 = rings without crossings, 2 = acyclic chain, 5 = three crossed
-            // rings all untangled, 22 = rescue rolled back, 42 = rescue kept but one ring
-            // stays crossed (so the repeat loop runs into a rejected pass).
+            // Random trials, chosen to cover every route through phase 2 (see `Rescue`).
             Fixture { name: "random_trial_01", mol: next(), rescue: Rescue::NotNeeded, fingerprint: 0x7c68_05f3_d142_0581 },
             Fixture { name: "random_trial_02", mol: next(), rescue: Rescue::NotNeeded, fingerprint: 0xf609_5d14_1c2e_9375 },
-            Fixture { name: "random_trial_05", mol: next(), rescue: Rescue::Accepted, fingerprint: 0xa05e_aa4f_57dd_f0dd },
+            Fixture { name: "random_trial_05", mol: next(), rescue: Rescue::KeptOnePass, fingerprint: 0xa05e_aa4f_57dd_f0dd },
+            Fixture { name: "random_trial_10", mol: next(), rescue: Rescue::KeptSeveralPasses, fingerprint: 0xf461_4345_0557_b563 },
             Fixture { name: "random_trial_22", mol: next(), rescue: Rescue::Rejected, fingerprint: 0x88b0_afef_6dfb_28b9 },
-            Fixture { name: "random_trial_42", mol: next(), rescue: Rescue::Accepted, fingerprint: 0x2f8b_bd1c_9ab9_256a },
+            Fixture { name: "random_trial_42", mol: next(), rescue: Rescue::KeptOnePass, fingerprint: 0x2f8b_bd1c_9ab9_256a },
         ]
     }
 
@@ -1533,14 +1534,52 @@ mod tests {
         positions
     }
 
+    /// Which route through phase 2 `cleanup_2d` took to produce `got`, found by replaying
+    /// phase 1 and a single rescue pass by hand and comparing.
+    fn observed_rescue(name: &str, mol: &Molecule, got: &[(u32, [u32; 2])], cleaned: &Molecule) -> Rescue {
+        if mol.atoms.is_empty() {
+            return Rescue::NotNeeded;
+        }
+        let mut st = CleanupState::new(mol);
+        st.step(JOB_PHASE_BUDGET);
+        let after_phase1 = position_bits(&st.positions());
+        let crossings_after_phase1 = st.ring_crossing_count();
+        if crossings_after_phase1 == 0 {
+            assert_eq!(got, after_phase1, "{name}: no crossed ring, yet the result is not phase 1's");
+            return Rescue::NotNeeded;
+        }
+        if got == after_phase1 {
+            return Rescue::Rejected;
+        }
+
+        st.apply_ring_fix();
+        st.step(JOB_PHASE_BUDGET);
+        let after_one_pass = position_bits(&st.positions());
+        let crossings_after_one_pass = st.ring_crossing_count();
+        assert!(
+            crossings_after_one_pass < crossings_after_phase1,
+            "{name}: a rescue pass was kept although it did not reduce crossings \
+             ({crossings_after_phase1} → {crossings_after_one_pass})"
+        );
+        let crossings_final = CleanupState::new(cleaned).ring_crossing_count();
+        if crossings_final < crossings_after_one_pass {
+            Rescue::KeptSeveralPasses
+        } else {
+            // Any later pass was rolled back, which restores the one-pass result exactly.
+            assert_eq!(got, after_one_pass, "{name}: later passes were rejected, yet the result moved");
+            Rescue::KeptOnePass
+        }
+    }
+
     /// `cleanup_2d` still produces exactly the recorded coordinates, and each fixture still
-    /// takes the recorded route through phase 2 — so the ring-rescue path is covered both
-    /// when it is kept and when it is rolled back.
+    /// takes the recorded route through phase 2 — so every branch of `ring_rescue` (skipped,
+    /// rolled back, one pass kept, repeated passes kept) is pinned.
     #[test]
     fn cleanup_2d_matches_recorded_coordinates() {
         let fixtures = characterization_fixtures();
-        assert!(fixtures.iter().any(|f| f.rescue == Rescue::Accepted));
-        assert!(fixtures.iter().any(|f| f.rescue == Rescue::Rejected));
+        for route in [Rescue::NotNeeded, Rescue::Rejected, Rescue::KeptOnePass, Rescue::KeptSeveralPasses] {
+            assert!(fixtures.iter().any(|f| f.rescue == route), "no fixture covers {route:?}");
+        }
 
         let mut mismatches = Vec::new();
         for fx in &fixtures {
@@ -1548,33 +1587,8 @@ mod tests {
             cleanup_2d(&mut mol);
             let got = coord_bits(&mol);
 
-            // Phase 1 on its own: the state `ring_rescue` starts from.
-            let (crossings_after_phase1, phase1) = if fx.mol.atoms.is_empty() {
-                (0, Vec::new())
-            } else {
-                let mut st = CleanupState::new(&fx.mol);
-                st.step(JOB_PHASE_BUDGET);
-                (st.ring_crossing_count(), position_bits(&st.positions()))
-            };
-            let rescue = if crossings_after_phase1 == 0 {
-                Rescue::NotNeeded
-            } else if got == phase1 {
-                Rescue::Rejected
-            } else {
-                Rescue::Accepted
-            };
+            let rescue = observed_rescue(fx.name, &fx.mol, &got, &mol);
             assert_eq!(rescue, fx.rescue, "{}: route through ring_rescue changed", fx.name);
-            if rescue == Rescue::NotNeeded {
-                assert_eq!(got, phase1, "{}: no rescue, yet the result is not phase 1's", fx.name);
-            }
-            if rescue == Rescue::Accepted {
-                let crossings_final = CleanupState::new(&mol).ring_crossing_count();
-                assert!(
-                    crossings_final < crossings_after_phase1,
-                    "{}: kept rescue did not reduce crossings ({crossings_after_phase1} → {crossings_final})",
-                    fx.name
-                );
-            }
 
             let fp = fingerprint(&got);
             if fp != fx.fingerprint {
