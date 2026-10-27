@@ -519,8 +519,8 @@ impl CleanupState {
     }
 
     /// Write the current relaxed positions back to the molecule.
-    /// Used by the synchronous `cleanup_2d` (tests / fragment-cleanup script); the interactive
-    /// path streams positions through `CleanupJob` instead.
+    /// Used by the synchronous `cleanup_2d`; the interactive path streams positions through
+    /// `CleanupJob` instead.
     #[allow(dead_code)]
     pub fn apply(&self, mol: &mut Molecule) {
         for (&id, &p) in &self.pos {
@@ -537,8 +537,9 @@ impl CleanupState {
 }
 
 // ─── One-shot synchronous entry point ────────────────────────────────────────
-// Blocking version, retained for tests and the fragment-cleanup script. The interactive
-// UI uses `CleanupJob` (background thread + cancel) instead so it never freezes.
+// Blocking version, for callers that need the result right away: the reaction-scheme
+// layout (`reaction::edit`), tests and the fragment-cleanup script. The interactive editor
+// uses `CleanupJob` (background thread + cancel) instead so it never freezes.
 
 pub fn cleanup_2d(mol: &mut Molecule) {
     let mut schedule = CleanupSchedule::new(mol);
@@ -547,18 +548,38 @@ pub fn cleanup_2d(mol: &mut Molecule) {
     schedule.apply(mol);
 }
 
-/// The two-phase cleanup — phase 1 relaxation, then the ring-crossing rescue of `ring_rescue`
-/// — as a resumable state machine, so a caller can run it to the end in one go, between
-/// cancel checks on a worker thread, or one chunk per UI frame where nothing may block.
+/// The two-phase cleanup as a resumable state machine, so a caller can run it to the end in
+/// one go, between cancel checks on a worker thread, or one chunk per UI frame where nothing
+/// may block.
+///
+/// Phase 1 relaxes the drawing.  Relaxation is local, so it happily settles into a minimum
+/// where a ring is drawn inside-out with its own bonds crossing; phase 2, the ring rescue, then
+/// runs `apply_ring_fix` (which permutes those ring atoms back into a valid angular order) and
+/// relaxes again from there.
+///
+/// A rescue pass is kept only when it strictly reduced the number of crossed rings, and passes
+/// repeat while they keep helping.  Both halves of that rule are needed to leave `cleanup_2d`
+/// idempotent — the property `convergence_50_random` checks by cleaning twice:
+///
+///   * Without the accept/reject, a molecule that simply cannot be drawn crossing-free (a
+///     random 19-atom graph with 9 extra bonds is essentially never planar) would re-trigger
+///     the permutation on every cleanup and shuffle its ring atoms somewhere new each time.
+///   * Without the repeat, a molecule the rescue can still improve would be improved a bit
+///     more on each successive cleanup, which moves atoms just the same.
+///
+/// Repeating terminates quickly: an accepted pass strictly lowers the crossing count, so there
+/// can be at most one accepted pass per ring, and the run ends on the first rejected pass.
 ///
 /// Each relaxation pass gets `JOB_PHASE_BUDGET` steps however it is chunked; `step` keeps all
 /// of its state between calls, so the coordinates do not depend on the chunk size.
 pub struct CleanupSchedule {
     state: CleanupState,
     stage: Stage,
+    /// Steps allowed per relaxation pass (`JOB_PHASE_BUDGET` outside tests).
+    pass_budget: usize,
     /// Steps run so far in the current relaxation pass.
     steps_in_pass: usize,
-    /// Rescue passes started so far (capped at `cycles.len().max(1)`, as in `ring_rescue`).
+    /// Rescue passes started so far (capped at `cycles.len().max(1)`).
     rescue_passes: usize,
     /// Positions to roll back to if the current rescue pass does not help, and the crossing
     /// count it has to beat.
@@ -575,9 +596,17 @@ enum Stage {
 
 impl CleanupSchedule {
     pub fn new(mol: &Molecule) -> Self {
+        Self::with_pass_budget(mol, JOB_PHASE_BUDGET)
+    }
+
+    /// `new` with another per-pass step budget, so tests can reach the end of a pass that ran
+    /// out of steps without spending `JOB_PHASE_BUDGET` of them.
+    fn with_pass_budget(mol: &Molecule, pass_budget: usize) -> Self {
+        debug_assert!(pass_budget > 0, "a zero pass budget would never finish a pass");
         CleanupSchedule {
             state: CleanupState::new(mol),
             stage: if mol.atoms.is_empty() { Stage::Done } else { Stage::Relax },
+            pass_budget,
             steps_in_pass: 0,
             rescue_passes: 0,
             rescue_snapshot: Vec::new(),
@@ -587,14 +616,17 @@ impl CleanupSchedule {
 
     /// Run at most `max_steps` relaxation steps (never past the end of the current pass) and
     /// take any phase transition that follows.  Returns `true` once the schedule is finished.
+    ///
+    /// `max_steps` must be positive: `advance(0)` runs no step and so never makes progress.
     pub fn advance(&mut self, max_steps: usize) -> bool {
+        debug_assert!(max_steps > 0, "advance(0) never makes progress");
         if self.stage == Stage::Done {
             return true;
         }
-        let chunk = max_steps.min(JOB_PHASE_BUDGET - self.steps_in_pass);
+        let chunk = max_steps.min(self.pass_budget - self.steps_in_pass);
         let converged = self.state.step(chunk);
         self.steps_in_pass += chunk;
-        if converged || self.steps_in_pass >= JOB_PHASE_BUDGET {
+        if converged || self.steps_in_pass >= self.pass_budget {
             self.finish_pass();
         }
         self.stage == Stage::Done
@@ -623,6 +655,16 @@ impl CleanupSchedule {
         self.stage = Stage::Rescue;
     }
 
+    /// Stop early.  Mid-rescue, roll back to the positions from before that rescue pass (an
+    /// unfinished pass is never kept); mid-relaxation, keep the atoms where they are now.
+    /// Does nothing once the schedule is finished.
+    pub fn cancel(&mut self) {
+        if self.stage == Stage::Rescue {
+            self.state.restore(&self.rescue_snapshot);
+        }
+        self.stage = Stage::Done;
+    }
+
     pub fn is_done(&self) -> bool {
         self.stage == Stage::Done
     }
@@ -635,40 +677,6 @@ impl CleanupSchedule {
     /// Write the current positions back to the molecule.
     pub fn apply(&self, mol: &mut Molecule) {
         self.state.apply(mol);
-    }
-}
-
-/// Phase 2, shared by every entry point.
-///
-/// Relaxation is local, so it happily settles into a minimum where a ring is drawn inside-out
-/// with its own bonds crossing.  `apply_ring_fix` permutes those ring atoms back into a valid
-/// angular order; `relax` then re-relaxes from there and returns false if it was cancelled.
-///
-/// A pass is kept only when it strictly reduced the number of crossed rings, and passes repeat
-/// while they keep helping.  Both halves of that rule are needed to leave `cleanup_2d`
-/// idempotent — the property `convergence_50_random` checks by cleaning twice:
-///
-///   * Without the accept/reject, a molecule that simply cannot be drawn crossing-free (a
-///     random 19-atom graph with 9 extra bonds is essentially never planar) would re-trigger
-///     the permutation on every cleanup and shuffle its ring atoms somewhere new each time.
-///   * Without the repeat, a molecule the rescue can still improve would be improved a bit
-///     more on each successive cleanup, which moves atoms just the same.
-///
-/// Repeating terminates quickly: an accepted pass strictly lowers the crossing count, so there
-/// can be at most one accepted pass per ring, and the run ends on the first rejected pass.
-fn ring_rescue(state: &mut CleanupState, mut relax: impl FnMut(&mut CleanupState) -> bool) {
-    for _ in 0..state.cycles.len().max(1) {
-        let before = state.ring_crossing_count();
-        if before == 0 {
-            return;
-        }
-        let snapshot = state.positions();
-        state.apply_ring_fix();
-        let completed = relax(state);
-        if !completed || state.ring_crossing_count() >= before {
-            state.restore(&snapshot);
-            return;
-        }
     }
 }
 
@@ -719,7 +727,9 @@ mod job_native {
         }
 
         pub fn is_done(&self) -> bool {
-            self.done.load(Ordering::Relaxed)
+            // Acquire pairs with the worker's Release store, so once this reads `true` the
+            // final positions it published are what `latest()` returns.
+            self.done.load(Ordering::Acquire)
         }
 
         /// Latest relaxed positions (for live preview each frame).
@@ -862,8 +872,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
-/// Worker body: mirrors `cleanup_2d`'s two-phase logic, but chunked so it can check the
-/// cancel flag and publish intermediate positions for a live preview.
+/// Worker body: the same `CleanupSchedule` as `cleanup_2d`, advanced `JOB_CHUNK` steps at a
+/// time so the worker can check the cancel flag and publish intermediate positions for the
+/// live preview in between.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_cleanup_job(
     mol: &Molecule,
@@ -871,46 +882,19 @@ fn run_cleanup_job(
     done: &AtomicBool,
     shared: &Mutex<Vec<(u32, [f32; 2])>>,
 ) {
-    if mol.atoms.is_empty() {
-        done.store(true, Ordering::Relaxed);
-        return;
-    }
-    // Same two phases as `cleanup_2d`, just chunked so the worker can be cancelled and can
-    // publish intermediate positions for the live preview.
-    let mut state = CleanupState::new(mol);
-    run_phase(&mut state, cancel, shared);
-    if !cancel.load(Ordering::Relaxed) {
-        ring_rescue(&mut state, |s| {
-            run_phase(s, cancel, shared);
-            !cancel.load(Ordering::Relaxed)
-        });
-    }
-
-    *shared.lock().unwrap() = state.positions();
-    done.store(true, Ordering::Relaxed);
-}
-
-/// Run one JOB_PHASE_BUDGET phase in chunks; returns true if it converged.
-#[cfg(not(target_arch = "wasm32"))]
-fn run_phase(
-    state: &mut CleanupState,
-    cancel: &AtomicBool,
-    shared: &Mutex<Vec<(u32, [f32; 2])>>,
-) -> bool {
-    let mut done_steps = 0;
-    while done_steps < JOB_PHASE_BUDGET {
+    let mut schedule = CleanupSchedule::new(mol);
+    while !schedule.is_done() {
         if cancel.load(Ordering::Relaxed) {
-            return false;
+            schedule.cancel();
+            break;
         }
-        let chunk = JOB_CHUNK.min(JOB_PHASE_BUDGET - done_steps);
-        let converged = state.step(chunk);
-        done_steps += chunk;
-        *shared.lock().unwrap() = state.positions();
-        if converged {
-            return true;
-        }
+        schedule.advance(JOB_CHUNK);
+        *shared.lock().unwrap() = schedule.positions();
     }
-    false
+
+    *shared.lock().unwrap() = schedule.positions();
+    // Release: publishes the final positions above to whoever sees `done` (see `is_done`).
+    done.store(true, Ordering::Release);
 }
 
 // ─── Force field ──────────────────────────────────────────────────────────────
@@ -1654,7 +1638,7 @@ mod tests {
     }
 
     /// `cleanup_2d` still produces exactly the recorded coordinates, and each fixture still
-    /// takes the recorded route through phase 2 — so every branch of `ring_rescue` (skipped,
+    /// takes the recorded route through phase 2 — so every branch of the ring rescue (skipped,
     /// rolled back, one pass kept, repeated passes kept) is pinned.
     #[test]
     fn cleanup_2d_matches_recorded_coordinates() {
@@ -1670,7 +1654,7 @@ mod tests {
             let got = coord_bits(&mol);
 
             let rescue = observed_rescue(fx.name, &fx.mol, &got, &mol);
-            assert_eq!(rescue, fx.rescue, "{}: route through ring_rescue changed", fx.name);
+            assert_eq!(rescue, fx.rescue, "{}: route through the ring rescue changed", fx.name);
 
             let fp = fingerprint(&got);
             if fp != fx.fingerprint {
@@ -1717,6 +1701,77 @@ mod tests {
                     fx.name
                 );
             }
+        }
+    }
+
+    fn fixture(name: &str) -> Molecule {
+        characterization_fixtures().into_iter().find(|f| f.name == name).unwrap().mol
+    }
+
+    /// Cancelled during phase 1, the schedule stops where the atoms are.
+    #[test]
+    fn cancel_mid_relaxation_keeps_current_positions() {
+        let mut schedule = CleanupSchedule::new(&fixture("toluene_distorted"));
+        assert!(!schedule.advance(10));
+        let before = position_bits(&schedule.positions());
+        schedule.cancel();
+        assert!(schedule.is_done());
+        assert!(schedule.advance(10));
+        assert_eq!(position_bits(&schedule.positions()), before);
+    }
+
+    /// Cancelled during a rescue pass, the schedule rolls back to the phase-1 result — the same
+    /// positions a finished schedule ends on when it rejects that pass.
+    #[test]
+    fn cancel_mid_rescue_restores_the_phase1_result() {
+        let mol = fixture("random_trial_05");
+        let mut st = CleanupState::new(&mol);
+        st.step(JOB_PHASE_BUDGET);
+        let after_phase1 = position_bits(&st.positions());
+
+        let mut schedule = CleanupSchedule::new(&mol);
+        while schedule.stage == Stage::Relax {
+            schedule.advance(JOB_CHUNK);
+        }
+        assert!(schedule.stage == Stage::Rescue);
+        schedule.advance(1);
+        assert!(schedule.stage == Stage::Rescue);
+        assert_ne!(position_bits(&schedule.positions()), after_phase1);
+        schedule.cancel();
+        assert!(schedule.is_done());
+        assert_eq!(position_bits(&schedule.positions()), after_phase1);
+    }
+
+    /// A pass that runs out of its budget ends there, and a chunk that would cross the end of
+    /// the pass is cut short: 3 + 3 + 3 requested against a budget of 7 runs exactly 7 steps.
+    #[test]
+    fn pass_ends_at_its_budget_and_caps_the_last_chunk() {
+        let mol = fixture("toluene_distorted");
+        let mut st = CleanupState::new(&mol);
+        assert!(!st.step(7), "the fixture must not converge within the test budget");
+        assert_eq!(st.ring_crossing_count(), 0, "no rescue may follow the pass");
+
+        let mut schedule = CleanupSchedule::with_pass_budget(&mol, 7);
+        assert!(!schedule.advance(3));
+        assert!(!schedule.advance(3));
+        assert!(schedule.advance(3), "the pass ran out of budget, so the schedule is done");
+        assert_eq!(position_bits(&schedule.positions()), position_bits(&st.positions()));
+    }
+
+    /// With every pass (phase 1 and the rescue passes) cut off by a small budget, the result
+    /// still does not depend on the chunk size.
+    #[test]
+    fn budget_limited_rescue_passes_do_not_depend_on_chunk_size() {
+        let mol = fixture("random_trial_10");
+        let run = |chunk: usize| {
+            let mut schedule = CleanupSchedule::with_pass_budget(&mol, 50);
+            while !schedule.advance(chunk) {}
+            assert!(schedule.rescue_passes > 0, "the fixture must reach the rescue");
+            position_bits(&schedule.positions())
+        };
+        let whole = run(50);
+        for chunk in [1, 7, 1000] {
+            assert_eq!(run(chunk), whole, "chunks of {chunk} differ from whole passes");
         }
     }
 
