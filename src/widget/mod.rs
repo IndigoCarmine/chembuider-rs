@@ -459,6 +459,15 @@ impl ChemStructEditor {
             .map(|json| format!("{CLIP_PREFIX}{json}"))
     }
 
+    /// Copy the selection (or the whole molecule when nothing is selected) to the system
+    /// clipboard, as Ctrl+C does: for a host's Edit menu. Returns false when there is nothing to
+    /// copy.
+    pub fn copy(&self, ctx: &egui::Context) -> bool {
+        let Some(text) = self.copy_to_string() else { return false };
+        self.copy_to_clipboard(ctx, text);
+        true
+    }
+
     /// Publish a copy to the system clipboard. On Windows this also attaches a CDX blob under
     /// the "ChemDraw Interchange Format" so the structure can be pasted into ChemDraw.
     #[cfg(windows)]
@@ -1174,9 +1183,7 @@ impl ChemStructEditor {
                 || (i.modifiers.command && i.key_pressed(egui::Key::C))
         });
         if do_copy {
-            if let Some(text) = self.copy_to_string() {
-                self.copy_to_clipboard(ui.ctx(), text);
-            }
+            self.copy(ui.ctx());
         }
 
         // Paste (Ctrl+V). On Windows, detect the keystroke from the OS (egui's Ctrl+V is
