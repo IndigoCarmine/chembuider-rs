@@ -352,12 +352,16 @@ mod tests {
     /// Measure and paint `reaction` with a default view at a fixed offset, returning the
     /// layout fingerprint and the painted shapes' fingerprint.
     fn figure_fingerprints(reaction: &Reaction) -> (String, String) {
+        styled_figure_fingerprints(ReactionView::new(), reaction)
+    }
+
+    /// As [`figure_fingerprints`], with a view whose styles the caller has set.
+    fn styled_figure_fingerprints(mut view: ReactionView, reaction: &Reaction) -> (String, String) {
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
             ..Default::default()
         };
-        let mut view = ReactionView::new();
         let mut layout_fp = String::new();
         let output = ctx.run_ui(raw, |ui| {
             let painter = ui.painter().clone();
@@ -423,6 +427,109 @@ mod tests {
         (layout, shapes)
     }
 
+    /// A structure-drawing style with *every* field moved off its default, so a figure that
+    /// ignored [`ReactionView::structure_style`] would paint differently.
+    fn non_default_structure_style() -> StyleConfig {
+        let d = StyleConfig::default();
+        let s = StyleConfig {
+            label_size: 17.0,
+            bond_width: 2.25,
+            double_bond_offset: 5.0,
+            atom_bg_radius: 12.0,
+            wedge_width: 7.5,
+            bold_width: 6.0,
+            dash_len: 3.0,
+            dash_gap: 2.5,
+            wavy_amplitude: 4.5,
+            label_trim_pad: 3.5,
+            label_bg_pad: 2.0,
+        };
+        for (name, value, default) in [
+            ("label_size", s.label_size, d.label_size),
+            ("bond_width", s.bond_width, d.bond_width),
+            ("double_bond_offset", s.double_bond_offset, d.double_bond_offset),
+            ("atom_bg_radius", s.atom_bg_radius, d.atom_bg_radius),
+            ("wedge_width", s.wedge_width, d.wedge_width),
+            ("bold_width", s.bold_width, d.bold_width),
+            ("dash_len", s.dash_len, d.dash_len),
+            ("dash_gap", s.dash_gap, d.dash_gap),
+            ("wavy_amplitude", s.wavy_amplitude, d.wavy_amplitude),
+            ("label_trim_pad", s.label_trim_pad, d.label_trim_pad),
+            ("label_bg_pad", s.label_bg_pad, d.label_bg_pad),
+        ] {
+            assert_ne!(value, default, "{name} must differ from its default");
+        }
+        s
+    }
+
+    /// One structure carrying every special bond kind — solid wedge, hashed wedge, bold,
+    /// dashed and wavy — next to a double bond, labelled atoms (OH, NH2) and an over-valence
+    /// C≡O, so each bond kind's widths, dashes and fills are pinned under a non-default style.
+    fn every_bond_kind() -> crate::molecule::Molecule {
+        use crate::molecule::BondStereo;
+        let mut m = crate::molecule::Molecule::default();
+        let c0 = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c1 = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c2 = m.add_atom("C".to_string(), [-0.75, 1.3], 0);
+        let o3 = m.add_atom("O".to_string(), [-0.75, -1.3], 0);
+        let n4 = m.add_atom("N".to_string(), [2.25, 1.3], 0);
+        let c5 = m.add_atom("C".to_string(), [2.25, -1.3], 0);
+        let c6 = m.add_atom("C".to_string(), [-2.25, 1.3], 0);
+        let o7 = m.add_atom("O".to_string(), [-3.0, 2.6], 0);
+        let stereo = [
+            (m.add_bond(c0, c1, BondOrder::Single), BondStereo::WedgeUp),
+            (m.add_bond(c0, c2, BondOrder::Single), BondStereo::WedgeDown),
+            (m.add_bond(c0, o3, BondOrder::Single), BondStereo::Bold),
+            (m.add_bond(c1, n4, BondOrder::Single), BondStereo::Dashed),
+            (m.add_bond(c1, c5, BondOrder::Single), BondStereo::Wavy),
+        ];
+        m.add_bond(c2, c6, BondOrder::Double);
+        m.add_bond(c6, o7, BondOrder::Triple);
+        for (id, kind) in stereo {
+            m.bonds.iter_mut().find(|b| b.id == id).expect("bond exists").stereo = kind;
+        }
+        for kind in [
+            BondStereo::WedgeUp,
+            BondStereo::WedgeDown,
+            BondStereo::Bold,
+            BondStereo::Dashed,
+            BondStereo::Wavy,
+        ] {
+            assert!(m.bonds.iter().any(|b| b.stereo == kind), "missing a {kind:?} bond");
+        }
+        assert!(
+            crate::widget::draw::is_valence_invalid(&m, o7),
+            "the C≡O oxygen must be over-valence"
+        );
+        m
+    }
+
+    /// The bond-kind structure on the main line *and* above an arrow, drawn through a view
+    /// with a non-default structure style and a non-default bond length and arrow text gap.
+    fn styled_fingerprints() -> (String, String) {
+        let structure_style = non_default_structure_style();
+        let style = ReactionStyle {
+            bond_length: 30.0,
+            arrow_text_gap: 9.0,
+            ..ReactionStyle::default()
+        };
+        assert_ne!(style.bond_length, ReactionStyle::default().bond_length);
+        assert_ne!(style.arrow_text_gap, ReactionStyle::default().arrow_text_gap);
+
+        let scheme = ReactionScheme::new()
+            .structure(every_bond_kind())
+            .arrow(Arrow::new().above_structure(every_bond_kind()).below("heat"))
+            .structure(demo::phenol());
+        let reaction = Reaction::new(scheme, Analysis::new());
+        let view = ReactionView::new().with_style(style).with_structure_style(structure_style);
+        let (layout, shapes) = styled_figure_fingerprints(view, &reaction);
+        assert!(
+            layout.contains("above=[structure") && layout.contains("below=[text"),
+            "the arrow carries the bond-kind structure above and text below:\n{layout}"
+        );
+        (layout, shapes)
+    }
+
     #[track_caller]
     fn assert_pinned(name: &str, actual: &str, expected: &str) {
         let expected = expected.trim();
@@ -483,7 +590,167 @@ mod tests {
     fn figure_fingerprints_are_reproducible() {
         assert_eq!(williamson_fingerprints(), williamson_fingerprints());
         assert_eq!(decorated_fingerprints(), decorated_fingerprints());
+        assert_eq!(styled_fingerprints(), styled_fingerprints());
     }
+
+    #[test]
+    fn styled_figure_layout_is_pinned() {
+        assert_pinned("styled layout", &styled_fingerprints().0, STYLED_LAYOUT);
+    }
+
+    #[test]
+    fn styled_figure_shapes_are_pinned() {
+        assert_pinned("styled shapes", &styled_fingerprints().1, STYLED_SHAPES);
+    }
+
+    const STYLED_LAYOUT: &str = r#"
+figure size=(423.651,176.000)
+scheme offset=(8.000,8.000)
+scheme size=(407.651,160.000) center_line=111.000
+  item (0.000,62.000)-(136.084,160.000) structure origin=(66.579,98.000)
+  item (150.084,0.000)-(314.167,139.000) arrow length=164.084 above=[structure origin=(230.663,36.000)] below=[text size=(26.156,15.000)]
+  item (328.167,66.466)-(407.651,155.534) structure origin=(344.292,154.409)
+table offset=(211.825,168.000)
+table size=(0.000,0.000)
+"#;
+
+    const STYLED_SHAPES: &str = r#"
+clip (0.000,0.000)-(1400.000,900.000)
+rect (30.000,40.000)-(453.651,216.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+path closed=true fill=#000000ff stroke=0.000/#00000000 pts=[(104.579,146.000) (134.579,153.500) (134.579,138.500)] kind=Middle
+line (100.996,149.709) (103.162,150.958) stroke=2.250/#000000ff
+line (97.414,153.417) (101.744,155.916) stroke=2.250/#000000ff
+line (93.831,157.126) (100.327,160.874) stroke=2.250/#000000ff
+line (90.248,160.835) (98.910,165.832) stroke=2.250/#000000ff
+line (86.665,164.543) (97.493,170.790) stroke=2.250/#000000ff
+line (83.083,168.252) (96.075,175.748) stroke=2.250/#000000ff
+line (104.579,146.000) (97.367,133.500) stroke=6.000/#000000ff
+line (134.579,146.000) (136.078,148.599) stroke=2.250/#000000ff
+line (137.327,150.764) (138.827,153.363) stroke=2.250/#000000ff
+line (140.076,155.528) (141.575,158.127) stroke=2.250/#000000ff
+line (134.579,146.000) (138.273,145.965) stroke=2.250/#000000ff
+line (138.273,145.965) (140.352,144.999) stroke=2.250/#000000ff
+line (140.352,144.999) (140.148,142.715) stroke=2.250/#000000ff
+line (140.148,142.715) (138.329,139.500) stroke=2.250/#000000ff
+line (138.329,139.500) (136.510,136.285) stroke=2.250/#000000ff
+line (136.510,136.285) (136.306,134.001) stroke=2.250/#000000ff
+line (136.306,134.001) (138.385,133.035) stroke=2.250/#000000ff
+line (138.385,133.035) (142.079,133.000) stroke=2.250/#000000ff
+line (142.079,133.000) (145.773,132.965) stroke=2.250/#000000ff
+line (145.773,132.965) (147.852,131.999) stroke=2.250/#000000ff
+line (147.852,131.999) (147.648,129.715) stroke=2.250/#000000ff
+line (147.648,129.715) (145.829,126.500) stroke=2.250/#000000ff
+line (145.829,126.500) (144.010,123.285) stroke=2.250/#000000ff
+line (144.010,123.285) (143.806,121.001) stroke=2.250/#000000ff
+line (143.806,121.001) (145.885,120.035) stroke=2.250/#000000ff
+line (145.885,120.035) (149.579,120.000) stroke=2.250/#000000ff
+line (89.579,169.500) (59.579,169.500) stroke=2.250/#000000ff
+line (89.579,174.500) (59.579,174.500) stroke=2.250/#000000ff
+line (59.579,172.000) (52.367,184.500) stroke=2.250/#000000ff
+line (55.248,169.501) (48.037,182.001) stroke=2.250/#000000ff
+line (63.910,174.499) (56.698,186.999) stroke=2.250/#000000ff
+rect (141.553,160.000)-(176.084,185.720) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (36.000,186.000)-(53.156,210.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (70.000,108.000)-(98.938,132.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "HO" at=(72.000,110.000) sections=["HO":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "NH" at=(143.553,162.000) sections=["NH":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "2" at=(167.365,169.720) sections=["2":#000000ff@11.900] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+line (78.579,172.000) (77.649,177.871) stroke=1.500/#dc1e1eff
+line (74.950,183.168) (70.747,187.371) stroke=1.500/#dc1e1eff
+line (65.450,190.070) (59.579,191.000) stroke=1.500/#dc1e1eff
+line (53.708,190.070) (48.411,187.371) stroke=1.500/#dc1e1eff
+line (44.208,183.168) (41.509,177.871) stroke=1.500/#dc1e1eff
+line (40.579,172.000) (41.509,166.129) stroke=1.500/#dc1e1eff
+line (44.208,160.832) (48.411,156.629) stroke=1.500/#dc1e1eff
+line (53.708,153.930) (59.579,153.000) stroke=1.500/#dc1e1eff
+line (65.450,153.930) (70.747,156.629) stroke=1.500/#dc1e1eff
+line (74.950,160.832) (77.649,166.129) stroke=1.500/#dc1e1eff
+line (63.579,198.000) (62.649,203.871) stroke=1.500/#dc1e1eff
+line (59.950,209.168) (55.747,213.371) stroke=1.500/#dc1e1eff
+line (50.450,216.070) (44.579,217.000) stroke=1.500/#dc1e1eff
+line (38.708,216.070) (33.411,213.371) stroke=1.500/#dc1e1eff
+line (29.208,209.168) (26.509,203.871) stroke=1.500/#dc1e1eff
+line (25.579,198.000) (26.509,192.129) stroke=1.500/#dc1e1eff
+line (29.208,186.832) (33.411,182.629) stroke=1.500/#dc1e1eff
+line (38.708,179.930) (44.579,179.000) stroke=1.500/#dc1e1eff
+line (50.450,179.930) (55.747,182.629) stroke=1.500/#dc1e1eff
+line (59.950,186.832) (62.649,192.129) stroke=1.500/#dc1e1eff
+text "O" at=(38.000,188.000) sections=["O":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+line (188.084,159.000) (347.167,159.000) stroke=1.500/#000000ff
+path closed=true fill=#000000ff stroke=0.000/#00000000 pts=[(352.167,159.000) (342.167,155.000) (342.167,163.000)] kind=Middle
+path closed=true fill=#000000ff stroke=0.000/#00000000 pts=[(268.663,84.000) (298.663,91.500) (298.663,76.500)] kind=Middle
+line (265.080,87.709) (267.245,88.958) stroke=2.250/#000000ff
+line (261.497,91.417) (265.828,93.916) stroke=2.250/#000000ff
+line (257.915,95.126) (264.411,98.874) stroke=2.250/#000000ff
+line (254.332,98.835) (262.994,103.832) stroke=2.250/#000000ff
+line (250.749,102.543) (261.576,108.790) stroke=2.250/#000000ff
+line (247.166,106.252) (260.159,113.748) stroke=2.250/#000000ff
+line (268.663,84.000) (261.451,71.500) stroke=6.000/#000000ff
+line (298.663,84.000) (300.162,86.599) stroke=2.250/#000000ff
+line (301.411,88.764) (302.910,91.363) stroke=2.250/#000000ff
+line (304.160,93.528) (305.659,96.127) stroke=2.250/#000000ff
+line (298.663,84.000) (302.356,83.965) stroke=2.250/#000000ff
+line (302.356,83.965) (304.436,82.999) stroke=2.250/#000000ff
+line (304.436,82.999) (304.231,80.715) stroke=2.250/#000000ff
+line (304.231,80.715) (302.413,77.500) stroke=2.250/#000000ff
+line (302.413,77.500) (300.594,74.285) stroke=2.250/#000000ff
+line (300.594,74.285) (300.390,72.001) stroke=2.250/#000000ff
+line (300.390,72.001) (302.469,71.035) stroke=2.250/#000000ff
+line (302.469,71.035) (306.163,71.000) stroke=2.250/#000000ff
+line (306.163,71.000) (309.856,70.965) stroke=2.250/#000000ff
+line (309.856,70.965) (311.936,69.999) stroke=2.250/#000000ff
+line (311.936,69.999) (311.731,67.715) stroke=2.250/#000000ff
+line (311.731,67.715) (309.913,64.500) stroke=2.250/#000000ff
+line (309.913,64.500) (308.094,61.285) stroke=2.250/#000000ff
+line (308.094,61.285) (307.890,59.001) stroke=2.250/#000000ff
+line (307.890,59.001) (309.969,58.035) stroke=2.250/#000000ff
+line (309.969,58.035) (313.663,58.000) stroke=2.250/#000000ff
+line (253.663,107.500) (223.663,107.500) stroke=2.250/#000000ff
+line (253.663,112.500) (223.663,112.500) stroke=2.250/#000000ff
+line (223.663,110.000) (216.451,122.500) stroke=2.250/#000000ff
+line (219.332,107.501) (212.120,120.001) stroke=2.250/#000000ff
+line (227.994,112.499) (220.782,124.999) stroke=2.250/#000000ff
+rect (200.084,124.000)-(217.240,148.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (234.084,46.000)-(263.021,70.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (305.636,98.000)-(340.167,123.720) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "HO" at=(236.084,48.000) sections=["HO":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "NH" at=(307.636,100.000) sections=["NH":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "2" at=(331.449,107.720) sections=["2":#000000ff@11.900] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+line (242.663,110.000) (241.733,115.871) stroke=1.500/#dc1e1eff
+line (239.034,121.168) (234.831,125.371) stroke=1.500/#dc1e1eff
+line (229.534,128.070) (223.663,129.000) stroke=1.500/#dc1e1eff
+line (217.791,128.070) (212.495,125.371) stroke=1.500/#dc1e1eff
+line (208.291,121.168) (205.593,115.871) stroke=1.500/#dc1e1eff
+line (204.663,110.000) (205.593,104.129) stroke=1.500/#dc1e1eff
+line (208.291,98.832) (212.495,94.629) stroke=1.500/#dc1e1eff
+line (217.791,91.930) (223.663,91.000) stroke=1.500/#dc1e1eff
+line (229.534,91.930) (234.831,94.629) stroke=1.500/#dc1e1eff
+line (239.034,98.832) (241.733,104.129) stroke=1.500/#dc1e1eff
+line (227.663,136.000) (226.733,141.871) stroke=1.500/#dc1e1eff
+line (224.034,147.168) (219.831,151.371) stroke=1.500/#dc1e1eff
+line (214.534,154.070) (208.663,155.000) stroke=1.500/#dc1e1eff
+line (202.791,154.070) (197.495,151.371) stroke=1.500/#dc1e1eff
+line (193.291,147.168) (190.593,141.871) stroke=1.500/#dc1e1eff
+line (189.663,136.000) (190.593,130.129) stroke=1.500/#dc1e1eff
+line (193.291,124.832) (197.495,120.629) stroke=1.500/#dc1e1eff
+line (202.791,117.930) (208.663,117.000) stroke=1.500/#dc1e1eff
+line (214.534,117.930) (219.831,120.629) stroke=1.500/#dc1e1eff
+line (224.034,124.832) (226.733,130.129) stroke=1.500/#dc1e1eff
+text "O" at=(202.084,126.000) sections=["O":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "heat" at=(257.047,172.000) sections=["heat":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+line (382.292,202.409) (412.292,202.409) stroke=2.250/#000000ff
+line (412.292,202.409) (427.292,176.428) stroke=2.250/#000000ff
+line (410.212,196.012) (420.712,177.825) stroke=2.250/#000000ff
+line (427.292,176.428) (412.292,150.447) stroke=2.250/#000000ff
+line (412.292,150.447) (382.292,150.447) stroke=2.250/#000000ff
+line (407.792,155.447) (386.792,155.447) stroke=2.250/#000000ff
+line (382.292,150.447) (367.292,176.428) stroke=2.250/#000000ff
+line (367.292,176.428) (382.292,202.409) stroke=2.250/#000000ff
+line (373.873,177.825) (384.373,196.012) stroke=2.250/#000000ff
+line (412.292,150.447) (419.498,137.966) stroke=2.250/#000000ff
+rect (418.713,112.466)-(447.651,136.466) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "OH" at=(420.713,114.466) sections=["OH":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+"#;
 
     const WILLIAMSON_LAYOUT: &str = r#"
 figure size=(494.031,403.293)
