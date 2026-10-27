@@ -5,11 +5,10 @@ use std::collections::HashMap;
 // Display rules (label text, folded hydrogens, valence warnings) live in `molecule::depict`;
 // re-exported so the old `widget::draw::*` paths keep compiling.
 pub use crate::molecule::depict::{is_folded_h, is_valence_invalid, AtomLabel};
-pub(crate) use crate::molecule::depict::{atom_label, displayed_h_count, folded_h, should_show_label};
-// The hydrogen side is only read by this file's label oracle and tests (the CDX writer takes it
-// from `molecule::depict` directly).
+// The crate-internal rules are only read by this file's label oracle and tests now; every other
+// caller (CDX, images, scene, formula, label chain) takes them from `molecule::depict` directly.
 #[cfg(test)]
-use crate::molecule::depict::{h_side, HSide};
+use crate::molecule::depict::{atom_label, displayed_h_count, h_side, HSide};
 
 // Geometry helpers moved to `scene.rs` (the backend-neutral primitive builder). Re-exported so
 // draw.rs's own unit tests keep reaching them by their old names.
