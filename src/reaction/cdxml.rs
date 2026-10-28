@@ -27,6 +27,8 @@ use crate::molecule::cdx::{
     OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT,
 };
 use crate::molecule::cdx_codec::{self, CdxObject};
+use crate::molecule::cdx_colors::{self, ColorTable};
+use crate::molecule::cdx_fonts;
 use crate::widget::ChemStructEditor;
 use crate::widget::rich_text::RichText;
 
@@ -150,11 +152,14 @@ struct Writer<'a> {
     style: &'a ReactionStyle,
     next: u32,
     page: CdxObject,
+    /// The document's colour table, which coloured atoms and bonds add to.
+    colors: ColorTable,
 }
 
 impl<'a> Writer<'a> {
     fn new(style: &'a ReactionStyle) -> Self {
-        Self { style, next: 1, page: CdxObject::new(OBJ_PAGE, 1) }
+        let colors = ColorTable::of(&cdx::new_document());
+        Self { style, next: 1, page: CdxObject::new(OBJ_PAGE, 1), colors }
     }
 
     fn id(&mut self) -> u32 {
@@ -228,6 +233,7 @@ impl<'a> Writer<'a> {
         self.steps(layout, &written);
 
         let mut doc = cdx::new_document();
+        self.colors.store(&mut doc);
         let mut page = std::mem::take(&mut self.page);
         if let Some(bbox) = page.children.iter().filter_map(cdx::bounding_box).reduce(|a, b| cdx::union(Some(a), b)) {
             page.props.insert(0, (PROP_BOUNDING_BOX, cdx::rect(bbox)));
@@ -241,7 +247,7 @@ impl<'a> Writer<'a> {
     /// its nodes and bonds.
     fn structure(&mut self, mol: &Molecule, origin: Vec2) -> Vec<(u32, Vec<u32>)> {
         let shift = ((origin.x + PAGE_MARGIN_PT) as f64 * PT, (origin.y + PAGE_MARGIN_PT) as f64 * PT);
-        let frags = cdx::fragments(mol, shift, &mut self.next);
+        let frags = cdx::fragments(mol, shift, &mut self.next, &mut self.colors);
         let out = frags
             .iter()
             .map(|f| (f.id, f.children.iter().filter(|c| matches!(c.tag, OBJ_NODE | OBJ_BOND)).map(|c| c.id).collect()))
@@ -250,9 +256,11 @@ impl<'a> Writer<'a> {
         out
     }
 
-    /// A text filling `rect` (figure points), centred in it.
+    /// A text filling `rect` (figure points), centred in it, its spans' colours named in the
+    /// document's colour table.
     fn text(&mut self, text: &RichText, rect: Rect) -> u32 {
-        let (runs, chars) = cdx::runs_of(text);
+        let colors = &mut self.colors;
+        let (runs, chars) = cdx::colored_runs_of(text, |c| colors.index_of(c));
         let chars = chars.replace('\n', "\r");
         let at = |x: f32, y: f32| ((x + PAGE_MARGIN_PT) as f64 * PT, (y + PAGE_MARGIN_PT) as f64 * PT);
         let (px, py) = at(rect.center().x, rect.min.y + ASCENT_PT);
@@ -263,7 +271,7 @@ impl<'a> Writer<'a> {
         t_obj.set(PROP_2D_POSITION, cdx::point(px, py));
         t_obj.set(PROP_BOUNDING_BOX, cdx::rect([l, t, r, b]));
         t_obj.set(PROP_JUSTIFICATION, vec![JUSTIFY_CENTER]);
-        t_obj.set(PROP_TEXT, cdx::cdx_string(&runs, &chars));
+        t_obj.set(PROP_TEXT, cdx::cdx_string_with_colors(&runs, &chars));
         if chars.chars().any(|c| c as u32 >= 0x100) {
             t_obj.set(PROP_UTF8_TEXT, utf8_string(&runs, &chars));
         }
@@ -326,11 +334,12 @@ fn ids_value(ids: &[u32]) -> Vec<u8> {
     ids.iter().flat_map(|id| id.to_le_bytes()).collect()
 }
 
-/// A CDXString in UTF-8 (the UTF-8 Text property): the style runs, then the text.
-pub(crate) fn utf8_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
+/// A CDXString in UTF-8 (the UTF-8 Text property): the style runs (start, face, colour
+/// index), then the text.
+pub(crate) fn utf8_string(runs: &[(u16, u16, u16)], text: &str) -> Vec<u8> {
     let mut out = (runs.len() as u16).to_le_bytes().to_vec();
-    for &(start, face) in runs {
-        for v in [start, LABEL_FONT, face, 200, 0] {
+    for &(start, face, color) in runs {
+        for v in [start, LABEL_FONT, face, 200, color] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -420,8 +429,9 @@ pub fn scheme_from_document(doc: &CdxObject) -> Option<ReactionScheme> {
     let mut objects = Objects::default();
     let mut superseded: HashMap<u32, u32> = HashMap::new();
     let mut arrow_objects: Vec<ReadArrow> = Vec::new();
+    let colors = ColorTable::of(doc);
     for page in doc.children.iter().filter(|c| c.tag == OBJ_PAGE) {
-        collect(page, &mut objects, &mut superseded, &mut arrow_objects);
+        collect(page, &mut objects, &mut superseded, &mut arrow_objects, &colors);
     }
     // A graphic superseded by an arrow object is the same arrow: keep the arrow's geometry,
     // answer to both ids.
@@ -440,13 +450,21 @@ pub fn scheme_from_document(doc: &CdxObject) -> Option<ReactionScheme> {
     (!scheme.is_empty()).then_some(scheme)
 }
 
-fn collect(obj: &CdxObject, out: &mut Objects, superseded: &mut HashMap<u32, u32>, arrow_objects: &mut Vec<ReadArrow>) {
+fn collect(
+    obj: &CdxObject,
+    out: &mut Objects,
+    superseded: &mut HashMap<u32, u32>,
+    arrow_objects: &mut Vec<ReadArrow>,
+    colors: &ColorTable,
+) {
+    // The colour what `obj` holds is in when it names none.
+    let colors = &colors.inside(obj);
     for child in &obj.children {
         match child.tag {
-            OBJ_GROUP => collect(child, out, superseded, arrow_objects),
+            OBJ_GROUP => collect(child, out, superseded, arrow_objects, colors),
             OBJ_FRAGMENT => {
                 let mut molecule = Molecule::default();
-                cdx::read_fragment(child, &mut molecule);
+                cdx::read_fragment(child, &mut molecule, colors);
                 if molecule.atoms.is_empty() {
                     continue;
                 }
@@ -459,7 +477,7 @@ fn collect(obj: &CdxObject, out: &mut Objects, superseded: &mut HashMap<u32, u32
                 out.fragments.push(ReadFragment { id: child.id, bbox, molecule, members });
             }
             OBJ_TEXT => {
-                let Some(text) = text_of(child) else { continue };
+                let Some(text) = colored_text_of(child, colors) else { continue };
                 let bbox = cdx::bounding_box(child).or_else(|| position(child).map(|(x, y)| [x, y - 7.2 * PT, x, y + 2.1 * PT]));
                 if let Some(bbox) = bbox {
                     out.texts.push(ReadText { id: child.id, bbox, text });
@@ -519,15 +537,37 @@ fn ids(obj: &CdxObject, tag: u16) -> Vec<u32> {
 }
 
 /// A text object's text: its style runs over the UTF-8 text when it has one, the Latin-1 text
-/// otherwise. Line breaks (carriage returns) become `\n`.
+/// otherwise. Line breaks (carriage returns) become `\n`. Colours are left out.
+#[cfg(test)]
 pub(crate) fn text_of(t: &CdxObject) -> Option<RichText> {
+    colored_text_of(t, &ColorTable::default()).map(|mut rich| {
+        rich.spans.iter_mut().for_each(|s| s.style.color = None);
+        rich
+    })
+}
+
+/// [`text_of`] with each span in the colour of its style run, read through `colors` (the
+/// document's colour table, inside the text's container). A text whose runs are all in colour 0
+/// (what ChemDraw writes for plain text) is in the text's own colour, else its container's, as
+/// a page text is.
+pub(crate) fn colored_text_of(t: &CdxObject, colors: &ColorTable) -> Option<RichText> {
     let (runs, latin1) = cdx::parse_cdx_string(t.prop(PROP_TEXT)?)?;
     let utf8 = t
         .prop(PROP_UTF8_TEXT)
         .and_then(|v| cdx::parse_cdx_string(v).map(|(_, s)| s))
         .and_then(|s| String::from_utf8(s.chars().map(|c| c as u8).collect()).ok());
     let text = utf8.filter(|u| u.chars().count() == latin1.chars().count()).unwrap_or(latin1).replace('\r', "\n");
-    let rich = cdx::rich_of(&runs, &text);
+    let style_runs = cdx_fonts::parse_string(t.prop(PROP_TEXT)?).map(|(r, _)| r).unwrap_or_default();
+    let plain = style_runs.iter().all(|r| r.color == 0).then(|| cdx_colors::foreground(t, colors)).flatten();
+    let runs: Vec<_> = runs
+        .iter()
+        .enumerate()
+        .map(|(k, &(start, face))| {
+            let color = style_runs.get(k).and_then(|r| colors.rgba(r.color)).or(plain);
+            (start, face, color.map(crate::widget::scene::color32))
+        })
+        .collect();
+    let rich = cdx::colored_rich_of(&runs, &text);
     (!rich.is_empty()).then_some(rich)
 }
 

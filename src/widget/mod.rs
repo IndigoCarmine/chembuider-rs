@@ -11,6 +11,8 @@ mod keyboard_tests;
 mod page_tests;
 #[cfg(test)]
 mod render_tests;
+#[cfg(test)]
+mod appearance_tests;
 pub mod rich_text;
 pub mod scene;
 pub mod text_format;
@@ -40,6 +42,14 @@ struct ClipAtom {
     /// still parse.
     #[serde(default)]
     group_h: bool,
+    /// The label colour ([`Atom::color`](crate::molecule::Atom::color)); left out when there
+    /// is none, so clipboard text without colours reads and writes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<[u8; 4]>,
+    /// The structure's drop shadow ([`Atom::shadow`](crate::molecule::Atom::shadow)), as for
+    /// `color`: a pasted structure keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shadow: Option<crate::molecule::Shadow>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +61,9 @@ struct ClipBond {
     stereo: BondStereo,
     #[serde(default)]
     double_position: DoublePosition,
+    /// The line colour ([`Bond::color`](crate::molecule::Bond::color)), as for [`ClipAtom::color`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<[u8; 4]>,
 }
 
 /// A ring fill on the clipboard: atom *indices* (positions within `ClipMol::atoms`, not ids,
@@ -59,6 +72,21 @@ struct ClipBond {
 struct ClipRingFill {
     atoms: Vec<usize>,
     color: [u8; 4],
+}
+
+/// A page text on the clipboard (reaction conditions, a caption): what a [`PageText`] is, but
+/// its id, which paste gives anew, and its ChemDraw source, which a copy is not.
+///
+/// [`PageText`]: crate::molecule::PageText
+#[derive(Serialize, Deserialize)]
+struct ClipText {
+    pos: [f32; 2],
+    text: String,
+    #[serde(default)]
+    align: crate::molecule::TextAlign,
+    /// The text colour, as for [`ClipAtom::color`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<[u8; 4]>,
 }
 
 /// A self-contained copy of a sub-structure (atoms + the bonds among them), used for
@@ -71,6 +99,10 @@ struct ClipMol {
     /// still parses (and a copy with no fills omits it entirely).
     #[serde(default)]
     ring_fills: Vec<ClipRingFill>,
+    /// Page texts. Defaulted and left out when there are none, so clipboard text without them
+    /// reads and writes as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    texts: Vec<ClipText>,
 }
 pub const SCALE_FACTOR: f32 = 50.0;
 pub const NODE_HIT_RADIUS_PX: f32 = 15.0;
@@ -420,20 +452,33 @@ impl ChemStructEditor {
         }
     }
 
+    /// The atoms the selection covers: the selected atoms and both ends of every selected bond
+    /// (the Select tool can pick bonds on their own).
+    fn selection_atom_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.selected_atoms.iter().copied().collect();
+        for b in self.selected_bonds.iter().filter_map(|&id| self.molecule.bond_by_id(id)) {
+            ids.extend([b.begin, b.end]);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Fill the ring the current selection points at.
     ///
     /// A selection of two or more atoms *is* the ring the user means, so it wins over the
     /// hotspot (which only follows the cursor and, on a fused ring, may sit on the wrong cycle):
     /// every ring confined to the selected atoms is filled — the four-membered ring for the four
     /// atoms of a square fused onto benzene, the hexagon for benzene's six, both for a selection
-    /// spanning several rings — under a single undo step. When the selection
+    /// spanning several rings — under a single undo step. A selected bond counts as its two
+    /// atoms. When the selection
     /// encloses no ring of its own we fall back to a single seed, still preferring an explicit
     /// selection over the hotspot; a lone selected atom or a bare hotspot keeps the old
     /// smallest-ring-through-the-seed behavior. Returns false when nothing is selected/hovered
     /// or the seed atom is on no ring.
     pub fn fill_selected_ring(&mut self, color: [u8; 4]) -> bool {
-        if self.selected_atoms.len() >= 2 {
-            let sel: Vec<u32> = self.selected_atoms.iter().copied().collect();
+        let sel = self.selection_atom_ids();
+        if sel.len() >= 2 {
             let rings = self.molecule.rings_from_atoms(&sel);
             if !rings.is_empty() {
                 self.push_undo();
@@ -443,34 +488,138 @@ impl ChemStructEditor {
                 return true;
             }
         }
-        let seed = self
-            .selected_atoms
-            .iter()
-            .copied()
-            .min()
-            .or(self.hotspot_atom);
+        let seed = sel.first().copied().or(self.hotspot_atom);
         match seed {
             Some(a) => self.fill_ring_at(a, color),
             None => false,
         }
     }
 
-    /// Remove the ring fill through the hotspot / any selected atom. Returns true if one went.
+    /// Remove ring fills the selection points at, as one undo step. Returns true if any went.
+    ///
+    /// As for [`fill_selected_ring`](Self::fill_selected_ring), a selection of two or more atoms
+    /// (or bonds) is what the user means, whatever the hotspot: every fill whose ring lies
+    /// within it goes, else every fill whose ring holds all of it (a selected bond of a filled
+    /// ring), else nothing. Otherwise the fill through the hotspot, or through the one selected
+    /// atom, goes.
     pub fn clear_selected_ring_fill(&mut self) -> bool {
-        let seed = self
-            .hotspot_atom
-            .or_else(|| self.selected_atoms.iter().copied().min());
-        match seed {
-            Some(a) => {
-                self.push_undo();
-                let removed = self.molecule.clear_ring_fill_containing(a);
-                if !removed {
-                    self.undo_stack.pop_back();
-                }
-                removed
+        let sel = self.selection_atom_ids();
+        if sel.len() >= 2 {
+            let inside = |atoms: &[u32]| atoms.iter().all(|a| sel.binary_search(a).is_ok());
+            let holds = |atoms: &[u32]| sel.iter().all(|a| atoms.contains(a));
+            let within = self.molecule.ring_fills.iter().any(|rf| inside(&rf.atoms));
+            let goes = |atoms: &[u32]| if within { inside(atoms) } else { holds(atoms) };
+            if !self.molecule.ring_fills.iter().any(|rf| goes(&rf.atoms)) {
+                return false;
             }
-            None => false,
+            self.push_undo();
+            self.molecule.ring_fills.retain(|rf| !goes(&rf.atoms));
+            return true;
         }
+        let seed = self.hotspot_atom.or_else(|| sel.first().copied());
+        match seed {
+            Some(a) if self.molecule.ring_fills.iter().any(|rf| rf.atoms.contains(&a)) => {
+                self.push_undo();
+                self.molecule.clear_ring_fill_containing(a)
+            }
+            _ => false,
+        }
+    }
+
+    /// Give the selected bonds — those selected on their own and those with both atoms selected
+    /// — the line colour `color` (straight RGBA; `None` is the style's colour), as one undo step.
+    /// Their atoms' labels keep their own colour. Returns false when no selected bond changes.
+    pub fn set_selected_bond_color(&mut self, color: Option<[u8; 4]>) -> bool {
+        let selected = |b: &crate::molecule::Bond| {
+            self.selected_bonds.contains(&b.id)
+                || (self.selected_atoms.contains(&b.begin) && self.selected_atoms.contains(&b.end))
+        };
+        let ids: Vec<u32> =
+            self.molecule.bonds.iter().filter(|b| selected(b) && b.color != color).map(|b| b.id).collect();
+        if ids.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        for b in self.molecule.bonds.iter_mut().filter(|b| ids.contains(&b.id)) {
+            b.color = color;
+        }
+        true
+    }
+
+    /// Give the labels of the selected atoms and the selected texts the text colour `color`
+    /// (straight RGBA; `None` is the style's colour), as one undo step. Bonds keep their own
+    /// colour. Returns false when nothing selected changes.
+    pub fn set_selected_text_color(&mut self, color: Option<[u8; 4]>) -> bool {
+        use crate::molecule::PageObject;
+        let atoms: Vec<u32> = self
+            .molecule
+            .atoms
+            .iter()
+            .filter(|a| self.selected_atoms.contains(&a.id) && a.color != color)
+            .map(|a| a.id)
+            .collect();
+        let texts: Vec<u32> = self
+            .molecule
+            .objects
+            .iter()
+            .filter(|o| self.selected_objects.contains(&o.id()))
+            .filter(|o| matches!(o, PageObject::Text(t) if t.color != color))
+            .map(|o| o.id())
+            .collect();
+        if atoms.is_empty() && texts.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        for a in self.molecule.atoms.iter_mut().filter(|a| atoms.contains(&a.id)) {
+            a.color = color;
+        }
+        for o in self.molecule.objects.iter_mut() {
+            if let PageObject::Text(t) = o
+                && texts.contains(&t.id)
+            {
+                t.color = color;
+            }
+        }
+        true
+    }
+
+    /// The structures (connected atoms) the selection touches — through a selected atom or
+    /// bond — or every structure when nothing at all is selected, as their atom ids. A
+    /// selection of page objects alone touches none.
+    fn selected_structures(&self) -> Vec<Vec<u32>> {
+        let sel = self.selection_atom_ids();
+        let mut structures = self.molecule.structures();
+        if !sel.is_empty() || !self.selected_objects.is_empty() {
+            structures.retain(|atoms| atoms.iter().any(|a| sel.binary_search(a).is_ok()));
+        }
+        structures
+    }
+
+    /// Set the drop shadow of the structures the selection touches (through a selected atom or
+    /// bond), or of every structure when nothing is selected; `None` removes theirs. One undo
+    /// step. Other structures keep theirs. Returns false when nothing changes. Atoms drawn
+    /// afterwards carry no shadow of their own. While they are bonded to the structure they cast
+    /// its shadow, but a branch of them cut off later casts none.
+    pub fn set_shadow(&mut self, shadow: Option<crate::molecule::Shadow>) -> bool {
+        // Each atom of each structure carries the shadow, so it stays the structure's however the
+        // structure is edited afterwards (see `Atom::shadow`).
+        let atoms: HashSet<u32> = self.selected_structures().into_iter().flatten().collect();
+        let changes = self.molecule.atoms.iter().any(|a| atoms.contains(&a.id) && a.shadow != shadow);
+        if !changes {
+            return false;
+        }
+        self.push_undo();
+        for a in self.molecule.atoms.iter_mut().filter(|a| atoms.contains(&a.id)) {
+            a.shadow = shadow;
+        }
+        true
+    }
+
+    /// The drop shadow of the first structure the selection touches, or of the first structure
+    /// when nothing is selected (what a shadow control shows); `None` when it casts none.
+    pub fn selected_shadow(&self) -> Option<crate::molecule::Shadow> {
+        let first = self.selected_structures().into_iter().next()?;
+        first.iter().find_map(|&id| self.molecule.atom_by_id(id)?.shadow)
     }
 
     /// Build a fragment from the current selection and save it to `fragments/<name>.json`.
@@ -528,21 +677,40 @@ impl ChemStructEditor {
     }
 
     /// Serialize the current selection (or the whole molecule when nothing is selected)
-    /// into clipboard text. Returns None if there is nothing to copy.
+    /// into clipboard text: the selected atoms with the bonds and ring fills among them, and the
+    /// selected page texts. Returns None if there is nothing to copy.
     pub fn copy_to_string(&self) -> Option<String> {
+        let everything = self.selected_atoms.is_empty() && self.selected_objects.is_empty();
         let ids: Vec<u32> = self.molecule.atoms.iter()
             .map(|a| a.id)
-            .filter(|id| self.selected_atoms.is_empty() || self.selected_atoms.contains(id))
+            .filter(|id| everything || self.selected_atoms.contains(id))
             .collect();
-        if ids.is_empty() {
+        let texts: Vec<ClipText> = self.molecule.objects.iter()
+            .filter(|o| everything || self.selected_objects.contains(&o.id()))
+            .filter_map(|o| match o {
+                crate::molecule::PageObject::Text(t) => {
+                    Some(ClipText { pos: t.pos, text: t.text.clone(), align: t.align, color: t.color })
+                }
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() && texts.is_empty() {
             return None;
         }
         let index: std::collections::HashMap<u32, usize> =
             ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
+        // A copied part of a shadowed structure is shadowed too: it was drawn so.
+        let shadows: std::collections::HashMap<u32, crate::molecule::Shadow> = self
+            .molecule
+            .structure_shadows()
+            .into_iter()
+            .flat_map(|(atoms, shadow)| atoms.into_iter().map(move |a| (a, shadow)))
+            .collect();
         let atoms = ids.iter().map(|&id| {
             let a = self.molecule.atom_by_id(id).unwrap();
-            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge, group_h: a.group_h }
+            let shadow = shadows.get(&id).copied();
+            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge, group_h: a.group_h, color: a.color, shadow }
         }).collect();
         let bonds = self.molecule.bonds.iter().filter_map(|b| {
             Some(ClipBond {
@@ -551,6 +719,7 @@ impl ChemStructEditor {
                 order: b.order.clone(),
                 stereo: b.stereo.clone(),
                 double_position: b.double_position,
+                color: b.color,
             })
         }).collect();
 
@@ -560,7 +729,7 @@ impl ChemStructEditor {
             Some(ClipRingFill { atoms: atoms?, color: rf.color })
         }).collect();
 
-        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills })
+        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills, texts })
             .ok()
             .map(|json| format!("{CLIP_PREFIX}{json}"))
     }
@@ -607,15 +776,16 @@ impl ChemStructEditor {
         ctx.copy_text(text);
     }
 
-    /// Parse clipboard text in our format and paste the atoms/bonds, offset slightly so the
-    /// copy is visible, leaving the pasted atoms selected. Returns true if anything was added.
+    /// Parse clipboard text in our format and paste the atoms/bonds and texts, offset slightly
+    /// so the copy is visible, leaving what was pasted selected. Returns true if anything was
+    /// added.
     pub fn paste_from_string(&mut self, text: &str) -> bool {
         let json = match text.strip_prefix(CLIP_PREFIX) {
             Some(rest) => rest,
             None => return false, // not our format
         };
         let Ok(clip) = serde_json::from_str::<ClipMol>(json) else { return false };
-        if clip.atoms.is_empty() {
+        if clip.atoms.is_empty() && clip.texts.is_empty() {
             return false;
         }
         // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
@@ -627,6 +797,8 @@ impl ChemStructEditor {
                 [a.pos[0] + OFFSET[0], a.pos[1] + OFFSET[1]], a.charge);
             if let Some(atom) = self.molecule.atom_by_id_mut(id) {
                 atom.group_h = a.group_h;
+                atom.color = a.color;
+                atom.shadow = a.shadow;
             }
             id
         }).collect();
@@ -637,6 +809,7 @@ impl ChemStructEditor {
                     if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
                         bond.stereo = b.stereo.clone();
                         bond.double_position = b.double_position;
+                        bond.color = b.color;
                     }
                 }
             }
@@ -648,8 +821,19 @@ impl ChemStructEditor {
                 self.molecule.set_ring_fill(ids, rf.color);
             }
         }
+        let new_texts: Vec<u32> = clip.texts.into_iter().map(|t| {
+            self.molecule.push_object(crate::molecule::PageObject::Text(crate::molecule::PageText {
+                id: 0,
+                pos: [t.pos[0] + OFFSET[0], t.pos[1] + OFFSET[1]],
+                text: t.text,
+                align: t.align,
+                source: None,
+                color: t.color,
+            }))
+        }).collect();
         self.selected_atoms = new_ids.into_iter().collect();
         self.selected_bonds.clear();
+        self.selected_objects = new_texts.into_iter().collect();
         true
     }
 
@@ -673,6 +857,8 @@ impl ChemStructEditor {
             let id = self.molecule.add_atom(a.element.clone(), pos, a.charge);
             if let Some(atom) = self.molecule.atom_by_id_mut(id) {
                 atom.group_h = a.group_h;
+                atom.color = a.color;
+                atom.shadow = a.shadow;
             }
             map.insert(a.id, id);
         }
@@ -683,6 +869,7 @@ impl ChemStructEditor {
                     if let Some(bond) = self.molecule.bond_by_id_mut(bid) {
                         bond.stereo = b.stereo.clone();
                         bond.double_position = b.double_position;
+                        bond.color = b.color;
                     }
                 }
             }
@@ -1935,9 +2122,13 @@ impl ChemStructEditor {
         self.last_label_rects = label_layouts.iter().map(|(id, l)| (*id, l.rect)).collect();
         // Ring fills sit behind the bonds (ChemDraw-style shading). Same shared fill polygons the
         // image exporter draws, so the canvas and the copied picture look identical.
+        // The structures' drop shadows go under all of them: before every ring fill, bond and
+        // label, and again inside the label backgrounds (which would hide them).
+        draw::draw_shadows(self, &painter, center, &label_layouts, true);
         draw::draw_ring_fills(self, &painter, center);
         draw::draw_bonds(self, &painter, center, &label_layouts);
         draw::draw_atom_backgrounds(self, &painter, center, &label_layouts);
+        draw::draw_shadows_under_labels(self, &painter, center, &label_layouts, true);
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
         let painted = draw::draw_page_objects(self, &painter, center);
         self.last_object_rects = painted.rects;

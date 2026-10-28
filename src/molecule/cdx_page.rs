@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use super::cdx::{self, OBJ_GROUP, OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT, SCALE};
 use super::cdx_bracket::{self, OBJ_BRACKETED_GROUP};
 use super::cdx_codec::CdxObject;
+use super::cdx_colors::{self, ColorTable};
 use super::cdx_fonts::{self, FontTable};
 use super::cdx_table::{self, OBJ_STOICHIOMETRY_GRID};
 use super::page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TextAlign};
@@ -166,8 +167,10 @@ fn justification(t: &CdxObject) -> TextAlign {
     }
 }
 
-/// A ChemDraw text as page text: its markup (lines joined by `\n`), alignment and anchor.
-fn read_text(t: &CdxObject, fonts: &FontTable) -> Option<PageText> {
+/// A ChemDraw text as page text: its markup (lines joined by `\n`), alignment, anchor and
+/// colour, which is one for the whole text (a text of several colours takes its first). What
+/// names no colour is in its container's ([`ColorTable::inside`]).
+fn read_text(t: &CdxObject, fonts: &FontTable, colors: &ColorTable) -> Option<PageText> {
     let rich = cdx_fonts::text_of(t, fonts)?;
     let markup = markup_lines(&rich);
     if markup.trim().is_empty() {
@@ -175,7 +178,14 @@ fn read_text(t: &CdxObject, fonts: &FontTable) -> Option<PageText> {
     }
     let pos = point_2d(t, PROP_2D_POSITION)
         .or_else(|| cdx::bounding_box(t).map(|b| (b[0], b[1] + ASCENT_PT * PT)))?;
-    Some(PageText { id: 0, pos: mol_point(pos), text: markup, align: justification(t), source: Some(t.id) })
+    // That of its first coloured run (0, black, is what ChemDraw writes for a plain one), else
+    // the text's own, else the page's or the document's.
+    let runs = t.prop(cdx::PROP_TEXT).and_then(cdx_fonts::parse_string).map(|(runs, _)| runs).unwrap_or_default();
+    let color = match runs.iter().map(|r| r.color).find(|&c| c != 0) {
+        Some(run) => colors.rgba(run),
+        None => cdx_colors::foreground(t, colors),
+    };
+    Some(PageText { id: 0, pos: mol_point(pos), text: markup, align: justification(t), source: Some(t.id), color })
 }
 
 /// Markup for rich text that may hold line breaks: each line written on its own, so a script
@@ -195,9 +205,9 @@ fn markup_lines(rich: &RichText) -> String {
 }
 
 /// The arrows and texts on `page` that become page objects, in document order (an arrow where
-/// its `arrow` object, or its lone graphic, stands). `fonts` is the document's font table, which
-/// names the texts' fonts.
-pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable) -> Vec<Converted> {
+/// its `arrow` object, or its lone graphic, stands). `fonts` and `colors` are the document's font
+/// and colour tables, which name the texts' fonts and colours.
+pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable, colors: &ColorTable) -> Vec<Converted> {
     let mut objects = Vec::new();
     page_level(page, &mut objects);
     // Arrow objects the editor draws, and the graphics superseded by them.
@@ -234,7 +244,7 @@ pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable) -> Vec<Converted
                 out.push(Converted { object: PageObject::Arrow(arrow), ids: vec![obj.id] });
             }
             OBJ_TEXT => {
-                if let Some(text) = read_text(obj, fonts) {
+                if let Some(text) = read_text(obj, fonts, &colors.inside(page)) {
                     out.push(Converted { object: PageObject::Text(text), ids: vec![obj.id] });
                 }
             }
@@ -411,8 +421,8 @@ fn new_arrow(arrow: &PageArrow, shift: (f64, f64), next: &mut u32) -> Vec<CdxObj
 }
 
 /// A text's characters (lines joined by ChemDraw's `\r`) with their style runs, its fonts
-/// given ids in `fonts`.
-fn text_runs(text: &PageText, fonts: &mut FontTable) -> (Vec<cdx_fonts::StyleRun>, String) {
+/// given ids in `fonts` and its colour in `colors`.
+fn text_runs(text: &PageText, fonts: &mut FontTable, colors: &mut ColorTable) -> (Vec<cdx_fonts::StyleRun>, String) {
     let mut rich = RichText::new();
     for (k, line) in text.lines().into_iter().enumerate() {
         if k > 0 {
@@ -422,7 +432,12 @@ fn text_runs(text: &PageText, fonts: &mut FontTable) -> (Vec<cdx_fonts::StyleRun
             rich = rich.span(span.text, span.style);
         }
     }
-    cdx_fonts::runs_of(&rich, fonts)
+    let (mut runs, chars) = cdx_fonts::runs_of(&rich, fonts);
+    let color = colors.index_of(text.color);
+    for run in &mut runs {
+        run.color = color;
+    }
+    (runs, chars)
 }
 
 /// Where ChemDraw will draw `text` anchored at `at` (CDX units): an estimate from Arial's
@@ -452,8 +467,8 @@ fn justification_value(align: TextAlign) -> Option<Vec<u8>> {
 }
 
 /// Write `text`'s characters, alignment and box into `t`, anchored at `at` (CDX units).
-fn set_text_content(t: &mut CdxObject, text: &PageText, at: (f64, f64), fonts: &mut FontTable) {
-    let (runs, chars) = text_runs(text, fonts);
+fn set_text_content(t: &mut CdxObject, text: &PageText, at: (f64, f64), fonts: &mut FontTable, colors: &mut ColorTable) {
+    let (runs, chars) = text_runs(text, fonts, colors);
     t.set(PROP_2D_POSITION, cdx::point(at.0, at.1));
     t.set(PROP_BOUNDING_BOX, cdx::rect(text_bbox(text, at)));
     match justification_value(text.align) {
@@ -469,10 +484,10 @@ fn set_text_content(t: &mut CdxObject, text: &PageText, at: (f64, f64), fonts: &
     }
 }
 
-fn new_text(text: &PageText, shift: (f64, f64), next: &mut u32, fonts: &mut FontTable) -> CdxObject {
+fn new_text(text: &PageText, shift: (f64, f64), next: &mut u32, fonts: &mut FontTable, colors: &mut ColorTable) -> CdxObject {
     *next += 1;
     let mut t = CdxObject::new(OBJ_TEXT, *next);
-    set_text_content(&mut t, text, cdx_point(text.pos, shift), fonts);
+    set_text_content(&mut t, text, cdx_point(text.pos, shift), fonts, colors);
     t
 }
 
@@ -482,8 +497,8 @@ fn new_text(text: &PageText, shift: (f64, f64), next: &mut u32, fonts: &mut Font
 pub(crate) type Owned = HashMap<u32, (PageObject, Vec<CdxObject>)>;
 
 /// Take the objects reading converts ([`convert_page`]) off `page` (and out of its groups).
-pub(crate) fn take_owned(page: &mut CdxObject, owned: &mut Owned, fonts: &FontTable) {
-    let converted = convert_page(page, fonts);
+pub(crate) fn take_owned(page: &mut CdxObject, owned: &mut Owned, fonts: &FontTable, colors: &ColorTable) {
+    let converted = convert_page(page, fonts, colors);
     let mut source_of: HashMap<u32, u32> = HashMap::new();
     for c in &converted {
         let source = c.object.source().expect("read objects have a source");
@@ -530,7 +545,8 @@ fn same_point(a: (f64, f64), b: (f64, f64)) -> bool {
 /// from `next`. An object whose source is in `owned` is written as its original objects with
 /// what changed rewritten; any other is written new. `fragment_of` is the fragment each atom
 /// was written in (a table names the fragments of its columns). Texts name their fonts in
-/// `fonts`, the document's font table, which gains the fonts it lacked.
+/// `fonts`, the document's font table, which gains the fonts it lacked, and their colours in
+/// `colors`, its colour table, likewise.
 pub(crate) fn write_objects(
     mol: &Molecule,
     fragment_of: &HashMap<u32, u32>,
@@ -538,6 +554,7 @@ pub(crate) fn write_objects(
     shift: (f64, f64),
     next: &mut u32,
     fonts: &mut FontTable,
+    colors: &mut ColorTable,
 ) -> Vec<CdxObject> {
     let mut out = Vec::new();
     for object in &mol.objects {
@@ -557,8 +574,8 @@ pub(crate) fn write_objects(
                 let at = cdx_point(t.pos, shift);
                 let was = cdx_point(read.pos, (0.0, 0.0));
                 let obj = &mut cdx_objects[0];
-                if t.text != read.text || t.align != read.align {
-                    set_text_content(obj, t, at, fonts);
+                if t.text != read.text || t.align != read.align || t.color != read.color {
+                    set_text_content(obj, t, at, fonts, colors);
                 } else if !same_point(at, was) {
                     // Only moved: keep ChemDraw's own text (fonts, colours) and shift its box.
                     let (dx, dy) = (at.0 - was.0, at.1 - was.1);
@@ -594,7 +611,7 @@ pub(crate) fn write_objects(
             }
             (PageObject::Text(t), _) => {
                 if !t.is_blank() {
-                    out.push(new_text(t, shift, next, fonts));
+                    out.push(new_text(t, shift, next, fonts, colors));
                 }
             }
             // Written with the fragments they enclose (`cdx_bracket::write_brackets`); what
@@ -776,7 +793,7 @@ mod tests {
         m.add_arrow([7.0, 5.0], [11.5, 5.0], ArrowKind::Reaction);
         m.add_arrow([7.0, 8.0], [11.5, 6.0], ArrowKind::Equilibrium);
         m.add_text([7.5, 4.2], "Pd(PPh_3)_4\nTHF, 60 \u{b0}C");
-        m.push_object(PageObject::Text(PageText { id: 0, pos: [9.0, 7.0], text: "K_2CO_3".into(), align: TextAlign::Center, source: None }));
+        m.push_object(PageObject::Text(PageText { id: 0, pos: [9.0, 7.0], text: "K_2CO_3".into(), align: TextAlign::Center, source: None, color: None }));
         m
     }
 

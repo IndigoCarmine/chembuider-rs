@@ -56,6 +56,165 @@ pub fn compute_label_layouts(
     )
 }
 
+// ─── Layer -2: the drop shadow ────────────────────────────────────────────────
+
+/// How many layers past the sharp one a blurred shadow is painted in on screen (egui has no
+/// blur): each a little wider and as faint, so the stack fades out over the blur radius. A blur
+/// under a pixel is painted as one sharp layer.
+const SHADOW_LAYERS: usize = 4;
+
+/// The layers of `shadow` to paint: how far each spreads past the shape (pixels) and its colour.
+fn shadow_layers(shadow: &scene::SceneShadow) -> Vec<(f32, egui::Color32)> {
+    if shadow.blur < 1.0 {
+        return vec![(0.0, shadow.color)];
+    }
+    let n = SHADOW_LAYERS + 1;
+    (0..n)
+        .map(|k| (shadow.blur * k as f32 / SHADOW_LAYERS as f32, shadow.color.gamma_multiply(1.0 / n as f32)))
+        .collect()
+}
+
+/// The drop shadows the shadowed structures cast ([`Molecule::structure_shadows`]), painted
+/// first, under every structure's ring fills, bonds and labels: each structure's primitives
+/// (the same the picture draws) moved by its offset, in its colour, blurred by layering. What
+/// is transparent casts none, and a translucent thing a fainter one. `ring_fills` is whether
+/// the drawing paints ring fills (and so their shadows).
+///
+/// The label backgrounds painted later hide what is under a label, shadows too; paint the
+/// shadows again inside them with [`draw_shadows_under_labels`], so a label shows over a shadow
+/// as in the exported picture (where a label cuts a hole in the bonds, not a white box).
+///
+/// [`Molecule::structure_shadows`]: crate::molecule::Molecule::structure_shadows
+pub fn draw_shadows(
+    editor: &ChemStructEditor,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
+    ring_fills: bool,
+) {
+    paint_shadows(editor, painter, center, labels, ring_fills, &[]);
+}
+
+/// [`draw_shadows`] again, inside each label's background only: painted between the label
+/// backgrounds and the labels.
+pub fn draw_shadows_under_labels(
+    editor: &ChemStructEditor,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
+    ring_fills: bool,
+) {
+    let pad = editor.config.style.label_bg_pad * editor.zoom;
+    let backgrounds: Vec<egui::Rect> = labels.values().map(|l| l.rect.expand(pad)).collect();
+    if !backgrounds.is_empty() {
+        paint_shadows(editor, painter, center, labels, ring_fills, &backgrounds);
+    }
+}
+
+/// The screen rect the structures' shadows cover (see [`draw_shadows`]), `None` when they cast
+/// none.
+pub fn shadow_bounds(
+    editor: &ChemStructEditor,
+    center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
+    ring_fills: bool,
+) -> Option<egui::Rect> {
+    let mol = &editor.molecule;
+    if mol.atoms.iter().all(|a| a.shadow.is_none()) {
+        return None;
+    }
+    let xf = editor_transform(editor, center);
+    let fills = if ring_fills { scene::build_ring_fills(mol, xf) } else { Vec::new() };
+    let bonds = scene::build_bonds(mol, &editor.config.style, xf, labels);
+    scene::build_shadows(mol, xf, &bonds, labels)
+        .iter()
+        .map(|s| scene::shadow_extent(s, &fills, &bonds, labels))
+        .filter(|r| r.min.x <= r.max.x)
+        .reduce(|a, b| a.union(b))
+}
+
+/// Paint the structures' shadows, once, or once inside each of `clips` when there are any.
+fn paint_shadows(
+    editor: &ChemStructEditor,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    labels: &HashMap<u32, AtomLabelLayout>,
+    ring_fills: bool,
+    clips: &[egui::Rect],
+) {
+    let mol = &editor.molecule;
+    if mol.atoms.iter().all(|a| a.shadow.is_none()) {
+        return;
+    }
+    let xf = editor_transform(editor, center);
+    let fills = if ring_fills { scene::build_ring_fills(mol, xf) } else { Vec::new() };
+    let bonds = scene::build_bonds(mol, &editor.config.style, xf, labels);
+    let shadows = scene::build_shadows(mol, xf, &bonds, labels);
+    // The alpha of what casts a shadow, which scales the shadow's.
+    let opacity = |rgba: Option<[u8; 4]>| rgba.map_or(1.0, |c| c[3] as f32 / 255.0);
+    let extents: Vec<egui::Rect> = shadows.iter().map(|s| scene::shadow_extent(s, &fills, &bonds, labels)).collect();
+    let paint = |painter: &egui::Painter| {
+        for (shadow, extent) in shadows.iter().zip(&extents) {
+            if !extent.intersects(painter.clip_rect()) {
+                continue;
+            }
+            let d = shadow.offset;
+            let polygon = |points: &[egui::Pos2], spread: f32, color: egui::Color32| {
+                let stroke = if spread > 0.0 { egui::epaint::PathStroke::new(2.0 * spread, color) } else { egui::epaint::PathStroke::NONE };
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: points.iter().map(|p| *p + d).collect(),
+                    closed: true,
+                    fill: color,
+                    stroke,
+                }));
+            };
+            for (spread, color) in shadow_layers(shadow) {
+                for poly in shadow.ring_fills.iter().filter_map(|&i| fills.get(i)) {
+                    polygon(&poly.points, spread, color.gamma_multiply(opacity(Some(poly.rgba))));
+                }
+                for bond in shadow.bonds.iter().filter_map(|&i| bonds.get(i)) {
+                    let color = color.gamma_multiply(opacity(bond.color));
+                    if color.a() == 0 {
+                        continue;
+                    }
+                    for s in &bond.strokes {
+                        painter.line_segment([s.a + d, s.b + d], egui::Stroke::new(s.width + 2.0 * spread, color));
+                    }
+                    for fill in &bond.fills {
+                        polygon(fill, spread, color);
+                    }
+                }
+                // A layer of a blurred glyph: copies spread around the offset point.
+                let around: Vec<egui::Vec2> = if spread > 0.0 {
+                    [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
+                        .iter()
+                        .map(|&(x, y)| egui::vec2(x, y) * spread * 0.5)
+                        .collect()
+                } else {
+                    vec![egui::Vec2::ZERO]
+                };
+                for &atom in &shadow.labels {
+                    let Some(layout) = labels.get(&atom) else { continue };
+                    let alpha = opacity(mol.atom_by_id(atom).and_then(|a| a.color));
+                    let color = color.gamma_multiply(alpha / around.len() as f32);
+                    if color.a() == 0 {
+                        continue;
+                    }
+                    for v in &around {
+                        layout.galley.paint_in(painter, layout.rect.min + d + *v, color);
+                    }
+                }
+            }
+        }
+    };
+    if clips.is_empty() {
+        paint(painter);
+    }
+    for clip in clips {
+        paint(&painter.with_clip_rect(*clip));
+    }
+}
+
 // ─── Layer -1: ring fills ─────────────────────────────────────────────────────
 
 /// Colored ring interiors, drawn behind the bonds (ChemDraw-style ring shading). Same shared
@@ -94,7 +253,7 @@ pub fn draw_bonds(
         } else if editor.selected_bonds.contains(&bond.bond_id) {
             egui::Color32::from_rgb(80, 130, 255)
         } else {
-            egui::Color32::BLACK
+            bond.color.map_or(egui::Color32::BLACK, scene::color32)
         };
         for s in &bond.strokes {
             painter.line_segment([s.a, s.b], egui::Stroke::new(s.width, color));

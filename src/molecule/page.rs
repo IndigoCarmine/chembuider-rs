@@ -66,6 +66,11 @@ pub struct PageText {
     /// The id of the ChemDraw text object this was read from; see [`PageArrow::source`].
     #[serde(default)]
     pub source: Option<u32>,
+    /// The colour of the whole text (straight RGBA); `None` draws it in the style's colour, as
+    /// before colours existed. One colour for the text, not one per run: the markup has no
+    /// colour of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 4]>,
 }
 
 impl PageText {
@@ -297,7 +302,7 @@ mod tests {
 
     #[test]
     fn text_lines_split_on_newlines() {
-        let t = PageText { id: 1, pos: [0.0, 0.0], text: "Pd(PPh_3)_4\nTHF, 60 °C".into(), align: TextAlign::Left, source: None };
+        let t = PageText { id: 1, pos: [0.0, 0.0], text: "Pd(PPh_3)_4\nTHF, 60 °C".into(), align: TextAlign::Left, source: None, color: None };
         let lines = t.lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].spans.len(), 4, "Pd(PPh, 3, )_, 4");

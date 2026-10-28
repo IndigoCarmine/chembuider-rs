@@ -49,7 +49,7 @@ fn reaction() -> Molecule {
     bond(&mut m, c2, c3);
     bond(&mut m, c2, o);
     m.add_arrow([8.0, 5.0], [12.0, 5.0], ArrowKind::Reaction);
-    m.push_object(PageObject::Text(PageText { id: 0, pos: [10.0, 4.4], text: "NaH".into(), align: TextAlign::Center, source: None }));
+    m.push_object(PageObject::Text(PageText { id: 0, pos: [10.0, 4.4], text: "NaH".into(), align: TextAlign::Center, source: None, color: None }));
     let r1 = m.add_atom("C".into(), [14.0, 5.0], 0);
     let r2 = m.add_atom("C".into(), [15.5, 5.0], 0);
     let ro = m.add_atom("O".into(), [14.75, 3.7], 0);
