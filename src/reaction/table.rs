@@ -537,7 +537,7 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
             ..Default::default()
         };
-        let _ = ctx.run_ui(raw, |ui| f(ui.painter()));
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| f(ui.painter()));
     }
 
     /// Geometry: two separate frames side by side, a label column plus one column per
@@ -614,7 +614,7 @@ mod tests {
             ..Default::default()
         };
         let mut frames: Vec<Rect> = Vec::new();
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             let layout = measure_table(&table, ui.painter(), &style);
             frames = layout
                 .blocks

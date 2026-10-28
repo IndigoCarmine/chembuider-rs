@@ -176,6 +176,97 @@ pub fn draw_atom_labels(
     }
 }
 
+// ─── Layer 2b: page objects (arrows, texts) ──────────────────────────────────
+
+const SELECTED: egui::Color32 = egui::Color32::from_rgb(80, 130, 255);
+const HOVERED: egui::Color32 = egui::Color32::from_rgb(50, 180, 50);
+
+/// Paint the page objects from the shared scene (the geometry the image export draws), tinted
+/// when hovered or selected, with the end handles of a lone selected arrow and the arrow being
+/// drawn. Returns the screen rect of every text and table painted, and every table's cells,
+/// for next frame's hit testing.
+pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) -> PageObjectRects {
+    use crate::molecule::PageObject;
+    let xf = editor_transform(editor, center);
+    let style = &editor.config.style;
+    let editing = editor.text_edit.as_ref().and_then(|e| e.id);
+    let mut rects = HashMap::new();
+    let mut cells = HashMap::new();
+    let editing_cell = editor.table_edit.as_ref().map(|e| (e.id, e.cell));
+    let paint = |obj: &scene::SceneObject, color: egui::Color32| {
+        for s in &obj.strokes {
+            painter.line_segment([s.a, s.b], egui::Stroke::new(s.width, color));
+        }
+        for fill in &obj.fills {
+            painter.add(egui::Shape::convex_polygon(fill.clone(), color, egui::Stroke::NONE));
+        }
+        for line in &obj.texts {
+            line.galley.paint(painter, line.rect.min);
+        }
+    };
+    for object in &editor.molecule.objects {
+        let id = object.id();
+        if editing == Some(id) {
+            continue;
+        }
+        let selected = editor.selected_objects.contains(&id);
+        let hovered = editor.hovered_object == Some(id);
+        let color = if selected { SELECTED } else if hovered { HOVERED } else { egui::Color32::BLACK };
+        if let PageObject::Table(t) = object {
+            let mut table = scene::build_table(t, &editor.molecule, style, xf, |job| painter.layout_job(job));
+            // The cell being typed into shows the edit box instead of its value.
+            if let Some((_, cell)) = editing_cell.filter(|(eid, _)| *eid == id)
+                && let Some(&(_, r)) = table.cells.iter().find(|(c, _)| *c == cell)
+            {
+                table.object.texts.retain(|line| !r.contains(line.rect.center()));
+            }
+            paint(&table.object, color);
+            rects.insert(id, table.object.rect);
+            cells.insert(id, table.cells);
+            if selected || hovered {
+                painter.rect_stroke(table.object.rect.expand(2.0), 2.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Outside);
+            }
+            continue;
+        }
+        let obj = scene::build_object(object, &editor.molecule, style, xf, |job| painter.layout_job(job));
+        paint(&obj, color);
+        if let PageObject::Bracket(_) = object {
+            // Its label, for hit testing (the marks are tested by their geometry).
+            if let Some(label) = obj.texts.first() {
+                rects.insert(id, label.rect);
+            }
+        }
+        if matches!(object, PageObject::Text(_)) {
+            rects.insert(id, obj.rect);
+            if selected || hovered {
+                painter.rect_stroke(obj.rect.expand(2.0), 2.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Outside);
+            }
+        }
+    }
+    // The ends of a lone selected arrow can be dragged: mark them.
+    if let Some(a) = super::interact::lone_selected_arrow(editor) {
+        for p in [a.tail, a.head] {
+            let sp = xf.apply(p);
+            painter.circle(sp, 4.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
+        }
+    }
+    // The arrow being drawn with the Arrow tool.
+    if let Some(super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag {
+        let preview = PageObject::Arrow(crate::molecule::PageArrow { id: 0, tail, head, kind, source: None });
+        let obj = scene::build_object(&preview, &editor.molecule, style, xf, |job| painter.layout_job(job));
+        paint(&obj, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
+    }
+    PageObjectRects { rects, cells }
+}
+
+/// Where page objects were painted, for hit testing on the next frame: the rect of each text
+/// and table, and each table's value cells.
+#[derive(Default)]
+pub struct PageObjectRects {
+    pub rects: HashMap<u32, egui::Rect>,
+    pub cells: HashMap<u32, Vec<(crate::reaction::edit::CellRef, egui::Rect)>>,
+}
+
 // ─── Layer 3: overlays ───────────────────────────────────────────────────────
 
 pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
@@ -652,7 +743,7 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
             ..Default::default()
         };
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             editor.ui(ui);
         });
 
@@ -692,7 +783,7 @@ mod tests {
         editor.molecule.add_bond(o, c, BondOrder::Single); // bond from the right → "HO"
 
         let center = egui::pos2(200.0, 150.0);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
             let layouts = compute_label_layouts(&editor, ui.painter(), center);
             let layout = &layouts[&o];
             let sp = editor.mol_to_screen([0.0, 0.0], center);
@@ -725,7 +816,7 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
             ..Default::default()
         };
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             editor.ui(ui);
         });
 
@@ -763,7 +854,7 @@ mod tests {
         let a = editor.molecule.add_atom("CO2Et".to_string(), [0.0, 0.0], 0);
 
         let center = egui::pos2(200.0, 150.0);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
             let layouts = compute_label_layouts(&editor, ui.painter(), center);
             editor.last_label_rects =
                 layouts.iter().map(|(id, l)| (*id, l.rect)).collect();

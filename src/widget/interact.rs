@@ -1,6 +1,7 @@
 use super::{ChemStructEditor, DEFAULT_BOND_LENGTH};
 use crate::config::{AtomAction, BondAction, ResolvedAtomAction, SelectionAction};
-use crate::molecule::{BondOrder, BondStereo};
+use crate::molecule::{ArrowKind, BondOrder, BondStereo, PageArrow, PageObject};
+use crate::molecule::page::{snap_direction, DEFAULT_ARROW_LENGTH};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Group-hydrogen bookkeeping
@@ -227,9 +228,10 @@ pub fn process_bond_tool(
 ///
 /// Returns true if something was removed.
 fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
-    enum Target { Atom(u32), Bond(u32) }
+    enum Target { Atom(u32), Bond(u32), Object(u32) }
 
     let target = editor.hovered_atom.map(Target::Atom)
+        .or_else(|| editor.hovered_object.map(Target::Object))
         .or_else(|| editor.hovered_bond.map(Target::Bond))
         .or_else(|| editor.hotspot_bond.map(Target::Bond))
         .or_else(|| editor.hotspot_atom.map(Target::Atom));
@@ -254,6 +256,13 @@ fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
             editor.molecule.remove_bond(bond_id);
             editor.hovered_bond = None;
             editor.hotspot_bond = None;
+            true
+        }
+        Some(Target::Object(id)) => {
+            editor.push_undo();
+            editor.molecule.remove_object(id);
+            editor.selected_objects.remove(&id);
+            editor.hovered_object = None;
             true
         }
         None => false,
@@ -289,12 +298,23 @@ fn lasso_begin(editor: &mut ChemStructEditor, origin: egui::Pos2) {
 fn lasso_select(editor: &mut ChemStructEditor, center: egui::Pos2) {
     if editor.lasso_path.len() > 2 {
         editor.selected_atoms.clear();
+        editor.selected_objects.clear();
         let lasso = editor.lasso_path.clone();
         let hits: Vec<u32> = editor.molecule.atoms.iter().filter_map(|atom| {
             let sp = editor.mol_to_screen(atom.pos, center);
             if is_point_in_polygon(sp, &lasso) { Some(atom.id) } else { None }
         }).collect();
         editor.selected_atoms.extend(hits);
+        // A page object is taken when it lies inside whole: both ends of an arrow, a text's
+        // anchor, all the atoms of a bracket.
+        let objects: Vec<u32> = editor.molecule.objects.iter().filter(|o| match o {
+            PageObject::Bracket(b) => {
+                let atoms: Vec<u32> = b.atoms.iter().copied().filter(|a| editor.molecule.atom_by_id(*a).is_some()).collect();
+                !atoms.is_empty() && atoms.iter().all(|a| editor.selected_atoms.contains(a))
+            }
+            _ => o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), &lasso)),
+        }).map(PageObject::id).collect();
+        editor.selected_objects.extend(objects);
     }
 }
 
@@ -318,6 +338,21 @@ pub fn process_select_tool(
         });
         if let Some(atom_id) = seed {
             editor.selected_atoms = editor.molecule.connected_atoms(atom_id).into_iter().collect();
+        } else if let Some(id) = editor.hovered_object {
+            // Double-click a text (or a bracket, for its label) to edit it, a table's cell to
+            // enter its value.
+            if editor.molecule.object_by_id(id).is_some_and(|o| o.as_table().is_some()) {
+                // The release that completes a double-click may carry no interaction position.
+                let at = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                    .unwrap_or(mouse);
+                if let Some(cell) = editor.table_cell_at(id, at) {
+                    modified |= editor.edit_table_cell(id, cell);
+                }
+            } else {
+                editor.edit_text(id);
+            }
         }
     } else if response.clicked() {
         editor.lasso_path.clear();
@@ -327,8 +362,13 @@ pub fn process_select_tool(
             } else {
                 editor.selected_atoms.insert(atom_id);
             }
+        } else if let Some(id) = editor.hovered_object {
+            if !editor.selected_objects.remove(&id) {
+                editor.selected_objects.insert(id);
+            }
         } else {
             editor.selected_atoms.clear();
+            editor.selected_objects.clear();
         }
     }
 
@@ -337,6 +377,7 @@ pub fn process_select_tool(
         // `drag_started()` fires the pointer may already have left the atom it was pressed on.
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
         lasso_begin(editor, origin);
+        editor.object_drag = None;
         // Alt+drag with a selection rotates the molecule around its centroid.
         if ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty() {
             editor.push_undo();
@@ -346,11 +387,22 @@ pub fn process_select_tool(
             editor.dragging_atom = None;
         } else {
             editor.rotate_last_angle = None;
-            editor.dragging_atom = editor.hit_test_atom(origin, center);
-            if editor.dragging_atom.is_some() {
-                // Snapshot once, before the first frame of movement, so the whole move is one
-                // undo step (the Alt-rotation branch above does the same).
+            editor.dragging_atom = None;
+            if let Some(end) = arrow_end_at(editor, origin, center) {
+                // An end of the lone selected arrow: drag that end.
                 editor.push_undo();
+                editor.object_drag = Some(end);
+            } else {
+                editor.dragging_atom = editor.hit_test_atom(origin, center);
+                if editor.dragging_atom.is_some() {
+                    // Snapshot once, before the first frame of movement, so the whole move is
+                    // one undo step (the Alt-rotation branch above does the same).
+                    editor.push_undo();
+                } else if let Some(id) = editor.hit_test_object(origin, center) {
+                    // A page object: move it, or the whole selection when it is part of it.
+                    editor.push_undo();
+                    editor.object_drag = Some(ObjectDrag::Move { with_selection: editor.selected_objects.contains(&id), id });
+                }
             }
         }
     }
@@ -363,11 +415,17 @@ pub fn process_select_tool(
             let angle = (mp[1] - c[1]).atan2(mp[0] - c[0]);
             let ids: Vec<u32> = editor.selected_atoms.iter().copied().collect();
             rotate_atoms(editor, &ids, angle - last);
+            for id in editor.selected_objects.clone() {
+                if let Some(o) = editor.molecule.object_by_id_mut(id) {
+                    o.rotate_about(c, angle - last);
+                }
+            }
             editor.rotate_last_angle = Some(angle);
             modified = true;
         } else if let Some(atom_id) = editor.dragging_atom {
             let [dx, dy] = editor.view(center).screen_delta_to_mol(response.drag_delta());
-            let atoms_to_move: Vec<u32> = if editor.selected_atoms.contains(&atom_id) {
+            let with_selection = editor.selected_atoms.contains(&atom_id);
+            let atoms_to_move: Vec<u32> = if with_selection {
                 editor.selected_atoms.iter().cloned().collect()
             } else {
                 vec![atom_id]
@@ -377,6 +435,34 @@ pub fn process_select_tool(
                     atom.pos[0] += dx;
                     atom.pos[1] += dy;
                 }
+            }
+            if with_selection {
+                let moved = editor.selected_atoms.clone();
+                move_objects(editor, &editor.selected_objects.clone(), [dx, dy], &moved);
+            }
+            modified = true;
+        } else if let Some(drag) = editor.object_drag.clone() {
+            match drag {
+                ObjectDrag::Move { id, with_selection } => {
+                    let delta = editor.view(center).screen_delta_to_mol(response.drag_delta());
+                    if with_selection {
+                        let moved = editor.selected_atoms.clone();
+                        move_objects(editor, &editor.selected_objects.clone(), delta, &moved);
+                        let atoms: Vec<u32> = editor.selected_atoms.iter().copied().collect();
+                        move_atoms(editor, &atoms, delta);
+                    } else {
+                        move_objects(editor, &[id].into_iter().collect(), delta, &Default::default());
+                    }
+                }
+                ObjectDrag::ArrowEnd { id, head } => {
+                    let free = ui.input(|i| i.modifiers.shift);
+                    let to = editor.screen_to_mol(mouse, center);
+                    if let Some(PageObject::Arrow(a)) = editor.molecule.object_by_id_mut(id) {
+                        let (fixed, moving) = if head { (a.tail, &mut a.head) } else { (a.head, &mut a.tail) };
+                        *moving = if free { to } else { snap_direction(fixed, to, 15.0) };
+                    }
+                }
+                ObjectDrag::NewArrow { .. } => {}
             }
             modified = true;
         } else {
@@ -389,6 +475,8 @@ pub fn process_select_tool(
             // rotation finished
         } else if editor.dragging_atom.is_some() {
             editor.dragging_atom = None;
+        } else if editor.object_drag.take().is_some() {
+            // move finished
         } else {
             lasso_select(editor, center);
         }
@@ -401,10 +489,7 @@ pub fn process_select_tool(
     let delete_pressed =
         ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
     if delete_pressed {
-        if !editor.selected_atoms.is_empty() {
-            editor.push_undo();
-            let ids: Vec<u32> = editor.selected_atoms.drain().collect();
-            for id in ids { editor.molecule.remove_atom(id); }
+        if editor.delete_selection() {
             modified = true;
         } else if delete_hovered(editor) {
             modified = true;
@@ -427,6 +512,12 @@ pub fn process_eraser_tool(
             editor.push_undo();
             editor.molecule.remove_atom(atom_id);
             modified = true;
+        } else if let Some(id) = editor.hovered_object {
+            editor.push_undo();
+            editor.molecule.remove_object(id);
+            editor.selected_objects.remove(&id);
+            editor.hovered_object = None;
+            modified = true;
         } else if let Some(bond_id) = editor.hovered_bond {
             editor.push_undo();
             editor.molecule.remove_bond(bond_id);
@@ -434,6 +525,149 @@ pub fn process_eraser_tool(
         }
     }
     modified
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Page objects: the Arrow and Text tools, and dragging objects
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A drag on page objects in progress.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ObjectDrag {
+    /// The Arrow tool drawing a new arrow, from where the drag began to the pointer.
+    NewArrow { tail: [f32; 2], head: [f32; 2], kind: ArrowKind },
+    /// Moving page object `id` with the Select tool: alone, or with the whole selection (atoms
+    /// included) when it is part of it.
+    Move { id: u32, with_selection: bool },
+    /// Dragging one end of arrow `id` (its head, or its tail).
+    ArrowEnd { id: u32, head: bool },
+}
+
+/// The arrow that is the whole selection, whose ends can then be dragged.
+pub(crate) fn lone_selected_arrow(editor: &ChemStructEditor) -> Option<&PageArrow> {
+    if editor.selected_objects.len() != 1 || !editor.selected_atoms.is_empty() {
+        return None;
+    }
+    let id = *editor.selected_objects.iter().next()?;
+    editor.molecule.object_by_id(id)?.as_arrow()
+}
+
+/// The end of the lone selected arrow under screen point `screen`, if any.
+fn arrow_end_at(editor: &ChemStructEditor, screen: egui::Pos2, center: egui::Pos2) -> Option<ObjectDrag> {
+    let a = lone_selected_arrow(editor)?;
+    let near = |p: [f32; 2]| editor.mol_to_screen(p, center).distance(screen) <= super::NODE_HIT_RADIUS_PX * 0.7;
+    if near(a.head) {
+        Some(ObjectDrag::ArrowEnd { id: a.id, head: true })
+    } else if near(a.tail) {
+        Some(ObjectDrag::ArrowEnd { id: a.id, head: false })
+    } else {
+        None
+    }
+}
+
+/// Move page objects `ids` by `delta`. A bracket stands where its atoms are, so moving it
+/// moves them, except those in `moved` (which the caller moves itself).
+fn move_objects(
+    editor: &mut ChemStructEditor,
+    ids: &std::collections::HashSet<u32>,
+    delta: [f32; 2],
+    moved: &std::collections::HashSet<u32>,
+) {
+    let mut atoms: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for o in &mut editor.molecule.objects {
+        if ids.contains(&o.id()) {
+            o.translate(delta);
+            if let PageObject::Bracket(b) = o {
+                atoms.extend(b.atoms.iter().copied().filter(|a| !moved.contains(a)));
+            }
+        }
+    }
+    for a in &mut editor.molecule.atoms {
+        if atoms.contains(&a.id) {
+            a.pos[0] += delta[0];
+            a.pos[1] += delta[1];
+        }
+    }
+}
+
+/// The Arrow tool: drag from tail to head to draw an arrow of `kind` (its direction snaps to
+/// 15° steps unless Shift is held), or click to place one of the default length pointing
+/// right. Delete removes what is under the pointer, as in the Bond tool.
+pub fn process_arrow_tool(
+    editor: &mut ChemStructEditor,
+    response: &egui::Response,
+    center: egui::Pos2,
+    ui: &egui::Ui,
+    kind: ArrowKind,
+) -> bool {
+    let mut modified = false;
+    let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
+    let drag = PrimaryDrag::of(response, ui);
+    if drag.started {
+        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
+        let tail = editor.screen_to_mol(origin, center);
+        editor.object_drag = Some(ObjectDrag::NewArrow { tail, head: tail, kind });
+    }
+    if drag.dragged {
+        let free = ui.input(|i| i.modifiers.shift);
+        let to = editor.screen_to_mol(mouse, center);
+        if let Some(ObjectDrag::NewArrow { tail, head, .. }) = &mut editor.object_drag {
+            *head = if free { to } else { snap_direction(*tail, to, 15.0) };
+        }
+    }
+    if drag.stopped {
+        if let Some(ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag.take() {
+            let (dx, dy) = (head[0] - tail[0], head[1] - tail[1]);
+            // A drag too short to give the arrow a direction draws nothing.
+            if (dx * dx + dy * dy).sqrt() >= DEFAULT_BOND_LENGTH * 0.25 {
+                editor.push_undo();
+                editor.molecule.add_arrow(tail, head, kind);
+                modified = true;
+            }
+        }
+    }
+    if response.clicked() {
+        let tail = editor.screen_to_mol(mouse, center);
+        editor.push_undo();
+        editor.molecule.add_arrow(tail, [tail[0] + DEFAULT_ARROW_LENGTH, tail[1]], kind);
+        modified = true;
+    }
+    let delete_pressed =
+        ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+    if delete_pressed && delete_hovered(editor) {
+        modified = true;
+    }
+    modified
+}
+
+/// The Text tool: a click on a text opens it for editing; a click anywhere else opens a new,
+/// empty text there (the click is on its first line, at its left end). Typing goes to the text
+/// box ([`ChemStructEditor::text_edit`]) until it is committed.
+pub fn process_text_tool(
+    editor: &mut ChemStructEditor,
+    response: &egui::Response,
+    center: egui::Pos2,
+    _ui: &egui::Ui,
+) -> bool {
+    if response.clicked() {
+        let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
+        let on_text = editor
+            .hit_test_object(mouse, center)
+            .filter(|id| editor.molecule.object_by_id(*id).is_some_and(|o| o.as_text().is_some()));
+        match on_text {
+            Some(id) => {
+                editor.edit_text(id);
+            }
+            None => {
+                // The click marks the middle of the first line's capital letters, so the
+                // baseline sits a little below it.
+                let size = editor.config.style.label_size / super::SCALE_FACTOR;
+                let at = editor.screen_to_mol(mouse, center);
+                editor.text_edit = Some(super::TextEditState::new([at[0], at[1] + size * 0.35]));
+            }
+        }
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

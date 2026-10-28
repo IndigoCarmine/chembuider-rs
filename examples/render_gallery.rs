@@ -163,8 +163,8 @@ impl CellRenderer {
                 egui::StrokeKind::Inside,
             );
         };
-        let output = self.ctx.run_ui(raw, |ui| frame(editor, ui));
-        self.fold_textures(&output.textures_delta);
+        let mut output = self.ctx.run_ui(raw, |ui| frame(editor, ui));
+        self.fold_textures(&mut output.textures_delta);
 
         let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         rasterize(&primitives, &self.textures, CELL_W, CELL_H)
@@ -172,28 +172,31 @@ impl CellRenderer {
 
     /// Fold a frame's texture uploads (full images and sub-rect patches) into the
     /// persistent atlas copies.
-    fn fold_textures(&mut self, deltas: &egui::TexturesDelta) {
-        for (id, delta) in &deltas.set {
+    fn fold_textures(&mut self, deltas: &mut egui::TexturesDelta) {
+        for (id, id_deltas) in &deltas.set {
             let egui::TextureId::Managed(mid) = id else {
                 continue;
             };
-            let egui::epaint::image::ImageData::Color(img) = &delta.image;
-            match delta.pos {
-                None => {
-                    self.textures
-                        .insert(*mid, (img.size[0], img.size[1], img.pixels.clone()));
-                }
-                Some([px, py]) => {
-                    if let Some((w, _h, pixels)) = self.textures.get_mut(mid) {
-                        for y in 0..img.size[1] {
-                            for x in 0..img.size[0] {
-                                pixels[(py + y) * *w + px + x] = img.pixels[y * img.size[0] + x];
+            for delta in id_deltas {
+                let egui::epaint::image::ImageData::Color(img) = &delta.image;
+                match delta.pos {
+                    None => {
+                        self.textures
+                            .insert(*mid, (img.size[0], img.size[1], img.pixels.clone()));
+                    }
+                    Some([px, py]) => {
+                        if let Some((w, _h, pixels)) = self.textures.get_mut(mid) {
+                            for y in 0..img.size[1] {
+                                for x in 0..img.size[0] {
+                                    pixels[(py + y) * *w + px + x] = img.pixels[y * img.size[0] + x];
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        deltas.clear();
     }
 }
 

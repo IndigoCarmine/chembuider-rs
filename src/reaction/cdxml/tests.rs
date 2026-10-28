@@ -13,7 +13,7 @@ fn document(scheme: &ReactionScheme) -> CdxObject {
         ..Default::default()
     };
     let mut out = None;
-    let _ = ctx.run_ui(raw, |ui| {
+    let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
         out = Some(scheme_document(
             scheme,
             ui.painter(),

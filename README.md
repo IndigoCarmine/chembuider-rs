@@ -50,7 +50,7 @@ Add the crate and a matching egui/eframe:
 ```toml
 [dependencies]
 chembuider-rs = { git = "https://github.com/IndigoCarmine/chembuider-rs" }
-eframe = "0.34"
+eframe = "0.37"
 ```
 
 The widget depends only on `egui` (re-exported as `chembuider_rs::egui` so you always get a
@@ -163,6 +163,28 @@ RichText::parse("SO_4^{2-}")                            // or paint directly
     .paint(&painter, pos, egui::Align2::CENTER_CENTER, &style);
 ```
 
+## Language
+
+The widgets' labels, menus and messages (the Analysis panel, the bond menu, the ibisOffice
+editor) come in Japanese, English, Simplified and Traditional Chinese, Spanish, French,
+German, Brazilian Portuguese, Korean, Russian and Italian. Set the language once for the
+whole process:
+
+```rust
+use chembuider_rs::i18n::{self, Language};
+
+i18n::set_language(Language::Ko);
+// or from a BCP-47 tag / POSIX locale
+i18n::set_language(Language::from_tag("zh-TW").unwrap_or(Language::En));
+```
+
+Until it is set, nothing changes: the widgets are in English, or in Japanese where the older
+per-widget flags ask for it (`AnalysisPanel::ja`, `bond_menu(ui, bond, true)`). IUPAC names
+are English in every language. Chinese, Japanese and Korean labels need a font that has
+them: `widget::fonts::add_cjk_ui_font(&mut fonts, language)` adds a system one (YaHei /
+JhengHei / Malgun Gothic, PingFang SC / TC / Apple SD Gothic Neo, Noto Sans CJK SC / TC / KR
+first for those languages; a Japanese font otherwise).
+
 ## Configuration
 
 `Config` holds the key shortcuts, drawing style (label size, bond widths, dash spacing, …),
@@ -223,5 +245,6 @@ Pre-1.0 and evolving; the public API may change between minor versions.
 
 ## License
 
-Copyright © 2026 IndigoCarmine. All rights reserved. See [LICENSE](LICENSE).
-The licensing terms are still to be determined.
+Copyright © 2026 IndigoCarmine.
+
+Licensed under the either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option (MIT OR Apache-2.0).

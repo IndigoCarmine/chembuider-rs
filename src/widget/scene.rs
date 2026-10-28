@@ -24,10 +24,26 @@ use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
-use crate::molecule::{BondOrder, BondStereo, DoublePosition, Molecule};
+use crate::molecule::{ArrowKind, BondOrder, Bracket, BondStereo, DoublePosition, Molecule, PageObject, PageText, ReactionTable, TextAlign};
+use crate::reaction::edit::CellRef;
+use crate::widget::rich_text::{RichText, SpanStyle};
 
 use crate::molecule::depict::{atom_label, folded_h, should_show_label};
 use super::rich_text::{RichGalley, RichTextStyle};
+
+/// Arrowhead proportions, in line widths: what ChemDraw 25 writes for a new reaction arrow
+/// (`HeadSize="2250" ArrowheadCenterSize="1969" ArrowheadWidth="563"`, hundredths of the line
+/// width). The head is `ARROW_HEAD_LENGTH` long, `2 × ARROW_HEAD_HALF_WIDTH` wide, and its back
+/// is notched: the shaft meets it `ARROW_HEAD_CENTER` behind the tip.
+pub const ARROW_HEAD_LENGTH: f32 = 22.5;
+/// See [`ARROW_HEAD_LENGTH`].
+pub const ARROW_HEAD_CENTER: f32 = 19.69;
+/// See [`ARROW_HEAD_LENGTH`].
+pub const ARROW_HEAD_HALF_WIDTH: f32 = 5.63;
+/// Distance between the two shafts of an equilibrium arrow, in line widths.
+pub const ARROW_SHAFT_SPACING: f32 = 6.0;
+/// Baseline-to-baseline distance of a page text's lines, in font sizes.
+pub const TEXT_LINE_HEIGHT: f32 = 1.2;
 
 // Fixed internal detail (not user-tunable): hash-wedge line count and wavy-bond resolution.
 const HASH_COUNT: usize = 6;
@@ -95,6 +111,25 @@ pub struct MoleculeScene {
     pub labels: HashMap<u32, SceneLabel>,
     /// Padding of the white rectangle painted behind an atom label (already scaled).
     pub label_bg_pad: f32,
+    /// Arrows and texts on the page ([`Molecule::objects`]), drawn over the structures.
+    pub objects: Vec<SceneObject>,
+}
+
+/// One laid-out line of a page text: the galley and the rect it is painted in.
+pub struct SceneText {
+    pub galley: RichGalley,
+    pub rect: Rect,
+}
+
+/// The drawing primitives of one page object: strokes and filled polygons (an arrow's shafts
+/// and heads), laid-out text lines, and the rect covering all of it (for hit testing and
+/// bounds). Color is up to the backend, as for [`SceneBond`].
+pub struct SceneObject {
+    pub object_id: u32,
+    pub strokes: Vec<SceneStroke>,
+    pub fills: Vec<Vec<Pos2>>,
+    pub texts: Vec<SceneText>,
+    pub rect: Rect,
 }
 
 impl MoleculeScene {
@@ -106,10 +141,12 @@ impl MoleculeScene {
         xf: RenderTransform,
         layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
     ) -> Self {
-        let labels = build_labels(mol, style, xf, layout);
+        let mut layout = layout;
+        let labels = build_labels(mol, style, xf, &mut layout);
         let bonds = build_bonds(mol, style, xf, &labels);
         let ring_fills = build_ring_fills(mol, xf);
-        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale }
+        let objects = build_objects(mol, style, xf, &mut layout);
+        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale, objects }
     }
 
     /// The pixel rect covering everything drawn: every atom position of `mol` (under `xf`, the
@@ -135,6 +172,10 @@ impl MoleculeScene {
         for l in self.labels.values() {
             r.extend_with(l.rect.min);
             r.extend_with(l.rect.max);
+        }
+        for o in self.objects.iter().filter(|o| o.rect.is_finite()) {
+            r.extend_with(o.rect.min);
+            r.extend_with(o.rect.max);
         }
         (r.min.x <= r.max.x && r.min.y <= r.max.y).then_some(r)
     }
@@ -169,6 +210,316 @@ pub fn build_labels(
         map.insert(atom.id, SceneLabel { galley, rect });
     }
     map
+}
+
+// ─── Page objects ─────────────────────────────────────────────────────────────
+
+/// Primitives for every page object of `mol` (arrows and texts), in their order. Arrow lines are
+/// as wide as bonds and their heads are sized in line widths, as ChemDraw sizes them; text is set
+/// at the atom-label size. `layout` is the galley source, as for [`build_labels`].
+pub fn build_objects(
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> Vec<SceneObject> {
+    mol.objects.iter().map(|o| build_object(o, mol, style, xf, &mut layout)).collect()
+}
+
+/// Primitives of one page object of `mol` (a table needs the structures it describes); see
+/// [`build_objects`].
+pub fn build_object(
+    object: &PageObject,
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> SceneObject {
+    match object {
+        PageObject::Arrow(a) => {
+            let width = style.bond_width * xf.visual_scale;
+            let (strokes, fills) = arrow_primitives(xf.apply(a.tail), xf.apply(a.head), a.kind, width);
+            let mut rect = Rect::NOTHING;
+            for st in &strokes {
+                rect.extend_with(st.a);
+                rect.extend_with(st.b);
+            }
+            fills.iter().flatten().for_each(|p| rect.extend_with(*p));
+            if strokes.is_empty() {
+                rect = Rect::from_center_size(xf.apply(a.tail), Vec2::splat(width));
+            }
+            SceneObject { object_id: a.id, strokes, fills, texts: Vec::new(), rect: rect.expand(width * 0.5) }
+        }
+        PageObject::Text(t) => {
+            let texts = text_lines(t, style, xf, layout);
+            let rect = texts.iter().map(|l| l.rect).reduce(|a, b| a.union(b)).unwrap_or_else(|| {
+                let size = style.label_size * xf.visual_scale;
+                Rect::from_min_size(xf.apply(t.pos) - Vec2::new(0.0, size * 0.8), Vec2::new(1.0, size))
+            });
+            SceneObject { object_id: t.id, strokes: Vec::new(), fills: Vec::new(), texts, rect }
+        }
+        PageObject::Table(t) => build_table(t, mol, style, xf, layout).object,
+        PageObject::Bracket(b) => build_bracket(b, mol, style, xf, layout),
+    }
+}
+
+/// Size of a bracket's label relative to the atom labels (ChemDraw: 7.5 pt beside 10 pt).
+pub const BRACKET_LABEL_SCALE: f32 = 0.75;
+
+/// A bracket pair as ChemDraw draws it: each mark across its crossing bond (lines as wide as
+/// bonds), the label set small at the lower right of the closing one. A bracket whose atoms are
+/// all gone draws nothing.
+pub fn build_bracket(
+    b: &Bracket,
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> SceneObject {
+    let width = style.bond_width * xf.visual_scale;
+    let mut strokes = Vec::new();
+    let mut texts = Vec::new();
+    let mut rect = Rect::NOTHING;
+    if let Some(g) = crate::molecule::bracket::geometry(mol, b) {
+        for side in &g.sides {
+            for line in crate::molecule::bracket::side_polylines(side, b.shape) {
+                for w in line.windows(2) {
+                    let (a, c) = (xf.apply(w[0]), xf.apply(w[1]));
+                    rect.extend_with(a);
+                    rect.extend_with(c);
+                    strokes.push(SceneStroke { a, b: c, width });
+                }
+            }
+        }
+        let label = b.label.trim();
+        if !label.is_empty() {
+            let text_style = RichTextStyle::new(style.label_size * BRACKET_LABEL_SCALE * xf.visual_scale, Color32::BLACK);
+            let galley = RichText::plain(label).layout_with(&text_style, &mut layout);
+            let at = xf.apply(g.label_at);
+            let r = Rect::from_min_size(Pos2::new(at.x, at.y - galley.baseline()), galley.size());
+            rect = rect.union(r);
+            texts.push(SceneText { galley, rect: r });
+        }
+    }
+    // Nothing drawn: a rect that covers nothing (see `MoleculeScene::bounds`).
+    let rect = if rect.is_finite() { rect.expand(width * 0.5) } else { Rect::NOTHING };
+    SceneObject { object_id: b.id, strokes, fills: Vec::new(), texts, rect }
+}
+
+// ─── Reaction tables ──────────────────────────────────────────────────────────
+
+/// ChemDraw's stoichiometry grid, in points (its text is 10 pt): from the grid's top to its
+/// frames. The other `TABLE_` constants are the row height, from a row's top to its baseline,
+/// the padding left of a cell's text (and right of the widest), the gap between the two
+/// blocks, and from the frames' top up to the block titles' baseline — all measured off
+/// ChemDraw 25's own `ReactionAnalysis` document.
+pub const TABLE_FRAME_TOP: f32 = 15.0;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_ROW_HEIGHT: f32 = 15.0;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_BASELINE: f32 = 11.25;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_CELL_PAD: f32 = 7.5;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_BLOCK_GAP: f32 = 1.875;
+/// See [`TABLE_FRAME_TOP`].
+pub const TABLE_TITLE_RAISE: f32 = 3.75;
+/// Letter spacing of the block titles (*R e a c t a n t s*), in points.
+pub const TABLE_TITLE_TRACKING: f32 = 3.0;
+/// The narrowest a value column gets, in points (a column with nothing in it yet).
+pub const TABLE_MIN_COLUMN: f32 = 40.0;
+/// Size of a unit after its number (`1.00`g), relative to the text.
+pub const TABLE_UNIT_SCALE: f32 = 0.75;
+
+/// A reaction table's primitives, and where each of its cells is (for picking the one to
+/// edit): `cells` holds every value cell, labels and titles excluded, at its row's full height
+/// and its column's full width.
+pub struct TableScene {
+    pub object: SceneObject,
+    pub cells: Vec<(CellRef, Rect)>,
+}
+
+/// Lay `table` out against the structures of `mol`, as ChemDraw draws its stoichiometry grid:
+/// the italic, letter-spaced block title over a framed block with a rule between columns,
+/// row labels in the first column, values left-aligned, units smaller. Sizes follow the atom
+/// label size (taken as ChemDraw's 10 pt).
+pub fn build_table(
+    table: &ReactionTable,
+    mol: &Molecule,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> TableScene {
+    let state = crate::molecule::reaction_table::TableState::of(mol, table);
+    let blocks = state.blocks();
+    let pt = style.label_size * xf.visual_scale / 10.0;
+    let width = style.bond_width * xf.visual_scale;
+    let text_style = RichTextStyle::new(10.0 * pt, Color32::BLACK);
+    let unit_style = RichTextStyle::new(10.0 * pt * TABLE_UNIT_SCALE, Color32::BLACK);
+    let origin = xf.apply(table.pos);
+    let frame_top = origin.y + TABLE_FRAME_TOP * pt;
+    let rows = blocks.iter().map(|b| b.row_labels.len()).max().unwrap_or(0);
+    let frame_bottom = frame_top + rows as f32 * TABLE_ROW_HEIGHT * pt;
+    let pad = TABLE_CELL_PAD * pt;
+    let mut strokes = Vec::new();
+    let mut texts = Vec::new();
+    let mut cells = Vec::new();
+    // Put a laid-out text with its baseline at `baseline`, its left end at `x`; its width.
+    let place = |galley: super::rich_text::RichGalley, x: f32, baseline: f32, texts: &mut Vec<SceneText>| -> f32 {
+        let w = galley.size().x;
+        let rect = Rect::from_min_size(Pos2::new(x, baseline - galley.baseline()), galley.size());
+        if !galley.parts.is_empty() {
+            texts.push(SceneText { galley, rect });
+        }
+        w
+    };
+    let mut x0 = origin.x;
+    for block in &blocks {
+        // Lay every cell out first: the columns are as wide as their widest text.
+        let labels: Vec<_> =
+            block.row_labels.iter().map(|l| RichText::plain(l.clone()).layout_with(&text_style, &mut layout)).collect();
+        let values: Vec<Vec<_>> = block
+            .columns
+            .iter()
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|c| {
+                        let value = c.text.layout_with(&text_style, &mut layout);
+                        let unit = (!c.unit.is_empty())
+                            .then(|| RichText::plain(c.unit.clone()).layout_with(&unit_style, &mut layout));
+                        (value, unit)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut column_x = vec![x0];
+        let label_w = labels.iter().map(|g| g.size().x).fold(0.0, f32::max);
+        column_x.push(x0 + label_w + 2.0 * pad);
+        for column in &values {
+            let w = column
+                .iter()
+                .map(|(v, u)| v.size().x + u.as_ref().map_or(0.0, |u| u.size().x))
+                .fold(0.0, f32::max);
+            let last = *column_x.last().expect("one edge at least");
+            column_x.push(last + (w + 2.0 * pad).max(TABLE_MIN_COLUMN * pt));
+        }
+        let x1 = *column_x.last().expect("one edge at least");
+        // The frame and the rules between columns.
+        for (a, b) in [
+            ((x0, frame_top), (x1, frame_top)),
+            ((x1, frame_top), (x1, frame_bottom)),
+            ((x1, frame_bottom), (x0, frame_bottom)),
+            ((x0, frame_bottom), (x0, frame_top)),
+        ] {
+            strokes.push(SceneStroke { a: Pos2::new(a.0, a.1), b: Pos2::new(b.0, b.1), width });
+        }
+        for &x in &column_x[1..column_x.len() - 1] {
+            strokes.push(SceneStroke { a: Pos2::new(x, frame_top), b: Pos2::new(x, frame_bottom), width });
+        }
+        // The title, a letter at a time.
+        let title_style = SpanStyle { italic: true, ..Default::default() };
+        let mut tx = x0;
+        for c in block.title.chars() {
+            let g = RichText::new().span(c.to_string(), title_style).layout_with(&text_style, &mut layout);
+            tx += place(g, tx, frame_top - TABLE_TITLE_RAISE * pt, &mut texts) + TABLE_TITLE_TRACKING * pt;
+        }
+        let baseline = |r: usize| frame_top + (r as f32 * TABLE_ROW_HEIGHT + TABLE_BASELINE) * pt;
+        for (r, g) in labels.into_iter().enumerate() {
+            place(g, x0 + pad, baseline(r), &mut texts);
+        }
+        for (c, column) in values.into_iter().enumerate() {
+            let (left, right) = (column_x[c + 1], column_x[c + 2]);
+            for (r, (value, unit)) in column.into_iter().enumerate() {
+                let x = left + pad;
+                let w = place(value, x, baseline(r), &mut texts);
+                if let Some(unit) = unit {
+                    place(unit, x + w, baseline(r), &mut texts);
+                }
+                let top = frame_top + r as f32 * TABLE_ROW_HEIGHT * pt;
+                cells.push((
+                    CellRef::new(block.kind, c, r),
+                    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, top + TABLE_ROW_HEIGHT * pt)),
+                ));
+            }
+        }
+        x0 = x1 + TABLE_BLOCK_GAP * pt;
+    }
+    let mut rect = Rect::from_min_max(origin, Pos2::new(x0 - TABLE_BLOCK_GAP * pt, frame_bottom)).expand(width * 0.5);
+    for t in &texts {
+        rect = rect.union(t.rect);
+    }
+    TableScene { object: SceneObject { object_id: table.id, strokes, fills: Vec::new(), texts, rect }, cells }
+}
+
+/// The lines of a page text laid out and placed: line `k`'s baseline is `k` line heights below
+/// the anchor, and each line sits right of, around or left of the anchor by its alignment.
+fn text_lines(
+    t: &PageText,
+    style: &StyleConfig,
+    xf: RenderTransform,
+    mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
+) -> Vec<SceneText> {
+    let size = style.label_size * xf.visual_scale;
+    let text_style = RichTextStyle::new(size, Color32::BLACK);
+    let anchor = xf.apply(t.pos);
+    let mut out = Vec::new();
+    for (k, line) in t.lines().iter().enumerate() {
+        let galley = line.layout_with(&text_style, &mut layout);
+        if galley.parts.is_empty() {
+            continue;
+        }
+        let w = galley.size().x;
+        let x = match t.align {
+            TextAlign::Left => anchor.x,
+            TextAlign::Center => anchor.x - w * 0.5,
+            TextAlign::Right => anchor.x - w,
+        };
+        let y = anchor.y + k as f32 * size * TEXT_LINE_HEIGHT - galley.baseline();
+        let rect = Rect::from_min_size(Pos2::new(x, y), galley.size());
+        out.push(SceneText { galley, rect });
+    }
+    out
+}
+
+/// Shafts and heads of an arrow from `tail` to `head` (pixels), lines `width` wide. A head never
+/// takes more than half the arrow, so a short arrow still shows a shaft. Each head is filled as
+/// two triangles (tip, barb, notch), since the notched head is not convex.
+pub fn arrow_primitives(tail: Pos2, head: Pos2, kind: ArrowKind, width: f32) -> (Vec<SceneStroke>, Vec<Vec<Pos2>>) {
+    let mut strokes = Vec::new();
+    let mut fills = Vec::new();
+    let d = head - tail;
+    let len = d.length();
+    if len < 1e-3 {
+        return (strokes, fills);
+    }
+    let u = d / len;
+    // Left of the direction of travel, on a y-down screen.
+    let left = Vec2::new(u.y, -u.x);
+    let scale = (len * 0.5 / (ARROW_HEAD_LENGTH * width)).min(1.0);
+    let head_len = ARROW_HEAD_LENGTH * width * scale;
+    let center = ARROW_HEAD_CENTER * width * scale;
+    let half = ARROW_HEAD_HALF_WIDTH * width * scale;
+    // One shaft from `a` to `b` with a head at `b`: whole, or only its half on `side`.
+    let mut one = |a: Pos2, b: Pos2, dir: Vec2, side: Vec2, half_head: bool| {
+        let base = b - dir * head_len;
+        let notch = b - dir * center;
+        strokes.push(SceneStroke { a, b: notch, width });
+        fills.push(vec![b, base + side * half, notch]);
+        if !half_head {
+            fills.push(vec![b, notch, base - side * half]);
+        }
+    };
+    match kind {
+        ArrowKind::Reaction => one(tail, head, u, left, false),
+        ArrowKind::Equilibrium => {
+            let off = left * (ARROW_SHAFT_SPACING * width * 0.5);
+            // Forward on the left, back on the right; each half head points outward.
+            one(tail + off, head + off, u, left, true);
+            one(head - off, tail - off, -u, -left, true);
+        }
+    }
+    (strokes, fills)
 }
 
 // ─── Ring fills ───────────────────────────────────────────────────────────────
@@ -877,5 +1228,42 @@ mod tests {
         assert!(inset(&m) < 0.0, "automatic: toward the substituent");
         m.bond_by_id_mut(id).unwrap().double_position = DoublePosition::Right;
         assert!(inset(&m) > 0.0, "chosen: Right");
+    }
+
+    /// A reaction table is drawn as ChemDraw draws its grid: two framed blocks (four sides
+    /// each) with a rule between columns, the letter-spaced titles, labels and values, and a
+    /// cell rect for every value; the scene's bounds take it in.
+    #[test]
+    fn a_reaction_table_draws_frames_rules_and_cells() {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".into(), [0.0, 0.0], 0);
+        let b = m.add_atom("O".into(), [1.3, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        m.add_arrow([2.5, 0.0], [5.5, 0.0], ArrowKind::Reaction);
+        m.add_atom("C".into(), [6.5, 0.0], 0);
+        let table = crate::molecule::reaction_table::new_table(&m, None).unwrap();
+        let id = m.push_object(PageObject::Table(table));
+        let PageObject::Table(table) = m.object_by_id(id).unwrap().clone() else { unreachable!() };
+        let style = StyleConfig::chemdraw();
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let mut fonts = fonts();
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let scene = build_table(&table, &m, &style, xf, |job| view.layout_job(job));
+        let horizontal = scene.object.strokes.iter().filter(|s| (s.a.y - s.b.y).abs() < 1e-3).count();
+        assert_eq!(horizontal, 4, "top and bottom of each block, no rules between rows");
+        // Reactants: 4 sides + 1 rule; Products: 4 sides + 1 rule.
+        assert_eq!(scene.object.strokes.len(), 10);
+        assert_eq!(scene.cells.len(), 2 * 11, "one value column per block");
+        let text: String = scene.object.texts.iter().flat_map(|t| t.galley.glyph_placements()).map(|g| g.chr).collect();
+        for expected in ["Reactants", "Products", "Formula", "%Yield", "Yes", "32.04"] {
+            assert!(text.contains(expected), "{expected} in {text}");
+        }
+        // 10 pt text on a 14.4 pt bond: a row is 15 pt.
+        let pt = style.label_size / 10.0;
+        let r = scene.cells[1].1;
+        assert!((r.height() - 15.0 * pt).abs() < 1e-3);
+        let full = MoleculeScene::build(&m, &style, xf, |job| view.layout_job(job));
+        let bounds = full.bounds(&m, xf).unwrap();
+        assert!(bounds.max.y >= scene.object.rect.max.y - 1e-3 && bounds.max.x >= scene.object.rect.max.x - 1e-3);
     }
 }

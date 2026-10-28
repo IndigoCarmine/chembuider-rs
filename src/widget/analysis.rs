@@ -1,6 +1,6 @@
 //! An "Analysis" panel in the manner of ChemDraw's: chemical formula, exact mass, molecular
-//! weight, the m/z pattern of a chosen ESI ion and the elemental analysis of the structure
-//! being drawn.
+//! weight, the m/z pattern of a chosen ESI ion, the elemental analysis and the IUPAC name
+//! ([`crate::naming`]) of the structure being drawn.
 //!
 //! [`AnalysisPanel`] holds only the ion choice (and a cache); the host passes the molecule
 //! and selection in every frame:
@@ -15,12 +15,20 @@
 //!
 //! With atoms selected, the panel analyses the structures they belong to (whole connected
 //! components, so a selected part of a molecule does not grow implicit hydrogens at the cut).
+//!
+//! Brackets with a number (`[CH2–CH2–O]3`, a multiple group) are written out, so every value is
+//! that of the molecule they stand for. A repeat unit labelled `n` is shown as `C2H6(C2H4O)n`,
+//! end groups first; its values are those of `n = 1`, and the masses are also given as the end
+//! groups' plus `n` times the unit's.
 
 use std::collections::HashSet;
 
+use crate::i18n::{self, Language, Msg, tr_in, trf};
 use crate::molecule::Molecule;
+use crate::molecule::bracket::expand;
+use crate::naming::{has_stereo_marks, iupac_name, NameResult};
 use crate::reaction::ion::{Adduct, Ion, IonError};
-use crate::reaction::{FormulaAnalysis, MolecularFormula};
+use crate::reaction::{FormulaAnalysis, MolecularFormula, PolymerFormula};
 use crate::widget::rich_text::RichLabel;
 
 /// Which adduct the m/z line is for.
@@ -45,7 +53,13 @@ pub struct AnalysisPanel {
     pub custom_name: String,
     pub custom_formula: String,
     pub custom_charge: i32,
+    /// Show the labels in Japanese while no language is set with [`i18n::set_language`]
+    /// (which, once called, decides for every widget). The numbers and notation are the same
+    /// in every language.
+    pub ja: bool,
     cache: Option<(MolecularFormula, Option<Ion>, FormulaAnalysis)>,
+    /// The structures last named, and their name (naming is too slow to redo every frame).
+    name_cache: Option<(Molecule, NameResult)>,
 }
 
 impl Default for AnalysisPanel {
@@ -57,12 +71,20 @@ impl Default for AnalysisPanel {
             custom_name: "ACN+H".into(),
             custom_formula: "C2H4N".into(),
             custom_charge: 1,
+            ja: false,
             cache: None,
+            name_cache: None,
         }
     }
 }
 
 impl AnalysisPanel {
+    /// The language the panel is shown in: the one set with [`i18n::set_language`], or else
+    /// Japanese with [`ja`](Self::ja) and English without.
+    pub fn language(&self) -> Language {
+        i18n::language_or(if self.ja { Language::Ja } else { Language::En })
+    }
+
     /// The ion the current choice describes: `Ok(None)` for the neutral molecule, `Err` when
     /// the choice makes no ion (zero charge, a charge the adduct cannot reach, a bad formula).
     pub fn ion(&self) -> Result<Option<Ion>, IonError> {
@@ -89,10 +111,27 @@ impl AnalysisPanel {
         Ok(&self.cache.as_ref().unwrap().2)
     }
 
+    /// The IUPAC name of `mol` (or of the selected structures). Recomputed only when they
+    /// changed.
+    pub fn iupac_name(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &NameResult {
+        let target = expand(&analysis_target(mol, selection));
+        let fresh = matches!(&self.name_cache, Some((m, _)) if *m == target);
+        if !fresh {
+            let name = iupac_name(&target);
+            self.name_cache = Some((target, name));
+        }
+        &self.name_cache.as_ref().unwrap().1
+    }
+
     /// Draw the panel. Returns `true` when the user copied the report to the clipboard.
     pub fn ui(&mut self, ui: &mut egui::Ui, mol: &Molecule, selection: &HashSet<u32>) -> bool {
-        let scope = if selection.is_empty() { "Whole drawing" } else { "Selected structures" };
-        ui.heading("Analysis");
+        let lang = self.language();
+        let scope = if selection.is_empty() {
+            tr_in(lang, Msg::WholeDrawing)
+        } else {
+            tr_in(lang, Msg::SelectedStructures)
+        };
+        ui.heading(tr_in(lang, Msg::Analysis));
         ui.weak(scope);
         ui.separator();
 
@@ -101,34 +140,59 @@ impl AnalysisPanel {
 
         let mut copied = false;
         let ion_result = self.analysis(mol, selection).cloned();
+        // A polymer's formula is written with its repeat units labelled `n`, `C2H6(C2H4)n`; the
+        // values are then those of n = 1 (the end groups and each unit once).
+        let polymer = if mol.brackets().next().is_some() {
+            PolymerFormula::of(&analysis_target(mol, selection))
+        } else {
+            None
+        };
         match ion_result {
             Ok(a) if a.formula.is_empty() => {
-                ui.weak("Nothing drawn yet.");
+                ui.weak(tr_in(lang, Msg::NothingDrawn));
             }
             Ok(a) => {
-                show_values(ui, &a);
+                let name = self.iupac_name(mol, selection).clone();
+                let stereo = has_stereo_marks(&analysis_target(mol, selection));
+                if show_values(ui, &a, polymer.as_ref(), &name, stereo, lang) {
+                    copied = true;
+                }
                 ui.add_space(4.0);
-                if ui.button("📋 Copy").on_hover_text("Copy the analysis as text").clicked() {
-                    ui.ctx().copy_text(a.report());
+                let copy = ui
+                    .button(format!("📋 {}", tr_in(lang, Msg::Copy)))
+                    .on_hover_text(tr_in(lang, Msg::CopyAnalysis));
+                if copy.clicked() {
+                    let mut report = a.report();
+                    if let Some(p) = &polymer {
+                        let plain = format!("Chemical formula: {}", a.formula.plain());
+                        let mut with = format!("Chemical formula: {} (values for n = 1: {})", p.plain(), a.formula.plain());
+                        if let Some(m) = per_unit(p, MolecularFormula::exact_mass) {
+                            with.push_str(&format!("\nExact mass with n: {m}"));
+                        }
+                        report = report.replacen(&plain, &with, 1);
+                    }
+                    ui.ctx().copy_text(format!("{}
+IUPAC name: {}", report, name_text(&name)));
                     copied = true;
                 }
             }
             Err(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, format!("Ion: {e}"));
+                ui.colored_label(ui.visuals().error_fg_color, format!("{}: {e}", tr_in(lang, Msg::Ion)));
             }
         }
         copied
     }
 
     fn ion_controls(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language();
         let presets = Adduct::presets();
         let label = |choice: &AdductChoice| match choice {
-            AdductChoice::Neutral => "Neutral (M)".to_string(),
+            AdductChoice::Neutral => tr_in(lang, Msg::Neutral).to_string(),
             AdductChoice::Preset(i) => adduct_label(&presets[*i]),
-            AdductChoice::Custom => "Custom…".to_string(),
+            AdductChoice::Custom => tr_in(lang, Msg::CustomAdduct).to_string(),
         };
         egui::Grid::new("analysis_ion").num_columns(2).show(ui, |ui| {
-            ui.label("Adduct");
+            ui.label(tr_in(lang, Msg::Adduct));
             let before = self.adduct.clone();
             egui::ComboBox::from_id_salt("analysis_adduct")
                 .selected_text(label(&self.adduct))
@@ -147,27 +211,27 @@ impl AnalysisPanel {
             ui.end_row();
 
             if self.adduct == AdductChoice::Custom {
-                ui.label("Name");
+                ui.label(tr_in(lang, Msg::AdductName));
                 ui.add(egui::TextEdit::singleline(&mut self.custom_name).desired_width(80.0));
                 ui.end_row();
-                ui.label("Formula");
+                ui.label(tr_in(lang, Msg::AdductFormula));
                 ui.add(egui::TextEdit::singleline(&mut self.custom_formula).desired_width(80.0));
                 ui.end_row();
-                ui.label("Charge / unit");
+                ui.label(tr_in(lang, Msg::ChargePerUnit));
                 ui.add(egui::DragValue::new(&mut self.custom_charge).range(-3..=3));
                 ui.end_row();
             }
 
             if self.adduct != AdductChoice::Neutral {
-                ui.label("Charge");
+                ui.label(tr_in(lang, Msg::Charge));
                 ui.add(egui::DragValue::new(&mut self.charge).range(-10..=10).custom_formatter(
                     |z, _| if z > 0.0 { format!("+{z}") } else { format!("{z}") },
                 ));
                 ui.end_row();
-                ui.label("Molecules");
+                ui.label(tr_in(lang, Msg::Molecules));
                 ui.add(egui::DragValue::new(&mut self.multimer).range(1..=10).prefix("n = "));
                 ui.end_row();
-                ui.label("Ion");
+                ui.label(tr_in(lang, Msg::Ion));
                 match self.ion() {
                     Ok(Some(ion)) => ui.strong(ion.notation()),
                     Ok(None) => ui.label("—"),
@@ -179,21 +243,83 @@ impl AnalysisPanel {
     }
 }
 
-/// Formula, masses, m/z and elemental analysis as a two-column grid.
-fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis) {
-    let unknown = || format!("— (unknown: {})", a.formula.unknown_elements().join(", "));
+/// The name, or why there is none, as one line of text.
+fn name_text(name: &NameResult) -> String {
+    match name {
+        NameResult::Ok(n) => n.clone(),
+        NameResult::Unsupported(reason) => format!("— (unsupported: {reason})"),
+    }
+}
+
+/// A polymer's mass as the end groups' plus each unit's times its label: `30.0470 + 44.0262 n`
+/// (`mass` is [`MolecularFormula::exact_mass`] or [`MolecularFormula::weight`]); `None` when a
+/// part holds a group label.
+fn per_unit(p: &PolymerFormula, mass: fn(&MolecularFormula) -> Option<f64>) -> Option<String> {
+    let mut parts = Vec::new();
+    if !p.rest.is_empty() {
+        parts.push(format!("{:.4}", mass(&p.rest)?));
+    }
+    for (f, label) in &p.units {
+        parts.push(format!("{:.4} {label}", mass(f)?));
+    }
+    Some(parts.join(" + "))
+}
+
+/// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid. A polymer's
+/// formula is shown with its repeat units (`polymer`), its values marked as those of n = 1 and
+/// its masses also given per n. Returns `true` when the user copied the name.
+fn show_values(
+    ui: &mut egui::Ui,
+    a: &FormulaAnalysis,
+    polymer: Option<&PolymerFormula>,
+    name: &NameResult,
+    stereo: bool,
+    lang: Language,
+) -> bool {
+    let mut copied = false;
+    let unknown = || {
+        format!("— ({})", trf(lang, Msg::UnknownElements, &[("elements", &a.formula.unknown_elements().join(", "))]))
+    };
     let mass = |m: Option<f64>| m.map_or_else(unknown, |m| format!("{m:.4}"));
     egui::Grid::new("analysis_values").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Chemical formula");
-        ui.add(RichLabel::new(a.formula.rich()));
+        ui.label(tr_in(lang, Msg::ChemicalFormula));
+        match polymer {
+            Some(p) => {
+                ui.vertical(|ui| {
+                    ui.add(RichLabel::new(p.rich()));
+                    ui.weak(format!(
+                        "{} ({})",
+                        tr_in(lang, Msg::ValuesForN1),
+                        a.formula.plain()
+                    ));
+                });
+            }
+            None => {
+                ui.add(RichLabel::new(a.formula.rich()));
+            }
+        }
         ui.end_row();
 
-        ui.label("Exact mass");
-        ui.label(mass(a.exact_mass));
+        // With `n`, the mass for any n under the n = 1 value.
+        let with_n = |ui: &mut egui::Ui, value: Option<f64>, of: fn(&MolecularFormula) -> Option<f64>| {
+            match polymer.and_then(|p| per_unit(p, of)) {
+                Some(general) => {
+                    ui.vertical(|ui| {
+                        ui.label(mass(value));
+                        ui.weak(general);
+                    });
+                }
+                None => {
+                    ui.label(mass(value));
+                }
+            }
+        };
+        ui.label(tr_in(lang, Msg::ExactMass));
+        with_n(ui, a.exact_mass, MolecularFormula::exact_mass);
         ui.end_row();
 
-        ui.label("Molecular weight");
-        ui.label(mass(a.molecular_weight));
+        ui.label(tr_in(lang, Msg::MolecularWeight));
+        with_n(ui, a.molecular_weight, MolecularFormula::weight);
         ui.end_row();
 
         ui.label(match &a.ion {
@@ -214,7 +340,7 @@ fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis) {
         }
         ui.end_row();
 
-        ui.label("Elemental analysis");
+        ui.label(tr_in(lang, Msg::ElementalAnalysis));
         match &a.elemental_analysis {
             Some(ea) => {
                 ui.vertical(|ui| {
@@ -228,7 +354,31 @@ fn show_values(ui: &mut egui::Ui, a: &FormulaAnalysis) {
             }
         }
         ui.end_row();
+
+        ui.label(tr_in(lang, Msg::IupacName));
+        ui.vertical(|ui| match name {
+            NameResult::Ok(n) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(n);
+                    let copy = ui
+                        .small_button("📋")
+                        .on_hover_text(tr_in(lang, Msg::CopyName));
+                    if copy.clicked() {
+                        ui.ctx().copy_text(n.clone());
+                        copied = true;
+                    }
+                });
+                if stereo {
+                    ui.weak(tr_in(lang, Msg::StereoNotIncluded));
+                }
+            }
+            NameResult::Unsupported(reason) => {
+                ui.weak(format!("— ({})", trf(lang, Msg::Unsupported, &[("reason", reason)])));
+            }
+        });
+        ui.end_row();
     });
+    copied
 }
 
 /// `H⁺`, `Cl⁻`, `e⁻` — the species with its charge sign, for the adduct list.
@@ -366,7 +516,46 @@ mod tests {
         assert_eq!(format!("{:.4}", a.isotope_pattern.as_ref().unwrap()[0].mz), "29.0386");
     }
 
-    /// The panel draws for an empty canvas, a structure, a group label and a bad ion choice.
+    #[test]
+    fn name_follows_the_selection() {
+        let (m, c1, o) = two_structures();
+        let mut p = AnalysisPanel::default();
+        assert_eq!(p.iupac_name(&m, &HashSet::new()), &NameResult::Ok("ethene; methanol".into()));
+        assert_eq!(p.iupac_name(&m, &[c1].into()), &NameResult::Ok("ethene".into()));
+        assert_eq!(p.iupac_name(&m, &[o].into()), &NameResult::Ok("methanol".into()));
+    }
+
+    /// Me–[CH2–CH2–O]3–Me: every value is that of CH3(CH2CH2O)3CH3, the end groups included.
+    #[test]
+    fn a_numbered_repeat_unit_is_analysed_written_out() {
+        let m = crate::testkit::glyme("3");
+        let mut p = AnalysisPanel::default();
+        let a = p.analysis(&m, &HashSet::new()).unwrap().clone();
+        assert_eq!(a.formula.plain(), "C8H18O3");
+        assert_eq!(format!("{:.3}", a.exact_mass.unwrap()), "162.126");
+        assert_eq!(format!("{:.4}", a.isotope_pattern.unwrap()[0].mz), "162.1256");
+        let ea: Vec<String> = a.elemental_analysis.unwrap().iter().map(|(el, pct)| format!("{el} {pct:.2}")).collect();
+        assert_eq!(ea, ["C 59.23", "H 11.18", "O 29.59"]);
+        assert!(PolymerFormula::of(&m).is_none());
+        assert!(matches!(p.iupac_name(&m, &HashSet::new()), NameResult::Ok(_)), "named as the written-out chain");
+    }
+
+    /// Me–[CH2–CH2–O]n–Me: written C2H6(C2H4O)n, the values those of n = 1, the masses also
+    /// per n.
+    #[test]
+    fn an_n_repeat_unit_keeps_its_end_groups() {
+        let m = crate::testkit::glyme("n");
+        let mut p = AnalysisPanel::default();
+        let a = p.analysis(&m, &HashSet::new()).unwrap().clone();
+        assert_eq!(a.formula.plain(), "C4H10O");
+        let poly = PolymerFormula::of(&m).unwrap();
+        assert_eq!(poly.plain(), "C2H6(C2H4O)n");
+        assert_eq!(per_unit(&poly, MolecularFormula::exact_mass).as_deref(), Some("30.0470 + 44.0262 n"));
+        assert_eq!(per_unit(&poly, MolecularFormula::weight).as_deref(), Some("30.0700 + 44.0530 n"));
+    }
+
+    /// The panel draws for an empty canvas, a structure, a group label, a bad ion choice and
+    /// polymers.
     #[test]
     fn panel_renders() {
         let ctx = egui::Context::default();
@@ -380,10 +569,12 @@ mod tests {
             (m.clone(), AdductChoice::Preset(0), 2),
             (labelled, AdductChoice::Preset(0), 1),
             (m, AdductChoice::Preset(0), 0),
+            (crate::testkit::glyme("n"), AdductChoice::Neutral, 1),
+            (crate::testkit::glyme("3"), AdductChoice::Neutral, 1),
         ] {
             p.adduct = adduct;
             p.charge = charge;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
                 p.ui(ui, &mol, &HashSet::new());
             });
         }

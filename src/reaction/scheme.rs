@@ -889,7 +889,7 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
             ..Default::default()
         };
-        let _ = ctx.run_ui(raw, |ui| f(ui.painter()));
+        let _ = crate::testkit::run_ui(&ctx, raw, |ui| f(ui.painter()));
     }
 
     fn scratch() -> ChemStructEditor {
@@ -1028,7 +1028,7 @@ mod tests {
             ..Default::default()
         };
         let mut ed = scratch();
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             let layout = measure_scheme(&scheme, ui.painter(), &style, &sstyle, &mut ed);
             paint_scheme(
                 &scheme,
@@ -1119,7 +1119,7 @@ mod tests {
             ..Default::default()
         };
         let mut ed = scratch();
-        let output = ctx.run_ui(raw, |ui| {
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
             let layout = measure_scheme(&scheme, ui.painter(), &style, &sstyle, &mut ed);
             paint_scheme(&scheme, &layout, ui.painter(), Pos2::new(20.0, 20.0), &style, &sstyle, &mut ed);
         });

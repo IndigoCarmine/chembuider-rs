@@ -5,8 +5,15 @@ pub mod cleanup;
 pub mod smiles;
 pub mod cdx;
 pub mod cdx_codec;
+pub(crate) mod cdx_fonts;
+pub(crate) mod cdx_page;
+pub(crate) mod cdx_table;
+pub mod reaction_table;
 pub mod elements;
 pub mod depict;
+pub mod page;
+pub mod bracket;
+pub(crate) mod cdx_bracket;
 pub(crate) mod lookup;
 #[cfg(windows)]
 pub mod image;
@@ -14,6 +21,9 @@ pub mod image;
 pub mod ole;
 
 use serde::{Deserialize, Serialize};
+
+pub use page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TableEntry, TextAlign};
+pub use bracket::{Bracket, BracketShape, BracketUsage, RepeatPattern};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum BondStereo {
@@ -245,6 +255,9 @@ pub struct Molecule {
     pub bonds: Vec<Bond>,
     /// Colored ring interiors (drawn behind bonds). Empty for a plain structure.
     pub ring_fills: Vec<RingFill>,
+    /// Reaction arrows and text on the page beside the structures ([`page`]). Their ids come
+    /// from the same allocator as atoms and bonds, so one id never names two things.
+    pub objects: Vec<PageObject>,
     next_id: u32,
 }
 
@@ -257,16 +270,26 @@ struct MoleculeData {
     bonds: Vec<Bond>,
     #[serde(default)]
     ring_fills: Vec<RingFill>,
+    /// Written only when there are any, so a plain structure saves as it always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    objects: Vec<PageObject>,
 }
 
 impl From<MoleculeData> for Molecule {
     fn from(d: MoleculeData) -> Self {
-        let max_id = d.atoms.iter().map(|a| a.id).chain(d.bonds.iter().map(|b| b.id)).max();
+        let max_id = d
+            .atoms
+            .iter()
+            .map(|a| a.id)
+            .chain(d.bonds.iter().map(|b| b.id))
+            .chain(d.objects.iter().map(PageObject::id))
+            .max();
         Self {
             name: d.name,
             atoms: d.atoms,
             bonds: d.bonds,
             ring_fills: d.ring_fills,
+            objects: d.objects,
             next_id: max_id.map_or(1, |m| m + 1),
         }
     }
@@ -274,7 +297,7 @@ impl From<MoleculeData> for Molecule {
 
 impl From<Molecule> for MoleculeData {
     fn from(m: Molecule) -> Self {
-        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills }
+        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills, objects: m.objects }
     }
 }
 
@@ -285,6 +308,7 @@ impl Default for Molecule {
             atoms: Vec::new(),
             bonds: Vec::new(),
             ring_fills: Vec::new(),
+            objects: Vec::new(),
             next_id: 1,
         }
     }
@@ -327,10 +351,84 @@ impl Molecule {
         id
     }
 
+    /// Add a reaction arrow from `tail` to `head`; returns its id.
+    pub fn add_arrow(&mut self, tail: [f32; 2], head: [f32; 2], kind: ArrowKind) -> u32 {
+        let id = self.alloc_id();
+        self.objects.push(PageObject::Arrow(PageArrow { id, tail, head, kind, source: None }));
+        id
+    }
+
+    /// Add a left-aligned text whose first baseline starts at `pos`; returns its id.
+    /// `text` is markup, one line per newline (see [`PageText`]).
+    pub fn add_text(&mut self, pos: [f32; 2], text: impl Into<String>) -> u32 {
+        let id = self.alloc_id();
+        self.objects.push(PageObject::Text(PageText { id, pos, text: text.into(), align: TextAlign::Left, source: None }));
+        id
+    }
+
+    /// Add a page object as it is, giving it a fresh id (the one it carries is ignored).
+    pub fn push_object(&mut self, mut object: PageObject) -> u32 {
+        let id = self.alloc_id();
+        object.set_id(id);
+        self.objects.push(object);
+        id
+    }
+
+    pub fn object_by_id(&self, id: u32) -> Option<&PageObject> {
+        self.objects.iter().find(|o| o.id() == id)
+    }
+
+    pub fn object_by_id_mut(&mut self, id: u32) -> Option<&mut PageObject> {
+        self.objects.iter_mut().find(|o| o.id() == id)
+    }
+
+    /// Remove the page object `id`; false when there is none.
+    pub fn remove_object(&mut self, id: u32) -> bool {
+        let before = self.objects.len();
+        self.objects.retain(|o| o.id() != id);
+        self.objects.len() != before
+    }
+
+    /// True when nothing at all is drawn: no atoms and no page objects.
+    pub fn is_blank(&self) -> bool {
+        self.atoms.is_empty() && self.objects.is_empty()
+    }
+
     pub fn remove_atom(&mut self, id: u32) {
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
         self.drop_broken_ring_fills();
+        self.drop_atom_from_brackets(id);
+    }
+
+    /// Take a deleted atom out of the brackets enclosing it; brackets left enclosing nothing
+    /// go too.
+    fn drop_atom_from_brackets(&mut self, id: u32) {
+        if !self.objects.iter().any(|o| matches!(o, PageObject::Bracket(_))) {
+            return;
+        }
+        self.objects.retain_mut(|o| match o {
+            PageObject::Bracket(b) => {
+                b.atoms.retain(|&a| a != id);
+                !b.atoms.is_empty()
+            }
+            _ => true,
+        });
+    }
+
+    /// Put brackets of `usage` around `atoms` (with the hydrogens folded into their labels);
+    /// returns the new object's id, or `None` when none of the atoms exists.
+    pub fn add_bracket(&mut self, atoms: &std::collections::HashSet<u32>, usage: BracketUsage) -> Option<u32> {
+        let enclosed = bracket::atoms_for_selection(self, atoms);
+        if enclosed.is_empty() {
+            return None;
+        }
+        Some(self.push_object(PageObject::Bracket(Bracket::new(enclosed, usage))))
+    }
+
+    /// The brackets on the page.
+    pub fn brackets(&self) -> impl Iterator<Item = &Bracket> {
+        self.objects.iter().filter_map(PageObject::as_bracket)
     }
 
     pub fn remove_bond(&mut self, id: u32) {

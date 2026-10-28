@@ -3,6 +3,7 @@ name = "chembuider-rs"
 version = "0.4.2"
 edition = "2024"
 description = "An egui widget library for drawing and editing 2D chemical structure diagrams"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "chembuider_rs"
@@ -18,11 +19,15 @@ required-features = ["office"]
 office = ["dep:eframe", "dep:interprocess", "dep:base64"]
 
 [dependencies]
-egui = "0.35.0"
+egui = "0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # ChemDraw CDXML (and the CDX object model) without its renderer/viewer.
-cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "87ebf5d2b3bb19e148d6f142638ee47a5fd3d67d", default-features = false }
+cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "e98de81a15c41ab4b6edb001de97956088b6f3f7", default-features = false }
+
+# System fonts for named fonts in rich text (font lists, font data for egui and the exports).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fontdb = "0.23"
 
 # Only the example host app needs a windowing backend / file dialogs.
 # Native: glow (OpenGL) backend rather than the default wgpu one — wgpu-hal's Direct3D12
@@ -30,13 +35,13 @@ cdx-file-rs = { git = "https://github.com/IndigoCarmine/cdx_file_rs", rev = "87e
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # x11/wayland: winit needs at least one Linux backend enabled or it fails to compile
 # there (both features are no-ops on Windows/macOS).
-eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 rfd = "0.17.2"
 
 # Web (wasm32): eframe's wgpu backend (WebGPU, auto-falling back to WebGL2) — the glow
 # backend needs native-only windowing (glutin) and isn't available on wasm32.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts"] }
 log = "0.4"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -52,4 +57,4 @@ uuid = "1"
 # `office`: ibisOffice's local-socket protocol (a named pipe) and its window.
 interprocess = { version = "2.4", optional = true }
 base64 = { version = "0.22", optional = true }
-eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"], optional = true }

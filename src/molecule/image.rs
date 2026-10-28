@@ -27,8 +27,8 @@ const MARGIN_PX: f32 = 12.0;
 fn egui_font() -> (Arc<fontdb::Database>, String) {
     static DB: OnceLock<(Arc<fontdb::Database>, String)> = OnceLock::new();
     DB.get_or_init(|| {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
+        // The system fonts (named fonts in text are drawn with them), read once for everything.
+        let mut db = crate::widget::fonts::system_database().clone();
         let mut family = String::from("sans-serif");
         let defs = egui::FontDefinitions::default();
         if let Some(first) = defs
@@ -38,7 +38,7 @@ fn egui_font() -> (Arc<fontdb::Database>, String) {
         {
             if let Some(data) = defs.font_data.get(first) {
                 let before: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
-                db.load_font_data(data.font.to_vec());
+                db.load_font_data((*data.font).as_ref().to_vec());
                 if let Some(face) = db.faces().find(|f| !before.contains(&f.id)) {
                     if let Some((fam, _)) = face.families.first() {
                         family = fam.clone();
@@ -54,7 +54,7 @@ fn egui_font() -> (Arc<fontdb::Database>, String) {
 /// Render the molecule to an RGBA pixmap. `background` paints an opaque fill (e.g. white);
 /// None leaves the background transparent.
 fn render_pixmap(mol: &Molecule, background: Option<resvg::tiny_skia::Color>) -> Option<resvg::tiny_skia::Pixmap> {
-    if mol.atoms.is_empty() {
+    if mol.is_blank() {
         return None;
     }
     let svg = molecule_to_svg(mol)?;
@@ -83,7 +83,7 @@ pub const PT_PER_PX: f32 = 14.4 / (1.5 * SCALE_FACTOR);
 /// side), drawn in ChemDraw's style, and the size it is drawn at, in points at ChemDraw's
 /// scale. `None` with no atoms.
 pub fn preview_png(mol: &Molecule, max_side: u32) -> Option<(Vec<u8>, [f32; 2])> {
-    if mol.atoms.is_empty() {
+    if mol.is_blank() {
         return None;
     }
     let svg = molecule_to_svg_styled(mol, &StyleConfig::chemdraw())?;
@@ -188,13 +188,16 @@ fn molecule_to_svg(mol: &Molecule) -> Option<String> {
 fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String> {
     let family = egui_font().1;
 
-    // Standalone egui font stack: the same layout egui does on-screen, so label geometry matches.
-    let mut fonts = egui::epaint::text::Fonts::new(
-        egui::epaint::text::TextOptions::default(),
-        egui::FontDefinitions::default(),
-    );
+    // Standalone egui font stack: the same layout egui does on-screen, so label geometry matches
+    // (named fonts included: they are laid out with the system font the SVG names).
+    let mut fonts = crate::widget::fonts::standalone_fonts();
     let mut view = fonts.with_pixels_per_point(1.0);
     let (scene, bounds) = build_scene(mol, style, |job| view.layout_job(job))?;
+    // A glyph's font family: its span's named font first, then egui's.
+    let families = |font: Option<crate::widget::fonts::FontName>| match font {
+        Some(f) => format!("{}, {family}", svg_family(f.as_str())),
+        None => family.clone(),
+    };
 
     let w = bounds.width() + 2.0 * MARGIN_PX;
     let h = bounds.height() + 2.0 * MARGIN_PX;
@@ -266,6 +269,7 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
             let style_attr = if g.italic { r#" font-style="italic""# } else { "" };
             let x = base.x + g.x;
             let y = base.y + g.baseline_y;
+            let family = families(g.font);
             let mut emit = |gx: f32| {
                 s.push_str(&format!(
                     r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} fill="black" xml:space="preserve">{ch}</text>"#,
@@ -279,8 +283,47 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
         }
     }
 
+    // Page objects (arrows, texts) over everything else.
+    for obj in &scene.objects {
+        for st in &obj.strokes {
+            s.push_str(&format!(
+                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="black" stroke-width="{:.3}" stroke-linecap="butt"/>"#,
+                st.a.x, st.a.y, st.b.x, st.b.y, st.width
+            ));
+        }
+        for fill in &obj.fills {
+            let pts = fill.iter().map(|p| format!("{:.2},{:.2}", p.x, p.y)).collect::<Vec<_>>().join(" ");
+            s.push_str(&format!(r#"<polygon points="{pts}" fill="black"/>"#));
+        }
+        for line in &obj.texts {
+            let base = line.rect.min;
+            for g in line.galley.glyph_placements() {
+                let ch = xml_escape(g.chr);
+                let style_attr = if g.italic { r#" font-style="italic""# } else { "" };
+                let y = base.y + g.baseline_y;
+                let family = families(g.font);
+                let mut emit = |gx: f32| {
+                    s.push_str(&format!(
+                        r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} fill="black" xml:space="preserve">{ch}</text>"#,
+                        g.size
+                    ));
+                };
+                emit(base.x + g.x);
+                if let Some(dxb) = g.bold_offset {
+                    emit(base.x + g.x + dxb);
+                }
+            }
+        }
+    }
+
     s.push_str("</g></svg>");
     Some(s)
+}
+
+/// A font family name for an SVG `font-family` attribute: quoted, with what XML reserves escaped.
+fn svg_family(name: &str) -> String {
+    let escaped: String = name.chars().filter(|c| *c != '\'').map(xml_escape).collect();
+    format!("'{escaped}'")
 }
 
 // ─── EMF (GDI vector) path ─────────────────────────────────────────────────────
@@ -317,17 +360,14 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         fn CreateFontW(ch: i32, cw: i32, esc: i32, ori: i32, wt: i32, it: u32, un: u32, so: u32,
             cs: u32, op: u32, cp: u32, q: u32, pf: u32, face: *const u16) -> isize;
     }
-    if mol.atoms.is_empty() {
+    if mol.is_blank() {
         return None;
     }
     const BLACK: u32 = 0x0000_0000;
     const WHITE: u32 = 0x00FF_FFFF;
 
     let style = StyleConfig::default();
-    let mut fonts = egui::epaint::text::Fonts::new(
-        egui::epaint::text::TextOptions::default(),
-        egui::FontDefinitions::default(),
-    );
+    let mut fonts = crate::widget::fonts::standalone_fonts();
     let mut view = fonts.with_pixels_per_point(1.0);
     let (scene, bounds) = build_scene(mol, &style, |job| view.layout_job(job))?;
 
@@ -414,6 +454,43 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         for (cx, cy, text) in &labels {
             let utf16: Vec<u16> = text.encode_utf16().collect();
             TextOutW(hdc, *cx, cy + font_h / 2, utf16.as_ptr(), utf16.len() as i32);
+        }
+
+        // Page objects: arrow shafts and heads, then text lines (flattened, as the labels).
+        SelectObject(hdc, pen);
+        for obj in &scene.objects {
+            for st in &obj.strokes {
+                MoveToEx(hdc, tx(st.a.x), ty(st.a.y), std::ptr::null_mut());
+                LineTo(hdc, tx(st.b.x), ty(st.b.y));
+            }
+            for fill in &obj.fills {
+                SelectObject(hdc, black_brush);
+                SelectObject(hdc, no_pen);
+                let pts: Vec<Point_> = fill.iter().map(|p| Point_ { x: tx(p.x), y: ty(p.y) }).collect();
+                Polygon(hdc, pts.as_ptr(), pts.len() as i32);
+                SelectObject(hdc, pen);
+            }
+        }
+        // Each styled part on its own, in its font (GDI's face of that name; Arial for the base
+        // font), size, weight and slant, on its own baseline (sub/superscripts included).
+        SetTextAlign(hdc, 24); // TA_LEFT | TA_BASELINE
+        for obj in &scene.objects {
+            for line in &obj.texts {
+                for part in &line.galley.parts {
+                    let text: String = part.galley.rows.iter().flat_map(|r| r.row.glyphs.iter().map(|g| g.chr)).collect();
+                    let utf16: Vec<u16> = text.encode_utf16().collect();
+                    let face: Vec<u16> = part.font.map_or("Arial", |f| f.as_str()).encode_utf16().chain([0]).collect();
+                    let weight = if part.bold_offset.is_some() { 700 } else { 400 };
+                    let height = -(part.size.round().max(1.0) as i32);
+                    let part_font = CreateFontW(height, 0, 0, 0, weight, part.italic as u32, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
+                    SelectObject(hdc, part_font);
+                    let x = line.rect.min.x + part.offset.x;
+                    let baseline = line.rect.min.y + part.offset.y + part.baseline();
+                    TextOutW(hdc, tx(x), ty(baseline), utf16.as_ptr(), utf16.len() as i32);
+                    SelectObject(hdc, font);
+                    DeleteObject(part_font);
+                }
+            }
         }
 
         SelectObject(hdc, old_font);
@@ -542,6 +619,45 @@ mod tests {
         assert_eq!(svg.matches("<line").count(), 2, "double bond renders two lines");
         assert!(svg.contains(">O</text>"), "oxygen gets a label");
         assert!(!svg.contains(">C</text>"), "carbon stays a skeletal vertex");
+    }
+
+    /// Arrows and text are part of the picture, and are enough of one on their own.
+    #[test]
+    fn svg_and_emf_draw_arrows_and_text() {
+        use crate::molecule::ArrowKind;
+        let mut mol = Molecule::default();
+        mol.add_arrow([0.0, 0.0], [4.5, 0.0], ArrowKind::Reaction);
+        mol.add_arrow([0.0, 2.0], [4.5, 2.0], ArrowKind::Equilibrium);
+        mol.add_text([0.5, -0.5], "K_2CO_3");
+        let svg = molecule_to_svg(&mol).expect("arrows alone are a picture");
+        assert_eq!(svg.matches("<line").count(), 3, "one shaft, and two for the equilibrium");
+        assert_eq!(svg.matches("<polygon").count(), 4, "a full head is two triangles, a half head one");
+        assert!(svg.contains(">K</text>") && svg.contains(">O</text>"), "{svg}");
+        assert!(molecule_to_png(&mol).is_some());
+        let emf = molecule_to_emf(&mol).expect("an EMF of the arrows");
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn DeleteEnhMetaFile(h: isize) -> i32;
+        }
+        unsafe { DeleteEnhMetaFile(emf) };
+    }
+
+    /// Named fonts reach the SVG (by name, with egui's font after them) and Symbol text is drawn
+    /// as its Greek.
+    #[test]
+    fn svg_and_emf_draw_texts_in_their_fonts() {
+        let mut mol = Molecule::default();
+        mol.add_text([0.0, 0.0], "{@Times New Roman,14:x}{@Symbol:p}y");
+        let svg = molecule_to_svg(&mol).expect("text alone is a picture");
+        assert!(svg.contains("font-family=\"'Times New Roman', ") && svg.contains(">x</text>"), "{svg}");
+        assert!(svg.contains(">π</text>") && !svg.contains(">p</text>"), "{svg}");
+        assert!(molecule_to_png(&mol).is_some());
+        let emf = molecule_to_emf(&mol).expect("an EMF of the text");
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn DeleteEnhMetaFile(h: isize) -> i32;
+        }
+        unsafe { DeleteEnhMetaFile(emf) };
     }
 
     #[test]

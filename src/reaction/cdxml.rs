@@ -313,7 +313,7 @@ fn ids_value(ids: &[u32]) -> Vec<u8> {
 }
 
 /// A CDXString in UTF-8 (the UTF-8 Text property): the style runs, then the text.
-fn utf8_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
+pub(crate) fn utf8_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
     let mut out = (runs.len() as u16).to_le_bytes().to_vec();
     for &(start, face) in runs {
         for v in [start, LABEL_FONT, face, 200, 0] {
@@ -506,7 +506,7 @@ fn ids(obj: &CdxObject, tag: u16) -> Vec<u32> {
 
 /// A text object's text: its style runs over the UTF-8 text when it has one, the Latin-1 text
 /// otherwise. Line breaks (carriage returns) become `\n`.
-fn text_of(t: &CdxObject) -> Option<RichText> {
+pub(crate) fn text_of(t: &CdxObject) -> Option<RichText> {
     let (runs, latin1) = cdx::parse_cdx_string(t.prop(PROP_TEXT)?)?;
     let utf8 = t
         .prop(PROP_UTF8_TEXT)

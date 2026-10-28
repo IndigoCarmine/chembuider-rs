@@ -968,6 +968,14 @@ impl DemoApp {
 mod tests {
     use super::*;
 
+    /// One headless frame. egui (0.37+) debug-asserts that a frame's texture uploads were applied
+    /// before its output is dropped; there is no renderer here, so they are discarded.
+    fn run_ui(ctx: &egui::Context, raw: egui::RawInput, f: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let mut output = ctx.run_ui(raw, f);
+        output.textures_delta.clear();
+        output
+    }
+
     /// 表示とパースが同じ文法を共有していること。ここがずれると、オーバーレイに出た文字列を
     /// ゴールデン列に貼り戻せなくなる。
     #[test]
@@ -1059,15 +1067,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut replay = Replay { tokens: vec!["text:Si".to_owned()], ..Default::default() };
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let _ = run_ui(&ctx, egui::RawInput::default(), |_| {});
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {
+        let _ = run_ui(&ctx, egui::RawInput::default(), |_| {
             assert!(matches!(replay.emit(&ctx), Emitted::NeedsAnotherFrame));
         });
         assert_eq!(replay.idx, 0, "整定フレームではトークンを消化しない");
         assert!(replay.awaiting_text);
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {
+        let _ = run_ui(&ctx, egui::RawInput::default(), |_| {
             assert!(matches!(replay.emit(&ctx), Emitted::Token(Some(_))));
             let texts = ctx.input(|i| {
                 i.events
@@ -1105,7 +1113,7 @@ mod tests {
                 focused: true,
                 ..Default::default()
             };
-            let _ = ctx.run_ui(raw, |ui| {
+            let _ = run_ui(&ctx, raw, |ui| {
                 // アプリと同じ順序。`release_stray_focus` を含めているのは、これがラベル編集
                 // ボックスのフォーカスを巻き添えで奪わないことを `text:` を含むキー列で
                 // 確かめるため（奪うと P が置かれず、静かに失敗する）。
@@ -1198,8 +1206,8 @@ mod tests {
             tokens: vec!["Shift+ArrowLeft".to_owned()],
             ..Default::default()
         };
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {
+        let _ = run_ui(&ctx, egui::RawInput::default(), |_| {});
+        let _ = run_ui(&ctx, egui::RawInput::default(), |_| {
             assert!(matches!(replay.emit(&ctx), Emitted::Token(None)));
             assert!(ctx.input(|i| i.modifiers.shift));
             assert!(ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)));
