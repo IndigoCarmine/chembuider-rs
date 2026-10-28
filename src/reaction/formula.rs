@@ -178,7 +178,7 @@ impl MolecularFormula {
         }
         let chars: Vec<char> = text.chars().collect();
         let mut pos = 0;
-        let counts = parse_group(&chars, &mut pos, 0)?;
+        let counts = parse_group(&chars, &mut pos)?;
         if pos != chars.len() || counts.is_empty() {
             return None;
         }
@@ -382,22 +382,33 @@ fn label_formula(label: &str) -> Option<MolecularFormula> {
     MolecularFormula::parse(&plain)
 }
 
-/// One level of [`MolecularFormula::parse`]: element symbols with counts, and `( … )n`
-/// groups, until the end of the text or (when `depth > 0`) the closing parenthesis.
-fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap<String, usize>> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+/// How deeply `( … )` groups may nest in a written formula. Real formulas nest two or three
+/// levels (`Ca((OH)2)3`, `[Co(NH3)6]` written with parentheses); a label nested deeper than
+/// this is no formula a chemist writes, and is left unknown rather than read.
+const MAX_GROUP_DEPTH: usize = 64;
+
+/// The counts [`MolecularFormula::parse`] reads: element symbols with counts, and `( … )n`
+/// groups nested at most [`MAX_GROUP_DEPTH`] deep. Open groups are kept on an explicit stack
+/// rather than the call stack, so no label, however long, can overflow it.
+fn parse_group(chars: &[char], pos: &mut usize) -> Option<BTreeMap<String, usize>> {
+    // The innermost open group is last; the bottom entry is the whole formula.
+    let mut open: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
     while *pos < chars.len() {
         let c = chars[*pos];
         let group = if c == '(' {
-            *pos += 1;
-            let inner = parse_group(chars, pos, depth + 1)?;
-            if chars.get(*pos) != Some(&')') || inner.is_empty() {
+            if open.len() > MAX_GROUP_DEPTH {
                 return None;
             }
             *pos += 1;
+            open.push(BTreeMap::new());
+            continue;
+        } else if c == ')' && open.len() > 1 {
+            *pos += 1;
+            let inner = open.pop()?;
+            if inner.is_empty() {
+                return None;
+            }
             inner
-        } else if c == ')' && depth > 0 {
-            return Some(counts);
         } else if c.is_ascii_uppercase() {
             // Prefer the two-letter symbol (`Co`, `Cs`) when it is an element; a lowercase
             // letter that does not complete one (`Me`, `Et`) is not a formula.
@@ -432,11 +443,13 @@ fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap
         if n == 0 {
             return None;
         }
+        let counts = open.last_mut()?;
         for (el, k) in group {
-            add(&mut counts, el, k.checked_mul(n)?)?;
+            add(counts, el, k.checked_mul(n)?)?;
         }
     }
-    (depth == 0).then_some(counts)
+    // A group still open at the end of the text is unclosed.
+    if open.len() == 1 { open.pop() } else { None }
 }
 
 /// Convenience: [`MolecularFormula::of`].
@@ -775,6 +788,39 @@ mod tests {
         let c = m.add_atom("C".into(), [1.5, 0.0], 0);
         m.add_bond(a, c, BondOrder::Single);
         assert_eq!(molecular_weight(&m), None);
+    }
+
+    /// Atom labels are user input, so a pathological one must leave the formula unknown, not
+    /// overflow the stack: parentheses nested far past [`MAX_GROUP_DEPTH`] are refused, on a
+    /// thread whose stack is much smaller than the main thread's, while ordinary nesting
+    /// still counts.
+    #[test]
+    fn deeply_nested_labels_are_unknown_without_recursion() {
+        let deep = format!("{}C{}", "(".repeat(20_000), ")".repeat(20_000));
+        let just_deep = format!("{}C{}", "(".repeat(MAX_GROUP_DEPTH), ")".repeat(MAX_GROUP_DEPTH));
+        let too_deep =
+            format!("{}C{}", "(".repeat(MAX_GROUP_DEPTH + 1), ")".repeat(MAX_GROUP_DEPTH + 1));
+        let result = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut m = Molecule::default();
+                m.add_atom(deep.as_str().into(), [0.0, 0.0], 0);
+                let f = MolecularFormula::of(&m);
+                (
+                    f.weight(),
+                    f.unknown_elements() == vec![deep.as_str()],
+                    MolecularFormula::parse(&just_deep).map(|f| f.plain()),
+                    MolecularFormula::parse(&too_deep),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(result.0, None, "no MW");
+        assert!(result.1, "the label stays unknown");
+        assert_eq!(result.2.as_deref(), Some("C"), "nesting up to the limit still counts");
+        assert_eq!(result.3, None, "one level more is refused");
+        assert_eq!(MolecularFormula::parse("Ca((OH)2)3").map(|f| f.plain()).as_deref(), Some("CaH6O6"));
     }
 
     /// Every element up to uranium that has an IUPAC standard atomic weight has one in the

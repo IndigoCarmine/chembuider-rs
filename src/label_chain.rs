@@ -117,8 +117,12 @@ pub fn resolve_label(config: &Config, label: &str) -> Option<Fragment> {
 /// **Longest match first, with backtracking.** At each position the candidate names are tried
 /// longest-first (ties broken lexicographically, so the result never depends on the order
 /// fragments happened to load in); if the remainder of the label turns out to be unreadable,
-/// the next-shorter candidate is tried instead. Positions already proven hopeless are
-/// remembered, which makes the search linear in the label length rather than exponential.
+/// the next-shorter candidate is tried instead. That search is run without recursion or
+/// re-exploration: first, from the end of the label backwards, which positions can be read to
+/// the end at all; then, from the front, the first candidate (in longest-first order) that
+/// lands on such a position — the very split the backtracking search finds, in time linear in
+/// the label length (times the number of names), and with no call-stack depth to exhaust on a
+/// long label.
 ///
 /// Longest-first is what keeps existing names whole: `NO2` is the nitro fragment, not `N`
 /// followed by an unreadable `O2`; `CO2Me`, `SiH3`, `TMS` and `CF3` are likewise never
@@ -150,9 +154,34 @@ pub fn tokenize(config: &Config, label: &str) -> Option<Vec<String>> {
         return None;
     }
     let names = token_names(config);
-    let mut hopeless = vec![false; label.len() + 1];
+    let bytes = label.as_bytes();
+    // A name matching at `pos`. Compared as bytes: a name starts on a character boundary, so
+    // it can never match from inside a multi-byte character.
+    let matches = |pos: usize| {
+        names
+            .iter()
+            .copied()
+            .filter(move |n| bytes[pos..].starts_with(n.as_bytes()))
+    };
+
+    // readable[pos]: the rest of the label from `pos` splits into tokens.
+    let mut readable = vec![false; label.len() + 1];
+    readable[label.len()] = true;
+    for pos in (0..label.len()).rev() {
+        readable[pos] = matches(pos).any(|n| readable[pos + n.len()]);
+    }
+    if !readable[0] {
+        return None;
+    }
+
     let mut out: Vec<String> = Vec::new();
-    walk(label, 0, &names, &mut hopeless, &mut out).then_some(out)
+    let mut pos = 0;
+    while pos < label.len() {
+        let name = matches(pos).find(|n| readable[pos + n.len()])?;
+        out.push(name.to_string());
+        pos += name.len();
+    }
+    Some(out)
 }
 
 /// Candidate token names: every fragment the config knows and every [element
@@ -199,32 +228,6 @@ fn element_atom(symbol: &str) -> Option<Fragment> {
         bonds: Vec::new(),
         attach_idx: 0,
     })
-}
-
-fn walk(
-    label: &str,
-    pos: usize,
-    names: &[&str],
-    hopeless: &mut [bool],
-    out: &mut Vec<String>,
-) -> bool {
-    if pos == label.len() {
-        return true;
-    }
-    if hopeless[pos] {
-        return false;
-    }
-    for name in names {
-        if label[pos..].starts_with(name) {
-            out.push((*name).to_string());
-            if walk(label, pos + name.len(), names, hopeless, out) {
-                return true;
-            }
-            out.pop();
-        }
-    }
-    hopeless[pos] = true;
-    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -716,6 +719,30 @@ mod tests {
             assert_eq!(after.atoms.len(), before.atoms.len(), "{label}");
             assert_eq!(after.bonds.len(), before.bonds.len(), "{label}");
         }
+    }
+
+    /// A very long label tokenizes without recursion — on a thread with a small stack — and
+    /// in time linear in its length, even when every prefix is ambiguous (`C`/`Co`/`CO…`).
+    #[test]
+    fn long_labels_tokenize_without_recursion_in_linear_time() {
+        let start = std::time::Instant::now();
+        let (na, mixed, dead) = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let config = cfg();
+                let na = tokenize(&config, &"Na".repeat(20_000)).map(|t| t.len());
+                let mixed = tokenize(&config, &"CoCOCNOMe".repeat(2_000)).map(|t| t.len());
+                // Readable up to the very end, then a dead end: every split must fail.
+                let dead = tokenize(&config, &format!("{}q", "CO".repeat(10_000)));
+                (na, mixed, dead)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(na, Some(20_000));
+        assert!(mixed.is_some());
+        assert_eq!(dead, None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(30), "{:?}", start.elapsed());
     }
 
     // ── Non-regression ───────────────────────────────────────────────────────
