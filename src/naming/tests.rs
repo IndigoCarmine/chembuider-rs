@@ -1554,3 +1554,63 @@ fn substituted_formic_acid_and_hydrogen_salts_are_refused() {
         ),
     ]);
 }
+
+/// A free valence is a bond: an atom drawn with more bonds and attachment points than its
+/// valence allows is refused, not named as a group with fewer free valences.
+#[test]
+fn free_valences_count_toward_valence() {
+    let reason = "more bonds than its valence allows";
+    check_refused(&[
+        ("*C(*)(=O)C", reason),   // not carbonyl
+        ("*C(=O)(C)C", reason),   // not propanoyl
+        ("*C(C)(C)(C)C", reason), // not 2,2-dimethylpropan-2-yl
+        ("*N(C)(C)C", reason),    // not trimethylamino
+        ("*C(*)(*)(*)*", reason), // not methanepentayl
+        ("*O(C)C", reason),
+        ("*=C(C)(C)C", reason),
+        ("*#C(C)C=O", reason),
+        ("*S(C)C", reason),
+        ("*Cl(C)", reason),
+    ]);
+    // The oxygens and nitrogen of a nitro group have no room for a free valence either.
+    check_refused(&[
+        ("C[N+](*)(=O)[O-]", "charged"),
+        ("C[N+](=O)[O-]*", "charged"),
+        ("C[N+](=O*)[O-]", "charged"),
+        ("CN(*)(=O)=O", reason),
+        ("CN(=O)=O*", reason),
+    ]);
+}
+
+/// The symmetry check of mixed acyl halides refines atom colours a bounded number of rounds,
+/// not one per pair of chain atoms (a 400-carbon chain would take 200): on long chains it stops as soon as the two acyl halide
+/// carbons differ, and otherwise leaves the rest to the exact mapping search. The names are
+/// those of the matching diacids, as on short chains.
+#[test]
+fn mixed_acyl_halides_on_long_chains_refine_few_rounds() {
+    use super::graph::{MAX_REFINEMENT_ROUNDS, REFINEMENT_ROUNDS};
+    let chain = "C".repeat(400);
+    let rounds = |smiles: &str| {
+        REFINEMENT_ROUNDS.set(0);
+        let result = name_of(smiles);
+        (result, REFINEMENT_ROUNDS.get())
+    };
+    // The methyl tells the two ends apart at once.
+    let (result, n) = rounds(&format!("BrC(=O)C(C){chain}C(Cl)=O"));
+    match result {
+        NameResult::Unsupported(r) => assert!(r.contains("not interchangeable"), "{r}"),
+        other => panic!("expected unsupported, got {other:?}"),
+    }
+    assert!(n <= 2, "{n} rounds");
+    // Symmetric: the name of the diacid with the acyl halide ending.
+    let NameResult::Ok(acid) = name_of(&format!("OC(=O){chain}C(O)=O")) else {
+        panic!("diacid not named");
+    };
+    let stem = acid.strip_suffix("dioic acid").expect("a dioic acid");
+    let (result, n) = rounds(&format!("BrC(=O){chain}C(Cl)=O"));
+    assert_eq!(
+        result,
+        NameResult::Ok(format!("{stem}dioyl bromide chloride"))
+    );
+    assert!(n <= MAX_REFINEMENT_ROUNDS, "{n} rounds");
+}

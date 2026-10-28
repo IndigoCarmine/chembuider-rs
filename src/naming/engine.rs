@@ -1111,20 +1111,32 @@ impl<'a> Namer<'a> {
             }
         }
         let bond = |x: usize, y: usize, o: u8| if kekule.contains(&(x, y)) { 4 } else { o };
-        let c0 = groups[0].0;
-        if kinds.len() == 2
-            && once
-            && groups
-                .iter()
-                .all(|&(c, _)| g.automorphic(c0, c, &kind, bond))
-        {
-            return Ok(());
-        }
-        Err(
+        let not_interchangeable = || -> Unsupported {
             "different halides on acyl groups that are not interchangeable (P-65.5.1 cites \
              no locants for them)"
-                .into(),
-        )
+                .into()
+        };
+        if kinds.len() != 2 || !once {
+            return Err(not_interchangeable());
+        }
+        // Refuse rather than guess when the symmetry search gives up.
+        let c0 = groups[0].0;
+        let mut undecided = false;
+        for &(c, _) in groups {
+            match g.automorphic(c0, c, &kind, bond) {
+                Some(true) => {}
+                Some(false) => return Err(not_interchangeable()),
+                None => undecided = true,
+            }
+        }
+        if undecided {
+            return Err(
+                "different halides on acyl groups whose symmetry is too costly to check \
+                 (P-65.5.1 cites no locants for them)"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

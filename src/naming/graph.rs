@@ -69,6 +69,17 @@ impl El {
     }
 }
 
+/// Rounds of colour refinement `Graph::automorphic` runs at most. Refinement only prunes the
+/// exact mapping search, and a round costs a pass over the whole structure while a long chain
+/// needs one round per pair of its atoms to settle.
+pub(crate) const MAX_REFINEMENT_ROUNDS: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    /// The most rounds one colour refinement ran on this thread, for tests to bound.
+    pub(crate) static REFINEMENT_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One connected structure: heavy atoms, their charges and hydrogen counts, and bonds.
 pub(crate) struct Graph {
     pub el: Vec<El>,
@@ -98,8 +109,10 @@ impl Graph {
         self.adj[a].iter().map(|(n, _)| *n)
     }
 
+    /// The bond orders on `a`, free valences included.
     fn bond_sum(&self, a: usize) -> i16 {
-        self.adj[a].iter().map(|(_, o)| *o as i16).sum()
+        let free = self.free.iter().filter(|(f, _)| *f == a);
+        self.adj[a].iter().chain(free).map(|(_, o)| *o as i16).sum()
     }
 
     /// The number of free valences on `a`.
@@ -110,14 +123,20 @@ impl Graph {
     /// Whether a symmetry of the structure (an automorphism) maps atom `a` to atom `b`, atoms
     /// being told apart by `kind` and by their charge, hydrogens and free valences, bonds by
     /// `bond` (from the two atoms and the drawn order: the bonds of a Kekulé ring all alike).
-    /// Colour refinement prunes an exact backtracking search for the mapping.
+    /// Colour refinement prunes an exact backtracking search for the mapping. Colours that
+    /// differ after any round of refinement already rule a mapping out, so refinement stops
+    /// there, once the colours settle, or after `MAX_REFINEMENT_ROUNDS`; `None` when the search
+    /// runs out of steps before it finds the answer.
     pub(crate) fn automorphic(
         &self,
         a: usize,
         b: usize,
         kind: &[u8],
         bond: impl Fn(usize, usize, u8) -> u8,
-    ) -> bool {
+    ) -> Option<bool> {
+        if a == b {
+            return Some(true);
+        }
         let n = self.len();
         let adj: Vec<Vec<(usize, u8)>> = (0..n)
             .map(|x| {
@@ -137,7 +156,10 @@ impl Graph {
             })
             .collect();
         let mut color = ranks(&initial);
-        loop {
+        for _round in 0..MAX_REFINEMENT_ROUNDS {
+            if color[a] != color[b] {
+                return Some(false);
+            }
             let signature: Vec<(usize, Vec<(u8, usize)>)> = (0..n)
                 .map(|x| {
                     let mut s: Vec<(u8, usize)> =
@@ -146,6 +168,8 @@ impl Graph {
                     (color[x], s)
                 })
                 .collect();
+            #[cfg(test)]
+            REFINEMENT_ROUNDS.set(REFINEMENT_ROUNDS.get().max(_round + 1));
             let next = ranks(&signature);
             let classes = |c: &[usize]| c.iter().max().map_or(0, |m| m + 1);
             let done = classes(&next) == classes(&color);
@@ -155,7 +179,7 @@ impl Graph {
             }
         }
         if color[a] != color[b] {
-            return false;
+            return Some(false);
         }
         // Map the atoms in breadth-first order from `a`, each to a neighbour of the image of
         // the atom it was reached from (the structure is connected).
@@ -188,11 +212,13 @@ impl Graph {
                 .collect()
         };
         if bfs.len() == 1 {
-            return true;
+            return Some(true);
         }
         // `options[k - 1]`: the images left to try for `bfs[k]`.
         let mut options = vec![candidates(bfs[1], &image, &used)];
         let mut k = 1;
+        // Images left to try before the search gives up undecided.
+        let mut steps = 64 * n.max(64);
         loop {
             let x = bfs[k];
             if image[x] != usize::MAX {
@@ -203,10 +229,14 @@ impl Graph {
                 options.pop();
                 k -= 1;
                 if k == 0 {
-                    return false;
+                    return Some(false);
                 }
                 continue;
             };
+            if steps == 0 {
+                return None;
+            }
+            steps -= 1;
             // Every bond of x to a mapped atom must have its image, and y no other bond to a
             // mapped atom.
             let mapped = adj[x].iter().filter(|&&(m, _)| image[m] != usize::MAX);
@@ -219,7 +249,7 @@ impl Graph {
             used[y] = true;
             k += 1;
             if k == bfs.len() {
-                return true;
+                return Some(true);
             }
             options.push(candidates(bfs[k], &image, &used));
         }
@@ -740,10 +770,14 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             .copied()
             .filter(|&(m, _)| g.el[m] == El::C)
             .collect();
-        if os.len() != 2 || cs.len() != 1 || g.adj[a].len() != 3 || cs[0].1 != 1 {
+        if os.len() != 2 || cs.len() != 1 || g.adj[a].len() != 3 || cs[0].1 != 1 || g.free_on(a) > 0
+        {
             continue;
         }
-        if os.iter().any(|&(o, _)| g.adj[o].len() != 1) {
+        if os
+            .iter()
+            .any(|&(o, _)| g.adj[o].len() != 1 || g.free_on(o) > 0)
+        {
             continue;
         }
         let charged = g.charge[a] == 1
