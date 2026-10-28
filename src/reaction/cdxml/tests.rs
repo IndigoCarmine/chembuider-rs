@@ -272,3 +272,48 @@ fn written_row_items_keep_their_gaps_as_chemdraw_draws_them() {
         }
     }
 }
+
+/// The colour of every span of `label`'s text (`None` for an uncoloured one).
+fn span_colors(label: &ArrowLabel) -> Vec<Option<egui::Color32>> {
+    match label {
+        ArrowLabel::Text(t) => t.spans.iter().map(|s| s.style.color).collect(),
+        _ => panic!("a text label"),
+    }
+}
+
+/// A reaction-arrow label's text colour (OPE-16) is written as its runs' colour index and
+/// read back, span by span; an uncoloured span stays uncoloured.
+#[test]
+fn arrow_label_colours_survive_cdxml_and_cdx() {
+    use crate::widget::rich_text::{RichText, SpanStyle};
+    let red = egui::Color32::from_rgb(220, 20, 30);
+    let blue = egui::Color32::from_rgb(10, 40, 230);
+    let mut arrow = Arrow::new().below("THF");
+    arrow.above = ArrowLabel::Text(
+        RichText::new()
+            .span("Pd", SpanStyle { color: Some(red), ..Default::default() })
+            .span("(PPh", SpanStyle::default())
+            .span("3", SpanStyle { color: Some(blue), script: crate::widget::rich_text::Script::Sub, ..Default::default() }),
+    );
+    let scheme = ReactionScheme::new().structure(demo::phenol()).arrow(arrow).structure(demo::anisole());
+    let doc = document(&scheme);
+    let xml = cdx::cdxml_of_document(&doc);
+    assert!(xml.contains(r#"<color r="0.862745" g="0.078431" b="0.117647"/>"#), "red joins the table: {xml}");
+    for read in [scheme_from_cdxml(&xml).expect("a scheme"), scheme_from_cdx(&cdx_codec::write(&doc)).expect("a scheme")] {
+        let SchemeItem::Arrow(a) = &read.items[1] else { panic!("an arrow") };
+        assert_eq!(span_colors(&a.above), [Some(red), None, Some(blue)]);
+        assert_eq!(span_colors(&a.below), [None], "the uncoloured label stays uncoloured");
+    }
+}
+
+/// An uncoloured scheme writes every text run in colour 0 and adds nothing to the table, as
+/// before colours existed.
+#[test]
+fn an_uncoloured_scheme_writes_no_colours() {
+    let xml = cdx::cdxml_of_document(&document(&demo::multi_step_scheme().scheme));
+    assert_eq!(xml.matches("<color ").count(), 8, "ChemDraw's eight: {xml}");
+    for (at, _) in xml.match_indices(r#" color=""#) {
+        let index: String = xml[at + 8..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        assert!(index == "0" || index == "1", "colour index {index}");
+    }
+}

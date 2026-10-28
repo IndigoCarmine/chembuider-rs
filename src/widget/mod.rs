@@ -46,6 +46,10 @@ struct ClipAtom {
     /// is none, so clipboard text without colours reads and writes as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     color: Option<[u8; 4]>,
+    /// The structure's drop shadow ([`Atom::shadow`](crate::molecule::Atom::shadow)), as for
+    /// `color`: a pasted structure keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shadow: Option<crate::molecule::Shadow>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,6 +74,21 @@ struct ClipRingFill {
     color: [u8; 4],
 }
 
+/// A page text on the clipboard (reaction conditions, a caption): what a [`PageText`] is, but
+/// its id, which paste gives anew, and its ChemDraw source, which a copy is not.
+///
+/// [`PageText`]: crate::molecule::PageText
+#[derive(Serialize, Deserialize)]
+struct ClipText {
+    pos: [f32; 2],
+    text: String,
+    #[serde(default)]
+    align: crate::molecule::TextAlign,
+    /// The text colour, as for [`ClipAtom::color`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<[u8; 4]>,
+}
+
 /// A self-contained copy of a sub-structure (atoms + the bonds among them), used for
 /// clipboard copy/paste. Atom indices in bonds are positions within `atoms`.
 #[derive(Serialize, Deserialize)]
@@ -80,6 +99,10 @@ struct ClipMol {
     /// still parses (and a copy with no fills omits it entirely).
     #[serde(default)]
     ring_fills: Vec<ClipRingFill>,
+    /// Page texts. Defaulted and left out when there are none, so clipboard text without them
+    /// reads and writes as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    texts: Vec<ClipText>,
 }
 pub const SCALE_FACTOR: f32 = 50.0;
 pub const NODE_HIT_RADIUS_PX: f32 = 15.0;
@@ -475,17 +498,23 @@ impl ChemStructEditor {
     /// Remove ring fills the selection points at, as one undo step. Returns true if any went.
     ///
     /// As for [`fill_selected_ring`](Self::fill_selected_ring), a selection of two or more atoms
-    /// (or bonds) wins: every fill whose ring lies within it goes. Otherwise the fill through
-    /// the hotspot, or through a selected atom, goes.
+    /// (or bonds) is what the user means, whatever the hotspot: every fill whose ring lies
+    /// within it goes, else every fill whose ring holds all of it (a selected bond of a filled
+    /// ring), else nothing. Otherwise the fill through the hotspot, or through the one selected
+    /// atom, goes.
     pub fn clear_selected_ring_fill(&mut self) -> bool {
         let sel = self.selection_atom_ids();
         if sel.len() >= 2 {
             let inside = |atoms: &[u32]| atoms.iter().all(|a| sel.binary_search(a).is_ok());
-            if self.molecule.ring_fills.iter().any(|rf| inside(&rf.atoms)) {
-                self.push_undo();
-                self.molecule.ring_fills.retain(|rf| !inside(&rf.atoms));
-                return true;
+            let holds = |atoms: &[u32]| sel.iter().all(|a| atoms.contains(a));
+            let within = self.molecule.ring_fills.iter().any(|rf| inside(&rf.atoms));
+            let goes = |atoms: &[u32]| if within { inside(atoms) } else { holds(atoms) };
+            if !self.molecule.ring_fills.iter().any(|rf| goes(&rf.atoms)) {
+                return false;
             }
+            self.push_undo();
+            self.molecule.ring_fills.retain(|rf| !goes(&rf.atoms));
+            return true;
         }
         let seed = self.hotspot_atom.or_else(|| sel.first().copied());
         match seed {
@@ -554,15 +583,41 @@ impl ChemStructEditor {
         true
     }
 
-    /// Set the drop shadow the structures cast (`None`: none), as one undo step. Returns false
-    /// when it is already that.
+    /// The structures (connected atoms) the selection touches — through a selected atom or
+    /// bond — or every structure when nothing at all is selected, as their atom ids. A
+    /// selection of page objects alone touches none.
+    fn selected_structures(&self) -> Vec<Vec<u32>> {
+        let sel = self.selection_atom_ids();
+        let mut structures = self.molecule.structures();
+        if !sel.is_empty() || !self.selected_objects.is_empty() {
+            structures.retain(|atoms| atoms.iter().any(|a| sel.binary_search(a).is_ok()));
+        }
+        structures
+    }
+
+    /// Set the drop shadow of the structures the selection touches (through a selected atom or
+    /// bond), or of every structure when nothing is selected; `None` removes theirs. One undo
+    /// step. Other structures keep theirs. Returns false when nothing changes.
     pub fn set_shadow(&mut self, shadow: Option<crate::molecule::Shadow>) -> bool {
-        if self.molecule.shadow == shadow {
+        // Each atom of each structure carries the shadow, so it stays the structure's however the
+        // structure is edited afterwards (see `Atom::shadow`).
+        let atoms: HashSet<u32> = self.selected_structures().into_iter().flatten().collect();
+        let changes = self.molecule.atoms.iter().any(|a| atoms.contains(&a.id) && a.shadow != shadow);
+        if !changes {
             return false;
         }
         self.push_undo();
-        self.molecule.shadow = shadow;
+        for a in self.molecule.atoms.iter_mut().filter(|a| atoms.contains(&a.id)) {
+            a.shadow = shadow;
+        }
         true
+    }
+
+    /// The drop shadow of the first structure the selection touches, or of the first structure
+    /// when nothing is selected (what a shadow control shows); `None` when it casts none.
+    pub fn selected_shadow(&self) -> Option<crate::molecule::Shadow> {
+        let first = self.selected_structures().into_iter().next()?;
+        first.iter().find_map(|&id| self.molecule.atom_by_id(id)?.shadow)
     }
 
     /// Build a fragment from the current selection and save it to `fragments/<name>.json`.
@@ -620,21 +675,40 @@ impl ChemStructEditor {
     }
 
     /// Serialize the current selection (or the whole molecule when nothing is selected)
-    /// into clipboard text. Returns None if there is nothing to copy.
+    /// into clipboard text: the selected atoms with the bonds and ring fills among them, and the
+    /// selected page texts. Returns None if there is nothing to copy.
     pub fn copy_to_string(&self) -> Option<String> {
+        let everything = self.selected_atoms.is_empty() && self.selected_objects.is_empty();
         let ids: Vec<u32> = self.molecule.atoms.iter()
             .map(|a| a.id)
-            .filter(|id| self.selected_atoms.is_empty() || self.selected_atoms.contains(id))
+            .filter(|id| everything || self.selected_atoms.contains(id))
             .collect();
-        if ids.is_empty() {
+        let texts: Vec<ClipText> = self.molecule.objects.iter()
+            .filter(|o| everything || self.selected_objects.contains(&o.id()))
+            .filter_map(|o| match o {
+                crate::molecule::PageObject::Text(t) => {
+                    Some(ClipText { pos: t.pos, text: t.text.clone(), align: t.align, color: t.color })
+                }
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() && texts.is_empty() {
             return None;
         }
         let index: std::collections::HashMap<u32, usize> =
             ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
+        // A copied part of a shadowed structure is shadowed too: it was drawn so.
+        let shadows: std::collections::HashMap<u32, crate::molecule::Shadow> = self
+            .molecule
+            .structure_shadows()
+            .into_iter()
+            .flat_map(|(atoms, shadow)| atoms.into_iter().map(move |a| (a, shadow)))
+            .collect();
         let atoms = ids.iter().map(|&id| {
             let a = self.molecule.atom_by_id(id).unwrap();
-            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge, group_h: a.group_h, color: a.color }
+            let shadow = shadows.get(&id).copied();
+            ClipAtom { element: a.element.clone(), pos: a.pos, charge: a.charge, group_h: a.group_h, color: a.color, shadow }
         }).collect();
         let bonds = self.molecule.bonds.iter().filter_map(|b| {
             Some(ClipBond {
@@ -653,7 +727,7 @@ impl ChemStructEditor {
             Some(ClipRingFill { atoms: atoms?, color: rf.color })
         }).collect();
 
-        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills })
+        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills, texts })
             .ok()
             .map(|json| format!("{CLIP_PREFIX}{json}"))
     }
@@ -700,15 +774,16 @@ impl ChemStructEditor {
         ctx.copy_text(text);
     }
 
-    /// Parse clipboard text in our format and paste the atoms/bonds, offset slightly so the
-    /// copy is visible, leaving the pasted atoms selected. Returns true if anything was added.
+    /// Parse clipboard text in our format and paste the atoms/bonds and texts, offset slightly
+    /// so the copy is visible, leaving what was pasted selected. Returns true if anything was
+    /// added.
     pub fn paste_from_string(&mut self, text: &str) -> bool {
         let json = match text.strip_prefix(CLIP_PREFIX) {
             Some(rest) => rest,
             None => return false, // not our format
         };
         let Ok(clip) = serde_json::from_str::<ClipMol>(json) else { return false };
-        if clip.atoms.is_empty() {
+        if clip.atoms.is_empty() && clip.texts.is_empty() {
             return false;
         }
         // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
@@ -721,6 +796,7 @@ impl ChemStructEditor {
             if let Some(atom) = self.molecule.atom_by_id_mut(id) {
                 atom.group_h = a.group_h;
                 atom.color = a.color;
+                atom.shadow = a.shadow;
             }
             id
         }).collect();
@@ -743,8 +819,19 @@ impl ChemStructEditor {
                 self.molecule.set_ring_fill(ids, rf.color);
             }
         }
+        let new_texts: Vec<u32> = clip.texts.into_iter().map(|t| {
+            self.molecule.push_object(crate::molecule::PageObject::Text(crate::molecule::PageText {
+                id: 0,
+                pos: [t.pos[0] + OFFSET[0], t.pos[1] + OFFSET[1]],
+                text: t.text,
+                align: t.align,
+                source: None,
+                color: t.color,
+            }))
+        }).collect();
         self.selected_atoms = new_ids.into_iter().collect();
         self.selected_bonds.clear();
+        self.selected_objects = new_texts.into_iter().collect();
         true
     }
 
@@ -769,6 +856,7 @@ impl ChemStructEditor {
             if let Some(atom) = self.molecule.atom_by_id_mut(id) {
                 atom.group_h = a.group_h;
                 atom.color = a.color;
+                atom.shadow = a.shadow;
             }
             map.insert(a.id, id);
         }
@@ -2032,13 +2120,13 @@ impl ChemStructEditor {
         self.last_label_rects = label_layouts.iter().map(|(id, l)| (*id, l.rect)).collect();
         // Ring fills sit behind the bonds (ChemDraw-style shading). Same shared fill polygons the
         // image exporter draws, so the canvas and the copied picture look identical.
-        // The drop shadow goes under what casts it: ring fills and bonds first, labels over
-        // the label backgrounds (which would hide it).
-        draw::draw_structure_shadow(self, &painter, center, &label_layouts);
+        // The structures' drop shadows go under all of them: before every ring fill, bond and
+        // label, and again inside the label backgrounds (which would hide them).
+        draw::draw_shadows(self, &painter, center, &label_layouts, true);
         draw::draw_ring_fills(self, &painter, center);
         draw::draw_bonds(self, &painter, center, &label_layouts);
         draw::draw_atom_backgrounds(self, &painter, center, &label_layouts);
-        draw::draw_label_shadows(self, &painter, center, &label_layouts);
+        draw::draw_shadows_under_labels(self, &painter, center, &label_layouts, true);
         draw::draw_atom_labels(self, &painter, center, &label_layouts);
         let painted = draw::draw_page_objects(self, &painter, center);
         self.last_object_rects = painted.rects;

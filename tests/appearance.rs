@@ -66,7 +66,7 @@ fn a_colourless_drawing_saves_byte_for_byte_as_before() {
     assert_eq!(back, m);
     assert!(back.atoms.iter().all(|a| a.color.is_none()));
     assert!(back.bonds.iter().all(|b| b.color.is_none()));
-    assert!(back.shadow.is_none());
+    assert!(back.atoms.iter().all(|a| a.shadow.is_none()));
 }
 
 #[test]
@@ -78,14 +78,14 @@ fn colours_and_shadow_survive_save_and_load() {
         t.color = Some(GREEN);
     }
     let shadow = Shadow { color: [10, 20, 30, 100], offset: [0.2, -0.1], blur: 0.3 };
-    e.molecule.shadow = Some(shadow);
+    assert!(e.set_shadow(Some(shadow)));
     let json = serde_json::to_string(&e.molecule).unwrap();
     let back: Molecule = serde_json::from_str(&json).unwrap();
     assert_eq!(back, e.molecule);
     assert_eq!(back.bond_by_id(co).unwrap().color, Some(RED));
     assert_eq!(back.atom_by_id(o).unwrap().color, Some(BLUE));
     assert_eq!(back.atom_by_id(c2).unwrap().color, None);
-    assert_eq!(back.shadow, Some(shadow));
+    assert_eq!(back.shadow_of(c2), Some(shadow));
 }
 
 // ─── Fill Ring ───────────────────────────────────────────────────────────────
@@ -253,21 +253,110 @@ fn copy_and_paste_keep_colours() {
 
 #[test]
 fn the_shadow_is_set_in_one_undo_step() {
-    let (mut e, ..) = ethanol_with_text();
+    let (mut e, [c1, ..], ..) = ethanol_with_text();
     let shadow = Shadow { blur: 0.2, ..Shadow::default() };
     assert!(e.set_shadow(Some(shadow)));
-    assert_eq!(e.molecule.shadow, Some(shadow));
+    assert_eq!(e.molecule.shadow_of(c1), Some(shadow));
     assert!(!e.set_shadow(Some(shadow)), "the same shadow again is no edit");
     let changed = Shadow { offset: [0.3, 0.3], ..shadow };
     assert!(e.set_shadow(Some(changed)));
     assert!(e.undo());
-    assert_eq!(e.molecule.shadow, Some(shadow));
+    assert_eq!(e.molecule.shadow_of(c1), Some(shadow));
     assert!(e.undo());
-    assert_eq!(e.molecule.shadow, None);
+    assert_eq!(e.molecule.shadow_of(c1), None);
     assert!(e.redo());
-    assert_eq!(e.molecule.shadow, Some(shadow));
+    assert_eq!(e.molecule.shadow_of(c1), Some(shadow));
     assert!(e.set_shadow(None));
-    assert_eq!(e.molecule.shadow, None);
+    assert_eq!(e.molecule.shadow_of(c1), None);
+}
+
+/// Ethanol (C–C–O) and, apart from it, a methylamine (C–N): two structures.
+fn two_structures() -> (ChemStructEditor, [u32; 3], [u32; 2]) {
+    let (mut e, ethanol, ..) = ethanol_with_text();
+    let c = e.molecule.add_atom("C".into(), [8.0, 0.0], 0);
+    let n = e.molecule.add_atom("N".into(), [9.5, 0.0], 0);
+    e.molecule.add_bond(c, n, BondOrder::Single);
+    (e, ethanol, [c, n])
+}
+
+/// The shadow is set per structure: on those the selection touches (by an atom or a bond),
+/// or on every one when nothing is selected; the others keep theirs.
+#[test]
+fn the_shadow_is_set_on_the_selected_structures() {
+    let (mut e, [c1, c2, o], [c, n]) = two_structures();
+    let shadow = Shadow::default();
+    e.selected_atoms = [o].into_iter().collect();
+    assert!(e.set_shadow(Some(shadow)));
+    assert_eq!(e.molecule.shadow_of(c1), Some(shadow), "the whole of ethanol, from its O");
+    assert_eq!(e.molecule.shadow_of(n), None, "not the amine");
+    assert_eq!(e.selected_shadow(), Some(shadow));
+    assert_eq!(e.molecule.structure_shadows(), [(vec![c1, c2, o], shadow)]);
+
+    // A bond of the amine, selected on its own, gives it another.
+    let other = Shadow { color: [200, 0, 0, 80], ..shadow };
+    e.selected_atoms.clear();
+    e.selected_bonds = [e.molecule.bond_between(c, n).unwrap().id].into_iter().collect();
+    assert_eq!(e.selected_shadow(), None);
+    assert!(e.set_shadow(Some(other)));
+    assert_eq!(e.molecule.shadow_of(c), Some(other));
+    assert_eq!(e.molecule.shadow_of(c2), Some(shadow), "ethanol keeps its own");
+
+    // Removing it from the amine leaves ethanol's; one undo step brings it back.
+    assert!(e.set_shadow(None));
+    assert_eq!(e.molecule.shadow_of(n), None);
+    assert_eq!(e.molecule.shadow_of(o), Some(shadow));
+    assert!(e.undo());
+    assert_eq!(e.molecule.shadow_of(n), Some(other));
+
+    // A text alone selected touches no structure.
+    e.selected_bonds.clear();
+    e.selected_objects = [e.molecule.objects[0].id()].into_iter().collect();
+    assert!(!e.set_shadow(Some(other)));
+    assert_eq!(e.selected_shadow(), None);
+
+    // Nothing selected: every structure.
+    e.selected_objects.clear();
+    assert!(e.set_shadow(None));
+    assert!(e.molecule.structure_shadows().is_empty());
+    assert!(e.set_shadow(Some(shadow)));
+    assert_eq!(e.molecule.structure_shadows().len(), 2);
+}
+
+/// The shadow stays the structure's however it is edited: an atom drawn onto it is in it, two
+/// structures joined cast the shadow of the lowest-id shadowed atom, an atom cut off is its own.
+#[test]
+fn the_shadow_follows_its_structure_through_edits() {
+    let (mut e, [c1, c2, o], [c, n]) = two_structures();
+    let shadow = Shadow::default();
+    let other = Shadow { color: [200, 0, 0, 80], ..shadow };
+    e.selected_atoms = [c1].into_iter().collect();
+    e.set_shadow(Some(shadow));
+    e.selected_atoms = [n].into_iter().collect();
+    e.set_shadow(Some(other));
+
+    let added = e.molecule.add_atom("C".into(), [2.6, -1.5], 0);
+    e.molecule.add_bond(o, added, BondOrder::Single);
+    assert_eq!(e.molecule.shadow_of(added), Some(shadow), "drawn onto ethanol");
+    e.molecule.add_bond(added, c, BondOrder::Single);
+    assert_eq!(e.molecule.shadow_of(n), Some(shadow), "joined, the lowest-id shadowed atom's (ethanol's C1)");
+    let cc = e.molecule.bond_between(c1, c2).unwrap().id;
+    e.molecule.remove_bond(cc);
+    assert_eq!(e.molecule.shadow_of(c1), Some(shadow), "cut off, the atom keeps the shadow it carries");
+
+    // Saved and loaded, and through the clipboard, it stays.
+    let back: Molecule = serde_json::from_str(&serde_json::to_string(&e.molecule).unwrap()).unwrap();
+    assert_eq!(back.structure_shadows(), e.molecule.structure_shadows());
+    let (mut e, _, [c, n]) = two_structures();
+    e.selected_atoms = [c].into_iter().collect();
+    e.set_shadow(Some(other));
+    e.selected_atoms = [c, n].into_iter().collect();
+    let mut pasted = ChemStructEditor::default();
+    assert!(pasted.paste_from_string(&e.copy_to_string().unwrap()));
+    assert_eq!(pasted.molecule.structure_shadows().len(), 1);
+    assert_eq!(pasted.molecule.structure_shadows()[0].1, other);
+    // A structure without a shadow copies without one: its clipboard text names none.
+    let (plain, ..) = ethanol_with_text();
+    assert!(!plain.copy_to_string().unwrap().contains("shadow"));
 }
 
 // ─── CDXML ───────────────────────────────────────────────────────────────────
@@ -318,4 +407,218 @@ fn a_colourless_drawing_writes_the_same_cdxml_as_before() {
     let read = read_cdxml(&xml).unwrap().molecule;
     assert!(read.atoms.iter().all(|a| a.color.is_none()));
     assert!(read.bonds.iter().all(|b| b.color.is_none()));
+}
+
+// ─── CDXML written by others ─────────────────────────────────────────────────
+
+/// A ChemDraw document: an oxygen (labelled) bonded to a carbon, `doc`, `node`, `bond` and
+/// `run` being extra attributes of the document, both nodes and the fragment, the bond, and
+/// the label's style run, `table` its colour table.
+fn chemdraw_doc(doc: &str, table: &str, frag: &str, node: &str, bond: &str, run: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+<CDXML {doc}>{table}
+ <page id="1">
+  <fragment id="2" {frag}>
+   <n id="3" p="36 36" Element="8" NumHydrogens="1" {node}>
+    <t id="4" p="39.89 39.9" LabelAlignment="Right"><s font="3" size="10" face="96" {run}>HO</s></t>
+   </n>
+   <n id="5" p="50.4 36" {node}/>
+   <b id="6" B="3" E="5" {bond}/>
+  </fragment>
+  <t id="7" p="36 80"><s font="3" size="10" {run}>THF</s></t>
+ </page>
+</CDXML>"#
+    )
+}
+
+/// Index 2 is the background (white), 3 the foreground: here red.
+const RED_FOREGROUND: &str = r#"<colortable><color r="1" g="1" b="1"/><color r="1" g="0" b="0"/></colortable>"#;
+/// ChemDraw's own table: white, black, red, yellow, green, cyan, blue, magenta (indices 2–9).
+const CHEMDRAW_TABLE: &str = r#"<colortable><color r="1" g="1" b="1"/><color r="0" g="0" b="0"/><color r="1" g="0" b="0"/><color r="1" g="1" b="0"/><color r="0" g="1" b="0"/><color r="0" g="1" b="1"/><color r="0" g="0" b="1"/><color r="1" g="0" b="1"/></colortable>"#;
+
+type Colours = (Vec<Option<[u8; 4]>>, Vec<Option<[u8; 4]>>, Vec<Option<[u8; 4]>>);
+
+/// The colours of the atoms, the bonds and the page texts of `m`, in their order.
+fn colours_of(m: &Molecule) -> Colours {
+    let texts = m.objects.iter().filter_map(|o| if let PageObject::Text(t) = o { Some(t.color) } else { None }).collect();
+    (m.atoms.iter().map(|a| a.color).collect(), m.bonds.iter().map(|b| b.color).collect(), texts)
+}
+
+fn read_colours(xml: &str) -> Colours {
+    colours_of(&read_cdxml(xml).expect("reads").molecule)
+}
+
+const RED_FULL: Option<[u8; 4]> = Some([255, 0, 0, 255]);
+
+/// What names no colour is in the document's foreground (index 3 of the table), not black.
+#[test]
+fn what_names_no_colour_is_in_the_documents_foreground() {
+    let (atoms, bonds, texts) = read_colours(&chemdraw_doc("", RED_FOREGROUND, "", "", "", ""));
+    assert_eq!(atoms, [RED_FULL, RED_FULL]);
+    assert_eq!(bonds, [RED_FULL]);
+    assert_eq!(texts, [RED_FULL]);
+}
+
+/// Index 0 is black whatever the foreground: a document (or its objects) saying so reads
+/// uncoloured.
+#[test]
+fn index_zero_is_black_whatever_the_foreground() {
+    let (atoms, bonds, texts) = read_colours(&chemdraw_doc(r#"color="0""#, RED_FOREGROUND, "", "", "", ""));
+    assert_eq!((atoms, bonds, texts), (vec![None, None], vec![None], vec![None]));
+    let (atoms, bonds, _) =
+        read_colours(&chemdraw_doc("", RED_FOREGROUND, "", r#"color="0""#, r#"color="0""#, r#"color="0""#));
+    assert_eq!((atoms, bonds), (vec![None, None], vec![None]));
+}
+
+/// Without a colour table, 2 is white and 3 black (the default background and foreground).
+#[test]
+fn without_a_table_two_is_white_and_three_black() {
+    let white = Some([255, 255, 255, 255]);
+    let (atoms, bonds, _) = read_colours(&chemdraw_doc("", "", "", r#"color="2""#, r#"color="2""#, ""));
+    assert_eq!((atoms, bonds), (vec![white, white], vec![white]));
+    let (atoms, bonds, texts) = read_colours(&chemdraw_doc("", "", "", r#"color="3""#, r#"color="3""#, r#"color="3""#));
+    assert_eq!((atoms, bonds, texts), (vec![None, None], vec![None], vec![None]));
+}
+
+/// Explicit indices name ChemDraw's table: 4 red, 6 green, 8 blue; a label's run colour is its
+/// atom's when the node names none.
+#[test]
+fn explicit_indices_name_the_table() {
+    let (atoms, bonds, texts) =
+        read_colours(&chemdraw_doc(r#"color="0""#, CHEMDRAW_TABLE, "", "", r#"color="8""#, r#"color="6""#));
+    let (green, blue) = (Some([0, 255, 0, 255]), Some([0, 0, 255, 255]));
+    assert_eq!(atoms, [green, None], "the O's label run is green; the bare carbon names nothing");
+    assert_eq!(bonds, [blue]);
+    assert_eq!(texts, [green]);
+    let (atoms, ..) = read_colours(&chemdraw_doc(r#"color="0""#, CHEMDRAW_TABLE, "", r#"color="4""#, "", ""));
+    assert_eq!(atoms, [RED_FULL, RED_FULL]);
+}
+
+/// A fragment's colour is that of its nodes and bonds that name none of their own.
+#[test]
+fn a_fragments_colour_is_inherited() {
+    let (atoms, bonds, texts) =
+        read_colours(&chemdraw_doc(r#"color="0""#, CHEMDRAW_TABLE, r#"color="4""#, "", r#"color="8""#, ""));
+    assert_eq!(atoms, [RED_FULL, RED_FULL]);
+    assert_eq!(bonds, [Some([0, 0, 255, 255])], "the bond's own colour wins");
+    assert_eq!(texts, [None], "the page text is not in the fragment");
+}
+
+/// Merged into a document whose foreground is red, an uncoloured atom is written black (0), so
+/// ChemDraw does not paint it red, and a red one keeps its colour.
+#[test]
+fn writing_into_a_coloured_foreground_keeps_uncoloured_things_black() {
+    use chembuider_rs::molecule::{cdx, cdx_codec};
+    let original = cdx_codec::write(&cdx::cdxml_document(&chemdraw_doc("", RED_FOREGROUND, "", "", "", "")).unwrap());
+    let mut m = Molecule::default();
+    let o = m.add_atom("O".into(), [0.0, 0.0], 0);
+    let c = m.add_atom("C".into(), [1.5, 0.0], 0);
+    m.add_bond(o, c, BondOrder::Single);
+    m.atom_by_id_mut(c).unwrap().color = Some(BLUE);
+    let (atoms, bonds, _) = colours_of(&cdx::read_cdx(&cdx::merge_into_cdx(&original, &m)).expect("reads").molecule);
+    assert_eq!(atoms, [None, Some(BLUE)]);
+    assert_eq!(bonds, [None]);
+}
+
+// ─── Clearing ring fills only within the selection ───────────────────────────
+
+/// Two separate triangles, only the second filled.
+fn two_triangles() -> (ChemStructEditor, Vec<u32>, Vec<u32>) {
+    let mut e = ChemStructEditor::default();
+    let a = ring(&mut e.molecule, 3, [0.0, 0.0]);
+    let b = ring(&mut e.molecule, 3, [8.0, 0.0]);
+    e.molecule.set_ring_fill(b.clone(), GREEN);
+    (e, a, b)
+}
+
+/// A selection is the rings the user means: clearing an unfilled selected ring leaves the fill
+/// of the ring under the cursor alone.
+#[test]
+fn clearing_a_selected_unfilled_ring_leaves_the_hotspots_fill() {
+    let (mut e, a, b) = two_triangles();
+    e.selected_atoms = a.iter().copied().collect();
+    e.hotspot_atom = Some(b[0]);
+    let undo = e.undo_stack.len();
+    assert!(!e.clear_selected_ring_fill());
+    assert_eq!(e.molecule.ring_fills.len(), 1, "the other ring keeps its fill");
+    assert_eq!(e.undo_stack.len(), undo);
+}
+
+#[test]
+fn clearing_with_selected_bonds_of_an_unfilled_ring_leaves_the_hotspots_fill() {
+    let (mut e, a, b) = two_triangles();
+    e.selected_bonds = e.molecule.bonds.iter().filter(|bd| a.contains(&bd.begin)).map(|bd| bd.id).collect();
+    e.hotspot_atom = Some(b[0]);
+    assert!(!e.clear_selected_ring_fill());
+    assert_eq!(e.molecule.ring_fills.len(), 1);
+    // One bond of the filled ring selected clears that ring's fill.
+    e.selected_bonds = [e.molecule.bond_between(b[0], b[1]).unwrap().id].into_iter().collect();
+    e.hotspot_atom = Some(a[0]);
+    assert!(e.clear_selected_ring_fill());
+    assert!(e.molecule.ring_fills.is_empty());
+}
+
+// ─── Page texts through the clipboard ────────────────────────────────────────
+
+/// A coloured text keeps its words, alignment and colour through copy and paste, whether
+/// copied with the structure or on its own; an uncoloured one stays uncoloured.
+#[test]
+fn copy_and_paste_keep_page_texts_and_their_colours() {
+    let (mut e, [_, c2, o], _, text) = ethanol_with_text();
+    if let Some(PageObject::Text(t)) = e.molecule.object_by_id_mut(text) {
+        t.color = Some(GREEN);
+    }
+    let plain = e.molecule.add_text([5.0, 4.0], "THF, 60 °C");
+    let texts = |m: &Molecule| -> Vec<(String, Option<[u8; 4]>)> {
+        m.objects.iter().filter_map(|o| if let PageObject::Text(t) = o { Some((t.text.clone(), t.color)) } else { None }).collect()
+    };
+
+    // Everything (nothing selected).
+    let mut other = ChemStructEditor::default();
+    assert!(other.paste_from_string(&e.copy_to_string().unwrap()));
+    assert_eq!(texts(&other.molecule), [("K_2CO_3".to_string(), Some(GREEN)), ("THF, 60 °C".to_string(), None)]);
+    assert_eq!(other.molecule.atoms.len(), 3);
+
+    // Atoms and the coloured text selected: that text only, with the structure.
+    e.selected_atoms = [c2, o].into_iter().collect();
+    e.selected_objects = [text].into_iter().collect();
+    let mut other = ChemStructEditor::default();
+    assert!(other.paste_from_string(&e.copy_to_string().unwrap()));
+    assert_eq!(texts(&other.molecule), [("K_2CO_3".to_string(), Some(GREEN))]);
+    assert_eq!(other.molecule.atoms.len(), 2);
+    // Pasted texts get ids of their own, selected with the atoms.
+    let pasted = other.molecule.objects[0].id();
+    assert!(other.molecule.atoms.iter().all(|a| a.id != pasted));
+    assert!(other.selected_objects.contains(&pasted));
+
+    // A text alone, pasted into the same drawing: a second copy, moved over.
+    e.selected_atoms.clear();
+    e.selected_objects = [plain].into_iter().collect();
+    let clip = e.copy_to_string().unwrap();
+    assert!(e.paste_from_string(&clip));
+    assert_eq!(e.molecule.atoms.len(), 3, "no atoms copied");
+    let copies: Vec<&PageText> = e
+        .molecule
+        .objects
+        .iter()
+        .filter_map(|o| if let PageObject::Text(t) = o { Some(t) } else { None })
+        .filter(|t| t.text == "THF, 60 °C")
+        .collect();
+    assert_eq!(copies.len(), 2);
+    assert_ne!(copies[0].pos, copies[1].pos);
+    assert!(e.undo());
+    assert_eq!(texts(&e.molecule).len(), 2);
+}
+
+/// Clipboard text written before texts were copied still pastes; a copy without texts writes
+/// none.
+#[test]
+fn clipboard_text_without_texts_reads_and_writes_as_before() {
+    let old = r#"chembuilder-mol:{"atoms":[{"element":"O","pos":[0.0,0.0],"charge":0}],"bonds":[]}"#;
+    let mut e = ChemStructEditor::default();
+    assert!(e.paste_from_string(old));
+    assert!(e.molecule.objects.is_empty());
+    let clip = e.copy_to_string().unwrap();
+    assert!(!clip.contains("texts"), "{clip}");
 }

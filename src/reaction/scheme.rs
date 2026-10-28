@@ -808,10 +808,14 @@ pub fn structure_bounds(
     for label in labels.values() {
         grow(label.rect);
     }
+    if let Some(shadow) = structure_draw::shadow_bounds(scratch, Pos2::ZERO, &labels, false) {
+        grow(shadow);
+    }
     bounds.unwrap_or(Rect::from_min_size(Pos2::ZERO, Vec2::ZERO))
 }
 
-/// Draw a structure with its coordinate origin at `origin`, through the editor's renderer.
+/// Draw a structure with its coordinate origin at `origin`, through the editor's renderer: its
+/// drop shadow, bonds and labels. Ring fills are left out of the figure (and so their shadow).
 pub fn draw_structure(
     mol: &Molecule,
     painter: &Painter,
@@ -822,8 +826,10 @@ pub fn draw_structure(
 ) {
     load(mol, style, structure_style, scratch);
     let labels = structure_draw::compute_label_layouts(scratch, painter, origin);
+    structure_draw::draw_shadows(scratch, painter, origin, &labels, false);
     structure_draw::draw_bonds(scratch, painter, origin, &labels);
     structure_draw::draw_atom_backgrounds(scratch, painter, origin, &labels);
+    structure_draw::draw_shadows_under_labels(scratch, painter, origin, &labels, false);
     structure_draw::draw_atom_labels(scratch, painter, origin, &labels);
 }
 
@@ -1138,6 +1144,86 @@ mod tests {
         // Two main-line benzenes plus the biphenyl (two rings) above the arrow, and the shaft:
         // comfortably more bond lines than two rings alone would give.
         assert!(lines > 24, "expected the arrow structure's bonds to paint, got {lines}");
+    }
+
+    /// Every shape `scheme` paints, groups flattened, in paint order.
+    fn painted(scheme: &ReactionScheme) -> Vec<egui::Shape> {
+        let (style, sstyle) = (ReactionStyle::default(), StyleConfig::default());
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let mut ed = scratch();
+        let output = crate::testkit::run_ui(&ctx, raw, |ui| {
+            let layout = measure_scheme(scheme, ui.painter(), &style, &sstyle, &mut ed);
+            paint_scheme(scheme, &layout, ui.painter(), Pos2::new(20.0, 20.0), &style, &sstyle, &mut ed);
+        });
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                s => out.push(s.clone()),
+            }
+        }
+        let mut out = Vec::new();
+        output.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// A structure's drop shadow is part of its look in the figure too: painted under its bonds,
+    /// and measured, so the layout leaves room for it.
+    #[test]
+    fn a_structures_shadow_is_painted_under_it_and_measured() {
+        let shadow = crate::molecule::Shadow { color: [40, 50, 60, 200], offset: [0.3, 0.3], blur: 0.0 };
+        let mut phenol = demo::phenol();
+        phenol.atoms.iter_mut().for_each(|a| a.shadow = Some(shadow));
+        let scheme = ReactionScheme::new().structure(phenol.clone()).arrow(Arrow::new()).structure(demo::anisole());
+        let tint = egui::Color32::from_rgba_unmultiplied(40, 50, 60, 200);
+        let shapes = painted(&scheme);
+        let line = |s: &egui::Shape| match s {
+            egui::Shape::LineSegment { stroke, .. } => Some(stroke.color),
+            _ => None,
+        };
+        let first_shadow = shapes.iter().position(|s| line(s) == Some(tint)).expect("the shadow's bonds");
+        let first_bond = shapes.iter().position(|s| line(s) == Some(egui::Color32::BLACK)).unwrap();
+        assert!(first_shadow < first_bond, "the shadow goes under the bonds");
+        // Anisole casts none: under phenol, as many shadow lines as its bond lines (they are
+        // painted again inside its label's background, before its label).
+        let shadows = shapes[..first_bond].iter().filter(|s| line(s) == Some(tint)).count();
+        let plain = painted(&ReactionScheme::new().structure(demo::phenol()));
+        let phenol_lines = plain.iter().filter(|s| line(s) == Some(egui::Color32::BLACK)).count();
+        assert_eq!(shadows, phenol_lines);
+
+        let width = |mol: &crate::molecule::Molecule| {
+            let mut w = 0.0;
+            with_painter(|painter| {
+                w = structure_bounds(mol, painter, &ReactionStyle::default(), &StyleConfig::default(), &mut scratch()).width();
+            });
+            w
+        };
+        assert!(width(&phenol) > width(&demo::phenol()) + 1.0, "the shadow is measured");
+    }
+
+    /// A coloured reagent on an arrow is painted in its colour, the rest of the label as before.
+    #[test]
+    fn an_arrow_labels_colour_is_painted() {
+        use crate::widget::rich_text::SpanStyle;
+        let red = egui::Color32::from_rgb(220, 20, 30);
+        let mut arrow = Arrow::new();
+        arrow.above = ArrowLabel::Text(
+            RichText::new().span("Pd", SpanStyle { color: Some(red), ..Default::default() }).span(" THF", SpanStyle::default()),
+        );
+        let shapes = painted(&ReactionScheme::new().structure(demo::phenol()).arrow(arrow).structure(demo::anisole()));
+        let colour_of = |text: &str| {
+            shapes.iter().find_map(|s| match s {
+                egui::Shape::Text(t) if t.galley.job.text == text => {
+                    Some(t.override_text_color.unwrap_or(t.galley.job.sections[0].format.color))
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(colour_of("Pd"), Some(red));
+        assert_eq!(colour_of(" THF"), Some(egui::Color32::BLACK));
     }
 
     /// An empty scheme measures to nothing instead of panicking.

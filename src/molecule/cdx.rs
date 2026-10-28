@@ -136,9 +136,15 @@ pub(crate) fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
 
 /// [`cdx_string`] with every run in colour index `color`.
 fn colored_cdx_string(runs: &[(u16, u16)], text: &str, color: u16) -> Vec<u8> {
+    let runs: Vec<(u16, u16, u16)> = runs.iter().map(|&(start, face)| (start, face, color)).collect();
+    cdx_string_with_colors(&runs, text)
+}
+
+/// [`cdx_string`] with style runs (start, face, colour index) of their own colours.
+pub(crate) fn cdx_string_with_colors(runs: &[(u16, u16, u16)], text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(runs.len() as u16).to_le_bytes());
-    for &(start, face) in runs {
+    for &(start, face, color) in runs {
         for v in [start, LABEL_FONT, face, LABEL_SIZE, color] {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -289,7 +295,17 @@ pub(super) fn node_rules(mol: &impl AtomLookup, atom: &super::Atom) -> NodeRules
 
 /// Style runs (start char, face) for rich text, and its characters.
 pub(crate) fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
-    let mut runs: Vec<(u16, u16)> = Vec::new();
+    let (runs, text) = colored_runs_of(rich, |_| 0);
+    (runs.into_iter().map(|(start, face, _)| (start, face)).collect(), text)
+}
+
+/// [`runs_of`] with each run's colour index too, `color_of` naming a span's colour (straight
+/// RGBA, `None` for an uncoloured span); a run starts where the face or the colour changes.
+pub(crate) fn colored_runs_of(
+    rich: &RichText,
+    mut color_of: impl FnMut(Option<[u8; 4]>) -> u16,
+) -> (Vec<(u16, u16, u16)>, String) {
+    let mut runs: Vec<(u16, u16, u16)> = Vec::new();
     let mut text = String::new();
     for span in &rich.spans {
         let mut face = match span.style.script {
@@ -303,8 +319,9 @@ pub(crate) fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
         if span.style.italic {
             face |= FACE_ITALIC;
         }
-        if runs.last().is_none_or(|r| r.1 != face) {
-            runs.push((text.chars().count() as u16, face));
+        let color = color_of(span.style.color.map(|c| c.to_srgba_unmultiplied()));
+        if runs.last().is_none_or(|r| (r.1, r.2) != (face, color)) {
+            runs.push((text.chars().count() as u16, face, color));
         }
         text.push_str(&span.text);
     }
@@ -314,13 +331,19 @@ pub(crate) fn runs_of(rich: &RichText) -> (Vec<(u16, u16)>, String) {
 /// Rich text from a CDXString's runs: formula face turns digits into subscripts and the
 /// trailing charge into a superscript, as ChemDraw draws it.
 pub(crate) fn rich_of(runs: &[(usize, u16)], text: &str) -> RichText {
+    let runs: Vec<(usize, u16, Option<egui::Color32>)> = runs.iter().map(|&(start, face)| (start, face, None)).collect();
+    colored_rich_of(&runs, text)
+}
+
+/// [`rich_of`] from runs (start, face, colour) that each give their spans a colour too.
+pub(crate) fn colored_rich_of(runs: &[(usize, u16, Option<egui::Color32>)], text: &str) -> RichText {
     let chars: Vec<char> = text.chars().collect();
     let mut rich = RichText::new();
-    let runs: Vec<(usize, u16)> = if runs.is_empty() { vec![(0, 0)] } else { runs.to_vec() };
-    for (i, &(start, face)) in runs.iter().enumerate() {
+    let runs = if runs.is_empty() { vec![(0, 0, None)] } else { runs.to_vec() };
+    for (i, &(start, face, color)) in runs.iter().enumerate() {
         let end = runs.get(i + 1).map_or(chars.len(), |r| r.0).min(chars.len());
         let Some(part) = chars.get(start.min(end)..end) else { continue };
-        let base = SpanStyle { bold: face & FACE_BOLD != 0, italic: face & FACE_ITALIC != 0, ..Default::default() };
+        let base = SpanStyle { bold: face & FACE_BOLD != 0, italic: face & FACE_ITALIC != 0, color, ..Default::default() };
         if face & FACE_FORMULA == FACE_FORMULA {
             let charge_from = part.iter().rposition(|c| !matches!(c, '+' | '-')).map_or(0, |p| p + 1);
             for (k, &c) in part.iter().enumerate() {
@@ -650,7 +673,8 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
 
 /// Read one fragment's own nodes and bonds into `mol` (not the hidden insides of an
 /// abbreviation, which ChemDraw keeps as a fragment inside its node). The colours they name are
-/// those of `colors`, the document's colour table.
+/// those of `colors`, the document's colour table (what names none is in the colour of the
+/// fragment's container, [`ColorTable::inside`]).
 pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule, colors: &ColorTable) {
     read_fragment_mapped(frag, mol, &mut HashMap::new(), colors);
 }
@@ -663,6 +687,8 @@ fn read_fragment_mapped(
     atoms_of: &mut HashMap<u32, Vec<u32>>,
     colors: &ColorTable,
 ) {
+    // The colour of the fragment's nodes and bonds that name none of their own.
+    let colors = &colors.inside(frag);
     let mut atoms: HashMap<u32, u32> = HashMap::new();
     // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own), with their position.
     let mut hydrogens: Vec<(u32, [f32; 2], usize)> = Vec::new();
@@ -686,11 +712,16 @@ fn read_fragment_mapped(
         let charge = node.prop_int(PROP_ATOM_CHARGE).unwrap_or(0).clamp(-128, 127) as i8;
         let label_text = node.children.iter().find(|c| c.tag == OBJ_TEXT).and_then(|t| t.prop(PROP_TEXT));
         let label = label_text.and_then(parse_cdx_string).map(|(runs, text)| rich_of(&runs, &text));
-        // The label's colour: the node's own, else its text's.
-        let color = cdx_colors::foreground(node, colors).or_else(|| {
+        // The label's colour: the node's own, else its text's first coloured run (0, black, is
+        // what ChemDraw writes for a plain run), else what the node inherits.
+        let run_color = || {
             let (runs, _) = cdx_fonts::parse_string(label_text?)?;
-            runs.iter().find(|r| r.color != 0).and_then(|r| colors.rgba(r.color))
-        });
+            runs.iter().map(|r| r.color).find(|&c| c != 0)
+        };
+        let color = match cdx_colors::own_index(node) {
+            Some(own) => colors.rgba(own),
+            None => colors.rgba(run_color().unwrap_or(colors.inherited())),
+        };
         let element = match node.prop_i16(PROP_NODE_ELEMENT) {
             Some(z) if node_type == NODE_ELEMENT => elements::symbol(z as u16).unwrap_or("C").to_string(),
             None if node_type == NODE_ELEMENT => "C".to_string(),
@@ -827,6 +858,8 @@ fn read_container(
     atoms_of: &mut HashMap<u32, Vec<u32>>,
     colors: &ColorTable,
 ) {
+    // The colour what `obj` holds is in when it names none.
+    let colors = &colors.inside(obj);
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => {

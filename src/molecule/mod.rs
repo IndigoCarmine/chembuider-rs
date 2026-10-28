@@ -226,6 +226,11 @@ pub struct Atom {
     /// as before colours existed. Independent of the colour of its bonds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 4]>,
+    /// The drop shadow of the structure this atom is in ([`Molecule::shadow_of`]): a structure
+    /// casts the shadow of its lowest-id atom that has one, so an atom added to a shadowed
+    /// structure (or two structures joined) needs none of its own. `None` everywhere casts none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Shadow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,8 +249,9 @@ pub struct Bond {
     pub color: Option<[u8; 4]>,
 }
 
-/// A drop shadow cast by a molecule's structures: their ring fills, bonds and atom labels (not
-/// the arrows and texts on the page), drawn behind everything else.
+/// A drop shadow cast by one structure (a connected set of atoms, [`Molecule::structures`]):
+/// its ring fills, bonds and atom labels (not the arrows and texts on the page), drawn behind
+/// everything else. Each structure has its own, kept on its atoms ([`Atom::shadow`]).
 ///
 /// Lengths are molecule units (a bond is 1.5, y grows downward), so the shadow keeps its
 /// proportion to the drawing at any zoom and in the exported picture.
@@ -293,8 +299,6 @@ pub struct Molecule {
     /// Reaction arrows and text on the page beside the structures ([`page`]). Their ids come
     /// from the same allocator as atoms and bonds, so one id never names two things.
     pub objects: Vec<PageObject>,
-    /// The drop shadow the structures cast; `None` (the default) casts none.
-    pub shadow: Option<Shadow>,
     next_id: u32,
 }
 
@@ -310,9 +314,6 @@ struct MoleculeData {
     /// Written only when there are any, so a plain structure saves as it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     objects: Vec<PageObject>,
-    /// Written only when there is one, for the same reason.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    shadow: Option<Shadow>,
 }
 
 impl From<MoleculeData> for Molecule {
@@ -330,7 +331,6 @@ impl From<MoleculeData> for Molecule {
             bonds: d.bonds,
             ring_fills: d.ring_fills,
             objects: d.objects,
-            shadow: d.shadow,
             next_id: max_id.map_or(1, |m| m + 1),
         }
     }
@@ -338,7 +338,7 @@ impl From<MoleculeData> for Molecule {
 
 impl From<Molecule> for MoleculeData {
     fn from(m: Molecule) -> Self {
-        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills, objects: m.objects, shadow: m.shadow }
+        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills, objects: m.objects }
     }
 }
 
@@ -350,7 +350,6 @@ impl Default for Molecule {
             bonds: Vec::new(),
             ring_fills: Vec::new(),
             objects: Vec::new(),
-            shadow: None,
             next_id: 1,
         }
     }
@@ -365,7 +364,7 @@ impl Molecule {
 
     pub fn add_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
         let id = self.alloc_id();
-        self.atoms.push(Atom { id, element, pos, charge, group_h: false, color: None });
+        self.atoms.push(Atom { id, element, pos, charge, group_h: false, color: None, shadow: None });
         id
     }
 
@@ -374,7 +373,7 @@ impl Molecule {
     fn add_fragment_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
         let id = self.alloc_id();
         let group_h = element == "H";
-        self.atoms.push(Atom { id, element, pos, charge, group_h, color: None });
+        self.atoms.push(Atom { id, element, pos, charge, group_h, color: None, shadow: None });
         id
     }
 
@@ -545,6 +544,37 @@ impl Molecule {
             .iter()
             .map(|b| if b.begin == atom_id { b.end } else { b.begin })
             .collect()
+    }
+
+    /// The connected structures, each as its sorted atom ids, in the order of their first atom
+    /// (what a shadow, a reaction table's column or a cleanup takes as one structure).
+    pub fn structures(&self) -> Vec<Vec<u32>> {
+        reaction_table::structures(self)
+    }
+
+    /// The drop shadow each structure casts, with the structure's sorted atom ids: the shadow of
+    /// its lowest-id atom that has one ([`Atom::shadow`]). Structures that cast none are left
+    /// out.
+    pub fn structure_shadows(&self) -> Vec<(Vec<u32>, Shadow)> {
+        let shadow_of: std::collections::HashMap<u32, Shadow> =
+            self.atoms.iter().filter_map(|a| Some((a.id, a.shadow?))).collect();
+        if shadow_of.is_empty() {
+            return Vec::new();
+        }
+        self.structures()
+            .into_iter()
+            .filter_map(|atoms| {
+                let shadow = atoms.iter().find_map(|id| shadow_of.get(id).copied())?;
+                Some((atoms, shadow))
+            })
+            .collect()
+    }
+
+    /// The drop shadow the structure holding `atom_id` casts ([`structure_shadows`](Self::structure_shadows)).
+    pub fn shadow_of(&self, atom_id: u32) -> Option<Shadow> {
+        let mut atoms = self.connected_atoms(atom_id);
+        atoms.sort_unstable();
+        atoms.iter().find_map(|&id| self.atom_by_id(id)?.shadow)
     }
 
     /// All atom ids in the same connected molecule as `start` (graph traversal over bonds,

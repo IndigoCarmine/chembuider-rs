@@ -168,7 +168,8 @@ fn justification(t: &CdxObject) -> TextAlign {
 }
 
 /// A ChemDraw text as page text: its markup (lines joined by `\n`), alignment, anchor and
-/// colour (that of its first coloured run, else the object's own).
+/// colour, which is one for the whole text (a text of several colours takes its first). What
+/// names no colour is in its container's ([`ColorTable::inside`]).
 fn read_text(t: &CdxObject, fonts: &FontTable, colors: &ColorTable) -> Option<PageText> {
     let rich = cdx_fonts::text_of(t, fonts)?;
     let markup = markup_lines(&rich);
@@ -177,12 +178,13 @@ fn read_text(t: &CdxObject, fonts: &FontTable, colors: &ColorTable) -> Option<Pa
     }
     let pos = point_2d(t, PROP_2D_POSITION)
         .or_else(|| cdx::bounding_box(t).map(|b| (b[0], b[1] + ASCENT_PT * PT)))?;
+    // That of its first coloured run (0, black, is what ChemDraw writes for a plain one), else
+    // the text's own, else the page's or the document's.
     let runs = t.prop(cdx::PROP_TEXT).and_then(cdx_fonts::parse_string).map(|(runs, _)| runs).unwrap_or_default();
-    let color = runs
-        .iter()
-        .find(|r| r.color != 0)
-        .and_then(|r| colors.rgba(r.color))
-        .or_else(|| cdx_colors::foreground(t, colors));
+    let color = match runs.iter().map(|r| r.color).find(|&c| c != 0) {
+        Some(run) => colors.rgba(run),
+        None => cdx_colors::foreground(t, colors),
+    };
     Some(PageText { id: 0, pos: mol_point(pos), text: markup, align: justification(t), source: Some(t.id), color })
 }
 
@@ -242,7 +244,7 @@ pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable, colors: &ColorTa
                 out.push(Converted { object: PageObject::Arrow(arrow), ids: vec![obj.id] });
             }
             OBJ_TEXT => {
-                if let Some(text) = read_text(obj, fonts, colors) {
+                if let Some(text) = read_text(obj, fonts, &colors.inside(page)) {
                     out.push(Converted { object: PageObject::Text(text), ids: vec![obj.id] });
                 }
             }

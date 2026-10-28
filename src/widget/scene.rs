@@ -96,10 +96,12 @@ pub struct SceneBond {
     pub color: Option<[u8; 4]>,
 }
 
-/// The drop shadow of a scene ([`Molecule::shadow`]) in target pixels: its ring fills, bonds
-/// and labels drawn again in `color`, moved by `offset` and blurred by `blur` (the blur radius,
-/// twice the Gaussian's standard deviation), behind everything else.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The drop shadow one structure casts ([`Molecule::structure_shadows`]) in target pixels: the
+/// structure's ring fills, bonds and labels drawn again in `color`, moved by `offset` and
+/// blurred by `blur` (the blur radius, twice the Gaussian's standard deviation), behind every
+/// structure's ring fills, bonds and labels. What is transparent casts none, as an SVG
+/// shadow of the source's alpha would have it.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SceneShadow {
     pub offset: Vec2,
     pub blur: f32,
@@ -107,27 +109,64 @@ pub struct SceneShadow {
     pub color: Color32,
     /// Straight RGBA, for the SVG/EMF backends.
     pub rgba: [u8; 4],
+    /// What casts it: indices into the scene's [`ring_fills`](MoleculeScene::ring_fills) (as
+    /// [`build_ring_fills`] makes them) and [`bonds`](MoleculeScene::bonds), and the atoms of
+    /// the [`labels`](MoleculeScene::labels), in the molecule's order.
+    pub ring_fills: Vec<usize>,
+    pub bonds: Vec<usize>,
+    pub labels: Vec<u32>,
 }
 
-impl SceneShadow {
-    /// How far past what casts it the shadow reaches, in pixels: its offset plus three standard
-    /// deviations of blur.
-    pub fn reach(&self) -> f32 {
-        self.offset.length() + 1.5 * self.blur
+/// The shadows the structures of `mol` cast under `xf`, one per shadowed structure, in the
+/// order of the structures: lengths in molecule units scaled like atom positions, so each keeps
+/// its proportion to the drawing at any zoom. `bonds` and `labels` are the scene's (what
+/// [`build_bonds`] and [`build_labels`] made of `mol`).
+pub fn build_shadows(
+    mol: &Molecule,
+    xf: RenderTransform,
+    bonds: &[SceneBond],
+    labels: &HashMap<u32, SceneLabel>,
+) -> Vec<SceneShadow> {
+    let structures = mol.structure_shadows();
+    if structures.is_empty() {
+        return Vec::new();
     }
-}
-
-/// The shadow `mol` casts under `xf`, if it has one: lengths in molecule units scaled like
-/// atom positions, so it keeps its proportion to the drawing at any zoom.
-pub fn build_shadow(mol: &Molecule, xf: RenderTransform) -> Option<SceneShadow> {
-    let s = mol.shadow?;
-    let [r, g, b, a] = s.color;
-    Some(SceneShadow {
-        offset: Vec2::new(s.offset[0], s.offset[1]) * xf.coord_scale,
-        blur: s.blur.max(0.0) * xf.coord_scale,
-        color: Color32::from_rgba_unmultiplied(r, g, b, a),
-        rgba: s.color,
-    })
+    let index = MolIndex::new(mol);
+    // The structure each atom is in (an index into `structures`).
+    let mut structure_of: HashMap<u32, usize> = HashMap::new();
+    for (k, (atoms, _)) in structures.iter().enumerate() {
+        structure_of.extend(atoms.iter().map(|&a| (a, k)));
+    }
+    let mut out: Vec<SceneShadow> = structures
+        .iter()
+        .map(|(_, s)| SceneShadow {
+            offset: Vec2::new(s.offset[0], s.offset[1]) * xf.coord_scale,
+            blur: s.blur.max(0.0) * xf.coord_scale,
+            color: color32(s.color),
+            rgba: s.color,
+            ring_fills: Vec::new(),
+            bonds: Vec::new(),
+            labels: Vec::new(),
+        })
+        .collect();
+    let drawn_fills = mol.ring_fills.iter().filter(|rf| ring_fill_is_drawn(rf, &index));
+    for (i, rf) in drawn_fills.enumerate() {
+        if let Some(&k) = structure_of.get(&rf.atoms[0]) {
+            out[k].ring_fills.push(i);
+        }
+    }
+    let begin_of: HashMap<u32, u32> = mol.bonds.iter().map(|b| (b.id, b.begin)).collect();
+    for (i, b) in bonds.iter().enumerate() {
+        if let Some(&k) = begin_of.get(&b.bond_id).and_then(|a| structure_of.get(a)) {
+            out[k].bonds.push(i);
+        }
+    }
+    for atom in mol.atoms.iter().filter(|a| labels.contains_key(&a.id)) {
+        if let Some(&k) = structure_of.get(&atom.id) {
+            out[k].labels.push(atom.id);
+        }
+    }
+    out
 }
 
 /// Straight RGBA as egui's (premultiplied) colour.
@@ -156,8 +195,9 @@ pub struct MoleculeScene {
     pub label_bg_pad: f32,
     /// Arrows and texts on the page ([`Molecule::objects`]), drawn over the structures.
     pub objects: Vec<SceneObject>,
-    /// The drop shadow of the ring fills, bonds and labels, drawn behind them.
-    pub shadow: Option<SceneShadow>,
+    /// The drop shadows of the shadowed structures, drawn behind every structure's ring fills,
+    /// bonds and labels.
+    pub shadows: Vec<SceneShadow>,
 }
 
 /// One laid-out line of a page text: the galley and the rect it is painted in.
@@ -191,8 +231,8 @@ impl MoleculeScene {
         let bonds = build_bonds(mol, style, xf, &labels);
         let ring_fills = build_ring_fills(mol, xf);
         let objects = build_objects(mol, style, xf, &mut layout);
-        let shadow = build_shadow(mol, xf);
-        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale, objects, shadow }
+        let shadows = build_shadows(mol, xf, &bonds, &labels);
+        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale, objects, shadows }
     }
 
     /// The pixel rect covering everything drawn: every atom position of `mol` (under `xf`, the
@@ -220,12 +260,11 @@ impl MoleculeScene {
             r.extend_with(l.rect.min);
             r.extend_with(l.rect.max);
         }
-        if let Some(shadow) = &self.shadow
-            && r.min.x <= r.max.x
-        {
-            // The structures' shadow: what they cover, moved and blurred.
-            let cast = r.translate(shadow.offset).expand(1.5 * shadow.blur);
-            r = r.union(cast);
+        for shadow in &self.shadows {
+            let cast = shadow_extent(shadow, &self.ring_fills, &self.bonds, &self.labels);
+            if cast.min.x <= cast.max.x {
+                r = r.union(cast);
+            }
         }
         for o in self.objects.iter().filter(|o| o.rect.is_finite()) {
             r.extend_with(o.rect.min);
@@ -233,6 +272,34 @@ impl MoleculeScene {
         }
         (r.min.x <= r.max.x && r.min.y <= r.max.y).then_some(r)
     }
+}
+
+/// The pixel rect `shadow` covers: what casts it (of `ring_fills`, `bonds` and `labels`, the
+/// scene's), moved by its offset and grown by three standard deviations of its blur.
+/// [`Rect::NOTHING`] when it is cast by nothing.
+pub fn shadow_extent(
+    shadow: &SceneShadow,
+    ring_fills: &[ScenePolygon],
+    bonds: &[SceneBond],
+    labels: &HashMap<u32, SceneLabel>,
+) -> Rect {
+    let mut r = Rect::NOTHING;
+    for poly in shadow.ring_fills.iter().filter_map(|&i| ring_fills.get(i)) {
+        poly.points.iter().for_each(|p| r.extend_with(*p));
+    }
+    for b in shadow.bonds.iter().filter_map(|&i| bonds.get(i)) {
+        for s in &b.strokes {
+            r = r.union(Rect::from_two_pos(s.a, s.b).expand(s.width * 0.5));
+        }
+        b.fills.iter().flatten().for_each(|p| r.extend_with(*p));
+    }
+    for l in shadow.labels.iter().filter_map(|a| labels.get(a)) {
+        r = r.union(l.rect);
+    }
+    if r.min.x > r.max.x {
+        return Rect::NOTHING;
+    }
+    r.translate(shadow.offset).expand(1.5 * shadow.blur)
 }
 
 // ─── Label layout ─────────────────────────────────────────────────────────────
@@ -586,7 +653,7 @@ pub fn build_ring_fills(mol: &Molecule, xf: RenderTransform) -> Vec<ScenePolygon
     mol.ring_fills
         .iter()
         .filter_map(|rf| {
-            if rf.atoms.len() < 3 {
+            if !ring_fill_is_drawn(rf, &index) {
                 return None;
             }
             let mut points = Vec::with_capacity(rf.atoms.len());
@@ -601,6 +668,11 @@ pub fn build_ring_fills(mol: &Molecule, xf: RenderTransform) -> Vec<ScenePolygon
             })
         })
         .collect()
+}
+
+/// Whether [`build_ring_fills`] draws `rf`: it has three vertices or more, all of them atoms.
+fn ring_fill_is_drawn(rf: &crate::molecule::RingFill, index: &MolIndex) -> bool {
+    rf.atoms.len() >= 3 && rf.atoms.iter().all(|&id| index.atom_by_id(id).is_some())
 }
 
 // ─── Bonds ────────────────────────────────────────────────────────────────────
