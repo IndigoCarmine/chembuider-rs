@@ -1441,3 +1441,116 @@ fn alkoxy_prefixes() {
         ("CCCCCOCCCCC", "1-(pentyloxy)pentane"),
     ]);
 }
+
+/// Substituent groups with several free valences that are not all on one parent chain or
+/// ring: IUPAC 2013 names them as compound or multiplied groups ("1,4-phenylenebis(methylene)",
+/// "oxydi(ethane-2,1-diyl)", P-29.4.2), which this namer does not produce. Naming the parent
+/// alone would drop a free valence and name a different, monovalent group.
+#[test]
+fn free_valences_off_the_parent_are_refused() {
+    let reason = "free valences not all on one parent";
+    check_refused(&[
+        ("*CC1=CC=C(C*)C=C1", reason), // not (4-methylphenyl)methyl
+        ("*C1=CC=C(C=C1)C*", reason),  // not 4-methylphenyl
+        ("*CC1=CC=CC=C1*", reason),    // not 2-methylphenyl
+        ("*C1CCC(CC*)CC1", reason),    // not 4-ethylcyclohexyl
+        ("*CCOCC*", reason),           // not 2-ethoxyethyl
+        ("*C1CC1C*", reason),          // not 2-methylcyclopropyl
+        ("*CC(C*)C*", reason),         // three free valences, not 2-methylpropane-1,3-diyl
+        ("*C(=O)CC1CCC(CC1)C(=O)*", reason),
+    ]);
+}
+
+/// Divalent acyl groups (P-65.1.7): "carbonyl" (P-65.2.1.5), "oxalyl" (P-65.1.7.2.1), the
+/// "-dioyl" groups of chain diacids (P-65.1.7.3.1) and the "-dicarbonyl" groups of rings and
+/// of chains with more than two acid groups (P-65.1.7.2.2).
+#[test]
+fn diacyl_groups() {
+    check_names(&[
+        ("*C(=O)*", "carbonyl"),
+        ("*C(*)=O", "carbonyl"),
+        ("*C(=O)C(=O)*", "oxalyl"),
+        ("*C(=O)CC(=O)*", "propanedioyl"),
+        ("*C(=O)CCC(=O)*", "butanedioyl"),
+        ("*C(=O)CC(C)C(=O)*", "2-methylbutanedioyl"),
+        ("*C(=O)C1=CC=C(C=C1)C(=O)*", "benzene-1,4-dicarbonyl"),
+        ("*C(=O)C1=CC=CC(C(=O)*)=C1", "benzene-1,3-dicarbonyl"),
+        ("*C(=O)C1CCC(CC1)C(=O)*", "cyclohexane-1,4-dicarbonyl"),
+        ("*C(=O)CC(CC(=O)*)C(=O)*", "propane-1,2,3-tricarbonyl"),
+    ]);
+    check_refused(&[
+        (
+            "*C(=O)CC*",
+            "free valences both on C=O carbons and on other atoms",
+        ),
+        (
+            "*C(=O)C1=CC=C(C*)C=C1",
+            "free valences both on C=O carbons and on other atoms",
+        ),
+    ]);
+}
+
+/// Acyl halides with different halides (P-65.5.1) cite them without locants, so the name fits
+/// one structure only when the acyl halide groups are interchangeable; otherwise the namer
+/// refuses rather than give two isomers one name.
+#[test]
+fn mixed_acyl_halides() {
+    check_names(&[
+        ("BrC(=O)CCC(Cl)=O", "butanedioyl bromide chloride"),
+        ("ClC(=O)CCC(Br)=O", "butanedioyl bromide chloride"),
+        (
+            "BrC(=O)C1=CC=CC(C(Cl)=O)=C1",
+            "benzene-1,3-dicarbonyl bromide chloride",
+        ),
+        (
+            "BrC(=O)CC(Cl)CC(Cl)=O",
+            "3-chloropentanedioyl bromide chloride",
+        ),
+        (
+            "BrC(=O)C1=CC(=CC(=C1)C(Cl)=O)C(Cl)=O",
+            "benzene-1,3,5-tricarbonyl bromide dichloride",
+        ),
+        (
+            "ClC(=O)CC(CC(Cl)=O)C(Cl)=O",
+            "propane-1,2,3-tricarbonyl trichloride",
+        ),
+        // Kekulé rings: the symmetry ignores where the double bonds are drawn.
+        (
+            "BrC(=O)C1=CC=CC(=N1)C(Cl)=O",
+            "pyridine-2,6-dicarbonyl bromide chloride",
+        ),
+        (
+            "BrC(=O)C1=CC=C(C=C1)C1=CC=C(C=C1)C(Cl)=O",
+            "[1,1'-biphenyl]-4,4'-dicarbonyl bromide chloride",
+        ),
+    ]);
+    let reason = "different halides on acyl groups that are not interchangeable";
+    check_refused(&[
+        ("BrC(=O)C(Cl)CC(Cl)=O", reason),
+        ("ClC(=O)C(Cl)CC(Br)=O", reason),
+        ("BrC(=O)CC(CC(Cl)=O)C(Cl)=O", reason),
+        ("ClC(=O)CC(CC(Cl)=O)C(Br)=O", reason),
+        ("BrC(=O)C(Cl)CCC(Cl)=O", reason),
+        ("BrC(=O)C1=CC=C(C)C(C(Cl)=O)=C1", reason),
+        ("BrC(=O)C1=CC(=CC(=C1)C(I)=O)C(Cl)=O", reason),
+        ("BrC(=O)C1=CC(=NC=C1)C(Cl)=O", reason),
+        ("BrC(=O)C1=CC=C(C=C1)C1=CC=CC(=C1)C(Cl)=O", reason),
+    ]);
+}
+
+/// A one-carbon acid, nitrile or acyl parent takes no prefix on its carbon: carboxy- and
+/// cyanoformic acid are named otherwise (P-65.1.8: hydrogen oxalate, carbonocyanidic acid).
+/// The partial salt of an acid with more than two acid groups is "hydrogen …tricarboxylate"
+/// (P-65.6.2.3), not produced here.
+#[test]
+fn substituted_formic_acid_and_hydrogen_salts_are_refused() {
+    check_refused(&[
+        ("[O-]C(=O)C(=O)O.[Na+]", "one-carbon"),
+        ("OC(=O)C#N", "one-carbon"),
+        ("*C(=O)C#N", "one-carbon"),
+        (
+            "OC(=O)CC(CC([O-])=O)C([O-])=O.[K+].[Na+]",
+            "partial salt of an acid with more than two acid groups",
+        ),
+    ]);
+}

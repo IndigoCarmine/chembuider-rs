@@ -34,15 +34,17 @@
 //! - halogens, nitro groups and ethers (alkoxy prefixes) as prefixes; N-substituted amines
 //!   and amides with N locants; thiols ("pentane-2-thiol", "2-sulfanylpentan-1-ol");
 //! - functional class names: esters ("ethyl propanoate"), acyl halides with F, Cl, Br, I
-//!   ("acetyl chloride", "butanedioyl bromide chloride", P-65.5.1), acyclic anhydrides
+//!   ("acetyl chloride", "butanedioyl bromide chloride", P-65.5.1; different halides only
+//!   where the acyl halide groups are interchangeable by symmetry), acyclic anhydrides
 //!   ("propanoic anhydride", "acetic propanoic anhydride", P-65.7);
 //! - salts of carboxylic acids drawn as separate ions (P-65.6.2): the cations Li⁺, Na⁺, K⁺,
 //!   Rb⁺, Cs⁺ and NH₄⁺ (`ions.rs`) in alphabetical order, then the carboxylate anion
 //!   ("potassium propanoate", "disodium butanedioate", "ammonium 3-carboxypropanoate"). The
 //!   ions of a drawing are named together as one salt;
 //! - substituent groups drawn with attachment points ("*", P-29): "pentyl", "pentyloxy",
-//!   "hexanoyl", "1-chloropropan-2-yl", and with several free valences on carbon
-//!   "propane-1,3-diyl", "methylene", "1,4-phenylene".
+//!   "hexanoyl", "1-chloropropan-2-yl", and with several free valences on carbon, all on the
+//!   parent, "propane-1,3-diyl", "methylene", "1,4-phenylene"; or all on C=O carbons,
+//!   "carbonyl", "oxalyl", "butanedioyl", "benzene-1,4-dicarbonyl" (P-65.1.7).
 //!
 //! Not supported (an [`NameResult::Unsupported`] with the reason): rings sharing atoms (fused,
 //! bridged, spiro), branched ring assemblies, suffixes or free valences on assemblies of
@@ -57,9 +59,13 @@
 //! O, S and the halogens (except the cations above), charged species other than nitro groups,
 //! carboxylate anions and those cations (substituted ammonium, zwitterions, metals bonded to
 //! the structure, salts whose charges do not balance or with two kinds of anion), isotopes,
-//! acid halide, anhydride and carboxylate groups as prefixes, cyclic anhydrides, free
-//! valences on sulfur or an acid's oxygen (acyloxy), several free valences other than single
-//! bonds on carbon, and other functional groups (imines, azo, peroxides, carbonates, ureas…).
+//! acid halide, anhydride and carboxylate groups as prefixes, cyclic anhydrides, partial salts
+//! of acids with more than two acid groups ("hydrogen …tricarboxylate"), prefixes on a
+//! one-carbon acid parent (carboxyformic acid, P-65.1.8), different halides on acyl halide
+//! groups that are not interchangeable (no locants for them), free valences on sulfur or an
+//! acid's oxygen (acyloxy), several free valences other than single bonds on carbon or not
+//! all on one parent ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and
+//! others, and other functional groups (imines, azo, peroxides, carbonates, ureas…).
 //! Stereodescriptors (E/Z, R/S) are not generated: the name describes the constitution only;
 //! see [`has_stereo_marks`].
 //!

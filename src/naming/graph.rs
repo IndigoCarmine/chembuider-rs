@@ -107,6 +107,124 @@ impl Graph {
         self.free.iter().filter(|(f, _)| *f == a).count()
     }
 
+    /// Whether a symmetry of the structure (an automorphism) maps atom `a` to atom `b`, atoms
+    /// being told apart by `kind` and by their charge, hydrogens and free valences, bonds by
+    /// `bond` (from the two atoms and the drawn order: the bonds of a Kekulé ring all alike).
+    /// Colour refinement prunes an exact backtracking search for the mapping.
+    pub(crate) fn automorphic(
+        &self,
+        a: usize,
+        b: usize,
+        kind: &[u8],
+        bond: impl Fn(usize, usize, u8) -> u8,
+    ) -> bool {
+        let n = self.len();
+        let adj: Vec<Vec<(usize, u8)>> = (0..n)
+            .map(|x| {
+                self.adj[x]
+                    .iter()
+                    .map(|&(m, o)| (m, bond(x, m, o)))
+                    .collect()
+            })
+            .collect();
+        let order = |x: usize, y: usize| adj[x].iter().find(|e| e.0 == y).map_or(0, |e| e.1);
+        let initial: Vec<_> = (0..n)
+            .map(|x| {
+                let mut free: Vec<u8> =
+                    self.free.iter().filter(|f| f.0 == x).map(|f| f.1).collect();
+                free.sort_unstable();
+                (kind[x], self.charge[x], self.h[x], free)
+            })
+            .collect();
+        let mut color = ranks(&initial);
+        loop {
+            let signature: Vec<(usize, Vec<(u8, usize)>)> = (0..n)
+                .map(|x| {
+                    let mut s: Vec<(u8, usize)> =
+                        adj[x].iter().map(|&(m, o)| (o, color[m])).collect();
+                    s.sort_unstable();
+                    (color[x], s)
+                })
+                .collect();
+            let next = ranks(&signature);
+            let classes = |c: &[usize]| c.iter().max().map_or(0, |m| m + 1);
+            let done = classes(&next) == classes(&color);
+            color = next;
+            if done {
+                break;
+            }
+        }
+        if color[a] != color[b] {
+            return false;
+        }
+        // Map the atoms in breadth-first order from `a`, each to a neighbour of the image of
+        // the atom it was reached from (the structure is connected).
+        let mut bfs = vec![a];
+        let mut parent = vec![usize::MAX; n];
+        let mut seen = vec![false; n];
+        seen[a] = true;
+        let mut i = 0;
+        while i < bfs.len() {
+            let x = bfs[i];
+            for y in self.nbrs(x) {
+                if !seen[y] {
+                    seen[y] = true;
+                    parent[y] = x;
+                    bfs.push(y);
+                }
+            }
+            i += 1;
+        }
+        let mut image = vec![usize::MAX; n];
+        let mut used = vec![false; n];
+        image[a] = b;
+        used[b] = true;
+        let candidates = |x: usize, image: &[usize], used: &[bool]| -> Vec<usize> {
+            let (p, o) = (parent[x], order(parent[x], x));
+            adj[image[p]]
+                .iter()
+                .filter(|&&(y, oy)| oy == o && !used[y] && color[y] == color[x])
+                .map(|&(y, _)| y)
+                .collect()
+        };
+        if bfs.len() == 1 {
+            return true;
+        }
+        // `options[k - 1]`: the images left to try for `bfs[k]`.
+        let mut options = vec![candidates(bfs[1], &image, &used)];
+        let mut k = 1;
+        loop {
+            let x = bfs[k];
+            if image[x] != usize::MAX {
+                used[image[x]] = false;
+                image[x] = usize::MAX;
+            }
+            let Some(y) = options[k - 1].pop() else {
+                options.pop();
+                k -= 1;
+                if k == 0 {
+                    return false;
+                }
+                continue;
+            };
+            // Every bond of x to a mapped atom must have its image, and y no other bond to a
+            // mapped atom.
+            let mapped = adj[x].iter().filter(|&&(m, _)| image[m] != usize::MAX);
+            let fits = mapped.clone().all(|&(m, o)| order(image[m], y) == o)
+                && self.nbrs(y).filter(|&m| used[m]).count() == mapped.count();
+            if !fits {
+                continue;
+            }
+            image[x] = y;
+            used[y] = true;
+            k += 1;
+            if k == bfs.len() {
+                return true;
+            }
+            options.push(candidates(bfs[k], &image, &used));
+        }
+    }
+
     /// The net charge of the structure.
     pub(crate) fn net_charge(&self) -> i32 {
         self.charge.iter().map(|&c| c as i32).sum()
@@ -271,6 +389,16 @@ pub(crate) const MAX_ASSEMBLY: usize = 10;
 
 /// A reason a structure cannot be named.
 pub(crate) type Unsupported = String;
+
+/// Each value's rank among the distinct values of `v` (equal values, equal ranks).
+fn ranks<T: Ord + Clone>(v: &[T]) -> Vec<usize> {
+    let mut sorted = v.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    v.iter()
+        .map(|x| sorted.binary_search(x).expect("value of v"))
+        .collect()
+}
 
 /// Split `mol` into its connected structures, each as a list of atom indices into `mol.atoms`.
 /// Hydrogens drawn on their own stay with the structure they are bonded to; a structure that
