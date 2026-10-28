@@ -15,6 +15,8 @@ pub mod page;
 pub mod bracket;
 pub(crate) mod cdx_bracket;
 pub(crate) mod lookup;
+#[cfg(test)]
+mod chemdraw_look_tests;
 #[cfg(windows)]
 pub mod image;
 #[cfg(windows)]

@@ -550,14 +550,14 @@ mod tests {
         );
         let mut view = fonts.with_pixels_per_point(1.0);
         let (_, b) = build_scene(&mol, &style, |job| view.layout_job(job)).unwrap();
-        let expected = [-64.031, -47.5, 148.735, 65.0];
+        let expected = [-106.156, -70.0, 205.068, 80.333];
         for (got, want) in [b.min.x, b.min.y, b.max.x, b.max.y].into_iter().zip(expected) {
             assert!((got - want).abs() < 1e-3, "bounds {b:?}, expected {expected:?}");
         }
         let svg = molecule_to_svg(&mol).unwrap();
         assert!(
             svg.starts_with(
-                r#"<svg xmlns="http://www.w3.org/2000/svg" width="237" height="136" viewBox="0 0 237 136"><g transform="translate(76.031,59.500)">"#
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="335" height="174" viewBox="0 0 335 174"><g transform="translate(118.156,82.000)">"#
             ),
             "picture size and placement: {}",
             &svg[..120]
@@ -586,7 +586,7 @@ mod tests {
         let mut elements: Vec<&str> = svg.split('<').collect();
         elements.sort_unstable();
         let fnv = elements.concat().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-        assert_eq!((svg.len(), fnv), (2386, 9854542963868085436), "{svg}");
+        assert_eq!((svg.len(), fnv), (2394, 15025168934221154562), "{svg}");
     }
 
     #[test]

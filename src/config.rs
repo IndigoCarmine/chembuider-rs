@@ -170,37 +170,34 @@ pub struct StyleConfig {
     pub label_bg_pad: f32,
 }
 
-fn def_label_size() -> f32 { 13.0 }
-fn def_bond_width() -> f32 { 1.5 }
-fn def_double_bond_offset() -> f32 { 3.5 }
+/// One point of a ChemDraw document in the editor's pixels at zoom 1: a document's bond is
+/// 14.4 pt and the editor's [`DEFAULT_BOND_LENGTH`](crate::widget::DEFAULT_BOND_LENGTH) units
+/// at [`SCALE_FACTOR`](crate::widget::SCALE_FACTOR) pixels each, the scale `molecule::cdx`
+/// reads and writes coordinates at.
+const PT: f32 = crate::widget::SCALE_FACTOR * crate::widget::DEFAULT_BOND_LENGTH / 14.4;
+
+// ChemDraw's drawing style (its ACS-like default: 10 pt labels and 0.6 pt lines on a 14.4 pt
+// bond). Text, lines and arrowheads are written to a document at ChemDraw's sizes, and
+// ChemDraw's own documents are drawn in them; drawn in these, a structure looks the same here
+// and in ChemDraw.
+fn def_label_size() -> f32 { 10.0 * PT }
+fn def_bond_width() -> f32 { 0.6 * PT }
+fn def_double_bond_offset() -> f32 { 2.6 * PT }
 fn def_atom_bg_radius() -> f32 { 9.0 }
-fn def_wedge_width() -> f32 { 5.0 }
-fn def_bold_width() -> f32 { 4.0 }
-fn def_dash_len() -> f32 { 5.0 }
-fn def_dash_gap() -> f32 { 4.0 }
-fn def_wavy_amplitude() -> f32 { 3.0 }
-fn def_label_trim_pad() -> f32 { 2.0 }
-fn def_label_bg_pad() -> f32 { 1.0 }
+fn def_wedge_width() -> f32 { 1.3 * PT }
+fn def_bold_width() -> f32 { 2.0 * PT }
+fn def_dash_len() -> f32 { 0.8 * PT }
+fn def_dash_gap() -> f32 { 1.2 * PT }
+fn def_wavy_amplitude() -> f32 { 1.2 * PT }
+fn def_label_trim_pad() -> f32 { 1.2 * PT }
+fn def_label_bg_pad() -> f32 { 0.8 * PT }
 
 impl StyleConfig {
     /// ChemDraw's drawing style (its ACS-like default: 10 pt labels and 0.6 pt lines on a
     /// 14.4 pt bond), in the editor's pixels: how a structure is drawn for a document, so it
-    /// sits beside ones drawn in ChemDraw.
+    /// sits beside ones drawn in ChemDraw. It is the default style.
     pub fn chemdraw() -> Self {
-        let pt = crate::widget::SCALE_FACTOR * 1.5 / 14.4;
-        Self {
-            label_size: 10.0 * pt,
-            bond_width: 0.6 * pt,
-            double_bond_offset: 2.6 * pt,
-            atom_bg_radius: def_atom_bg_radius(),
-            wedge_width: 1.3 * pt,
-            bold_width: 2.0 * pt,
-            dash_len: 0.8 * pt,
-            dash_gap: 1.2 * pt,
-            wavy_amplitude: 1.2 * pt,
-            label_trim_pad: 1.2 * pt,
-            label_bg_pad: 0.8 * pt,
-        }
+        Self::default()
     }
 }
 
@@ -542,6 +539,23 @@ mod tests {
 
     fn ring_action(ring: usize) -> Option<ResolvedAtomAction> {
         cfg().atom_action_to_fragment(&AtomAction::Ring { ring })
+    }
+
+    /// The editor draws in ChemDraw's proportions — what a ChemDraw document holds: 10 pt
+    /// labels and 0.6 pt lines on a 14.4 pt bond — so a structure looks the same in both, and
+    /// the shipped config draws in the same style as the code's default.
+    #[test]
+    fn the_default_style_is_chemdraws_proportions() {
+        let s = StyleConfig::default();
+        let bond_px = crate::widget::DEFAULT_BOND_LENGTH * crate::widget::SCALE_FACTOR;
+        let in_bonds = |v: f32| v / bond_px;
+        assert!((in_bonds(s.label_size) - 10.0 / 14.4).abs() < 1e-6, "{}", s.label_size);
+        assert!((in_bonds(s.bond_width) - 0.6 / 14.4).abs() < 1e-6, "{}", s.bond_width);
+        assert!((in_bonds(s.bold_width) - 2.0 / 14.4).abs() < 1e-6);
+        assert!((in_bonds(s.double_bond_offset) - 2.6 / 14.4).abs() < 1e-6);
+        let json = |s: &StyleConfig| serde_json::to_value(s).unwrap();
+        assert_eq!(json(&cfg().style), json(&s), "the shipped config");
+        assert_eq!(json(&StyleConfig::chemdraw()), json(&s));
     }
 
     /// `ring` comes from the user-editable `chembuilder_config.json`; an out-of-range size
