@@ -15,10 +15,16 @@
 //!
 //! With atoms selected, the panel analyses the structures they belong to (whole connected
 //! components, so a selected part of a molecule does not grow implicit hydrogens at the cut).
+//!
+//! Brackets with a number (`[CH2–CH2–O]3`, a multiple group) are written out, so every value is
+//! that of the molecule they stand for. A repeat unit labelled `n` is shown as `C2H6(C2H4O)n`,
+//! end groups first; its values are those of `n = 1`, and the masses are also given as the end
+//! groups' plus `n` times the unit's.
 
 use std::collections::HashSet;
 
 use crate::molecule::Molecule;
+use crate::molecule::bracket::expand;
 use crate::naming::{has_stereo_marks, iupac_name, NameResult};
 use crate::reaction::ion::{Adduct, Ion, IonError};
 use crate::reaction::{FormulaAnalysis, MolecularFormula, PolymerFormula};
@@ -104,7 +110,7 @@ impl AnalysisPanel {
     /// The IUPAC name of `mol` (or of the selected structures). Recomputed only when they
     /// changed.
     pub fn iupac_name(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &NameResult {
-        let target = analysis_target(mol, selection);
+        let target = expand(&analysis_target(mol, selection));
         let fresh = matches!(&self.name_cache, Some((m, _)) if *m == target);
         if !fresh {
             let name = iupac_name(&target);
@@ -130,8 +136,8 @@ impl AnalysisPanel {
 
         let mut copied = false;
         let ion_result = self.analysis(mol, selection).cloned();
-        // A polymer's formula is written with its repeat units, `(C2H4)n`; the masses are then
-        // those of one repeat unit (with the end groups).
+        // A polymer's formula is written with its repeat units labelled `n`, `C2H6(C2H4)n`; the
+        // values are then those of n = 1 (the end groups and each unit once).
         let polymer = if mol.brackets().next().is_some() {
             PolymerFormula::of(&analysis_target(mol, selection))
         } else {
@@ -155,7 +161,11 @@ impl AnalysisPanel {
                     let mut report = a.report();
                     if let Some(p) = &polymer {
                         let plain = format!("Chemical formula: {}", a.formula.plain());
-                        report = report.replacen(&plain, &format!("Chemical formula: {} (per repeat unit: {})", p.plain(), a.formula.plain()), 1);
+                        let mut with = format!("Chemical formula: {} (values for n = 1: {})", p.plain(), a.formula.plain());
+                        if let Some(m) = per_unit(p, MolecularFormula::exact_mass) {
+                            with.push_str(&format!("\nExact mass with n: {m}"));
+                        }
+                        report = report.replacen(&plain, &with, 1);
                     }
                     ui.ctx().copy_text(format!("{}
 IUPAC name: {}", report, name_text(&name)));
@@ -237,9 +247,23 @@ fn name_text(name: &NameResult) -> String {
     }
 }
 
+/// A polymer's mass as the end groups' plus each unit's times its label: `30.0470 + 44.0262 n`
+/// (`mass` is [`MolecularFormula::exact_mass`] or [`MolecularFormula::weight`]); `None` when a
+/// part holds a group label.
+fn per_unit(p: &PolymerFormula, mass: fn(&MolecularFormula) -> Option<f64>) -> Option<String> {
+    let mut parts = Vec::new();
+    if !p.rest.is_empty() {
+        parts.push(format!("{:.4}", mass(&p.rest)?));
+    }
+    for (f, label) in &p.units {
+        parts.push(format!("{:.4} {label}", mass(f)?));
+    }
+    Some(parts.join(" + "))
+}
+
 /// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid. A polymer's
-/// formula is shown with its repeat units (`polymer`), and its masses marked as per repeat
-/// unit. Returns `true` when the user copied the name.
+/// formula is shown with its repeat units (`polymer`), its values marked as those of n = 1 and
+/// its masses also given per n. Returns `true` when the user copied the name.
 fn show_values(
     ui: &mut egui::Ui,
     a: &FormulaAnalysis,
@@ -259,7 +283,11 @@ fn show_values(
             Some(p) => {
                 ui.vertical(|ui| {
                     ui.add(RichLabel::new(p.rich()));
-                    ui.weak(t(ja, "Masses per repeat unit", "質量は繰り返し単位あたり"));
+                    ui.weak(format!(
+                        "{} ({})",
+                        t(ja, "Values for n = 1", "数値は n = 1 の値"),
+                        a.formula.plain()
+                    ));
                 });
             }
             None => {
@@ -268,12 +296,26 @@ fn show_values(
         }
         ui.end_row();
 
+        // With `n`, the mass for any n under the n = 1 value.
+        let with_n = |ui: &mut egui::Ui, value: Option<f64>, of: fn(&MolecularFormula) -> Option<f64>| {
+            match polymer.and_then(|p| per_unit(p, of)) {
+                Some(general) => {
+                    ui.vertical(|ui| {
+                        ui.label(mass(value));
+                        ui.weak(general);
+                    });
+                }
+                None => {
+                    ui.label(mass(value));
+                }
+            }
+        };
         ui.label(t(ja, "Exact mass", "精密質量"));
-        ui.label(mass(a.exact_mass));
+        with_n(ui, a.exact_mass, MolecularFormula::exact_mass);
         ui.end_row();
 
         ui.label(t(ja, "Molecular weight", "分子量"));
-        ui.label(mass(a.molecular_weight));
+        with_n(ui, a.molecular_weight, MolecularFormula::weight);
         ui.end_row();
 
         ui.label(match &a.ion {
@@ -479,7 +521,37 @@ mod tests {
         assert_eq!(p.iupac_name(&m, &[o].into()), &NameResult::Ok("methanol".into()));
     }
 
-    /// The panel draws for an empty canvas, a structure, a group label and a bad ion choice.
+    /// Me–[CH2–CH2–O]3–Me: every value is that of CH3(CH2CH2O)3CH3, the end groups included.
+    #[test]
+    fn a_numbered_repeat_unit_is_analysed_written_out() {
+        let m = crate::testkit::glyme("3");
+        let mut p = AnalysisPanel::default();
+        let a = p.analysis(&m, &HashSet::new()).unwrap().clone();
+        assert_eq!(a.formula.plain(), "C8H18O3");
+        assert_eq!(format!("{:.3}", a.exact_mass.unwrap()), "162.126");
+        assert_eq!(format!("{:.4}", a.isotope_pattern.unwrap()[0].mz), "162.1256");
+        let ea: Vec<String> = a.elemental_analysis.unwrap().iter().map(|(el, pct)| format!("{el} {pct:.2}")).collect();
+        assert_eq!(ea, ["C 59.23", "H 11.18", "O 29.59"]);
+        assert!(PolymerFormula::of(&m).is_none());
+        assert!(matches!(p.iupac_name(&m, &HashSet::new()), NameResult::Ok(_)), "named as the written-out chain");
+    }
+
+    /// Me–[CH2–CH2–O]n–Me: written C2H6(C2H4O)n, the values those of n = 1, the masses also
+    /// per n.
+    #[test]
+    fn an_n_repeat_unit_keeps_its_end_groups() {
+        let m = crate::testkit::glyme("n");
+        let mut p = AnalysisPanel::default();
+        let a = p.analysis(&m, &HashSet::new()).unwrap().clone();
+        assert_eq!(a.formula.plain(), "C4H10O");
+        let poly = PolymerFormula::of(&m).unwrap();
+        assert_eq!(poly.plain(), "C2H6(C2H4O)n");
+        assert_eq!(per_unit(&poly, MolecularFormula::exact_mass).as_deref(), Some("30.0470 + 44.0262 n"));
+        assert_eq!(per_unit(&poly, MolecularFormula::weight).as_deref(), Some("30.0700 + 44.0530 n"));
+    }
+
+    /// The panel draws for an empty canvas, a structure, a group label, a bad ion choice and
+    /// polymers.
     #[test]
     fn panel_renders() {
         let ctx = egui::Context::default();
@@ -493,6 +565,8 @@ mod tests {
             (m.clone(), AdductChoice::Preset(0), 2),
             (labelled, AdductChoice::Preset(0), 1),
             (m, AdductChoice::Preset(0), 0),
+            (crate::testkit::glyme("n"), AdductChoice::Neutral, 1),
+            (crate::testkit::glyme("3"), AdductChoice::Neutral, 1),
         ] {
             p.adduct = adduct;
             p.charge = charge;

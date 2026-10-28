@@ -532,6 +532,26 @@ fn fp_shape(shape: &egui::Shape, out: &mut Vec<FpLine>) {
     out.push(FpLine::new(text));
 }
 
+/// `Me–[CH2–CH2–O]–Me`, the repeat unit's brackets labelled `label` (`"3"`, `"n"`): a zigzag
+/// along x, the three unit atoms bracketed.
+pub(crate) fn glyme(label: &str) -> crate::molecule::Molecule {
+    use crate::molecule::{BondOrder, BracketUsage, Molecule, PageObject};
+    let mut m = Molecule::default();
+    let ids: Vec<u32> = ["C", "C", "C", "O", "C"]
+        .iter()
+        .enumerate()
+        .map(|(k, el)| m.add_atom((*el).into(), [k as f32 * 1.3, if k % 2 == 0 { 0.0 } else { -0.75 }], 0))
+        .collect();
+    for w in ids.windows(2) {
+        m.add_bond(w[0], w[1], BondOrder::Single);
+    }
+    let id = m.add_bracket(&[ids[1], ids[2], ids[3]].into(), BracketUsage::Sru).unwrap();
+    if let Some(PageObject::Bracket(b)) = m.object_by_id_mut(id) {
+        b.label = label.into();
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

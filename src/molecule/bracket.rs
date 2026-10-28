@@ -251,10 +251,10 @@ impl Bracket {
         }
     }
 
-    /// How many times a multiple group repeats: its label as a positive whole number (`None`
-    /// for any other usage, or a label that is not one).
+    /// How many times a multiple group or a polymer's repeat unit repeats: its label as a
+    /// positive whole number (`None` for any other usage, or a label that is not one — `n`).
     pub fn repeat_count(&self) -> Option<usize> {
-        if self.usage != BracketUsage::MultipleGroup {
+        if self.usage != BracketUsage::MultipleGroup && !self.usage.is_polymer_unit() {
             return None;
         }
         self.label.trim().parse::<usize>().ok().filter(|&n| n > 0)
@@ -504,9 +504,117 @@ pub fn atoms_for_selection(mol: &Molecule, selected: &HashSet<u32>) -> Vec<u32> 
     out
 }
 
+/// `mol` with every bracket that has a [repeat count](Bracket::repeat_count) written out: its
+/// atoms drawn that many times, the brackets gone. `Me–[CH2–CH2–O]3–Me` becomes the chain
+/// `CH3(CH2CH2O)3CH3`, each copy one step further along the chain (the part beyond it moved on
+/// to follow), so the result is the molecule the drawing stands for.
+///
+/// A unit crossed by two bonds is chained head to tail, the second crossing bond's order
+/// joining one copy to the next; a multiple group crossed by one bond has every copy bonded to
+/// the same outer atom (`N–[CH3]3`), one crossed by none stands that many times apart. Brackets
+/// that cannot be written out are kept as they are: a label that is no number (`n`), a polymer
+/// unit not crossed by exactly two bonds, a multiple group crossed by more, and brackets that
+/// share atoms with other brackets.
+pub fn expand(mol: &Molecule) -> Molecule {
+    let mut out = mol.clone();
+    let ids: Vec<u32> = mol.brackets().filter(|b| b.repeat_count().is_some()).map(|b| b.id).collect();
+    for id in ids {
+        let Some(b) = out.object_by_id(id).and_then(|o| o.as_bracket()).cloned() else { continue };
+        let overlaps = out.brackets().any(|o| o.id != id && o.atoms.iter().any(|a| b.atoms.contains(a)));
+        if !overlaps && expand_one(&mut out, &b) {
+            out.remove_object(id);
+        }
+    }
+    out
+}
+
+/// Write out one bracket of [`expand`]; `false` (and `mol` unchanged) when it cannot be.
+fn expand_one(mol: &mut Molecule, b: &Bracket) -> bool {
+    let Some(n) = b.repeat_count() else { return false };
+    let crossings = crossing_bonds(mol, b);
+    let chain = match crossings.len() {
+        2 => true,
+        0 | 1 if b.usage == BracketUsage::MultipleGroup => false,
+        _ => return false,
+    };
+    let inside: Vec<super::Atom> = mol.atoms.iter().filter(|a| b.atoms.contains(&a.id)).cloned().collect();
+    let enclosed: HashSet<u32> = inside.iter().map(|a| a.id).collect();
+    let pos = |mol: &Molecule, id: u32| mol.atom_by_id(id).map_or([0.0; 2], |a| a.pos);
+    let shift = if chain {
+        let (to, from) = (pos(mol, crossings[1].outer), pos(mol, crossings[0].inner));
+        [to[0] - from[0], to[1] - from[1]]
+    } else {
+        let xs = inside.iter().map(|a| a.pos[0]);
+        let width = xs.clone().fold(f32::NEG_INFINITY, f32::max) - xs.fold(f32::INFINITY, f32::min);
+        [width + 1.5, 0.0]
+    };
+    // What lies beyond the unit's second crossing moves on as the chain grows (not when the
+    // chain closes a ring back onto the first crossing's side).
+    let beyond = if chain { beyond(mol, &enclosed, crossings[1].outer, crossings[0].outer) } else { HashSet::new() };
+    let inner_bonds: Vec<super::Bond> =
+        mol.bonds.iter().filter(|bd| enclosed.contains(&bd.begin) && enclosed.contains(&bd.end)).cloned().collect();
+    let order_of = |mol: &Molecule, bond: u32| mol.bonds.iter().find(|bd| bd.id == bond).map(|bd| bd.order.clone());
+    let mut tail = chain.then(|| crossings[1].inner);
+    for k in 1..n {
+        let (dx, dy) = (shift[0] * k as f32, shift[1] * k as f32);
+        let mut copy = std::collections::HashMap::new();
+        for a in &inside {
+            let id = mol.alloc_id();
+            mol.atoms.push(super::Atom { id, pos: [a.pos[0] + dx, a.pos[1] + dy], ..a.clone() });
+            copy.insert(a.id, id);
+        }
+        for bd in &inner_bonds {
+            let id = mol.alloc_id();
+            mol.bonds.push(super::Bond { id, begin: copy[&bd.begin], end: copy[&bd.end], ..bd.clone() });
+        }
+        if let Some(prev) = tail {
+            let order = order_of(mol, crossings[1].bond).unwrap_or(super::BondOrder::Single);
+            mol.push_bond(prev, copy[&crossings[0].inner], order, super::BondStereo::None);
+            tail = Some(copy[&crossings[1].inner]);
+        } else if let Some(c) = crossings.first() {
+            let order = order_of(mol, c.bond).unwrap_or(super::BondOrder::Single);
+            mol.push_bond(c.outer, copy[&c.inner], order, super::BondStereo::None);
+        }
+    }
+    if let Some(last) = tail {
+        let c = crossings[1];
+        if let Some(bd) = mol.bonds.iter_mut().find(|bd| bd.id == c.bond) {
+            if bd.begin == c.inner {
+                bd.begin = last;
+            } else {
+                bd.end = last;
+            }
+        }
+        let steps = (n - 1) as f32;
+        for a in mol.atoms.iter_mut().filter(|a| beyond.contains(&a.id)) {
+            a.pos = [a.pos[0] + shift[0] * steps, a.pos[1] + shift[1] * steps];
+        }
+    }
+    true
+}
+
+/// The atoms reached from `start` without passing through `enclosed`; empty when that reaches
+/// `other_side` too (the chain is a ring).
+fn beyond(mol: &Molecule, enclosed: &HashSet<u32>, start: u32, other_side: u32) -> HashSet<u32> {
+    let mut seen: HashSet<u32> = [start].into();
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if id == other_side {
+            return HashSet::new();
+        }
+        for next in mol.neighbor_atom_ids(id) {
+            if !enclosed.contains(&next) && seen.insert(next) {
+                stack.push(next);
+            }
+        }
+    }
+    seen
+}
+
 /// "Open ends" of the polymer brackets of `mol`: the atoms at the outer end of a bond crossing
-/// a repeat unit's brackets that only stand for the chain going on — an unlabelled carbon with
-/// no other bond, outside every bracket. Their formula is not counted.
+/// a repeat unit's brackets that may only stand for the chain going on — an unlabelled carbon
+/// with no other bond, outside every bracket. The formula counts them all the same, as the
+/// methyl end groups they also read as.
 pub fn open_ends(mol: &Molecule) -> HashSet<u32> {
     let brackets: Vec<&Bracket> = mol.objects.iter().filter_map(|o| o.as_bracket()).collect();
     let enclosed: HashSet<u32> = brackets.iter().flat_map(|b| b.atoms.iter().copied()).collect();
@@ -619,5 +727,59 @@ mod tests {
         assert_eq!(BracketUsage::from_cdx(1), None);
         assert_eq!(BracketShape::from_cdx(Some(3)), BracketShape::Square);
         assert_eq!(BracketShape::from_cdx(None), BracketShape::Round);
+    }
+    fn plain(m: &Molecule) -> String {
+        crate::reaction::MolecularFormula::of(m).plain()
+    }
+
+    #[test]
+    fn a_numbered_repeat_unit_expands_into_the_chain() {
+        let m = crate::testkit::glyme("3");
+        let e = expand(&m);
+        assert_eq!(e.brackets().count(), 0);
+        assert_eq!(e.atoms.len(), 11, "C + 3 × (C, C, O) + C");
+        assert_eq!(e.bonds.len(), 10, "one chain");
+        assert_eq!(plain(&e), "C8H18O3");
+        assert_eq!(plain(&e), plain(&m), "the formula reads the brackets the same way");
+        // A chain: every atom has at most two neighbours, the ends one each.
+        let degrees: Vec<usize> = e.atoms.iter().map(|a| e.neighbor_atom_ids(a.id).len()).collect();
+        assert_eq!(degrees.iter().filter(|&&d| d == 1).count(), 2, "{degrees:?}");
+        assert!(degrees.iter().all(|&d| d <= 2), "{degrees:?}");
+        // The far methyl moved on past the last copy.
+        let xs: Vec<f32> = e.atoms.iter().map(|a| a.pos[0]).collect();
+        let last = e.atoms.iter().find(|a| e.neighbor_atom_ids(a.id).len() == 1 && a.pos[0] > 1.0).unwrap();
+        assert!(xs.iter().all(|&x| x <= last.pos[0] + 1e-4), "{xs:?}");
+    }
+
+    #[test]
+    fn an_n_repeat_unit_stays_bracketed() {
+        let m = crate::testkit::glyme("n");
+        assert_eq!(expand(&m), m);
+    }
+
+    #[test]
+    fn multiple_groups_expand() {
+        // N–[CH3]3: trimethylamine, every copy on the N.
+        let mut m = Molecule::default();
+        let n = m.add_atom("N".into(), [0.0, 0.0], 0);
+        let c = m.add_atom("C".into(), [1.3, 0.0], 0);
+        m.add_bond(n, c, BondOrder::Single);
+        let id = m.add_bracket(&[c].into(), BracketUsage::MultipleGroup).unwrap();
+        if let Some(PageObject::Bracket(b)) = m.object_by_id_mut(id) {
+            b.label = "3".into();
+        }
+        let e = expand(&m);
+        assert_eq!(plain(&e), "C3H9N");
+        assert_eq!(e.neighbor_atom_ids(n).len(), 3);
+        // [H2O]2 apart: two waters.
+        let mut m = Molecule::default();
+        let o = m.add_atom("O".into(), [0.0, 0.0], 0);
+        let h = m.add_atom("H".into(), [1.0, 0.0], 0);
+        m.add_bond(o, h, BondOrder::Single);
+        m.add_bracket(&[o, h].into(), BracketUsage::MultipleGroup);
+        let e = expand(&m);
+        assert_eq!(plain(&e), "H4O2");
+        assert_eq!(e.atoms.iter().filter(|a| a.element == "O").count(), 2);
+        assert_eq!(e.bonds.len(), 2);
     }
 }

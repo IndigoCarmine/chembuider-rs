@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::molecule::Molecule;
-use crate::molecule::bracket::open_ends;
 use crate::molecule::depict::{displayed_h_count, is_folded_h};
 use crate::widget::rich_text::{RichText, SpanStyle};
 
@@ -131,11 +130,13 @@ impl MolecularFormula {
     /// Folded terminal hydrogens (the `H` of an `OH` label) are counted once, through their
     /// heavy neighbour's displayed H count — never twice.
     ///
-    /// Brackets ([`crate::molecule::bracket`]) count as they read: the atoms of a multiple group
-    /// as many times as it repeats; a polymer's repeat unit once — with no hydrogen where a bond
-    /// crosses its brackets, and without the bare carbons that only stand for the chain going on
-    /// ([`open_ends`]) — so the formula is the unit's, `C2H4` for polyethylene (see
-    /// [`PolymerFormula`] for writing it `(C2H4)n`).
+    /// Brackets ([`crate::molecule::bracket`]) count as they read: the atoms of a multiple group,
+    /// or of a repeat unit labelled with a number, as many times as it repeats
+    /// (`Me–[CH2–CH2–O]3–Me` is C8H18O3); a repeat unit labelled `n` once — with no hydrogen
+    /// where a bond crosses its brackets — so the formula is that of `n = 1`. The atoms outside
+    /// the brackets, the end groups, always count: a bare carbon at a crossing bond's end is a
+    /// methyl (see [`PolymerFormula`] for writing the formula `CH3(C2H4)nCH3`'s way,
+    /// `C2H6(C2H4)n`).
     pub fn of(mol: &Molecule) -> Self {
         Self::from_counts(counts_of(mol, |_| true))
     }
@@ -236,8 +237,8 @@ impl MolecularFormula {
     }
 }
 
-/// How many times atom `id` counts: once, times the repeat count of every multiple group
-/// around it.
+/// How many times atom `id` counts: once, times the repeat count of every bracket around it
+/// that has one (a multiple group, a repeat unit labelled with a number).
 fn multiplicity(mol: &Molecule, id: u32) -> usize {
     mol.brackets()
         .filter(|b| b.atoms.contains(&id))
@@ -249,11 +250,10 @@ fn multiplicity(mol: &Molecule, id: u32) -> usize {
 /// brackets taken into account as [`MolecularFormula::of`] says.
 fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> BTreeMap<String, usize> {
     let has_brackets = mol.brackets().next().is_some();
-    let ends = if has_brackets { open_ends(mol) } else { Default::default() };
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for atom in &mol.atoms {
         // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
-        if is_folded_h(mol, atom.id) || ends.contains(&atom.id) || !keep(atom.id) {
+        if is_folded_h(mol, atom.id) || !keep(atom.id) {
             continue;
         }
         let times = if has_brackets { multiplicity(mol, atom.id) } else { 1 };
@@ -266,11 +266,12 @@ fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> BTreeMap<String, usi
     counts
 }
 
-/// The formula of a drawing with polymer brackets as it is written: what lies outside the
-/// repeat units, then each unit in parentheses with its label — `(C2H4)n`, `C2H6(C2H4)n`.
+/// The formula of a drawing with polymer brackets labelled `n` (no number) as it is written:
+/// what lies outside those repeat units — the end groups — then each unit in parentheses with
+/// its label: `(C2H4)n`, `C2H6(C2H4)n`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolymerFormula {
-    /// Everything outside the repeat units (the bare chain ends left out). Often empty.
+    /// Everything outside the repeat units: the end groups, and units with a number written out.
     pub rest: MolecularFormula,
     /// Each repeat unit's formula and label (`n`), in page order.
     pub units: Vec<(MolecularFormula, String)>,
@@ -278,9 +279,11 @@ pub struct PolymerFormula {
 
 impl PolymerFormula {
     /// The formula of `mol` written with its repeat units, or `None` when it has no polymer
-    /// brackets (its formula is then [`MolecularFormula::of`]'s).
+    /// brackets whose count is not a number (its formula is then [`MolecularFormula::of`]'s,
+    /// a numbered unit written out).
     pub fn of(mol: &Molecule) -> Option<Self> {
-        let units: Vec<_> = mol.brackets().filter(|b| b.usage.is_polymer_unit()).collect();
+        let units: Vec<_> =
+            mol.brackets().filter(|b| b.usage.is_polymer_unit() && b.repeat_count().is_none()).collect();
         if units.is_empty() {
             return None;
         }
@@ -415,11 +418,12 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_unit_counts_once_with_no_hydrogen_at_its_crossings() {
+    fn a_repeat_unit_counts_once_with_its_end_groups() {
+        // CH3–[CH2–CH2]n–CH3: the bare carbons are methyl end groups.
         let (m, _) = polyethylene();
-        assert_eq!(plain(&m), "C2H4");
+        assert_eq!(plain(&m), "C4H10", "n = 1");
         let p = PolymerFormula::of(&m).unwrap();
-        assert_eq!(p.plain(), "(C2H4)n");
+        assert_eq!(p.plain(), "C2H6(C2H4)n");
         let rich = p.rich();
         assert_eq!(rich.spans.last().map(|s| (s.text.as_str(), s.style.script)), Some(("n", Script::Sub)));
         assert!(PolymerFormula::of(&demo::phenol()).is_none());
@@ -427,12 +431,30 @@ mod tests {
 
     #[test]
     fn end_groups_stay_outside_the_unit() {
-        // ClCH2–[CH2–CH2]n–: the chloromethyl is an end group, the other end stays open.
+        // ClCH2–[CH2–CH2]n–CH3: the chloromethyl and the methyl are the end groups.
         let (mut m, ids) = polyethylene();
         let cl = m.add_atom("Cl".into(), [-1.3, -0.75], 0);
         m.add_bond(cl, ids[0], BondOrder::Single);
-        assert_eq!(PolymerFormula::of(&m).unwrap().plain(), "CH2Cl(C2H4)n");
-        assert_eq!(plain(&m), "C3H6Cl");
+        assert_eq!(PolymerFormula::of(&m).unwrap().plain(), "C2H5Cl(C2H4)n");
+        assert_eq!(plain(&m), "C4H9Cl");
+    }
+
+    #[test]
+    fn a_numbered_repeat_unit_is_written_out_with_its_end_groups() {
+        // CH3(CH2CH2O)3CH3.
+        let m = crate::testkit::glyme("3");
+        assert_eq!(plain(&m), "C8H18O3");
+        assert!(PolymerFormula::of(&m).is_none(), "nothing left to write with n");
+        assert_eq!(format!("{:.3}", MolecularFormula::of(&m).exact_mass().unwrap()), "162.126");
+    }
+
+    #[test]
+    fn an_n_repeat_unit_keeps_its_end_groups() {
+        let m = crate::testkit::glyme("n");
+        let p = PolymerFormula::of(&m).unwrap();
+        assert_eq!(p.plain(), "C2H6(C2H4O)n");
+        assert_eq!(p.rest.plain(), "C2H6");
+        assert_eq!(plain(&m), "C4H10O", "the values are those of n = 1");
     }
 
     #[test]
