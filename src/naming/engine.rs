@@ -23,9 +23,15 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use super::graph::{Class, El, Graph, Perceived, RingParent, Unsupported};
+use super::graph::{self, Class, El, Graph, Perceived, RingParent, Unsupported};
 use super::hetero::HeteroRing;
-use super::words::{alpha_key, enclose, multiplier, multiplier_complex, starts_with_vowel, stem};
+use super::words::{
+    MAX_NUMERAL, alpha_key, enclose, multiplier, multiplier_complex, starts_with_vowel, stem,
+};
+
+/// The atom a substituent named on its own is attached to: none (its attachment point "*" is
+/// not an atom of the graph).
+const NONE: usize = usize::MAX;
 
 /// A named unit: the molecule's name, or a substituent prefix ("2-chloroethyl").
 #[derive(Clone, Debug)]
@@ -128,6 +134,9 @@ struct Numbering {
     shape: Shape,
     /// For an assembly: the locants of each ring-to-ring bond.
     joins: Vec<(u32, u32)>,
+    /// A chain whose principal groups are attached to it rather than end it, expressed like
+    /// those on a ring: "propane-1,2,3-tricarboxylic acid" (P-65.1.2.2.1).
+    attached: bool,
 }
 
 /// What the unit being named is.
@@ -139,6 +148,12 @@ enum Mode {
     FreeValence { atom: usize, order: u8 },
     /// An acyl substituent whose C=O carbon `atom` carries the free valence (acetyl, benzoyl).
     Acyl { atom: usize },
+    /// A substituent group drawn on its own with several free valences, all single bonds on
+    /// carbon ([`Graph::free`]): propane-1,3-diyl, methylene, 1,4-phenylene.
+    Valences,
+    /// A substituent group drawn on its own whose free valences are all on C=O carbons, one on
+    /// each: oxalyl, butanedioyl, benzene-1,4-dicarbonyl (P-65.1.7).
+    Acyls,
 }
 
 /// One principal group instance and where it may sit on a parent.
@@ -179,6 +194,7 @@ struct Eval {
     atoms: Vec<usize>,
     shape: Shape,
     joins: Vec<(u32, u32)>,
+    attached: bool,
     suffix: Vec<u32>,
     mults: Vec<(u32, u8)>,
     prefixes: Vec<(Loc, usize, usize)>,
@@ -202,8 +218,89 @@ impl<'a> Namer<'a> {
     }
 
     pub(crate) fn name(&self) -> Result<String, Unsupported> {
+        if !self.g.free.is_empty() {
+            return self.substituent();
+        }
+        let count = |k: Class| self.p.ctype.iter().filter(|t| **t == Some(k)).count();
+        if self.p.principal == Some(Class::Carboxylate)
+            && count(Class::Acid) > 0
+            && count(Class::Acid) + count(Class::Carboxylate) > 2
+        {
+            return Err("partial salt of an acid with more than two acid groups \
+                        (hydrogen …tricarboxylate, P-65.6.2.3)"
+                .into());
+        }
+        if self.p.principal == Some(Class::Anhydride) {
+            return self.anhydride();
+        }
         let region = vec![true; self.g.len()];
         Ok(self.unit(Mode::Molecule, &region)?.text)
+    }
+
+    /// The name of a substituent group drawn with attachment points (P-29): "pentyl",
+    /// "pentyloxy", "hexanoyl", "1-chloropropan-2-yl"; with several free valences on carbon,
+    /// "propane-1,3-diyl", "methylene", "1,4-phenylene".
+    fn substituent(&self) -> Result<String, Unsupported> {
+        let g = self.g;
+        if g.net_charge() != 0 {
+            return Err("charged substituent group".into());
+        }
+        match g.free[..] {
+            [(a, order)] => Ok(self.sub_with(a, NONE, order)?.text),
+            _ => {
+                if g.free.iter().any(|&(a, o)| o != 1 || g.el[a] != El::C) {
+                    return Err("several free valences other than single bonds on carbon \
+                                (…diylidene, …diylbis(oxy))"
+                        .into());
+                }
+                let acyl = |a: usize| !self.p.in_ring[a] && self.has_carbonyl(a).is_some();
+                let acyls = g.free.iter().filter(|&&(a, _)| acyl(a)).count();
+                let mode = if acyls == 0 {
+                    Mode::Valences
+                } else if acyls < g.free.len() {
+                    return Err("free valences both on C=O carbons and on other atoms \
+                                (…oxo…diyl or acyl…yl groups)"
+                        .into());
+                } else if g.free[0].0 == g.free[1].0 {
+                    // Two free valences on one C=O carbon, which then has no other neighbour:
+                    // P-65.2.1.5.
+                    return Ok("carbonyl".into());
+                } else {
+                    Mode::Acyls
+                };
+                let region = vec![true; g.len()];
+                Ok(self.unit(mode, &region)?.text)
+            }
+        }
+    }
+
+    /// An acyclic anhydride (P-65.7.1, P-65.7.2): the names of its two acids, "acid" replaced
+    /// by "anhydride" — "propanoic anhydride", "chloroacetic anhydride" — or, for two different
+    /// acids, both cited in alphanumerical order: "acetic propanoic anhydride".
+    fn anhydride(&self) -> Result<String, Unsupported> {
+        let (g, p) = (self.g, self.p);
+        let internal = || "internal error: anhydride".to_string();
+        let c = (0..g.len())
+            .find(|&c| p.ctype[c] == Some(Class::Anhydride))
+            .ok_or_else(internal)?;
+        let o = g
+            .nbrs(c)
+            .find(|&m| g.el[m] == El::O && g.order(c, m) == 1)
+            .ok_or_else(internal)?;
+        let d = g.nbrs(o).find(|&m| m != c).ok_or_else(internal)?;
+        let mut acids = Vec::new();
+        for half in [g.acid_half(c, o), g.acid_half(d, o)] {
+            let hp = graph::perceive(&half)?;
+            let name = Namer::new(&half, &hp).name()?;
+            let acid = name
+                .strip_suffix(" acid")
+                .filter(|_| hp.principal == Some(Class::Acid))
+                .ok_or_else(|| format!("anhydride of \u{201c}{name}\u{201d}"))?;
+            acids.push(acid.to_string());
+        }
+        acids.sort_by_key(|a| (alpha_key(a), a.clone()));
+        acids.dedup();
+        Ok(format!("{} anhydride", acids.join(" ")))
     }
 
     fn has_carbonyl(&self, c: usize) -> Option<usize> {
@@ -230,6 +327,15 @@ impl<'a> Namer<'a> {
                 anchors: vec![atom],
                 group: None,
             }],
+            Mode::Valences => g
+                .free
+                .iter()
+                .map(|&(a, _)| Pg::OnAtom {
+                    anchors: vec![a],
+                    group: None,
+                })
+                .collect(),
+            Mode::Acyls => g.free.iter().map(|&(a, _)| Pg::InChain(a)).collect(),
             Mode::Acyl { atom } => vec![Pg::InChain(atom)],
             Mode::Molecule => match p.principal {
                 None => vec![],
@@ -251,6 +357,13 @@ impl<'a> Namer<'a> {
                         group: Some(o),
                     })
                     .collect(),
+                Some(Class::Thiol) => atoms
+                    .filter(|&a| p.thiol[a])
+                    .map(|s| Pg::OnAtom {
+                        anchors: vec![g.adj[s][0].0],
+                        group: Some(s),
+                    })
+                    .collect(),
                 Some(Class::Amine) => atoms
                     .filter(|&a| p.amine[a])
                     .map(|n| Pg::OnAtom {
@@ -258,30 +371,37 @@ impl<'a> Namer<'a> {
                         group: Some(n),
                     })
                     .collect(),
+                // Anhydrides are named by functional class (`anhydride`), never as a suffix.
                 Some(_) => unreachable!("every class is handled above"),
             },
         }
     }
 
     /// All chains (as numbered atom lists, both directions) of the acyclic skeleton in
-    /// `region`, from end to end; in a substituent, only those through its free valence.
-    fn chains(&self, mode: Mode, region: &[bool]) -> Vec<Vec<usize>> {
-        let g = self.g;
+    /// `region`, from end to end; in a substituent, only those through its free valence. With
+    /// `attached`, the carbons of the principal groups stay out of the chains.
+    fn chains(&self, mode: Mode, region: &[bool], attached: bool) -> Vec<Vec<usize>> {
+        let (g, p) = (self.g, self.p);
         let n = g.len();
         let ok: Vec<bool> = (0..n)
-            .map(|a| region[a] && !self.p.in_ring[a] && self.is_skeletal(a, mode))
+            .map(|a| {
+                region[a]
+                    && !p.in_ring[a]
+                    && self.is_skeletal(a, mode)
+                    && !(attached && self.is_group_carbon(a, mode))
+            })
             .collect();
         let nb = |a: usize| g.nbrs(a).filter(|&m| ok[m]).collect::<Vec<_>>();
-        let must = match mode {
-            Mode::FreeValence { atom, .. } | Mode::Acyl { atom } => Some(atom),
-            Mode::Molecule => None,
+        let must: Vec<usize> = match mode {
+            Mode::FreeValence { atom, .. } | Mode::Acyl { atom } => vec![atom],
+            Mode::Valences => g.free.iter().map(|&(a, _)| a).collect(),
+            Mode::Molecule | Mode::Acyls => vec![],
         };
         let mut ends: Vec<usize> = (0..n).filter(|&a| ok[a] && nb(a).len() <= 1).collect();
-        if let Some(m) = must
-            && ok[m]
-            && !ends.contains(&m)
-        {
-            ends.push(m);
+        for &m in &must {
+            if ok[m] && !ends.contains(&m) {
+                ends.push(m);
+            }
         }
         let mut out = Vec::new();
         for &u in &ends {
@@ -310,7 +430,7 @@ impl<'a> Namer<'a> {
                     path.push(cur);
                 }
                 path.reverse();
-                if must.is_none_or(|m| path.contains(&m)) {
+                if must.is_empty() || must.iter().any(|m| path.contains(m)) {
                     out.push(path);
                 }
             }
@@ -318,11 +438,23 @@ impl<'a> Namer<'a> {
         out
     }
 
-    fn counts(&self, pgs: &[Pg], atoms: &[usize], ring: bool) -> usize {
+    /// Whether `a` is the carbon of a principal group of the kind a chain may have attached
+    /// rather than end it (propane-1,2,3-tricarboxylic acid, propane-1,2,3-tricarbonyl).
+    fn is_group_carbon(&self, a: usize, mode: Mode) -> bool {
+        match mode {
+            Mode::Molecule => self.p.ctype[a].is_some() && self.p.ctype[a] == self.p.principal,
+            Mode::Acyls => self.g.free_on(a) > 0,
+            _ => false,
+        }
+    }
+
+    /// How many of the principal groups `pgs` a parent with `atoms` carries; with `attached`
+    /// (a ring, or a chain of attached groups), groups bonded to it rather than in it.
+    fn counts(&self, pgs: &[Pg], atoms: &[usize], attached: bool) -> usize {
         pgs.iter()
             .filter(|pg| match pg {
                 Pg::InChain(c) => {
-                    if ring {
+                    if attached {
                         !self.p.in_ring[*c] && self.g.nbrs(*c).any(|m| atoms.contains(&m))
                     } else {
                         atoms.contains(c)
@@ -349,11 +481,28 @@ impl<'a> Namer<'a> {
                 .filter(|r| r.atoms.iter().all(|&a| region[a]))
                 .collect(),
         };
-        let chains = match mode {
+        let mut chains = match mode {
             Mode::FreeValence { atom, .. } if p.in_ring[atom] => vec![],
-            _ => self.chains(mode, region),
+            _ => self.chains(mode, region, false),
         };
-        let chain_max = chains.iter().map(|c| self.counts(&pgs, c, false)).max();
+        let mut chain_max = chains.iter().map(|c| self.counts(&pgs, c, false)).max();
+        // More than two acid (amide, nitrile…) groups on one unbranched chain: all of them are
+        // expressed by the "carboxylic acid" kind of suffix, the chain not including their
+        // carbons (P-65.1.2.2.1: propane-1,2,3-tricarboxylic acid). Otherwise two end the chain
+        // ("dioic acid") and the others are prefixes: 3-(carboxymethyl)heptanedioic acid.
+        let mut attached = false;
+        let carbon_groups = match mode {
+            Mode::Molecule => p.principal.is_some_and(Class::has_carbon),
+            Mode::Acyls => true,
+            _ => false,
+        };
+        if carbon_groups && pgs.len() > 2 {
+            let alt = self.chains(mode, region, true);
+            let alt_max = alt.iter().map(|c| self.counts(&pgs, c, true)).max();
+            if alt_max.is_some_and(|m| m > 2) {
+                (chains, chain_max, attached) = (alt, alt_max, true);
+            }
+        }
         let ring_max = rings
             .iter()
             .map(|r| self.counts(&pgs, &r.atoms, true))
@@ -366,6 +515,16 @@ impl<'a> Namer<'a> {
                 _ => false,
             },
         };
+        // A group's free valences must all be on its parent: a parent with fewer would name a
+        // different group with fewer valences (the others lost in its prefixes). Groups whose
+        // valences lie on several parents are compound or multiplied (P-29.4.2).
+        if matches!(mode, Mode::Valences | Mode::Acyls)
+            && (if pick_ring { ring_max } else { chain_max }) != Some(pgs.len())
+        {
+            return Err("free valences not all on one parent chain or ring \
+                        (…phenylenebis(methylene), oxydi(ethane-2,1-diyl), P-29.4.2)"
+                .into());
+        }
         let numberings: Vec<Numbering> = if pick_ring {
             let best = ring_max.ok_or("internal error: ring parent outside the region")?;
             let rings: Vec<&RingParent> = rings
@@ -380,22 +539,16 @@ impl<'a> Namer<'a> {
             let best = chain_max.ok_or("internal error: no parent chain")?;
             chains
                 .into_iter()
-                .filter(|c| self.counts(&pgs, c, false) == best)
+                .filter(|c| self.counts(&pgs, c, attached) == best)
                 .map(|atoms| Numbering {
                     locs: (1..=atoms.len()).map(loc).collect(),
                     atoms,
                     shape: Shape::Chain,
                     joins: vec![],
+                    attached,
                 })
                 .collect()
         };
-        if mode == Mode::Molecule
-            && !pick_ring
-            && p.principal.is_some_and(Class::has_carbon)
-            && pgs.len() > 2
-        {
-            return Err("more than two acid/amide/nitrile/aldehyde groups on a chain".into());
-        }
 
         let evals: Vec<Eval> = numberings
             .into_iter()
@@ -515,6 +668,7 @@ impl<'a> Namer<'a> {
                     atoms,
                     shape,
                     joins: vec![],
+                    attached: true,
                 })
                 .collect();
         }
@@ -580,6 +734,7 @@ impl<'a> Namer<'a> {
                     atoms,
                     locs,
                     shape,
+                    attached: true,
                 });
             }
         }
@@ -603,6 +758,7 @@ impl<'a> Namer<'a> {
             locs,
             shape,
             joins,
+            attached,
         } = num;
         let ring = shape != Shape::Chain;
         let mut pos = vec![0u32; g.len()];
@@ -617,10 +773,10 @@ impl<'a> Namer<'a> {
         for pg in pgs {
             match pg {
                 Pg::InChain(c) => {
-                    if !ring && pos[*c] > 0 {
+                    if !attached && pos[*c] > 0 {
                         suffix.push(pos[*c]);
                         self.group_parts(*c, region, &mut skip, &mut nprefix, &mut rprime);
-                    } else if ring
+                    } else if attached
                         && !self.p.in_ring[*c]
                         && let Some(a) = g.nbrs(*c).find(|&m| pos[m] > 0)
                     {
@@ -702,6 +858,7 @@ impl<'a> Namer<'a> {
             atoms,
             shape,
             joins,
+            attached,
             suffix,
             mults,
             prefixes,
@@ -725,6 +882,9 @@ impl<'a> Namer<'a> {
                 _ => Suffix::None,
             },
             Mode::FreeValence { order, .. } => Suffix::Yl(order),
+            Mode::Valences => Suffix::Yl(1),
+            // The stems of the acyl halides: oxalyl, butanedioyl, benzene-1,4-dicarbonyl.
+            Mode::Acyls => Suffix::Class(Class::AcidHalide),
             Mode::Acyl { .. } => Suffix::Acyl,
         };
         let has_n_prefix = e.prefixes.iter().any(|(l, _, _)| *l == Loc::N);
@@ -786,8 +946,16 @@ impl<'a> Namer<'a> {
         let nsuf = e.suffix.len();
         let n_c_prefix = e.prefixes.iter().filter(|(l, _, _)| *l != Loc::N).count();
         let n_feat = nsuf + n_c_prefix;
-        let terminal =
-            matches!(suffix, Suffix::Acyl) || matches!(suffix, Suffix::Class(c) if c.has_carbon());
+        let terminal = !e.attached
+            && (matches!(suffix, Suffix::Acyl)
+                || matches!(suffix, Suffix::Class(c) if c.has_carbon()));
+        // Formic acid, formate, formyl… take no prefix on their carbon (P-65.1.8): carboxy- and
+        // cyanoformic acid are a hydrogen oxalate and carbonocyanidic acid.
+        if chain && len == 1 && terminal && n_c_prefix > 0 {
+            return Err("prefix on a one-carbon acid parent \
+                        (carboxy- or cyanoformic acid, P-65.1.8)"
+                .into());
+        }
         let retained_two =
             chain && len == 2 && nsuf == 1 && terminal && suffix != Suffix::Class(Class::Amide);
         // Every hydrogen of the parent replaced by one and the same prefix: hexachloroethane.
@@ -802,12 +970,17 @@ impl<'a> Namer<'a> {
             || (benzene && n_feat <= 1);
         let contracted =
             matches!(suffix, Suffix::Yl(_)) && e.suffix == [loc(1)] && e.mults.is_empty();
-        let cite_suffix = !omit_c && !(chain && terminal) && !contracted && !(benzene && nsuf == 1);
+        // Benzene's retained names (phenol, benzoic acid…) cite no locant; "4-methylbenzene-1-
+        // thiol" does.
+        let retained_benzene_suffix = benzene && nsuf == 1 && suffix != Suffix::Class(Class::Thiol);
+        let cite_suffix =
+            !omit_c && !(chain && terminal) && !contracted && !retained_benzene_suffix;
         let cite_unsat = !(chain && len <= 2) && !(ring && n_feat + e.mults.len() <= 1);
 
         let core = self.core(
             len,
             ring,
+            e.attached,
             benzene,
             &e.mults,
             suffix,
@@ -820,7 +993,12 @@ impl<'a> Namer<'a> {
         // N,N-dimethyl-1-phenylmethanamine.
         let (prefix_text, depth, order) = compose(&groups, (omit_c || fully) && !has_n_prefix);
 
-        let mut text = format!("{prefix_text}{core}");
+        let hyphen = if !prefix_text.is_empty() && core.starts_with(|c: char| c.is_ascii_digit()) {
+            "-"
+        } else {
+            ""
+        };
+        let mut text = format!("{prefix_text}{hyphen}{core}");
         let mut compound = !groups.is_empty();
         let mut oxy = (contracted && chain && len <= 4 && suffix == Suffix::Yl(1))
             || (benzene && suffix == Suffix::Yl(1));
@@ -851,14 +1029,114 @@ impl<'a> Namer<'a> {
         ))
     }
 
-    /// An ester's name: the alkyl group of its O, then the "-oate" name `text`.
+    /// The functional class words around the parent name `text`: an ester's alkyl group
+    /// ("ethyl propanoate"), an acyl halide's halides ("acetyl chloride", "butanedioyl bromide
+    /// chloride", "propanedioyl dichloride": P-65.5.1, in alphabetical order).
     fn with_ester(&self, e: &Eval, region: &[bool], text: String) -> Result<String, Unsupported> {
-        Ok(match e.rprime {
-            Some((r, o)) if self.p.principal == Some(Class::Ester) && region[r] => {
+        let (g, p) = (self.g, self.p);
+        Ok(match (p.principal, e.rprime) {
+            (Some(Class::Ester), Some((r, o))) if region[r] => {
                 format!("{} {text}", self.sub(r, o)?.text)
+            }
+            (Some(Class::AcidHalide), _) if !e.suffix.is_empty() => {
+                let groups: Vec<(usize, usize)> = (0..g.len())
+                    .filter(|&c| region[c] && p.ctype[c] == Some(Class::AcidHalide))
+                    .flat_map(|c| {
+                        g.nbrs(c)
+                            .filter(|&x| g.el[x].is_halogen())
+                            .map(move |x| (c, x))
+                    })
+                    .collect();
+                let mut halides: Vec<&str> =
+                    groups.iter().map(|&(_, x)| g.el[x].halide_word()).collect();
+                halides.sort_unstable();
+                self.halides_interchangeable(&groups, &halides)?;
+                let mut words = Vec::new();
+                for w in &halides {
+                    if !words.iter().any(|(v, _)| v == w) {
+                        let k = halides.iter().filter(|v| *v == w).count();
+                        words.push((*w, k));
+                    }
+                }
+                let words: Vec<String> = words
+                    .into_iter()
+                    .map(|(w, k)| format!("{}{w}", multiplier(k)))
+                    .collect();
+                format!("{text} {}", words.join(" "))
             }
             _ => text,
         })
+    }
+
+    /// Different halides are cited without locants (P-65.5.1), so the name fits one structure
+    /// only when every arrangement of the halides over the acyl halide `groups` (C=O carbon,
+    /// halogen) is the same compound: here, when there are two kinds, one of them once, and a
+    /// symmetry of the structure maps each group onto every other ("butanedioyl bromide
+    /// chloride", "benzene-1,3,5-tricarbonyl bromide dichloride"). `halides` is sorted.
+    fn halides_interchangeable(
+        &self,
+        groups: &[(usize, usize)],
+        halides: &[&str],
+    ) -> Result<(), Unsupported> {
+        let g = self.g;
+        let mut kinds = halides.to_vec();
+        kinds.dedup();
+        if kinds.len() < 2 {
+            return Ok(());
+        }
+        let once = kinds
+            .iter()
+            .any(|k| halides.iter().filter(|h| *h == k).count() == 1);
+        // Atoms by element, the halogens of the groups all alike.
+        let kind: Vec<u8> = (0..g.len())
+            .map(|a| {
+                if groups.iter().any(|&(_, x)| x == a) {
+                    u8::MAX
+                } else {
+                    g.el[a] as u8
+                }
+            })
+            .collect();
+        // The bonds of a benzene ring or of a fully unsaturated heterocycle, drawn in one of its
+        // Kekulé forms, are all alike.
+        let mut kekule = HashSet::new();
+        for r in &self.p.rings {
+            if r.benzene || r.hetero.as_ref().is_some_and(|h| h.kind.mancude) {
+                let n = r.atoms.len();
+                for i in 0..n {
+                    let (x, y) = (r.atoms[i], r.atoms[(i + 1) % n]);
+                    kekule.insert((x, y));
+                    kekule.insert((y, x));
+                }
+            }
+        }
+        let bond = |x: usize, y: usize, o: u8| if kekule.contains(&(x, y)) { 4 } else { o };
+        let not_interchangeable = || -> Unsupported {
+            "different halides on acyl groups that are not interchangeable (P-65.5.1 cites \
+             no locants for them)"
+                .into()
+        };
+        if kinds.len() != 2 || !once {
+            return Err(not_interchangeable());
+        }
+        // Refuse rather than guess when the symmetry search gives up.
+        let c0 = groups[0].0;
+        let mut undecided = false;
+        for &(c, _) in groups {
+            match g.automorphic(c0, c, &kind, bond) {
+                Some(true) => {}
+                Some(false) => return Err(not_interchangeable()),
+                None => undecided = true,
+            }
+        }
+        if undecided {
+            return Err(
+                "different halides on acyl groups whose symmetry is too costly to check \
+                 (P-65.5.1 cites no locants for them)"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -866,6 +1144,7 @@ impl<'a> Namer<'a> {
         &self,
         len: usize,
         ring: bool,
+        attached: bool,
         benzene: bool,
         mults: &[(u32, u8)],
         suffix: Suffix,
@@ -879,41 +1158,51 @@ impl<'a> Namer<'a> {
         if benzene {
             return Ok(match (suffix, count) {
                 (Suffix::None, _) => "benzene".into(),
-                (Suffix::Class(c), 1) => match c {
+                (Suffix::Class(c), 1) if c != Class::Thiol => match c {
                     Class::Acid => "benzoic acid",
-                    Class::Ester => "benzoate",
+                    Class::Ester | Class::Carboxylate => "benzoate",
+                    Class::AcidHalide => "benzoyl",
                     Class::Amide => "benzamide",
                     Class::Nitrile => "benzonitrile",
                     Class::Aldehyde => "benzaldehyde",
                     Class::Alcohol => "phenol",
                     Class::Amine => "aniline",
-                    Class::Ketone => return Err("internal error: ketone on benzene".into()),
+                    Class::Ketone | Class::Thiol | Class::Anhydride => {
+                        return Err("internal error: ketone or anhydride on benzene".into());
+                    }
                 }
                 .into(),
                 (Suffix::Class(c), _) => {
-                    format!(
-                        "benzene-{}-{}",
-                        loc_list(),
-                        multiplied(count, suffix_word(Suffix::Class(c), true))
-                    )
+                    let word = multiplied(count, suffix_word(Suffix::Class(c), true));
+                    if cite_suffix {
+                        format!("benzene-{}-{word}", loc_list())
+                    } else {
+                        format!("benzene{word}")
+                    }
                 }
-                (Suffix::Yl(1), _) => "phenyl".into(),
+                (Suffix::Yl(1), 1) => "phenyl".into(),
+                // P-29.6.1: the retained 1,2-, 1,3- and 1,4-phenylene.
+                (Suffix::Yl(1), 2) => format!("{}-phenylene", loc_list()),
+                (Suffix::Yl(1), _) => format!("benzene-{}-{}", loc_list(), multiplied(count, "yl")),
                 (Suffix::Acyl, _) => "benzoyl".into(),
                 (Suffix::Yl(_), _) => return Err("internal error: ylidene on benzene".into()),
             });
         }
-        let stem = stem(len).ok_or("chain or ring longer than 99 atoms")?;
+        let stem =
+            stem(len).ok_or_else(|| format!("chain or ring longer than {MAX_NUMERAL} atoms"))?;
         let base = if ring { format!("cyclo{stem}") } else { stem };
         if !ring && count == 1 && (len == 1 || len == 2) {
             let retained = match (len, suffix) {
                 (1, Suffix::Class(Class::Acid)) => Some("formic acid"),
-                (1, Suffix::Class(Class::Ester)) => Some("formate"),
+                (1, Suffix::Class(Class::Ester | Class::Carboxylate)) => Some("formate"),
+                (1, Suffix::Class(Class::AcidHalide)) => Some("formyl"),
                 (1, Suffix::Class(Class::Amide)) => Some("formamide"),
                 (1, Suffix::Class(Class::Nitrile)) => Some("formonitrile"),
                 (1, Suffix::Class(Class::Aldehyde)) => Some("formaldehyde"),
                 (1, Suffix::Acyl) => Some("formyl"),
                 (2, Suffix::Class(Class::Acid)) => Some("acetic acid"),
-                (2, Suffix::Class(Class::Ester)) => Some("acetate"),
+                (2, Suffix::Class(Class::Ester | Class::Carboxylate)) => Some("acetate"),
+                (2, Suffix::Class(Class::AcidHalide)) => Some("acetyl"),
                 (2, Suffix::Class(Class::Amide)) => Some("acetamide"),
                 (2, Suffix::Class(Class::Nitrile)) => Some("acetonitrile"),
                 (2, Suffix::Class(Class::Aldehyde)) => Some("acetaldehyde"),
@@ -924,8 +1213,18 @@ impl<'a> Namer<'a> {
                 return Ok(r.into());
             }
         }
-        if !ring && len == 2 && count == 2 && suffix == Suffix::Class(Class::Acid) {
-            return Ok("oxalic acid".into());
+        if !ring && !attached && len == 2 && count == 2 {
+            match suffix {
+                Suffix::Class(Class::Acid) => return Ok("oxalic acid".into()),
+                Suffix::Class(Class::Carboxylate) => return Ok("oxalate".into()),
+                // P-65.5.1: oxalyl is a retained preferred prefix.
+                Suffix::Class(Class::AcidHalide) => return Ok("oxalyl".into()),
+                _ => {}
+            }
+        }
+        // P-29.6.1: "methylene" (not "methanediyl").
+        if !ring && len == 1 && count == 2 && suffix == Suffix::Yl(1) {
+            return Ok("methylene".into());
         }
         if contracted {
             let Suffix::Yl(order) = suffix else {
@@ -940,7 +1239,7 @@ impl<'a> Namer<'a> {
         if suffix == Suffix::None {
             return Ok(hydride);
         }
-        let word = multiplied(count, suffix_word(suffix, ring));
+        let word = multiplied(count, suffix_word(suffix, ring || attached));
         if starts_with_vowel(&word) {
             hydride.pop();
         }
@@ -972,14 +1271,15 @@ impl<'a> Namer<'a> {
         if let Some(r) = self.cache.borrow().get(&(q, from)) {
             return r.clone();
         }
-        let r = self.sub_uncached(q, from);
+        let r = self.sub_with(q, from, self.g.order(q, from));
         self.cache.borrow_mut().insert((q, from), r.clone());
         r
     }
 
-    fn sub_uncached(&self, q: usize, from: usize) -> Result<Prefix, Unsupported> {
+    /// The prefix for the substituent that starts at `q`, attached to `from` (or, [`NONE`],
+    /// drawn on its own) by a bond of `order`.
+    fn sub_with(&self, q: usize, from: usize, order: u8) -> Result<Prefix, Unsupported> {
         let (g, p) = (self.g, self.p);
-        let order = g.order(q, from);
         let others: Vec<usize> = g.nbrs(q).filter(|&m| m != from).collect();
         match g.el[q] {
             e if e.is_halogen() => Ok(Prefix::simple(e.halo_prefix())),
@@ -1033,7 +1333,7 @@ impl<'a> Namer<'a> {
                 Some(Class::Amide) => {
                     // On a ring the prefix is "carbamoyl"; at the end of a chain IUPAC 2013 may
                     // prefer "amino…oxo" instead, which this namer does not decide.
-                    if !p.in_ring[from] {
+                    if from == NONE || !p.in_ring[from] {
                         return Err("amide group as a prefix (carbamoyl on a chain)".into());
                     }
                     let n = g.nbrs(q).find(|&m| g.el[m] == El::N).unwrap();
@@ -1042,6 +1342,19 @@ impl<'a> Namer<'a> {
                 }
                 Some(Class::Ester) => {
                     Err("ester group as a substituent (alkoxycarbonyl, acyloxy)".into())
+                }
+                // P-65.5.4: "carbonochloridoyl" on a ring, "chloro…oxo" at the end of a chain;
+                // not decided here.
+                Some(Class::AcidHalide) => {
+                    Err("acid halide group as a prefix (carbonochloridoyl, chloro…oxo)".into())
+                }
+                Some(Class::Anhydride) => Err(
+                    "anhydride group as a substituent (acyloxycarbonyl), or one together with \
+                     a carboxylic acid"
+                        .into(),
+                ),
+                Some(Class::Carboxylate) => {
+                    Err("carboxylate group as a prefix (carboxylato)".into())
                 }
                 _ => {
                     let region = self.region_from(q, from);
@@ -1053,6 +1366,7 @@ impl<'a> Namer<'a> {
                     self.unit(mode, &region)
                 }
             },
+            El::S if order == 1 && others.is_empty() => Ok(Prefix::simple("sulfanyl")),
             _ => Err("internal error: unknown element".into()),
         }
     }
@@ -1196,7 +1510,7 @@ fn assembly_name(
         let size = e.atoms.len() / rings;
         format!(
             "(cyclo{}ane)",
-            stem(size).ok_or("ring larger than 99 atoms")?
+            stem(size).ok_or_else(|| format!("ring larger than {MAX_NUMERAL} atoms"))?
         )
     };
     let hydride = format!("{joins}-{mult}{ring}");
@@ -1218,7 +1532,10 @@ fn assembly_name(
             "{prefixes}[{hydride}]-{locs}-{}",
             multiplied(e.suffix.len(), suffix_word(suffix, true))
         ),
-        Suffix::Yl(_) => format!("{prefixes}[{hydride}]-{locs}-yl"),
+        Suffix::Yl(_) => format!(
+            "{prefixes}[{hydride}]-{locs}-{}",
+            multiplied(e.suffix.len(), "yl")
+        ),
     };
     Ok((text, depth, order))
 }
@@ -1301,6 +1618,13 @@ fn suffix_word(suffix: Suffix, ring: bool) -> &'static str {
     match (suffix, ring) {
         (Suffix::Class(Class::Acid), false) => "oic acid",
         (Suffix::Class(Class::Acid), true) => "carboxylic acid",
+        (Suffix::Class(Class::Carboxylate), false) => "oate",
+        (Suffix::Class(Class::Carboxylate), true) => "carboxylate",
+        (Suffix::Class(Class::AcidHalide), false) => "oyl",
+        (Suffix::Class(Class::AcidHalide), true) => "carbonyl",
+        (Suffix::Class(Class::Anhydride), _) => {
+            unreachable!("anhydrides are named by functional class")
+        }
         (Suffix::Class(Class::Ester), false) => "oate",
         (Suffix::Class(Class::Ester), true) => "carboxylate",
         (Suffix::Class(Class::Amide), false) => "amide",
@@ -1311,6 +1635,7 @@ fn suffix_word(suffix: Suffix, ring: bool) -> &'static str {
         (Suffix::Class(Class::Aldehyde), true) => "carbaldehyde",
         (Suffix::Class(Class::Ketone), _) => "one",
         (Suffix::Class(Class::Alcohol), _) => "ol",
+        (Suffix::Class(Class::Thiol), _) => "thiol",
         (Suffix::Class(Class::Amine), _) => "amine",
         (Suffix::Acyl, false) => "oyl",
         (Suffix::Acyl, true) => "carbonyl",
