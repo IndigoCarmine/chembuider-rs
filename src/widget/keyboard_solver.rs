@@ -99,6 +99,7 @@ impl Sim {
         self.editor.undo_stack.clear();
         self.editor.redo_stack.clear();
         self.editor.selected_atoms.clear();
+        self.editor.selected_bonds.clear();
     }
 
     /// Drive a whitespace-separated chord sequence. Goes through [`kbd_frame`], so the

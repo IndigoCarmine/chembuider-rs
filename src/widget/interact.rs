@@ -289,15 +289,19 @@ fn lasso_begin(editor: &mut ChemStructEditor, origin: egui::Pos2) {
 }
 
 /// Finish a rubber-band selection: replace the selection with every atom whose screen position
-/// falls inside the drawn polygon. A polygon needs at least three vertices to bound an area, so
-/// a path too short to be a real lasso (a mere flick) selects nothing and leaves the selection
-/// untouched.
+/// falls inside the drawn polygon. A bond is taken through its atoms: one with both ends inside
+/// is covered (Cleanup moves both, Delete removes it with them), one with an end outside is
+/// not, wherever its midpoint lies. Bonds clicked into the selection
+/// ([`ChemStructEditor::selected_bonds`]) are dropped with the rest of the old selection. A
+/// polygon needs at least three vertices to bound an area, so a path too short to be a real
+/// lasso (a mere flick) selects nothing and leaves the selection untouched.
 ///
 /// Does not clear `lasso_path`/`drag_origin_screen`; the caller owns that teardown, since the
 /// Select tool clears them on every drag-stop regardless of which sub-gesture actually ran.
 fn lasso_select(editor: &mut ChemStructEditor, center: egui::Pos2) {
     if editor.lasso_path.len() > 2 {
         editor.selected_atoms.clear();
+        editor.selected_bonds.clear();
         editor.selected_objects.clear();
         let lasso = editor.lasso_path.clone();
         let hits: Vec<u32> = editor.molecule.atoms.iter().filter_map(|atom| {
@@ -338,6 +342,7 @@ pub fn process_select_tool(
         });
         if let Some(atom_id) = seed {
             editor.selected_atoms = editor.molecule.connected_atoms(atom_id).into_iter().collect();
+            editor.selected_bonds.clear();
         } else if let Some(id) = editor.hovered_object {
             // Double-click a text (or a bracket, for its label) to edit it, a table's cell to
             // enter its value.
@@ -366,8 +371,14 @@ pub fn process_select_tool(
             if !editor.selected_objects.remove(&id) {
                 editor.selected_objects.insert(id);
             }
+        } else if let Some(bond_id) = editor.hovered_bond {
+            // A bond on its own (see `ChemStructEditor::selected_bonds`).
+            if !editor.selected_bonds.remove(&bond_id) {
+                editor.selected_bonds.insert(bond_id);
+            }
         } else {
             editor.selected_atoms.clear();
+            editor.selected_bonds.clear();
             editor.selected_objects.clear();
         }
     }
@@ -1928,6 +1939,118 @@ mod tests {
 
         assert!(editor.selected_atoms.contains(&a), "the atom inside the lasso is selected");
         assert!(editor.undo_stack.is_empty(), "a lasso changes no coordinates");
+    }
+
+    /// A five-carbon zigzag chain with its middle bond (atoms 2–3) dragged out of shape, and
+    /// the screen point at the middle of that bond on the 640x480 test screen.
+    fn chain_with_distorted_middle_bond(editor: &mut ChemStructEditor) -> (Vec<u32>, u32, egui::Pos2) {
+        let (dx, dy) = (1.5 * 0.75_f32.sqrt(), 0.75);
+        let chain: Vec<u32> = (0..5)
+            .map(|i| editor.molecule.add_atom("C".to_string(), [i as f32 * dx, (i % 2) as f32 * dy], 0))
+            .collect();
+        for w in chain.windows(2) {
+            editor.molecule.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        editor.molecule.atom_by_id_mut(chain[2]).unwrap().pos = [2.2, -0.9];
+        editor.molecule.atom_by_id_mut(chain[3]).unwrap().pos = [4.6, 1.6];
+        let bond = editor.molecule.bond_between(chain[2], chain[3]).unwrap().id;
+        let mid = editor.mol_to_screen([3.4, 0.35], MID);
+        (chain, bond, mid)
+    }
+
+    /// Select tool: clicking a bond selects that bond alone, and Cleanup then lays out just
+    /// its two atoms against the rest, which keeps its exact coordinates. Driven through the
+    /// real pointer path, so the selection the Cleanup sees is the one the click made.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn select_click_on_a_bond_then_cleanup_moves_only_its_two_atoms() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let (chain, bond, mid) = chain_with_distorted_middle_bond(&mut editor);
+        let before = editor.molecule.clone();
+
+        primary_drag_along(&mut editor, &[mid], Default::default());
+        assert_eq!(editor.selected_bonds, [bond].into_iter().collect(), "the click selects the bond");
+        assert!(editor.selected_atoms.is_empty(), "and no atom of its own");
+        assert_eq!(editor.molecule, before, "selecting changes nothing");
+
+        editor.toggle_cleanup();
+        while editor.poll_cleanup() {
+            std::thread::yield_now();
+        }
+
+        let ends = [chain[2], chain[3]];
+        for a in &before.atoms {
+            let now = editor.molecule.atom_by_id(a.id).unwrap().pos;
+            if ends.contains(&a.id) {
+                assert_ne!(now, a.pos, "end atom {} of the selected bond is cleaned up", a.id);
+            } else {
+                assert_eq!(
+                    [now[0].to_bits(), now[1].to_bits()],
+                    [a.pos[0].to_bits(), a.pos[1].to_bits()],
+                    "atom {} is not selected and must not move", a.id
+                );
+            }
+        }
+        for w in chain.windows(2) {
+            let (p, q) = (editor.molecule.atom_by_id(w[0]).unwrap().pos, editor.molecule.atom_by_id(w[1]).unwrap().pos);
+            let d = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt();
+            assert!((d - 1.5).abs() < 0.05, "bond {}-{} is {d} after the cleanup", w[0], w[1]);
+        }
+    }
+
+    /// Select tool: a second click on a selected bond deselects it, a click on empty canvas
+    /// clears a bond selection, and a lasso replaces it.
+    #[test]
+    fn select_click_toggles_a_bond_and_empty_click_or_lasso_clears_it() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let (_, bond, mid) = chain_with_distorted_middle_bond(&mut editor);
+        let empty = MID + egui::vec2(-200.0, 150.0);
+
+        primary_drag_along(&mut editor, &[mid], Default::default());
+        assert!(editor.selected_bonds.contains(&bond));
+        primary_drag_along(&mut editor, &[mid], Default::default());
+        assert!(editor.selected_bonds.is_empty(), "a second click deselects the bond");
+
+        primary_drag_along(&mut editor, &[mid], Default::default());
+        primary_drag_along(&mut editor, &[empty], Default::default());
+        assert!(editor.selected_bonds.is_empty(), "a click on empty canvas clears it");
+
+        primary_drag_along(&mut editor, &[mid], Default::default());
+        let lasso = [empty, empty + egui::vec2(30.0, 0.0), empty + egui::vec2(30.0, 30.0), empty + egui::vec2(0.0, 30.0)];
+        primary_drag_along(&mut editor, &lasso, Default::default());
+        assert!(editor.selected_bonds.is_empty(), "a lasso replaces the selection");
+        assert!(editor.undo_stack.is_empty(), "selecting pushes no undo snapshot");
+    }
+
+    /// Delete with a bond selected removes that bond only: its atoms, and their other bonds,
+    /// stay.
+    #[test]
+    fn deleting_a_selected_bond_removes_only_the_bond() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let (chain, bond, mid) = chain_with_distorted_middle_bond(&mut editor);
+        primary_drag_along(&mut editor, &[mid], Default::default());
+
+        assert!(editor.delete_selection());
+        assert!(editor.molecule.bond_by_id(bond).is_none(), "the selected bond is deleted");
+        assert_eq!(editor.molecule.atoms.len(), chain.len(), "no atom is deleted");
+        assert_eq!(editor.molecule.bonds.len(), chain.len() - 2, "the other bonds stay");
+        assert!(editor.selected_bonds.is_empty());
+        assert!(editor.undo());
+        assert!(editor.molecule.bond_by_id(bond).is_some(), "undo brings the bond back");
+    }
+
+    /// The Bond tool keeps its own click on a bond: it cycles the bond's order and selects
+    /// nothing (bond selection is the Select tool's).
+    #[test]
+    fn bond_tool_click_on_a_bond_still_cycles_its_order() {
+        let mut editor = ChemStructEditor::default();
+        assert_eq!(editor.tool, crate::Tool::Bond);
+        let (_, bond, mid) = chain_with_distorted_middle_bond(&mut editor);
+
+        primary_drag_along(&mut editor, &[mid], Default::default());
+
+        assert_eq!(editor.molecule.bond_by_id(bond).unwrap().order, BondOrder::Double);
+        assert!(editor.selected_bonds.is_empty() && editor.selected_atoms.is_empty());
     }
 
     fn frag_shortcut(key: &str, fragment: &str) -> AtomShortcut {

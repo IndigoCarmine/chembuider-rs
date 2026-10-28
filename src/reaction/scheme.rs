@@ -776,6 +776,7 @@ fn load(mol: &Molecule, style: &ReactionStyle, structure_style: &StyleConfig, sc
     scratch.config.style = structure_style.clone();
     // No editing state may leak into a static drawing.
     scratch.selected_atoms.clear();
+    scratch.selected_bonds.clear();
     scratch.hovered_atom = None;
     scratch.hovered_bond = None;
     scratch.hotspot_atom = None;
