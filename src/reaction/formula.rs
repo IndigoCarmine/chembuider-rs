@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::molecule::Molecule;
 use crate::molecule::depict::{displayed_h_count, is_folded_h};
-use crate::widget::rich_text::{RichText, SpanStyle};
+use crate::widget::rich_text::{RichText, Script, SpanStyle};
 
 /// Standard atomic weight in g/mol (IUPAC conventional values, 2021), or `None` for a symbol
 /// that is not a plain element — a group label such as `OMe`, `Ts` or `CO2Et`, which the atom
@@ -137,8 +137,12 @@ impl MolecularFormula {
     /// the brackets, the end groups, always count: a bare carbon at a crossing bond's end is a
     /// methyl (see [`PolymerFormula`] for writing the formula `CH3(C2H4)nCH3`'s way,
     /// `C2H6(C2H4)n`).
+    ///
+    /// An atom labelled with a written formula rather than an element (`NaH`, `CN`, `CH_3`)
+    /// counts as the atoms its label spells — see [`label_formula`]. Any other label (`OMe`,
+    /// `Ts`) stays a symbol with no weight, as does a whole formula whose counts overflow.
     pub fn of(mol: &Molecule) -> Self {
-        Self::from_counts(counts_of(mol, |_| true))
+        counts_of(mol, |_| true)
     }
 
     /// A formula from per-element counts, put into Hill order. Zero counts are dropped.
@@ -168,14 +172,13 @@ impl MolecularFormula {
     /// `DCC` is D-C-C, `Ar` is argon, not aryl); those are refused rather than given a
     /// meaningless weight.
     pub fn parse(text: &str) -> Option<Self> {
-        const ABBREVIATIONS: [&str; 10] =
-            ["NBS", "NCS", "NIS", "DCC", "DIC", "PCC", "PDC", "NMO", "Ar", "Pr"];
-        if ABBREVIATIONS.contains(&text) {
+        const ABBREVIATIONS: [&str; 8] = ["NBS", "NCS", "NIS", "DCC", "DIC", "PCC", "PDC", "NMO"];
+        if ABBREVIATIONS.contains(&text) || ABBREVIATION_SYMBOLS.contains(&text) {
             return None;
         }
         let chars: Vec<char> = text.chars().collect();
         let mut pos = 0;
-        let counts = parse_group(&chars, &mut pos, 0)?;
+        let counts = parse_group(&chars, &mut pos)?;
         if pos != chars.len() || counts.is_empty() {
             return None;
         }
@@ -201,7 +204,7 @@ impl MolecularFormula {
     /// Styled text with the counts as true subscripts (`C₆H₆O`). `style` is applied to the
     /// element symbols; the counts get the same style plus [`Script::Sub`](crate::Script::Sub).
     pub fn rich_styled(&self, style: SpanStyle) -> RichText {
-        let sub = SpanStyle { script: crate::widget::rich_text::Script::Sub, ..style };
+        let sub = SpanStyle { script: Script::Sub, ..style };
         let mut rich = RichText::new();
         for (el, n) in &self.counts {
             rich = rich.span(el.clone(), style);
@@ -237,33 +240,57 @@ impl MolecularFormula {
     }
 }
 
+/// The symbol a formula holds in place of its counts when they do not fit in a `usize`
+/// (labels such as `C18446744073709551615C`): no element, so the formula has no weight.
+const UNCOUNTABLE: &str = "?";
+
+/// Add `n` atoms of `el` to `counts`; `None` when the total overflows.
+fn add(counts: &mut BTreeMap<String, usize>, el: String, n: usize) -> Option<()> {
+    let total = counts.entry(el).or_default();
+    *total = total.checked_add(n)?;
+    Some(())
+}
+
 /// How many times atom `id` counts: once, times the repeat count of every bracket around it
-/// that has one (a multiple group, a repeat unit labelled with a number).
-fn multiplicity(mol: &Molecule, id: u32) -> usize {
+/// that has one (a multiple group, a repeat unit labelled with a number). `None` on overflow.
+fn multiplicity(mol: &Molecule, id: u32) -> Option<usize> {
     mol.brackets()
         .filter(|b| b.atoms.contains(&id))
         .filter_map(|b| b.repeat_count())
-        .fold(1usize, |n, k| n.saturating_mul(k))
+        .try_fold(1usize, |n, k| n.checked_mul(k))
 }
 
 /// Element counts of the atoms of `mol` that `keep` accepts (each with its hydrogens), the
-/// brackets taken into account as [`MolecularFormula::of`] says.
-fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> BTreeMap<String, usize> {
-    let has_brackets = mol.brackets().next().is_some();
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for atom in &mol.atoms {
-        // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
-        if is_folded_h(mol, atom.id) || !keep(atom.id) {
-            continue;
+/// brackets taken into account as [`MolecularFormula::of`] says, already as a formula. When
+/// a count overflows, the formula is just [`UNCOUNTABLE`] — unknown, with no weight.
+fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> MolecularFormula {
+    let counts = (|| {
+        let has_brackets = mol.brackets().next().is_some();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for atom in &mol.atoms {
+            // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
+            if is_folded_h(mol, atom.id) || !keep(atom.id) {
+                continue;
+            }
+            let times = if has_brackets { multiplicity(mol, atom.id)? } else { 1 };
+            if let Some(label) = label_formula(&atom.element) {
+                for (el, n) in label.counts {
+                    add(&mut counts, el, n.checked_mul(times)?)?;
+                }
+                continue;
+            }
+            add(&mut counts, atom.element.clone(), times)?;
+            let h = displayed_h_count(mol, atom.id) as usize;
+            if h > 0 {
+                add(&mut counts, "H".to_string(), h.checked_mul(times)?)?;
+            }
         }
-        let times = if has_brackets { multiplicity(mol, atom.id) } else { 1 };
-        *counts.entry(atom.element.clone()).or_default() += times;
-        let h = displayed_h_count(mol, atom.id) as usize;
-        if h > 0 {
-            *counts.entry("H".to_string()).or_default() += h * times;
-        }
+        Some(counts)
+    })();
+    match counts {
+        Some(counts) => MolecularFormula::from_counts(counts),
+        None => MolecularFormula { counts: vec![(UNCOUNTABLE.to_string(), 1)] },
     }
-    counts
 }
 
 /// The formula of a drawing with polymer brackets labelled `n` (no number) as it is written:
@@ -288,12 +315,12 @@ impl PolymerFormula {
             return None;
         }
         let inside: HashSet<u32> = units.iter().flat_map(|b| b.atoms.iter().copied()).collect();
-        let rest = MolecularFormula::from_counts(counts_of(mol, |id| !inside.contains(&id)));
+        let rest = counts_of(mol, |id| !inside.contains(&id));
         let units = units
             .iter()
             .map(|b| {
                 let mine: HashSet<u32> = b.atoms.iter().copied().collect();
-                (MolecularFormula::from_counts(counts_of(mol, |id| mine.contains(&id))), b.label.trim().to_string())
+                (counts_of(mol, |id| mine.contains(&id)), b.label.trim().to_string())
             })
             .filter(|(f, _)| !f.is_empty())
             .collect();
@@ -327,22 +354,63 @@ impl PolymerFormula {
     }
 }
 
-/// One level of [`MolecularFormula::parse`]: element symbols with counts, and `( … )n`
-/// groups, until the end of the text or (when `depth > 0`) the closing parenthesis.
-fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap<String, usize>> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+/// Element symbols that a reagent or an atom label means as a group, not an element: `Ar` is
+/// aryl and `Pr` propyl. [`MolecularFormula::parse`] refuses them as a whole formula, and
+/// [`label_chain`](crate::label_chain) never reads them as an element token.
+pub(crate) const ABBREVIATION_SYMBOLS: [&str; 2] = ["Ar", "Pr"];
+
+/// The formula an atom label spells, when the label is a written formula rather than an
+/// element symbol: `NaH` → HNa, `CH_3` (a label with a subscript count) → CH3.
+///
+/// The label is read by the same rules as arrow text ([`MolecularFormula::parse`]), and what
+/// it spells is all it counts — no implicit hydrogens are added, because a label writes its
+/// hydrogens out. That is what keeps `CN` a nitrile and `CHO` a formyl group: reading them as
+/// single-bonded chains (C–N, C–H–O) and filling valences would give CH2NH2 and a divalent
+/// hydrogen, a wrong weight with nothing to show it is wrong.
+///
+/// `None` for a plain element (counted as such by the caller), a label with a superscript
+/// (a charge), and anything that is not a formula (`OMe`, `Ts`, `NBS`) — nor a label with
+/// more than [`MAX_GROUP_DEPTH`] braces: every markup group opens at a `{`, so that bounds
+/// how deeply groups nest, and with it the rich-text parser's per-character work.
+fn label_formula(label: &str) -> Option<MolecularFormula> {
+    if atomic_weight(label).is_some() || label.matches('{').count() > MAX_GROUP_DEPTH {
+        return None;
+    }
+    let rich = RichText::parse(label);
+    if rich.spans.iter().any(|s| s.style.script == Script::Super) {
+        return None;
+    }
+    let plain: String = rich.spans.iter().map(|s| s.text.as_str()).collect();
+    MolecularFormula::parse(&plain)
+}
+
+/// How deeply `( … )` groups may nest in a written formula. Real formulas nest two or three
+/// levels (`Ca((OH)2)3`, `[Co(NH3)6]` written with parentheses); a label nested deeper than
+/// this is no formula a chemist writes, and is left unknown rather than read.
+const MAX_GROUP_DEPTH: usize = 64;
+
+/// The counts [`MolecularFormula::parse`] reads: element symbols with counts, and `( … )n`
+/// groups nested at most [`MAX_GROUP_DEPTH`] deep. Open groups are kept on an explicit stack
+/// rather than the call stack, so no label, however long, can overflow it.
+fn parse_group(chars: &[char], pos: &mut usize) -> Option<BTreeMap<String, usize>> {
+    // The innermost open group is last; the bottom entry is the whole formula.
+    let mut open: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new()];
     while *pos < chars.len() {
         let c = chars[*pos];
         let group = if c == '(' {
-            *pos += 1;
-            let inner = parse_group(chars, pos, depth + 1)?;
-            if chars.get(*pos) != Some(&')') || inner.is_empty() {
+            if open.len() > MAX_GROUP_DEPTH {
                 return None;
             }
             *pos += 1;
+            open.push(BTreeMap::new());
+            continue;
+        } else if c == ')' && open.len() > 1 {
+            *pos += 1;
+            let inner = open.pop()?;
+            if inner.is_empty() {
+                return None;
+            }
             inner
-        } else if c == ')' && depth > 0 {
-            return Some(counts);
         } else if c.is_ascii_uppercase() {
             // Prefer the two-letter symbol (`Co`, `Cs`) when it is an element; a lowercase
             // letter that does not complete one (`Me`, `Et`) is not a formula.
@@ -377,11 +445,13 @@ fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap
         if n == 0 {
             return None;
         }
+        let counts = open.last_mut()?;
         for (el, k) in group {
-            *counts.entry(el).or_default() += k * n;
+            add(counts, el, k.checked_mul(n)?)?;
         }
     }
-    (depth == 0).then_some(counts)
+    // A group still open at the end of the text is unclosed.
+    if open.len() == 1 { open.pop() } else { None }
 }
 
 /// Convenience: [`MolecularFormula::of`].
@@ -643,6 +713,143 @@ mod tests {
         let f = MolecularFormula::of(&m);
         assert_eq!(f.weight(), None);
         assert_eq!(f.unknown_elements(), vec!["OMe"]);
+    }
+
+    /// An atom label that reads as a written formula (`NaH`, `CN`, `CH_3`) counts as the atoms
+    /// it spells, exactly as [`MolecularFormula::parse`] reads arrow text — and, like a label,
+    /// carries no implicit hydrogen: the hydrogens it has are the ones it writes.
+    #[test]
+    fn formula_labels_count_as_the_atoms_they_spell() {
+        let lone = |label: &str| {
+            let mut m = Molecule::default();
+            m.add_atom(label.into(), [0.0, 0.0], 0);
+            MolecularFormula::of(&m)
+        };
+        let on_methyl = |label: &str| {
+            let mut m = Molecule::default();
+            let c = m.add_atom("C".into(), [0.0, 0.0], 0);
+            let g = m.add_atom(label.into(), [1.5, 0.0], 0);
+            m.add_bond(c, g, BondOrder::Single);
+            MolecularFormula::of(&m)
+        };
+        let weight = |f: &MolecularFormula| format!("{:.2}", f.weight().unwrap());
+
+        let nah = lone("NaH");
+        assert_eq!(nah.plain(), "HNa");
+        assert_eq!(weight(&nah), "24.00");
+        assert_eq!(weight(&lone("LiAlH4")), "37.95");
+        // H3C–CN is acetonitrile and H3C–CHO acetaldehyde — not CH2–NH2 or C–H–OH.
+        assert_eq!(on_methyl("CN").plain(), "C2H3N");
+        assert_eq!(weight(&on_methyl("CN")), "41.05");
+        assert_eq!(on_methyl("CHO").plain(), "C2H4O");
+        assert_eq!(weight(&on_methyl("CHO")), "44.05");
+        // Counts written as subscripts (the markup a CDX label is read into) count too.
+        assert_eq!(on_methyl("CH_3").plain(), "C2H6");
+        assert_eq!(on_methyl("CH3").plain(), "C2H6");
+        // A label that is no formula stays unknown, as `group_labels_have_no_weight` requires.
+        assert_eq!(lone("NaOMe").weight(), None);
+        assert_eq!(lone("NaOMe").unknown_elements(), vec!["NaOMe"]);
+        assert_eq!(lone("NBS").weight(), None, "an abbreviation, as for arrow text");
+    }
+
+    /// Counts too large for `usize` make a formula unknown — no panic, no wrapped count, no
+    /// weight — whether they overflow inside one written formula (a repeated element, a
+    /// parenthesised group's count, nested groups) or only once atoms are added together.
+    #[test]
+    fn overflowing_counts_are_unknown() {
+        let lone = |label: &str| {
+            let mut m = Molecule::default();
+            m.add_atom(label.into(), [0.0, 0.0], 0);
+            MolecularFormula::of(&m)
+        };
+        let max = usize::MAX;
+        let half = usize::MAX / 2 + 1;
+        let quarter = usize::MAX / 4 + 1;
+        for text in [
+            format!("C{max}C"),          // the same element twice
+            format!("(C{max})2"),        // a group's count
+            format!("((C{quarter})2)2"), // the outer of nested groups
+            format!("(C{half}H)2"),      // one element of a group
+        ] {
+            assert_eq!(MolecularFormula::parse(&text), None, "{text}");
+            let f = lone(&text);
+            assert_eq!(f.weight(), None, "{text}");
+            assert_eq!(f.unknown_elements(), vec![text.as_str()], "the label stays unknown");
+        }
+
+        // Each label alone is countable; together they are not.
+        let mut m = Molecule::default();
+        let a = m.add_atom(format!("C{half}").into(), [0.0, 0.0], 0);
+        let b = m.add_atom(format!("C{half}").into(), [1.5, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        assert_eq!(MolecularFormula::of(&m).weight(), None);
+        assert!(PolymerFormula::of(&m).is_none());
+        // Nor is a huge label next to a drawn carbon (whose implicit hydrogens count).
+        let mut m = Molecule::default();
+        let a = m.add_atom(format!("C{max}").into(), [0.0, 0.0], 0);
+        let c = m.add_atom("C".into(), [1.5, 0.0], 0);
+        m.add_bond(a, c, BondOrder::Single);
+        assert_eq!(molecular_weight(&m), None);
+    }
+
+    /// Atom labels are user input, so a pathological one must leave the formula unknown, not
+    /// overflow the stack: parentheses nested far past [`MAX_GROUP_DEPTH`] are refused, on a
+    /// thread whose stack is much smaller than the main thread's, while ordinary nesting
+    /// still counts.
+    #[test]
+    fn deeply_nested_labels_are_unknown_without_recursion() {
+        let deep = format!("{}C{}", "(".repeat(20_000), ")".repeat(20_000));
+        let just_deep = format!("{}C{}", "(".repeat(MAX_GROUP_DEPTH), ")".repeat(MAX_GROUP_DEPTH));
+        let too_deep =
+            format!("{}C{}", "(".repeat(MAX_GROUP_DEPTH + 1), ")".repeat(MAX_GROUP_DEPTH + 1));
+        let result = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut m = Molecule::default();
+                m.add_atom(deep.as_str().into(), [0.0, 0.0], 0);
+                let f = MolecularFormula::of(&m);
+                (
+                    f.weight(),
+                    f.unknown_elements() == vec![deep.as_str()],
+                    MolecularFormula::parse(&just_deep).map(|f| f.plain()),
+                    MolecularFormula::parse(&too_deep),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(result.0, None, "no MW");
+        assert!(result.1, "the label stays unknown");
+        assert_eq!(result.2.as_deref(), Some("C"), "nesting up to the limit still counts");
+        assert_eq!(result.3, None, "one level more is refused");
+        assert_eq!(MolecularFormula::parse("Ca((OH)2)3").map(|f| f.plain()).as_deref(), Some("CaH6O6"));
+    }
+
+    /// Markup groups nested past [`MAX_GROUP_DEPTH`] (`_{C_{C…}}`) leave a label unknown
+    /// before it reaches the rich-text parser, whose cost grows with nesting depth; markup
+    /// up to the limit, and ordinary subscripts, still count.
+    #[test]
+    fn deeply_nested_markup_labels_are_unknown() {
+        let lone = |label: &str| {
+            let mut m = Molecule::default();
+            m.add_atom(label.into(), [0.0, 0.0], 0);
+            MolecularFormula::of(&m)
+        };
+        let nested = |n: usize| format!("{}{}", "_{C".repeat(n), "}".repeat(n));
+
+        let deep = nested(16_000);
+        let f = lone(&deep);
+        assert_eq!(f.weight(), None, "no MW");
+        assert_eq!(f.unknown_elements(), vec![deep.as_str()], "the label stays unknown");
+        assert_eq!(lone(&nested(MAX_GROUP_DEPTH + 1)).weight(), None, "one level more is refused");
+        assert_eq!(
+            label_formula(&nested(MAX_GROUP_DEPTH)).map(|f| f.plain()),
+            Some(format!("C{MAX_GROUP_DEPTH}")),
+            "nesting up to the limit still counts"
+        );
+        assert_eq!(lone("H_{2}O").plain(), "H2O");
+        assert_eq!(lone("CH_{3}").plain(), "CH3");
+        assert_eq!(label_formula("NH_{4}^{+}"), None, "a charge is still refused");
     }
 
     /// Every element up to uranium that has an IUPAC standard atomic weight has one in the
