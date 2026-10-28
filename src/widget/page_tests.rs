@@ -483,3 +483,92 @@ fn a_brackets_label_is_edited_in_the_text_box() {
     assert!(d.editor.set_bracket_shape(id, crate::molecule::BracketShape::Round));
     assert!(!d.editor.set_bracket_shape(id, crate::molecule::BracketShape::Round));
 }
+
+/// A sloppily drawn A + B → C on the page, with conditions over the arrow, everything off the
+/// arrow's line. Returns the arrow's id.
+fn sloppy_scheme(editor: &mut ChemStructEditor) -> u32 {
+    let mol = &mut editor.molecule;
+    let mut chain = |at: [f32; 2], n: usize| {
+        let ids: Vec<u32> = (0..n)
+            .map(|k| mol.add_atom("C".into(), [at[0] + 2.1 * k as f32, at[1] + if k % 2 == 0 { 0.0 } else { 0.9 }], 0))
+            .collect();
+        for w in ids.windows(2) {
+            mol.add_bond(w[0], w[1], BondOrder::Single);
+        }
+    };
+    chain([-14.0, 1.0], 3);
+    chain([-6.0, 2.5], 2);
+    chain([9.0, -2.0], 4);
+    mol.add_text([-8.5, -0.8], "+");
+    let arrow = mol.add_arrow([0.0, 0.0], [5.0, 0.0], ArrowKind::Reaction);
+    mol.add_text([0.8, -0.6], "MeI");
+    arrow
+}
+
+/// The reaction cleanup lines the scheme up on its arrow as one undo step: one Undo brings the
+/// drawing back as it was, and Redo brings the cleaned-up one back.
+#[test]
+fn the_reaction_cleanup_is_one_undo_step() {
+    let mut editor = ChemStructEditor::default();
+    let arrow = sloppy_scheme(&mut editor);
+    let before = editor.molecule.clone();
+    let depth = editor.undo_stack.len();
+
+    assert!(editor.cleanup_reaction());
+    let after = editor.molecule.clone();
+    assert_ne!(after, before, "the scheme was tidied");
+    assert_eq!(after.object_by_id(arrow).unwrap().key_points(), vec![[0.0, 0.0], [5.0, 0.0]], "the arrow stays");
+    for s in crate::molecule::reaction_table::structures(&after) {
+        let ys: Vec<f32> = s.iter().map(|&id| after.atom_by_id(id).unwrap().pos[1]).collect();
+        let mid = (ys.iter().copied().fold(f32::INFINITY, f32::min) + ys.iter().copied().fold(f32::NEG_INFINITY, f32::max)) * 0.5;
+        assert!(mid.abs() < 1e-3, "every structure is centred on the shaft: {mid}");
+    }
+    assert_eq!(editor.undo_stack.len(), depth + 1, "one undo step");
+
+    assert!(editor.undo());
+    assert_eq!(editor.molecule, before, "one Undo is the drawing before the cleanup");
+    assert!(editor.redo());
+    assert_eq!(editor.molecule, after);
+}
+
+/// With no arrow there is nothing to line up on: nothing changes and no undo step is taken.
+#[test]
+fn the_reaction_cleanup_needs_an_arrow() {
+    let mut editor = ChemStructEditor::default();
+    editor.molecule.add_atom("C".into(), [0.0, 0.0], 0);
+    let before = editor.molecule.clone();
+    assert!(!editor.cleanup_reaction());
+    assert_eq!(editor.molecule, before);
+    assert!(editor.undo_stack.is_empty());
+}
+
+/// With no arrow on the page the reaction cleanup has nothing to do, so a plain cleanup
+/// running at the time goes on.
+#[test]
+fn the_reaction_cleanup_without_an_arrow_leaves_a_plain_cleanup_running() {
+    let mut editor = ChemStructEditor::default();
+    let a = editor.molecule.add_atom("C".into(), [0.0, 0.0], 0);
+    let b = editor.molecule.add_atom("C".into(), [3.0, 0.4], 0);
+    editor.molecule.add_bond(a, b, BondOrder::Single);
+    editor.toggle_cleanup();
+    assert!(editor.is_cleaning());
+    assert!(!editor.cleanup_reaction());
+    assert!(editor.is_cleaning(), "the plain cleanup was not stopped");
+}
+
+/// Ctrl+Shift+K runs the reaction cleanup (at once, not in the background); Ctrl+K alone still
+/// starts the plain cleanup.
+#[test]
+fn ctrl_shift_k_cleans_up_the_reaction() {
+    let mut d = Driver::new(Tool::Select);
+    sloppy_scheme(&mut d.editor);
+    let mut direct = ChemStructEditor { molecule: d.editor.molecule.clone(), ..Default::default() };
+    assert!(direct.cleanup_reaction());
+
+    d.key(egui::Key::K, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+    assert!(!d.editor.is_cleaning(), "not the plain cleanup");
+    assert_eq!(d.editor.molecule, direct.molecule);
+
+    d.key(egui::Key::K, egui::Modifiers::CTRL);
+    assert!(d.editor.is_cleaning(), "Ctrl+K is the plain cleanup");
+}

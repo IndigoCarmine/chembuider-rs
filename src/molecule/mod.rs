@@ -9,6 +9,7 @@ pub(crate) mod cdx_fonts;
 pub(crate) mod cdx_page;
 pub(crate) mod cdx_table;
 pub mod reaction_table;
+pub mod reaction_cleanup;
 pub mod elements;
 pub mod depict;
 pub mod page;

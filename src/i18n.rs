@@ -665,6 +665,12 @@ catalog! {
         es: "Limpiar estructura", fr: "Nettoyer la structure", de: "Struktur bereinigen",
         pt_br: "Limpar estrutura", ko: "구조 정리", ru: "Упорядочить структуру", it: "Riordina struttura",
     }
+    /// Tidy a reaction scheme around its arrows (the arrows stay where they are).
+    CleanUpReaction {
+        ja: "反応式を整形", en: "Clean Up Reaction", zh_hans: "整理反应式", zh_hant: "整理反應式",
+        es: "Limpiar reacción", fr: "Nettoyer la réaction", de: "Reaktion bereinigen",
+        pt_br: "Limpar reação", ko: "반응식 정리", ru: "Упорядочить реакцию", it: "Riordina reazione",
+    }
 
     // ── ibisOffice editor ──
     /// A ChemDraw object's other objects kept untouched. `{n}`: how many.

@@ -181,6 +181,17 @@ impl App for EditorApp {
                         "Cleaning up… (click Stop to cancel)".to_string()
                     };
                 }
+                if ui
+                    .button("⚗ Clean Up Reaction")
+                    .on_hover_text("Line the reaction up on its arrows (Ctrl+Shift+K)")
+                    .clicked()
+                {
+                    self.status = if self.editor.cleanup_reaction() {
+                        "Reaction cleaned up.".to_string()
+                    } else {
+                        "Nothing to clean up (no reaction arrow, or already tidy).".to_string()
+                    };
+                }
 
                 ui.separator();
 
