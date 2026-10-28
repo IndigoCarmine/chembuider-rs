@@ -232,12 +232,21 @@ fn fix_ring_crossings(pos: &mut HashMap<u32, [f32; 2]>, cycles: &[Vec<u32>]) {
 
 // ─── Incremental cleanup state ────────────────────────────────────────────────
 
-/// Persistent state for continuous cleanup.  Create with `CleanupState::new`,
-/// advance with `step`, and write back to the molecule with `apply`.
+/// Persistent state for continuous cleanup.  Create with `CleanupState::new` (or
+/// `new_partial` to clean up a selection), advance with `step`, and write back to the molecule
+/// with `apply`.
 pub struct CleanupState {
     pos: HashMap<u32, [f32; 2]>,
     vel: HashMap<u32, [f32; 2]>,
     atom_ids: Vec<u32>,
+    // The atoms the relaxation moves, in `atom_ids` order: every atom for a whole-page
+    // cleanup.  For a selection cleanup only the selected ones; the others still pull on them
+    // through bonds, angles and repulsion but never move themselves.
+    movable: Vec<u32>,
+    // `None` for a whole-page cleanup, which keeps the structure centred on the origin.  For a
+    // selection cleanup, the groups of selected atoms that no bond ties to an unselected atom,
+    // each held at the centroid it was drawn at in place of that recentring.
+    free_groups: Option<Vec<FreeGroup>>,
     // forces holds F(x_current) — used for the first half-kick of the next VV step.
     forces: HashMap<u32, [f32; 2]>,
     bonds: Vec<(u32, u32)>,         // cached from mol (immutable during relaxation)
@@ -262,8 +271,32 @@ pub struct CleanupState {
     steps_since_ref: usize,
 }
 
+/// Selection cleanup: selected atoms bonded, through selected atoms, to no unselected one
+/// (a whole fragment).  Nothing anchors them, so like a whole-page cleanup they are kept from
+/// drifting or spinning, about the centroid they were drawn at.
+struct FreeGroup {
+    ids: Vec<u32>,
+    centroid: [f32; 2],
+}
+
 impl CleanupState {
     pub fn new(mol: &Molecule) -> Self {
+        Self::build(mol, None)
+    }
+
+    /// Clean up only the atoms in `movable`: every other atom keeps its exact position, and the
+    /// selected atoms are laid out against them (a bond from a selected atom to an unselected
+    /// one gets the standard length, the angles at the unselected atom the usual spread).  A
+    /// selected fragment bonded to nothing unselected is cleaned up as a whole and stays
+    /// centred where it was drawn.  Ids not in the molecule are ignored.
+    ///
+    /// Like the whole-page cleanup this is a local relaxation: selected atoms drawn far on the
+    /// wrong side of the fixed ones can settle with a bond left stretched.
+    pub fn new_partial(mol: &Molecule, movable: &HashSet<u32>) -> Self {
+        Self::build(mol, Some(movable))
+    }
+
+    fn build(mol: &Molecule, selection: Option<&HashSet<u32>>) -> Self {
         let atom_ids: Vec<u32> = mol.atoms.iter().map(|a| a.id).collect();
         let pos: HashMap<u32, [f32; 2]> = mol.atoms.iter().map(|a| (a.id, a.pos)).collect();
         let vel: HashMap<u32, [f32; 2]> = atom_ids.iter().map(|&id| (id, [0.0_f32; 2])).collect();
@@ -286,16 +319,33 @@ impl CleanupState {
 
         let linear_atoms = linear_centers(mol);
 
-        let cycles = find_simple_cycles(&adj, &atom_ids);
-        let has_rings = !cycles.is_empty();
+        let mut cycles = find_simple_cycles(&adj, &atom_ids);
+        let has_rings;
+        let movable: Vec<u32>;
+        let free_groups;
+        match selection {
+            None => {
+                has_rings = !cycles.is_empty();
+                movable = atom_ids.clone();
+                free_groups = None;
+            }
+            Some(sel) => {
+                // Friction damps the oscillation of any ring a moving atom sits in; the ring
+                // rescue only permutes rings whose atoms may all move.
+                has_rings = cycles.iter().any(|ring| ring.iter().any(|id| sel.contains(id)));
+                cycles.retain(|ring| ring.iter().all(|id| sel.contains(id)));
+                movable = atom_ids.iter().copied().filter(|id| sel.contains(id)).collect();
+                free_groups = Some(free_groups_of(&adj, &movable, sel, &pos));
+            }
+        }
 
         // Pre-compute initial forces so the first VV half-kick uses real forces, not zeros.
         compute_forces(&pos, &bonds, &adj, &atom_ids, &bonded, &linear_atoms, &PARAMS, &mut forces);
 
-        let ref_pos: Vec<[f32; 2]> = atom_ids.iter().map(|id| pos[id]).collect();
+        let ref_pos: Vec<[f32; 2]> = movable.iter().map(|id| pos[id]).collect();
 
         CleanupState {
-            pos, vel, atom_ids, forces, bonds, adj, bonded,
+            pos, vel, atom_ids, movable, free_groups, forces, bonds, adj, bonded,
             linear_atoms,
             cycles,
             dt: PARAMS.dt_init,
@@ -335,7 +385,7 @@ impl CleanupState {
         self.dt = PARAMS.dt_init;
         self.alpha = ALPHA_START;
         self.n_pos = 0;
-        for (k, &id) in self.atom_ids.iter().enumerate() {
+        for (k, &id) in self.movable.iter().enumerate() {
             self.ref_pos[k] = self.pos[&id];
         }
         self.steps_since_ref = 0;
@@ -362,8 +412,8 @@ impl CleanupState {
     }
 
     pub fn max_force(&self) -> f32 {
-        self.forces.values()
-            .map(|f| f[0] * f[0] + f[1] * f[1])
+        self.movable.iter()
+            .map(|id| { let f = self.forces[id]; f[0] * f[0] + f[1] * f[1] })
             .fold(0.0_f32, f32::max)
             .sqrt()
     }
@@ -387,7 +437,7 @@ impl CleanupState {
             let dt = self.dt;
 
             // 1. First half-kick with forces stored from the previous step.
-            for &id in &self.atom_ids {
+            for &id in &self.movable {
                 let f = self.forces[&id];
                 let v = self.vel.get_mut(&id).unwrap();
                 v[0] += f[0] * dt * 0.5;
@@ -395,13 +445,20 @@ impl CleanupState {
             }
 
             // 2. Drift.
-            for &id in &self.atom_ids {
+            for &id in &self.movable {
                 let v = self.vel[&id];
                 let q = self.pos.get_mut(&id).unwrap();
                 q[0] += v[0] * dt;
                 q[1] += v[1] * dt;
             }
-            recenter(&mut self.pos, &self.atom_ids);
+            match &self.free_groups {
+                None => recenter(&mut self.pos, &self.atom_ids, [0.0, 0.0]),
+                Some(groups) => {
+                    for g in groups {
+                        recenter(&mut self.pos, &g.ids, g.centroid);
+                    }
+                }
+            }
 
             // 3. Compute forces at the new positions (overwrites self.forces).
             compute_forces(
@@ -410,7 +467,7 @@ impl CleanupState {
             );
 
             // 4. Second half-kick — velocity is now the full VV velocity at the new position.
-            for &id in &self.atom_ids {
+            for &id in &self.movable {
                 let f = self.forces[&id];
                 let v = self.vel.get_mut(&id).unwrap();
                 v[0] += f[0] * dt * 0.5;
@@ -422,8 +479,8 @@ impl CleanupState {
             //    for this step (the second half-kick only updates velocity).
             self.steps_since_ref += 1;
             if self.steps_since_ref >= MSD_WINDOW {
-                let n = self.atom_ids.len().max(1) as f32;
-                let msd: f32 = self.atom_ids.iter().enumerate()
+                let n = self.movable.len().max(1) as f32;
+                let msd: f32 = self.movable.iter().enumerate()
                     .map(|(k, id)| {
                         let np = self.pos[id];
                         let dx = np[0] - self.ref_pos[k][0];
@@ -435,14 +492,14 @@ impl CleanupState {
                     return true;
                 }
                 // Not stationary yet: advance the reference window to the current positions.
-                for (k, &id) in self.atom_ids.iter().enumerate() {
+                for (k, &id) in self.movable.iter().enumerate() {
                     self.ref_pos[k] = self.pos[&id];
                 }
                 self.steps_since_ref = 0;
             }
 
             // 6. Power P = F · v (full velocity, new forces).
-            let power: f32 = self.atom_ids.iter()
+            let power: f32 = self.movable.iter()
                 .map(|id| {
                     let f = self.forces[id];
                     let v = self.vel[id];
@@ -471,18 +528,18 @@ impl CleanupState {
 
             // 8. FIRE: mix velocity toward force direction.
             //    v ← (1-α)v + α·(|v|/|F|)·F
-            let v_norm: f32 = self.atom_ids.iter()
+            let v_norm: f32 = self.movable.iter()
                 .map(|id| { let v = self.vel[id]; v[0] * v[0] + v[1] * v[1] })
                 .sum::<f32>()
                 .sqrt();
-            let f_norm: f32 = self.atom_ids.iter()
+            let f_norm: f32 = self.movable.iter()
                 .map(|id| { let f = self.forces[id]; f[0] * f[0] + f[1] * f[1] })
                 .sum::<f32>()
                 .sqrt()
                 .max(1e-10);
             let ratio = v_norm / f_norm;
             let alpha = self.alpha;
-            for &id in &self.atom_ids {
+            for &id in &self.movable {
                 let f = self.forces[&id];
                 let v = self.vel.get_mut(&id).unwrap();
                 v[0] = (1.0 - alpha) * v[0] + alpha * ratio * f[0];
@@ -490,7 +547,7 @@ impl CleanupState {
             }
 
             // 9. Clamp per-atom speed to prevent velocity runaway with large initial forces.
-            for &id in &self.atom_ids {
+            for &id in &self.movable {
                 let v = self.vel.get_mut(&id).unwrap();
                 let spd2 = v[0] * v[0] + v[1] * v[1];
                 if spd2 > V_MAX * V_MAX {
@@ -502,7 +559,7 @@ impl CleanupState {
 
             // 10. Friction: damp ring oscillations (ring molecules only).
             if self.has_rings {
-                for &id in &self.atom_ids {
+                for &id in &self.movable {
                     let v = self.vel.get_mut(&id).unwrap();
                     v[0] *= FRICTION;
                     v[1] *= FRICTION;
@@ -511,7 +568,14 @@ impl CleanupState {
 
             // 11. Drain whole-structure translation/rotation so the next drift only relaxes
             //     internal geometry (otherwise residual spin never lets positions converge).
-            remove_rigid_motion(&self.pos, &mut self.vel, &self.atom_ids);
+            match &self.free_groups {
+                None => remove_rigid_motion(&self.pos, &mut self.vel, &self.atom_ids, [0.0, 0.0]),
+                Some(groups) => {
+                    for g in groups {
+                        remove_rigid_motion(&self.pos, &mut self.vel, &g.ids, g.centroid);
+                    }
+                }
+            }
 
             // self.forces already holds F(x_new), ready for the next step's first half-kick.
         }
@@ -543,6 +607,14 @@ impl CleanupState {
 pub fn cleanup_2d(mol: &mut Molecule) {
     let mut schedule = CleanupSchedule::new(mol);
     // One call per relaxation pass; `advance` never runs more than one pass's budget.
+    while !schedule.advance(JOB_PHASE_BUDGET) {}
+    schedule.apply(mol);
+}
+
+/// `cleanup_2d` of a selection: only the atoms in `movable` move (see
+/// [`CleanupState::new_partial`]); every other atom keeps its exact coordinates.
+pub fn cleanup_2d_partial(mol: &mut Molecule, movable: &HashSet<u32>) {
+    let mut schedule = CleanupSchedule::new_partial(mol, movable);
     while !schedule.advance(JOB_PHASE_BUDGET) {}
     schedule.apply(mol);
 }
@@ -598,13 +670,23 @@ impl CleanupSchedule {
         Self::with_pass_budget(mol, JOB_PHASE_BUDGET)
     }
 
+    /// The cleanup of a selection: only the atoms in `movable` move
+    /// (see [`CleanupState::new_partial`]).
+    pub fn new_partial(mol: &Molecule, movable: &HashSet<u32>) -> Self {
+        Self::from_state(CleanupState::new_partial(mol, movable), JOB_PHASE_BUDGET)
+    }
+
     /// `new` with another per-pass step budget, so tests can reach the end of a pass that ran
     /// out of steps without spending `JOB_PHASE_BUDGET` of them.
     fn with_pass_budget(mol: &Molecule, pass_budget: usize) -> Self {
+        Self::from_state(CleanupState::new(mol), pass_budget)
+    }
+
+    fn from_state(state: CleanupState, pass_budget: usize) -> Self {
         debug_assert!(pass_budget > 0, "a zero pass budget would never finish a pass");
         CleanupSchedule {
-            state: CleanupState::new(mol),
-            stage: if mol.atoms.is_empty() { Stage::Done } else { Stage::Relax },
+            stage: if state.movable.is_empty() { Stage::Done } else { Stage::Relax },
+            state,
             pass_budget,
             steps_in_pass: 0,
             rescue_passes: 0,
@@ -716,6 +798,14 @@ pub trait CleanupRun {
 /// Starts cleanup runs: the swappable part behind the editor's Cleanup command.
 pub trait CleanupEngine {
     fn start(&self, mol: &Molecule) -> CleanupJob;
+
+    /// Start a cleanup of the selected atoms `movable` only (the editor's Cleanup with part of
+    /// the drawing selected): the run must leave every other atom where it is.  Defaults to the
+    /// built-in selection cleanup ([`CleanupJob::start_partial`]), so an engine that only
+    /// knows how to redraw a whole page still never moves an unselected atom.
+    fn start_partial(&self, mol: &Molecule, movable: &HashSet<u32>) -> CleanupJob {
+        CleanupJob::start_partial(mol, movable)
+    }
 }
 
 /// The built-in cleanup: the force-field relaxation plus ring rescue of `CleanupSchedule`,
@@ -741,7 +831,13 @@ pub struct CleanupJob {
 impl CleanupJob {
     /// Start the built-in cleanup of a snapshot of `mol` (see [`DefaultCleanupEngine`]).
     pub fn start(mol: &Molecule) -> Self {
-        Self::from_run(DefaultRun::start(mol))
+        Self::from_run(DefaultRun::start(mol, None))
+    }
+
+    /// Start the built-in cleanup of the atoms `movable` only, the others held still (see
+    /// [`CleanupState::new_partial`]).
+    pub fn start_partial(mol: &Molecule, movable: &HashSet<u32>) -> Self {
+        Self::from_run(DefaultRun::start(mol, Some(movable)))
     }
 
     /// Wrap another engine's run.
@@ -776,7 +872,8 @@ use job_wasm::PolledRun as DefaultRun;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod job_native {
-    use super::{run_cleanup_job, CleanupRun, Molecule};
+    use super::{run_cleanup_job, CleanupRun, CleanupSchedule, Molecule};
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -792,8 +889,9 @@ mod job_native {
     }
 
     impl ThreadedRun {
-        /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread.
-        pub fn start(mol: &Molecule) -> Self {
+        /// Spawn a worker that relaxes a snapshot of `mol` off the UI thread: all of it, or
+        /// only the atoms in `movable`.
+        pub fn start(mol: &Molecule, movable: Option<&HashSet<u32>>) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
             let shared = Arc::new(Mutex::new(
@@ -801,9 +899,14 @@ mod job_native {
             ));
 
             let snapshot = mol.clone();
+            let movable = movable.cloned();
             let (c, d, s) = (cancel.clone(), done.clone(), shared.clone());
             let handle = std::thread::spawn(move || {
-                run_cleanup_job(&snapshot, &c, &d, &s);
+                let schedule = match &movable {
+                    None => CleanupSchedule::new(&snapshot),
+                    Some(movable) => CleanupSchedule::new_partial(&snapshot, movable),
+                };
+                run_cleanup_job(schedule, &c, &d, &s);
             });
 
             ThreadedRun { cancel, done, shared, handle: Some(handle) }
@@ -855,6 +958,7 @@ mod job_native {
 #[cfg(target_arch = "wasm32")]
 mod job_wasm {
     use super::{CleanupRun, CleanupSchedule, Molecule, JOB_CHUNK};
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
@@ -866,9 +970,13 @@ mod job_wasm {
     }
 
     impl PolledRun {
-        pub fn start(mol: &Molecule) -> Self {
+        pub fn start(mol: &Molecule, movable: Option<&HashSet<u32>>) -> Self {
+            let schedule = match movable {
+                None => CleanupSchedule::new(mol),
+                Some(movable) => CleanupSchedule::new_partial(mol, movable),
+            };
             PolledRun {
-                schedule: Mutex::new(CleanupSchedule::new(mol)),
+                schedule: Mutex::new(schedule),
                 cancelled: AtomicBool::new(false),
             }
         }
@@ -906,17 +1014,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
-/// Worker body: the same `CleanupSchedule` as `cleanup_2d`, advanced `JOB_CHUNK` steps at a
-/// time so the worker can check the cancel flag and publish intermediate positions for the
-/// live preview in between.
+/// Worker body: the same `CleanupSchedule` as `cleanup_2d` (or `cleanup_2d_partial`),
+/// advanced `JOB_CHUNK` steps at a time so the worker can check the cancel flag and publish
+/// intermediate positions for the live preview in between.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_cleanup_job(
-    mol: &Molecule,
+    mut schedule: CleanupSchedule,
     cancel: &AtomicBool,
     done: &AtomicBool,
     shared: &Mutex<Vec<(u32, [f32; 2])>>,
 ) {
-    let mut schedule = CleanupSchedule::new(mol);
     while !schedule.is_done() {
         if cancel.load(Ordering::Relaxed) {
             schedule.cancel();
@@ -1140,7 +1247,9 @@ fn compute_forces(
     }
 }
 
-fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
+/// Move the atoms `ids` together so their centroid is at `target`.  (Subtracting a zero
+/// `target` is exact, so recentring on the origin is unchanged by the parameter.)
+fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32], target: [f32; 2]) {
     if ids.is_empty() {
         return;
     }
@@ -1149,7 +1258,7 @@ fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
         (ax + p[0], ay + p[1])
     });
     let n = ids.len() as f32;
-    let (cx, cy) = (sx / n, sy / n);
+    let (cx, cy) = (sx / n - target[0], sy / n - target[1]);
     for id in ids {
         let p = pos.get_mut(id).unwrap();
         p[0] -= cx;
@@ -1157,13 +1266,56 @@ fn recenter(pos: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
     }
 }
 
+/// The free groups of a selection cleanup: the connected pieces of the selected atoms
+/// (`movable`, in atom order) that have no bond to an unselected atom, each with its current
+/// centroid.
+fn free_groups_of(
+    adj: &HashMap<u32, Vec<u32>>,
+    movable: &[u32],
+    sel: &HashSet<u32>,
+    pos: &HashMap<u32, [f32; 2]>,
+) -> Vec<FreeGroup> {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut groups = Vec::new();
+    for &start in movable {
+        if !seen.insert(start) {
+            continue;
+        }
+        let mut ids = vec![start];
+        let mut anchored = false;
+        let mut k = 0;
+        while k < ids.len() {
+            for &nb in &adj[&ids[k]] {
+                if !sel.contains(&nb) {
+                    anchored = true;
+                } else if seen.insert(nb) {
+                    ids.push(nb);
+                }
+            }
+            k += 1;
+        }
+        if !anchored {
+            let n = ids.len() as f32;
+            let (sx, sy) = ids.iter().fold((0.0_f32, 0.0_f32), |(ax, ay), id| (ax + pos[id][0], ay + pos[id][1]));
+            groups.push(FreeGroup { ids, centroid: [sx / n, sy / n] });
+        }
+    }
+    groups
+}
+
 /// Project out rigid-body motion (net translation + net rotation) from the velocities.
 /// Whole-structure translation and rotation are zero-energy modes with no restoring force;
 /// the angle forces are not perfectly torque-free, so they keep pumping angular momentum into
 /// the rotation mode and the structure spins forever — which, with motion-based convergence,
 /// never settles.  Draining that net motion each step lets only the internal geometry relax,
-/// and keeps the result at the same orientation the user drew.  Assumes `pos` is centered.
-fn remove_rigid_motion(pos: &HashMap<u32, [f32; 2]>, vel: &mut HashMap<u32, [f32; 2]>, ids: &[u32]) {
+/// and keeps the result at the same orientation the user drew.  Assumes `ids` are centred on
+/// `center`.
+fn remove_rigid_motion(
+    pos: &HashMap<u32, [f32; 2]>,
+    vel: &mut HashMap<u32, [f32; 2]>,
+    ids: &[u32],
+    center: [f32; 2],
+) {
     if ids.len() < 2 {
         return;
     }
@@ -1179,10 +1331,11 @@ fn remove_rigid_motion(pos: &HashMap<u32, [f32; 2]>, vel: &mut HashMap<u32, [f32
     vx /= n;
     vy /= n;
 
-    // Angular velocity ω = L / I about the centroid (origin), using the de-translated velocity.
+    // Angular velocity ω = L / I about the centroid, using the de-translated velocity.
+    let arm = |id: &u32| [pos[id][0] - center[0], pos[id][1] - center[1]];
     let (mut l, mut inertia) = (0.0_f32, 0.0_f32);
     for id in ids {
-        let r = pos[id];
+        let r = arm(id);
         let v = vel[id];
         l += r[0] * (v[1] - vy) - r[1] * (v[0] - vx);
         inertia += r[0] * r[0] + r[1] * r[1];
@@ -1191,7 +1344,7 @@ fn remove_rigid_motion(pos: &HashMap<u32, [f32; 2]>, vel: &mut HashMap<u32, [f32
 
     // Subtract both the linear and rotational (v_rot = (-ω·y, ω·x)) components.
     for id in ids {
-        let r = pos[id];
+        let r = arm(id);
         let v = vel.get_mut(id).unwrap();
         v[0] -= vx - omega * r[1];
         v[1] -= vy + omega * r[0];
@@ -2112,6 +2265,302 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CleanupJob>();
         assert_send_sync::<crate::widget::ChemStructEditor>();
+    }
+
+    // ─── Cleanup of a selection ──────────────────────────────────────────────
+
+    /// A well-drawn zigzag chain of `n` carbons (bonds of length `L`, 120° angles) starting at
+    /// `origin`, returning the atom ids in chain order.
+    fn zigzag_chain(mol: &mut Molecule, n: usize, origin: [f32; 2]) -> Vec<u32> {
+        let ids: Vec<u32> = (0..n)
+            .map(|i| {
+                let p = [origin[0] + i as f32 * L * 0.75_f32.sqrt(), origin[1] + (i % 2) as f32 * L * 0.5];
+                mol.add_atom("C".to_string(), p, 0)
+            })
+            .collect();
+        for w in ids.windows(2) {
+            mol.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        ids
+    }
+
+    fn bond_length(mol: &Molecule, a: u32, b: u32) -> f32 {
+        let pa = mol.atom_by_id(a).unwrap().pos;
+        let pb = mol.atom_by_id(b).unwrap().pos;
+        ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2)).sqrt()
+    }
+
+    fn centroid(mol: &Molecule, ids: &[u32]) -> [f32; 2] {
+        let n = ids.len() as f32;
+        let (sx, sy) = ids.iter().fold((0.0, 0.0), |(x, y), &id| {
+            let p = mol.atom_by_id(id).unwrap().pos;
+            (x + p[0], y + p[1])
+        });
+        [sx / n, sy / n]
+    }
+
+    /// Run the editor's Cleanup to the end the way the UI does: toggle, then poll every frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_editor_cleanup(editor: &mut crate::widget::ChemStructEditor) {
+        editor.toggle_cleanup();
+        while editor.poll_cleanup() {
+            std::thread::yield_now();
+        }
+    }
+
+    /// The bit patterns of the atoms in `mol` that are not in `selected`.
+    fn unselected_bits(mol: &Molecule, selected: &HashSet<u32>) -> Vec<(u32, [u32; 2])> {
+        coord_bits(mol).into_iter().filter(|(id, _)| !selected.contains(id)).collect()
+    }
+
+    /// A six-carbon chain whose last two atoms were dragged out of shape: one bond stretched to
+    /// 4 units, the next squashed to 0.4.  Returns the molecule, the chain and the two atoms.
+    fn chain_with_distorted_end() -> (Molecule, Vec<u32>, HashSet<u32>) {
+        let mut mol = Molecule::default();
+        let chain = zigzag_chain(&mut mol, 6, [0.0, 0.0]);
+        mol.atom_by_id_mut(chain[4]).unwrap().pos = [8.5, -2.0];
+        mol.atom_by_id_mut(chain[5]).unwrap().pos = [8.7, -1.7];
+        let selected = [chain[4], chain[5]].into_iter().collect();
+        (mol, chain, selected)
+    }
+
+    /// Cleanup with part of the structure selected moves only the selected atoms: every other
+    /// atom keeps its exact coordinates.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_leaves_unselected_atoms_untouched() {
+        let (mol, chain, selected) = chain_with_distorted_end();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.selected_atoms = selected.clone();
+
+        run_editor_cleanup(&mut editor);
+
+        assert_eq!(unselected_bits(&editor.molecule, &selected), unselected_bits(&mol, &selected));
+        for &id in &selected {
+            assert_ne!(editor.molecule.atom_by_id(id).unwrap().pos, mol.atom_by_id(id).unwrap().pos, "atom {id} was cleaned");
+        }
+        assert_eq!(editor.molecule.bonds, mol.bonds);
+        assert!(chain.iter().all(|&id| editor.molecule.atom_by_id(id).is_some()));
+    }
+
+    /// The selected atoms are laid out against the unselected ones held still: the bond
+    /// crossing the selection boundary, and the bonds inside the selection, come out at the
+    /// standard length, and the angle at the fixed boundary atom at 120°.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_puts_boundary_bonds_at_the_standard_length() {
+        let (mol, chain, selected) = chain_with_distorted_end();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol;
+        editor.selected_atoms = selected;
+
+        run_editor_cleanup(&mut editor);
+
+        let m = &editor.molecule;
+        for (a, b) in [(chain[3], chain[4]), (chain[4], chain[5])] {
+            let d = bond_length(m, a, b);
+            assert!((d - L).abs() < 0.05, "bond {a}-{b} is {d}, want {L}");
+        }
+        let angle = angle_deg(m, chain[2], chain[3], chain[4]);
+        assert!((angle - 120.0).abs() < 3.0, "angle at the boundary atom is {angle}°");
+        let angle = angle_deg(m, chain[3], chain[4], chain[5]);
+        assert!((angle - 120.0).abs() < 3.0, "angle inside the selection is {angle}°");
+    }
+
+    /// A ring atom pulled out of place goes back between its two fixed ring neighbours.
+    #[test]
+    fn selection_cleanup_puts_a_ring_atom_back_between_fixed_neighbours() {
+        let mut mol = fixture("toluene_distorted");
+        cleanup_2d(&mut mol);
+        let ring: Vec<u32> = mol.atoms.iter().take(6).map(|a| a.id).collect();
+        mol.atom_by_id_mut(ring[2]).unwrap().pos[0] += 2.5;
+        let before = mol.clone();
+        let selected: HashSet<u32> = [ring[2]].into_iter().collect();
+
+        cleanup_2d_partial(&mut mol, &selected);
+
+        assert_eq!(unselected_bits(&mol, &selected), unselected_bits(&before, &selected));
+        for n in [ring[1], ring[3]] {
+            let d = bond_length(&mol, ring[2], n);
+            assert!((d - L).abs() < 0.05, "ring bond to {n} is {d}");
+        }
+    }
+
+    /// A selected fragment bonded to nothing unselected is cleaned up as a whole and put back
+    /// where it was: its centroid does not move, and the rest of the page does not move at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_of_a_separate_fragment_keeps_its_centroid() {
+        let mut mol = Molecule::default();
+        zigzag_chain(&mut mol, 4, [0.0, 0.0]);
+        let fragment: Vec<u32> = [[20.0, 10.0], [23.5, 10.4], [22.8, 13.0], [26.0, 9.0]]
+            .iter()
+            .map(|&p| mol.add_atom("C".to_string(), p, 0))
+            .collect();
+        for w in fragment.windows(2) {
+            mol.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        let selected: HashSet<u32> = fragment.iter().copied().collect();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.selected_atoms = selected.clone();
+
+        run_editor_cleanup(&mut editor);
+
+        let m = &editor.molecule;
+        assert_eq!(unselected_bits(m, &selected), unselected_bits(&mol, &selected));
+        let (was, now) = (centroid(&mol, &fragment), centroid(m, &fragment));
+        assert!((was[0] - now[0]).abs() < 1e-3 && (was[1] - now[1]).abs() < 1e-3, "centroid moved from {was:?} to {now:?}");
+        for w in fragment.windows(2) {
+            let d = bond_length(m, w[0], w[1]);
+            assert!((d - L).abs() < 0.05, "bond {}-{} is {d}", w[0], w[1]);
+        }
+
+        // Its shape is the one a plain cleanup of the fragment alone gives, moved back.
+        let mut alone = Molecule::default();
+        for &id in &fragment {
+            alone.add_atom("C".to_string(), mol.atom_by_id(id).unwrap().pos, 0);
+        }
+        let alone_ids: Vec<u32> = alone.atoms.iter().map(|a| a.id).collect();
+        for w in alone_ids.windows(2) {
+            alone.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        cleanup_2d(&mut alone);
+        for (&id, &aid) in fragment.iter().zip(&alone_ids) {
+            let p = m.atom_by_id(id).unwrap().pos;
+            let q = alone.atom_by_id(aid).unwrap().pos;
+            let (dx, dy) = (p[0] - was[0] - q[0], p[1] - was[1] - q[1]);
+            assert!(dx.hypot(dy) < 0.02, "atom {id} at {p:?}, plain cleanup puts it at {q:?} + {was:?}");
+        }
+    }
+
+    /// One Undo goes back to the drawing from before the selection cleanup.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_is_one_undo_step() {
+        let (mol, _, selected) = chain_with_distorted_end();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.selected_atoms = selected;
+
+        run_editor_cleanup(&mut editor);
+        assert_ne!(editor.molecule, mol);
+        assert_eq!(editor.undo_stack.len(), 1);
+
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, mol);
+    }
+
+    /// Selecting one bond selects its two atoms; Cleanup then moves just those two.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_of_one_bond_moves_its_two_atoms() {
+        let mut mol = Molecule::default();
+        let chain = zigzag_chain(&mut mol, 5, [0.0, 0.0]);
+        mol.atom_by_id_mut(chain[2]).unwrap().pos = [2.2, -0.9];
+        mol.atom_by_id_mut(chain[3]).unwrap().pos = [4.6, 1.6];
+        let selected: HashSet<u32> = [chain[2], chain[3]].into_iter().collect();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.selected_atoms = selected.clone();
+
+        run_editor_cleanup(&mut editor);
+
+        let m = &editor.molecule;
+        assert_eq!(unselected_bits(m, &selected), unselected_bits(&mol, &selected));
+        for w in chain.windows(2) {
+            let d = bond_length(m, w[0], w[1]);
+            assert!((d - L).abs() < 0.05, "bond {}-{} is {d}", w[0], w[1]);
+        }
+    }
+
+    /// With nothing selected, or everything, Cleanup is the plain whole-page cleanup.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cleanup_with_no_or_full_selection_is_the_plain_cleanup() {
+        for fx in characterization_fixtures() {
+            let mut expected = fx.mol.clone();
+            cleanup_2d(&mut expected);
+            let all: HashSet<u32> = fx.mol.atoms.iter().map(|a| a.id).collect();
+            for selected in [HashSet::new(), all] {
+                let mut editor = crate::widget::ChemStructEditor::default();
+                editor.molecule = fx.mol.clone();
+                editor.selected_atoms = selected;
+                run_editor_cleanup(&mut editor);
+                assert_eq!(coord_bits(&editor.molecule), coord_bits(&expected), "{}", fx.name);
+            }
+        }
+    }
+
+    /// The background job of a selection cleanup lands on the coordinates of the one-shot
+    /// `cleanup_2d_partial`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn partial_job_matches_cleanup_2d_partial() {
+        let (mol, _, selected) = chain_with_distorted_end();
+        let mut expected = mol.clone();
+        cleanup_2d_partial(&mut expected, &selected);
+        let from_job = position_bits(&run_polled(DefaultCleanupEngine.start_partial(&mol, &selected)));
+        assert_eq!(from_job, coord_bits(&expected));
+    }
+
+    /// An engine that records which of its entry points the editor called, and with what.
+    struct RecordingEngine {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Option<HashSet<u32>>>>>,
+    }
+
+    impl CleanupEngine for RecordingEngine {
+        fn start(&self, _mol: &Molecule) -> CleanupJob {
+            self.calls.lock().unwrap().push(None);
+            CleanupJob::from_run(FakeRun { positions: vec![], done: true, cancelled: Default::default(), joined: Default::default() })
+        }
+        fn start_partial(&self, _mol: &Molecule, movable: &HashSet<u32>) -> CleanupJob {
+            self.calls.lock().unwrap().push(Some(movable.clone()));
+            CleanupJob::from_run(FakeRun { positions: vec![], done: true, cancelled: Default::default(), joined: Default::default() })
+        }
+    }
+
+    /// The editor hands the engine the selected atoms (only those still on the page) and asks
+    /// for a whole-page run when nothing, or everything, is selected.
+    #[test]
+    fn editor_passes_the_selection_to_the_engine() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut editor = crate::widget::ChemStructEditor::default();
+        let chain = zigzag_chain(&mut editor.molecule, 4, [0.0, 0.0]);
+        editor.set_cleanup_engine(RecordingEngine { calls: calls.clone() });
+
+        for selection in [vec![], vec![chain[1], chain[2], 999], chain.clone()] {
+            editor.selected_atoms = selection.into_iter().collect();
+            editor.toggle_cleanup();
+            assert!(!editor.poll_cleanup());
+        }
+        let partial: HashSet<u32> = [chain[1], chain[2]].into_iter().collect();
+        assert_eq!(*calls.lock().unwrap(), vec![None, Some(partial), None]);
+    }
+
+    /// On a page holding a reaction, a selection cleanup moves only the selected atoms of one
+    /// structure: the arrow and the other structure stay exactly where they are.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_on_a_reaction_page_moves_only_the_selection() {
+        let mut mol = Molecule::default();
+        let reactant = zigzag_chain(&mut mol, 4, [0.0, 0.0]);
+        mol.add_arrow([6.0, 0.5], [10.0, 0.5], crate::molecule::ArrowKind::Reaction);
+        zigzag_chain(&mut mol, 4, [12.0, 0.0]);
+        mol.atom_by_id_mut(reactant[3]).unwrap().pos = [2.0, 3.0];
+        let selected: HashSet<u32> = [reactant[3]].into_iter().collect();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.selected_atoms = selected.clone();
+
+        run_editor_cleanup(&mut editor);
+
+        let m = &editor.molecule;
+        assert_eq!(unselected_bits(m, &selected), unselected_bits(&mol, &selected));
+        assert_eq!(m.objects, mol.objects);
+        let d = bond_length(m, reactant[2], reactant[3]);
+        assert!((d - L).abs() < 0.05, "boundary bond is {d}");
     }
 
     /// `CleanupSchedule` advanced in small chunks (as a worker or a per-frame poll would) lands

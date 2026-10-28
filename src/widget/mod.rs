@@ -749,6 +749,12 @@ impl ChemStructEditor {
     /// of the molecule in the background (a worker thread natively, one chunk per poll on
     /// wasm32) so the UI never freezes.
     ///
+    /// With part of the drawing selected only the selected atoms are cleaned up, laid out
+    /// against the unselected ones, which do not move at all
+    /// ([`CleanupEngine::start_partial`](crate::molecule::cleanup::CleanupEngine::start_partial)).
+    /// A selected bond is selected through its two atoms.  With nothing selected, or every
+    /// atom, the whole drawing is cleaned up.
+    ///
     /// Stopping this way only asks the run to stop: the next [`poll_cleanup`](Self::poll_cleanup)
     /// still copies in the positions the run ended on, so the layout reached so far is kept.
     /// To drop a run without letting it write anything more, use
@@ -761,7 +767,18 @@ impl ChemStructEditor {
                     return;
                 }
                 self.push_undo();
-                self.cleanup_job = Some(self.cleanup_engine.start(&self.molecule));
+                let movable: HashSet<u32> = self
+                    .selected_atoms
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.molecule.atom_by_id(id).is_some())
+                    .collect();
+                let whole = movable.is_empty() || movable.len() == self.molecule.atoms.len();
+                self.cleanup_job = Some(if whole {
+                    self.cleanup_engine.start(&self.molecule)
+                } else {
+                    self.cleanup_engine.start_partial(&self.molecule, &movable)
+                });
             }
         }
     }
