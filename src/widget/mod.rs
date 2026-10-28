@@ -597,7 +597,9 @@ impl ChemStructEditor {
 
     /// Set the drop shadow of the structures the selection touches (through a selected atom or
     /// bond), or of every structure when nothing is selected; `None` removes theirs. One undo
-    /// step. Other structures keep theirs. Returns false when nothing changes.
+    /// step. Other structures keep theirs. Returns false when nothing changes. Atoms drawn
+    /// afterwards carry no shadow of their own. While they are bonded to the structure they cast
+    /// its shadow, but a branch of them cut off later casts none.
     pub fn set_shadow(&mut self, shadow: Option<crate::molecule::Shadow>) -> bool {
         // Each atom of each structure carries the shadow, so it stays the structure's however the
         // structure is edited afterwards (see `Atom::shadow`).

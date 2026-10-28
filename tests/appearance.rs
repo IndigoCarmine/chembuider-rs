@@ -1,8 +1,12 @@
 //! Appearance settings (OPE-16): ring fills, line and text colours, and the drop shadow — in
-//! the saved file, through the editor's API with undo/redo, and through ChemDraw's CDXML.
+//! the saved file, through the editor's API with undo/redo, and through ChemDraw's CDX and
+//! CDXML.
 
-use chembuider_rs::molecule::cdx::{molecule_to_cdxml, read_cdxml};
-use chembuider_rs::molecule::{PageObject, PageText};
+use chembuider_rs::molecule::cdx::{
+    cdxml_document, merge_into_cdx, molecule_to_cdx_document, molecule_to_cdxml, read_cdx, read_cdxml, CdxImport,
+};
+use chembuider_rs::molecule::cdx_codec;
+use chembuider_rs::molecule::{PageObject, PageText, RingFill};
 use chembuider_rs::{BondOrder, ChemStructEditor, Molecule, Shadow};
 
 const RED: [u8; 4] = [220, 20, 30, 255];
@@ -521,6 +525,24 @@ fn writing_into_a_coloured_foreground_keeps_uncoloured_things_black() {
     assert_eq!(bonds, [None]);
 }
 
+/// The same when only the page names a colour (red): what the editor writes goes on that page,
+/// so an uncoloured atom or bond is written black there too.
+#[test]
+fn writing_onto_a_coloured_page_keeps_uncoloured_things_black() {
+    use chembuider_rs::molecule::{cdx, cdx_codec};
+    let xml = chemdraw_doc("", CHEMDRAW_TABLE, "", "", "", "").replace(r#"<page id="1">"#, r#"<page id="1" color="4">"#);
+    let original = cdx_codec::write(&cdx::cdxml_document(&xml).unwrap());
+    assert_eq!(colours_of(&cdx::read_cdx(&original).unwrap().molecule).0, [RED_FULL, RED_FULL], "the page's red");
+    let mut m = Molecule::default();
+    let o = m.add_atom("O".into(), [0.0, 0.0], 0);
+    let c = m.add_atom("C".into(), [1.5, 0.0], 0);
+    m.add_bond(o, c, BondOrder::Single);
+    m.atom_by_id_mut(c).unwrap().color = Some(BLUE);
+    let (atoms, bonds, _) = colours_of(&cdx::read_cdx(&cdx::merge_into_cdx(&original, &m)).expect("reads").molecule);
+    assert_eq!(atoms, [None, Some(BLUE)]);
+    assert_eq!(bonds, [None]);
+}
+
 // ─── Clearing ring fills only within the selection ───────────────────────────
 
 /// Two separate triangles, only the second filled.
@@ -621,4 +643,179 @@ fn clipboard_text_without_texts_reads_and_writes_as_before() {
     assert!(e.molecule.objects.is_empty());
     let clip = e.copy_to_string().unwrap();
     assert!(!clip.contains("texts"), "{clip}");
+}
+
+// ─── Ring fills and shadows in CDX and CDXML ─────────────────────────────────
+
+/// `m` saved and read back each way a document goes: a new CDX file, a new CDXML file, and the
+/// CDX file saved again over itself (as the editor saves a file it opened).
+fn saved_and_read(m: &Molecule) -> Vec<(&'static str, Molecule)> {
+    let cdx = molecule_to_cdx_document(m);
+    let again = merge_into_cdx(&cdx, m);
+    let read = |name, import: Option<CdxImport>| {
+        let import = import.unwrap_or_else(|| panic!("{name} reads back"));
+        assert_eq!(import.other_objects, 0, "{name}: a fill is no shape of its own");
+        (name, import.molecule)
+    };
+    vec![
+        read("CDX", read_cdx(&cdx)),
+        read("CDXML", read_cdxml(&molecule_to_cdxml(m))),
+        read("CDX saved again", read_cdx(&again)),
+    ]
+}
+
+/// The atom of `read` each atom of `m` became: the one in the same place of the list (a
+/// structure's atoms are written, and read, in their order).
+fn atom_map(m: &Molecule, read: &Molecule, name: &str) -> std::collections::HashMap<u32, u32> {
+    assert_eq!(read.atoms.len(), m.atoms.len(), "{name}: the same atoms");
+    m.atoms
+        .iter()
+        .zip(&read.atoms)
+        .map(|(a, b)| {
+            assert_eq!(a.element, b.element, "{name}");
+            (a.id, b.id)
+        })
+        .collect()
+}
+
+/// The fills of `read` are `m`'s, on the atoms they became, in the same ring order and colour
+/// (alpha included); the order of the fills aside.
+fn assert_same_fills(m: &Molecule, read: &Molecule, name: &str) {
+    let map = atom_map(m, read, name);
+    let mut want: Vec<RingFill> = m
+        .ring_fills
+        .iter()
+        .map(|rf| RingFill { atoms: rf.atoms.iter().map(|a| map[a]).collect(), color: rf.color })
+        .collect();
+    let mut got = read.ring_fills.clone();
+    want.sort_by_key(|rf| rf.atoms.clone());
+    got.sort_by_key(|rf| rf.atoms.clone());
+    assert_eq!(got, want, "{name}");
+}
+
+/// Every atom of `read` has the shadow its atom of `m` had, and so every structure casts the
+/// shadow it cast.
+fn assert_same_shadows(m: &Molecule, read: &Molecule, name: &str) {
+    let map = atom_map(m, read, name);
+    for a in &m.atoms {
+        assert_eq!(read.atom_by_id(map[&a.id]).unwrap().shadow, a.shadow, "{name}: atom {}", a.id);
+    }
+    let want: Vec<(Vec<u32>, Shadow)> = m
+        .structure_shadows()
+        .into_iter()
+        .map(|(atoms, s)| {
+            let mut atoms: Vec<u32> = atoms.iter().map(|a| map[a]).collect();
+            atoms.sort_unstable();
+            (atoms, s)
+        })
+        .collect();
+    assert_eq!(read.structure_shadows(), want, "{name}");
+}
+
+#[test]
+fn a_ring_fill_survives_cdx_and_cdxml_with_its_alpha() {
+    let mut m = Molecule::default();
+    let ids = ring(&mut m, 6, [0.0, 0.0]);
+    m.set_ring_fill(ids, GREEN);
+    for (name, read) in saved_and_read(&m) {
+        assert_eq!(read.ring_fills.len(), 1, "{name}");
+        assert_same_fills(&m, &read, name);
+    }
+}
+
+/// ChemDraw draws the fill itself: a closed, filled freeform curve in the fill's colour and
+/// alpha, on the page behind the structure.
+#[test]
+fn a_ring_fill_is_a_filled_closed_curve_behind_its_structure_in_chemdraw() {
+    let mut m = Molecule::default();
+    let ids = ring(&mut m, 6, [0.0, 0.0]);
+    m.set_ring_fill(ids, GREEN);
+    let xml = molecule_to_cdxml(&m);
+    let curve = xml.find("<curve ").unwrap_or_else(|| panic!("a curve in {xml}"));
+    assert!(curve < xml.find("<fragment ").unwrap(), "drawn first, behind the bonds: {xml}");
+    let tag = &xml[curve..curve + xml[curve..].find('>').unwrap()];
+    for attr in [r#"CurveType="129""#, r#"FillType="Solid""#, r#"alpha="32896""#] {
+        assert!(tag.contains(attr), "{attr} in {tag}");
+    }
+    // Six vertices, each with its two Bézier control points on it: straight edges.
+    let points = tag.split(r#"CurvePoints=""#).nth(1).unwrap().split('"').next().unwrap();
+    assert_eq!(points.split_whitespace().count(), 6 * 3 * 2, "{points}");
+}
+
+#[test]
+fn several_ring_fills_survive_cdx_and_cdxml() {
+    let (mut e, a, b) = naphthalene();
+    e.molecule.set_ring_fill(a, RED);
+    e.molecule.set_ring_fill(b, [0, 0, 0, 60]);
+    let c = ring(&mut e.molecule, 5, [10.0, 0.0]);
+    e.molecule.set_ring_fill(c, GREEN);
+    let m = e.molecule;
+    for (name, read) in saved_and_read(&m) {
+        assert_eq!(read.ring_fills.len(), 3, "{name}");
+        assert_same_fills(&m, &read, name);
+    }
+}
+
+#[test]
+fn a_shadow_on_one_of_two_structures_survives_cdx_and_cdxml() {
+    let (mut e, [_, _, o], [c, _]) = two_structures();
+    let shadow = Shadow { color: [10, 20, 30, 100], offset: [0.2, -0.1], blur: 0.3 };
+    e.selected_atoms = [o].into_iter().collect();
+    assert!(e.set_shadow(Some(shadow)));
+    let m = e.molecule;
+    assert_eq!(m.shadow_of(c), None);
+    for (name, read) in saved_and_read(&m) {
+        assert_same_shadows(&m, &read, name);
+        let amine = read.atoms.iter().find(|a| a.element == "N").unwrap().id;
+        assert_eq!(read.shadow_of(amine), None, "{name}: the other structure casts none");
+        let oxygen = read.atoms.iter().find(|a| a.element == "O").unwrap().id;
+        assert_eq!(read.shadow_of(oxygen), Some(shadow), "{name}");
+    }
+}
+
+/// A fill or shadow removed again leaves nothing behind: the file is the one the plain drawing
+/// writes (the writer's golden file pins that one), with no curve and no object tag in it.
+#[test]
+fn a_drawing_without_fills_and_shadows_writes_the_same_cdx_and_cdxml_as_before() {
+    let (plain, ..) = two_structures();
+    let mut p = plain.molecule;
+    ring(&mut p, 6, [0.0, 10.0]);
+    let (mut e, [c1, ..], _) = two_structures();
+    let a = ring(&mut e.molecule, 6, [0.0, 10.0]);
+    e.molecule.set_ring_fill(a.clone(), RED);
+    assert!(e.set_shadow(Some(Shadow::default())));
+    assert!(e.molecule.clear_ring_fill_containing(a[0]));
+    assert!(e.set_shadow(None));
+    assert!(e.molecule.shadow_of(c1).is_none());
+    assert_eq!(molecule_to_cdx_document(&e.molecule), molecule_to_cdx_document(&p));
+    let xml = molecule_to_cdxml(&e.molecule);
+    assert_eq!(xml, molecule_to_cdxml(&p));
+    assert!(!xml.contains("<curve") && !xml.contains("<objecttag"), "{xml}");
+}
+
+/// A curve drawn in ChemDraw is a shape the editor keeps, not a fill: saved over, it stays as
+/// it was, and the editor's fill is written beside it once.
+#[test]
+fn chemdraws_own_curves_stay_shapes_and_fills_are_not_written_twice() {
+    let mut m = Molecule::default();
+    let ids = ring(&mut m, 6, [0.0, 0.0]);
+    m.set_ring_fill(ids, RED);
+    let xml = molecule_to_cdxml(&m).replace(
+        "<fragment ",
+        r#"<curve id="900" CurveType="129" FillType="Solid" CurvePoints="10 10 10 10 10 10 30 10 30 10 30 10 20 30 20 30 20 30"/><fragment "#,
+    );
+    let original = cdx_codec::write(&cdxml_document(&xml).unwrap());
+    let import = read_cdx(&original).unwrap();
+    assert_eq!(import.other_objects, 1, "ChemDraw's curve");
+    assert_eq!(import.molecule.ring_fills.len(), 1);
+    let mut again = original;
+    for _ in 0..2 {
+        again = merge_into_cdx(&again, &import.molecule);
+    }
+    let read = read_cdx(&again).unwrap();
+    assert_eq!(read.other_objects, 1);
+    assert_same_fills(&import.molecule, &read.molecule, "saved twice");
+    let doc = cdx_codec::parse(&again).unwrap();
+    let curves = doc.children[0].children.iter().filter(|c| c.tag == 0x8008).count();
+    assert_eq!(curves, 2, "ChemDraw's and the fill");
 }

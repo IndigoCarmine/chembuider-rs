@@ -10,12 +10,14 @@
 //! - hydrogens folded into a label ("NH2") are not nodes of their own, only the count;
 //! - a label that is no element ("Ph", "CO_2Et") is a node of no element with its text;
 //! - wedges, hashes, bold, dashed and wavy bonds are the bond's display.
+//! - a ring fill is a filled curve behind its fragment, a drop shadow an object tag of the
+//!   fragment ([`cdx_appearance`](super::cdx_appearance)).
 //!
 //! Positions are in 1/65536 pt, y down, as on screen: [`SCALE`] maps the editor's 1.5-unit bond
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
-use super::{cdx_bracket, cdx_colors, cdx_fonts, cdx_page, cdx_table};
+use super::{cdx_appearance, cdx_bracket, cdx_colors, cdx_fonts, cdx_page, cdx_table};
 use super::cdx_colors::ColorTable;
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule, PageObject};
@@ -437,11 +439,18 @@ pub(crate) fn fragments_mapped(
             structures[structure_of[&bond.begin]].1.push(bond);
         }
     }
+    // The drop shadow each structure casts, by its atoms (none at all, as a rule).
+    let shadows: HashMap<u32, super::Shadow> = if mol.atoms.iter().any(|a| a.shadow.is_some()) {
+        mol.structure_shadows().into_iter().flat_map(|(atoms, s)| atoms.into_iter().map(move |a| (a, s))).collect()
+    } else {
+        HashMap::new()
+    };
     let mut out = Vec::new();
     let mut fragment_ids = Vec::with_capacity(structures.len());
     for (members, bonds) in structures {
         let mut frag = CdxObject::new(OBJ_FRAGMENT, id());
         fragment_ids.push(frag.id);
+        let shadow = members.first().and_then(|a| shadows.get(&a.id));
         let mut bbox = None;
         let mut nodes: HashMap<u32, u32> = HashMap::new();
         for atom in members {
@@ -515,6 +524,9 @@ pub(crate) fn fragments_mapped(
             }
             cdx_colors::set_foreground(&mut b, bond.color, colors);
             frag.children.push(b);
+        }
+        if let Some(shadow) = shadow {
+            frag.children.push(cdx_appearance::shadow_tag(id(), shadow));
         }
         if let Some(bbox) = bbox {
             frag.props.insert(0, (PROP_BOUNDING_BOX, rect(bbox)));
@@ -592,10 +604,12 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
     let mut fonts = cdx_fonts::FontTable::of(&doc);
     let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts, &mut colors);
     fonts.store(&mut doc);
-    colors.store(&mut doc);
     page.children.extend(objects);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut page.children);
     page.children.extend(brackets);
+    // Last, so the ids and colours of everything else are what they are without fills.
+    cdx_appearance::insert_ring_fills(mol, shift, &mut next, &ids, &mut colors, &mut page.children);
+    colors.store(&mut doc);
     if let Some(bbox) = page.children.iter().filter_map(page_extent).reduce(|a, b| union(Some(a), b)) {
         doc.props.insert(1, (PROP_BOUNDING_BOX, rect(bbox)));
     }
@@ -608,10 +622,12 @@ pub fn molecule_to_cdx_bytes(mol: &Molecule) -> Option<Vec<u8>> {
     (!mol.is_blank()).then(|| molecule_to_cdx_document(mol))
 }
 
-/// Drop every fragment inside `obj` (and groups left empty), counting what else stays.
+/// Drop every fragment inside `obj`, the curves of the ring fills written with them, and the
+/// groups left empty.
 fn strip_structures(obj: &mut CdxObject) {
     obj.children.retain_mut(|c| match c.tag {
         OBJ_FRAGMENT => false,
+        cdx_appearance::OBJ_CURVE if cdx_appearance::is_ring_fill(c) => false,
         OBJ_GROUP => {
             strip_structures(c);
             !c.children.is_empty()
@@ -635,7 +651,7 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     let mut next = cdx_table::document_max_id(&doc);
     let mut owned = cdx_page::Owned::new();
     let mut fonts = cdx_fonts::FontTable::of(&doc);
-    let mut colors = ColorTable::of(&doc);
+    let colors = ColorTable::of(&doc);
     for page in doc.children.iter_mut().filter(|c| c.tag == OBJ_PAGE) {
         cdx_page::take_owned(page, &mut owned, &fonts, &colors);
         strip_structures(page);
@@ -644,6 +660,8 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
         next += 1;
         doc.children.push(CdxObject::new(OBJ_PAGE, next));
     }
+    // What is written goes on the first page: what names no colour there is in the page's.
+    let mut colors = colors.inside(doc.children.iter().find(|c| c.tag == OBJ_PAGE).expect("a page"));
     // A drawing still on the page stays where it is, beside the objects kept from the file
     // (ChemDraw's own drawings often come within the margin a new document keeps); only one
     // dragged off the page's top or left edge is moved back onto it.
@@ -652,9 +670,11 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     let mut new = fragments_mapped(mol, shift, &mut next, &mut ids, &mut colors);
     new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts, &mut colors));
     fonts.store(&mut doc);
-    colors.store(&mut doc);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut new);
     new.extend(brackets);
+    // Last, so the ids and colours of everything else are what they are without fills.
+    cdx_appearance::insert_ring_fills(mol, shift, &mut next, &ids, &mut colors, &mut new);
+    colors.store(&mut doc);
     let page = doc.children.iter_mut().find(|c| c.tag == OBJ_PAGE).expect("a page");
     page.children.extend(new);
     let bbox = doc
@@ -697,6 +717,7 @@ fn read_fragment_mapped(
     // can repeat, and looking them up here keeps reading linear in the fragment's size.
     let mut bonds: HashSet<(u32, u32)> = HashSet::new();
     let mut bonded: HashSet<u32> = HashSet::new();
+    let first = mol.atoms.len();
     for node in frag.children.iter().filter(|c| c.tag == OBJ_NODE) {
         let node_type = node.prop_i16(PROP_NODE_TYPE).unwrap_or(NODE_ELEMENT);
         if node_type == NODE_EXTERNAL_CONNECTION_POINT {
@@ -807,6 +828,12 @@ fn read_fragment_mapped(
             // A group's hydrogen (`group_h`), new and so not bonded yet.
             let h = mol.add_fragment_atom("H".to_string(), [at[0] + angle.cos(), at[1] + angle.sin()], 0);
             mol.push_bond(atom, h, BondOrder::Single, BondStereo::None);
+        }
+    }
+    // The fragment's drop shadow: every atom of it casts it, as `set_shadow` has a structure.
+    if let Some(shadow) = cdx_appearance::read_shadow(frag) {
+        for a in &mut mol.atoms[first..] {
+            a.shadow = Some(shadow);
         }
     }
 }
@@ -922,9 +949,14 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     let mut atoms_of = HashMap::new();
     // The object each ChemDraw id became (an arrow's `arrow` and its graphic both name it).
     let mut object_of: HashMap<u32, u32> = HashMap::new();
+    // The ring fills' curves, put onto their atoms once every structure is read.
+    let mut fills = Vec::new();
     for page in pages() {
         let converted = cdx_page::convert_page(page, &fonts, &colors);
-        let taken: HashSet<u32> = converted.iter().flat_map(|c| c.ids.iter().copied()).collect();
+        let mut taken: HashSet<u32> = converted.iter().flat_map(|c| c.ids.iter().copied()).collect();
+        let before = fills.len();
+        cdx_appearance::read_ring_fills(page, &colors, &mut fills);
+        taken.extend(fills[before..].iter().map(|(id, _)| *id));
         read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom, &mut atoms_of, &colors);
         for mut c in converted {
             // A bracket's ids are its nodes': it encloses the atoms they became, when there are any.
@@ -939,6 +971,7 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
             object_of.extend(c.ids.iter().map(|&cdx_id| (cdx_id, id)));
         }
     }
+    cdx_appearance::link_ring_fills(&mut molecule, fills.into_iter().map(|(_, f)| f).collect());
     let steps: Vec<&CdxObject> = pages().flat_map(cdx_page::reaction_steps).collect();
     for object in &mut molecule.objects {
         if let PageObject::Table(table) = object {
@@ -1484,10 +1517,29 @@ mod tests {
     /// The writer writes [`writer_fixture`] byte for byte as they did when the golden files were
     /// saved (before the writers looked atoms up from an index), so a change to how they find
     /// their way around the molecule changes nothing they write.
+    ///
+    /// The golden file was saved when ring fills were not written, so it is the fixture without
+    /// its fill. With the fill, the file is that one plus the fill's curve and colour.
     #[test]
     fn writers_keep_their_output() {
-        let m = writer_fixture();
-        assert_eq!(cdx_without_version(&m), include_bytes!("../../tests/fixtures/writer_golden.cdx"));
+        let golden = include_bytes!("../../tests/fixtures/writer_golden.cdx");
+        let mut m = writer_fixture();
+        let filled = cdx_without_version(&m);
+        m.ring_fills.clear();
+        assert_eq!(cdx_without_version(&m), golden);
+
+        let mut doc = cdx_codec::parse(&filled).unwrap();
+        let page = &mut doc.children[0];
+        let curves: Vec<CdxObject> = page.children.iter().filter(|c| cdx_appearance::is_ring_fill(c)).cloned().collect();
+        assert_eq!(curves.len(), 1);
+        page.children.retain(|c| !cdx_appearance::is_ring_fill(c));
+        // The fill's colour is the one the golden table gets next.
+        let golden_doc = cdx_codec::parse(golden).unwrap();
+        let next_new = ColorTable::of(&golden_doc).index_of(Some([255, 200, 0, 255]));
+        assert_eq!(cdx_colors::own_index(&curves[0]), Some(next_new));
+        assert_eq!(ColorTable::of(&doc).rgba(next_new), Some([255, 200, 0, 255]));
+        doc.set(cdx_colors::PROP_COLOR_TABLE, golden_doc.prop(cdx_colors::PROP_COLOR_TABLE).unwrap().to_vec());
+        assert_eq!(cdx_codec::write(&doc), golden, "nothing else changes");
     }
 
     /// A zigzag chain of `n` atoms, every tenth an NH whose hydrogen is folded into its label.

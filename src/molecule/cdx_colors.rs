@@ -15,8 +15,9 @@
 //! (a style run) or as nothing (an object; 0 when the document's foreground is not black, so
 //! ChemDraw does not paint it in that colour). Writing adds to the table the colours it does
 //! not list yet, and only then rewrites it, so a document whose objects have no colour keeps its
-//! table byte for byte (as [`FontTable`](super::cdx_fonts::FontTable) does for fonts). ChemDraw's
-//! colours have no alpha: a translucent colour is written opaque, and read back opaque.
+//! table byte for byte (as [`FontTable`](super::cdx_fonts::FontTable) does for fonts). The table's
+//! colours have no alpha: a translucent atom, bond or text colour is written opaque, and read
+//! back opaque. Only a ring fill keeps its alpha, in the curve's ForegroundAlpha ([`set_alpha`]).
 
 use super::cdx_codec::CdxObject;
 
@@ -24,6 +25,8 @@ use super::cdx_codec::CdxObject;
 pub(crate) const PROP_COLOR_TABLE: u16 = 0x0300;
 /// kCDXProp_ForegroundColor: the colour index of an object.
 pub(crate) const PROP_FOREGROUND_COLOR: u16 = 0x0301;
+/// kCDXProp_ForegroundAlpha: an object's opacity, 16 bits (0xFFFF opaque).
+pub(crate) const PROP_FOREGROUND_ALPHA: u16 = 0x0306;
 /// The index of the first colour of the table.
 const FIRST_ENTRY: u16 = 2;
 /// The index of the document's foreground: what an object naming no colour anywhere is in.
@@ -162,6 +165,21 @@ pub(crate) fn foreground(obj: &CdxObject, table: &ColorTable) -> Option<[u8; 4]>
 pub(crate) fn set_foreground(obj: &mut CdxObject, color: Option<[u8; 4]>, table: &mut ColorTable) {
     if color.is_some() || table.rgba(table.inherited).is_some() {
         obj.set(PROP_FOREGROUND_COLOR, table.index_of(color).to_le_bytes().to_vec());
+    }
+}
+
+/// Give `obj` the ForegroundAlpha of the 8-bit `alpha`; nothing when it is opaque, the default.
+pub(crate) fn set_alpha(obj: &mut CdxObject, alpha: u8) {
+    if alpha != u8::MAX {
+        obj.set(PROP_FOREGROUND_ALPHA, wide(alpha).to_le_bytes().to_vec());
+    }
+}
+
+/// The 8-bit alpha of `obj`'s ForegroundAlpha: opaque when it has none.
+pub(crate) fn alpha(obj: &CdxObject) -> u8 {
+    match obj.prop(PROP_FOREGROUND_ALPHA) {
+        Some(&[lo, hi, ..]) => narrow(u16::from_le_bytes([lo, hi])),
+        _ => u8::MAX,
     }
 }
 

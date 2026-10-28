@@ -16,6 +16,7 @@ pub mod depict;
 pub mod page;
 pub mod bracket;
 pub(crate) mod cdx_bracket;
+pub(crate) mod cdx_appearance;
 pub(crate) mod lookup;
 #[cfg(test)]
 mod chemdraw_look_tests;
@@ -229,6 +230,11 @@ pub struct Atom {
     /// The drop shadow of the structure this atom is in ([`Molecule::shadow_of`]): a structure
     /// casts the shadow of its lowest-id atom that has one, so an atom added to a shadowed
     /// structure (or two structures joined) needs none of its own. `None` everywhere casts none.
+    /// Setting a shadow ([`set_shadow`](crate::ChemStructEditor::set_shadow)) gives it to every
+    /// atom the structure has at that time. An atom drawn afterwards carries none, so a branch
+    /// drawn after the shadow was set, then cut off from its structure, casts no shadow.
+    /// Saved as CDX or CDXML, the shadow is an object tag on the structure's fragment
+    /// (`cdx_appearance`), and every atom of it reads back with the shadow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Shadow>,
 }
@@ -274,6 +280,7 @@ impl Default for Shadow {
 }
 
 /// A colored fill painted inside a ring, *behind* the bond lines (ChemDraw's ring shading).
+/// In CDX and CDXML it is a closed, filled curve that ChemDraw draws too (`cdx_appearance`).
 ///
 /// The ring is stored as the ordered list of the atom **ids** on its cycle (the polygon is
 /// their positions connected in order) plus a straight (un-premultiplied) RGBA color. Storing
