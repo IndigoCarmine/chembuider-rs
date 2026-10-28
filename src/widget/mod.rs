@@ -1470,16 +1470,21 @@ impl ChemStructEditor {
                 output.response
             });
         let response = area.inner;
-        response.request_focus();
+        // While a popup is open (a host's font list, with its search box) it has the keyboard,
+        // and its Enter and Escape are its own.
+        let popup = egui::Popup::is_any_open(ui.ctx());
+        if !popup {
+            response.request_focus();
+        }
         if symbol && self.text_edit.as_ref().is_some_and(|e| e.text != before) {
             self.symbol_typed(&before);
         }
         let (enter, escape) = ui.input(|i| {
             (i.key_pressed(egui::Key::Enter) && !i.modifiers.shift, i.key_pressed(egui::Key::Escape))
         });
+        let (enter, escape) = (enter && !popup, escape && !popup);
         // A press on the host's format bar, or in a popup (its font list), is part of editing.
         let keep = std::mem::take(&mut self.text_ui_rects);
-        let popup = egui::Popup::is_any_open(ui.ctx());
         let clicked_elsewhere = ui.input(|i| i.pointer.any_pressed())
             && !popup
             && ui.input(|i| i.pointer.interact_pos())
