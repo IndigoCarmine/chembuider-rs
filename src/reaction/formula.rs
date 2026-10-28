@@ -140,9 +140,9 @@ impl MolecularFormula {
     ///
     /// An atom labelled with a written formula rather than an element (`NaH`, `CN`, `CH_3`)
     /// counts as the atoms its label spells — see [`label_formula`]. Any other label (`OMe`,
-    /// `Ts`) stays a symbol with no weight.
+    /// `Ts`) stays a symbol with no weight, as does a whole formula whose counts overflow.
     pub fn of(mol: &Molecule) -> Self {
-        Self::from_counts(counts_of(mol, |_| true))
+        counts_of(mol, |_| true)
     }
 
     /// A formula from per-element counts, put into Hill order. Zero counts are dropped.
@@ -240,39 +240,57 @@ impl MolecularFormula {
     }
 }
 
+/// The symbol a formula holds in place of its counts when they do not fit in a `usize`
+/// (labels such as `C18446744073709551615C`): no element, so the formula has no weight.
+const UNCOUNTABLE: &str = "?";
+
+/// Add `n` atoms of `el` to `counts`; `None` when the total overflows.
+fn add(counts: &mut BTreeMap<String, usize>, el: String, n: usize) -> Option<()> {
+    let total = counts.entry(el).or_default();
+    *total = total.checked_add(n)?;
+    Some(())
+}
+
 /// How many times atom `id` counts: once, times the repeat count of every bracket around it
-/// that has one (a multiple group, a repeat unit labelled with a number).
-fn multiplicity(mol: &Molecule, id: u32) -> usize {
+/// that has one (a multiple group, a repeat unit labelled with a number). `None` on overflow.
+fn multiplicity(mol: &Molecule, id: u32) -> Option<usize> {
     mol.brackets()
         .filter(|b| b.atoms.contains(&id))
         .filter_map(|b| b.repeat_count())
-        .fold(1usize, |n, k| n.saturating_mul(k))
+        .try_fold(1usize, |n, k| n.checked_mul(k))
 }
 
 /// Element counts of the atoms of `mol` that `keep` accepts (each with its hydrogens), the
-/// brackets taken into account as [`MolecularFormula::of`] says.
-fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> BTreeMap<String, usize> {
-    let has_brackets = mol.brackets().next().is_some();
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for atom in &mol.atoms {
-        // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
-        if is_folded_h(mol, atom.id) || !keep(atom.id) {
-            continue;
-        }
-        let times = if has_brackets { multiplicity(mol, atom.id) } else { 1 };
-        if let Some(label) = label_formula(&atom.element) {
-            for (el, n) in label.counts {
-                *counts.entry(el).or_default() += n * times;
+/// brackets taken into account as [`MolecularFormula::of`] says, already as a formula. When
+/// a count overflows, the formula is just [`UNCOUNTABLE`] — unknown, with no weight.
+fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> MolecularFormula {
+    let counts = (|| {
+        let has_brackets = mol.brackets().next().is_some();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for atom in &mol.atoms {
+            // Folded H is part of its neighbour's label; `displayed_h_count` already has it.
+            if is_folded_h(mol, atom.id) || !keep(atom.id) {
+                continue;
             }
-            continue;
+            let times = if has_brackets { multiplicity(mol, atom.id)? } else { 1 };
+            if let Some(label) = label_formula(&atom.element) {
+                for (el, n) in label.counts {
+                    add(&mut counts, el, n.checked_mul(times)?)?;
+                }
+                continue;
+            }
+            add(&mut counts, atom.element.clone(), times)?;
+            let h = displayed_h_count(mol, atom.id) as usize;
+            if h > 0 {
+                add(&mut counts, "H".to_string(), h.checked_mul(times)?)?;
+            }
         }
-        *counts.entry(atom.element.clone()).or_default() += times;
-        let h = displayed_h_count(mol, atom.id) as usize;
-        if h > 0 {
-            *counts.entry("H".to_string()).or_default() += h * times;
-        }
+        Some(counts)
+    })();
+    match counts {
+        Some(counts) => MolecularFormula::from_counts(counts),
+        None => MolecularFormula { counts: vec![(UNCOUNTABLE.to_string(), 1)] },
     }
-    counts
 }
 
 /// The formula of a drawing with polymer brackets labelled `n` (no number) as it is written:
@@ -297,12 +315,12 @@ impl PolymerFormula {
             return None;
         }
         let inside: HashSet<u32> = units.iter().flat_map(|b| b.atoms.iter().copied()).collect();
-        let rest = MolecularFormula::from_counts(counts_of(mol, |id| !inside.contains(&id)));
+        let rest = counts_of(mol, |id| !inside.contains(&id));
         let units = units
             .iter()
             .map(|b| {
                 let mine: HashSet<u32> = b.atoms.iter().copied().collect();
-                (MolecularFormula::from_counts(counts_of(mol, |id| mine.contains(&id))), b.label.trim().to_string())
+                (counts_of(mol, |id| mine.contains(&id)), b.label.trim().to_string())
             })
             .filter(|(f, _)| !f.is_empty())
             .collect();
@@ -415,7 +433,7 @@ fn parse_group(chars: &[char], pos: &mut usize, depth: usize) -> Option<BTreeMap
             return None;
         }
         for (el, k) in group {
-            *counts.entry(el).or_default() += k * n;
+            add(&mut counts, el, k.checked_mul(n)?)?;
         }
     }
     (depth == 0).then_some(counts)
@@ -717,6 +735,46 @@ mod tests {
         assert_eq!(lone("NaOMe").weight(), None);
         assert_eq!(lone("NaOMe").unknown_elements(), vec!["NaOMe"]);
         assert_eq!(lone("NBS").weight(), None, "an abbreviation, as for arrow text");
+    }
+
+    /// Counts too large for `usize` make a formula unknown — no panic, no wrapped count, no
+    /// weight — whether they overflow inside one written formula (a repeated element, a
+    /// parenthesised group's count, nested groups) or only once atoms are added together.
+    #[test]
+    fn overflowing_counts_are_unknown() {
+        let lone = |label: &str| {
+            let mut m = Molecule::default();
+            m.add_atom(label.into(), [0.0, 0.0], 0);
+            MolecularFormula::of(&m)
+        };
+        let max = usize::MAX;
+        let half = usize::MAX / 2 + 1;
+        let quarter = usize::MAX / 4 + 1;
+        for text in [
+            format!("C{max}C"),          // the same element twice
+            format!("(C{max})2"),        // a group's count
+            format!("((C{quarter})2)2"), // the outer of nested groups
+            format!("(C{half}H)2"),      // one element of a group
+        ] {
+            assert_eq!(MolecularFormula::parse(&text), None, "{text}");
+            let f = lone(&text);
+            assert_eq!(f.weight(), None, "{text}");
+            assert_eq!(f.unknown_elements(), vec![text.as_str()], "the label stays unknown");
+        }
+
+        // Each label alone is countable; together they are not.
+        let mut m = Molecule::default();
+        let a = m.add_atom(format!("C{half}").into(), [0.0, 0.0], 0);
+        let b = m.add_atom(format!("C{half}").into(), [1.5, 0.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        assert_eq!(MolecularFormula::of(&m).weight(), None);
+        assert!(PolymerFormula::of(&m).is_none());
+        // Nor is a huge label next to a drawn carbon (whose implicit hydrogens count).
+        let mut m = Molecule::default();
+        let a = m.add_atom(format!("C{max}").into(), [0.0, 0.0], 0);
+        let c = m.add_atom("C".into(), [1.5, 0.0], 0);
+        m.add_bond(a, c, BondOrder::Single);
+        assert_eq!(molecular_weight(&m), None);
     }
 
     /// Every element up to uranium that has an IUPAC standard atomic weight has one in the
