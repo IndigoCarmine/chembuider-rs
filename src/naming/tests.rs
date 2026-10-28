@@ -460,9 +460,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("C1=CC=C2C=CC=CC2=C1", "more than one ring"),
     ("C1=COCC1", "heterocycle"),
     ("O=C1NC=CC=C1", "heterocycle"),
-    ("CS", "element S"),
-    ("CC(=O)Cl", "acyl halide"),
-    ("CC(=O)OC(C)=O", "anhydride"),
+    ("CSC", "sulfide"),
     ("CC=NC", "imine"),
     ("CN=NC", "nitrogen group"),
     ("C[NH3+]", "charged"),
@@ -470,7 +468,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("COC(=O)OC", "carbonate"),
     ("NC(N)=O", "urea"),
     ("CC(=O)OCC(=O)O", "ester together with a carboxylic acid"),
-    ("OC(=O)CC(O)(CC(=O)O)C(=O)O", "more than two"),
     ("CCOOCC", "O–O"),
     ("CC(=O)OCCOC(C)=O", "more than one ester"),
     ("CC(=O)NCC(=O)O", "acylamino"),
@@ -482,7 +479,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
         "ester together with a carboxylic acid",
     ),
     ("CCOC(=O)CC(=O)OCC", "more than one ester"),
-    ("CC1=CC=C(C=C1)S", "element S"),
 ];
 
 #[test]
@@ -963,8 +959,8 @@ fn unsupported_heterocycles_say_why() {
         // A nitrile carbon on a ring nitrogen (a cyanamide).
         ("N#CN1CCCCC1", "cyanamide"),
         ("CN(C)C#N", "cyanamide"),
-        // Sulfur outside a ring.
-        ("CSC1=CC=CC=N1", "element S"),
+        // Sulfur outside a ring other than a thiol.
+        ("CSC1=CC=CC=N1", "sulfide"),
         // Assemblies of saturated heterocycles or of rings with indicated hydrogen.
         (
             "C1CCNC(C1)C1CCCCN1",
@@ -986,4 +982,462 @@ fn unsupported_heterocycles_say_why() {
             other => panic!("{smiles}: expected unsupported ({reason}), got {other:?}"),
         }
     }
+}
+
+/// Name every structure of `cases` and report all mismatches at once.
+fn check_names(cases: &[(&str, &str)]) {
+    let mut failures = Vec::new();
+    for (smiles, expected) in cases {
+        match name_of(smiles) {
+            NameResult::Ok(name) if name == *expected => {}
+            other => failures.push(format!("{smiles}: expected {expected:?}, got {other:?}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} names wrong:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+}
+
+/// Check that every structure of `cases` is refused with a reason containing the given text.
+fn check_refused(cases: &[(&str, &str)]) {
+    for (smiles, reason) in cases {
+        match name_of(smiles) {
+            NameResult::Unsupported(r) => assert!(
+                r.contains(reason),
+                "{smiles}: reason {r:?} lacks {reason:?}"
+            ),
+            other => panic!("{smiles}: expected unsupported ({reason}), got {other:?}"),
+        }
+    }
+}
+
+/// Every example of acyclic compounds and their characteristic groups in Wikipedia (ja)
+/// "IUPAC命名法" (oldid 111380645), structure → preferred IUPAC name. Where Wikipedia gives a
+/// name that is not the 2013 preferred name, the PIN is expected and Wikipedia's name noted;
+/// functional class names and retained names it lists beside the PIN (butyl chloride, methyl
+/// alcohol, glycerol, propylene…) are other names, not produced here.
+const WIKIPEDIA_ACYCLIC: &[(&str, &str)] = &[
+    // CH3–CH2–CH2–CH(C2H5)–CH3: the longest chain (not 2-ethylpentane).
+    ("CCCC(CC)C", "3-methylhexane"),
+    ("CCC=CC", "pent-2-ene"),
+    ("CCCCC#CCC", "oct-3-yne"),
+    ("CCC=CC=CC", "hepta-2,4-diene"),
+    ("CCCCCl", "1-chlorobutane"),
+    ("ClCC(Cl)Cl", "1,1,2-trichloroethane"),
+    // Wikipedia: "perbromoethane". "per" is no longer recommended (P-14.3.4.5); all locants
+    // are omitted for a fully substituted parent.
+    ("BrC(Br)(Br)C(Br)(Br)Br", "hexabromoethane"),
+    ("OCC(O)CO", "propane-1,2,3-triol"),
+    ("CC(O)C=O", "2-hydroxypropanal"),
+    ("COCC", "methoxyethane"),
+    // Wikipedia: "methanal"; formaldehyde is the retained PIN (P-66.6.1.1.1).
+    ("C=O", "formaldehyde"),
+    ("CCC(C)=O", "butan-2-one"),
+    ("OC(=O)CCC(O)=O", "butanedioic acid"),
+    // Wikipedia: "benzenecarboxylic acid"; benzoic acid is the retained PIN (P-65.1.1.1).
+    ("OC(=O)C1=CC=CC=C1", "benzoic acid"),
+    (
+        "OC(=O)CC(CC(O)=O)C(O)=O",
+        "propane-1,2,3-tricarboxylic acid",
+    ),
+    // Wikipedia: "2-(carboxymethyl)heptanedioic acid" for HOOC–(CH2)2–CH(CH2COOH)–(CH2)2–COOH;
+    // the branch is on C-4 of that heptanedioic acid from either end. (IUPAC 2013's example
+    // 3-(carboxymethyl)heptanedioic acid is in `polycarboxylic_acids`.)
+    (
+        "OC(=O)CCC(CC(O)=O)CCC(O)=O",
+        "4-(carboxymethyl)heptanedioic acid",
+    ),
+    ("CCC(=O)[O-].[K+]", "potassium propanoate"),
+    ("CCC(=O)OCC", "ethyl propanoate"),
+    // Wikipedia: "ethanoyl chloride"; acetyl is the retained preferred prefix (P-65.5.1).
+    ("CC(Cl)=O", "acetyl chloride"),
+    ("CCC(=O)OC(=O)CC", "propanoic anhydride"),
+    // Wikipedia: "ethanoic propanoic anhydride"; acetic acid is the retained PIN (P-65.7.2).
+    ("CC(=O)OC(=O)CC", "acetic propanoic anhydride"),
+    ("CN", "methanamine"),
+    ("CCC(CC)C#N", "2-ethylbutanenitrile"),
+    ("CC(S)CCC", "pentane-2-thiol"),
+    ("OCC(S)CCC", "2-sulfanylpentan-1-ol"),
+    ("C1CCC1", "cyclobutane"),
+    // Substituent groups, drawn with attachment points.
+    ("*CCCCC", "pentyl"),
+    // Wikipedia: "propylene"; propane-1,3-diyl is the preferred prefix (P-29.3.2.2; not
+    // trimethylene).
+    ("*CCC*", "propane-1,3-diyl"),
+    ("*C(=O)CCCCC", "hexanoyl"),
+    ("*OCCCCC", "pentyloxy"),
+    // Wikipedia: "1-chloro-2-propyl" (to show isopropyl cannot be substituted); the 2013 form
+    // cites the locant of the free valence before "yl".
+    ("*C(C)CCl", "1-chloropropan-2-yl"),
+];
+
+#[test]
+fn wikipedia_acyclic_examples() {
+    check_names(WIKIPEDIA_ACYCLIC);
+}
+
+/// Wikipedia's table of alkanes, each drawn as an unbranched chain, and its example of how
+/// the numerical terms combine (2567). Wikipedia writes the C500 alkane "pentacane": IUPAC
+/// 2013 Table 1.4 gives "pentacta" for 500, so the name is "pentactane".
+#[test]
+fn alkane_names_up_to_9999() {
+    let table = [
+        (1, "methane"),
+        (2, "ethane"),
+        (3, "propane"),
+        (4, "butane"),
+        (5, "pentane"),
+        (6, "hexane"),
+        (7, "heptane"),
+        (8, "octane"),
+        (9, "nonane"),
+        (10, "decane"),
+        (11, "undecane"),
+        (12, "dodecane"),
+        (13, "tridecane"),
+        (14, "tetradecane"),
+        (15, "pentadecane"),
+        (16, "hexadecane"),
+        (17, "heptadecane"),
+        (18, "octadecane"),
+        (19, "nonadecane"),
+        (20, "icosane"),
+        (21, "henicosane"),
+        (22, "docosane"),
+        (23, "tricosane"),
+        (24, "tetracosane"),
+        (25, "pentacosane"),
+        (26, "hexacosane"),
+        (27, "heptacosane"),
+        (28, "octacosane"),
+        (29, "nonacosane"),
+        (30, "triacontane"),
+        (31, "hentriacontane"),
+        (32, "dotriacontane"),
+        (40, "tetracontane"),
+        (50, "pentacontane"),
+        (60, "hexacontane"),
+        (70, "heptacontane"),
+        (80, "octacontane"),
+        (90, "nonacontane"),
+        (100, "hectane"),
+        (101, "henhectane"),
+        (111, "undecahectane"),
+        (200, "dictane"),
+        (300, "trictane"),
+        (400, "tetractane"),
+        (500, "pentactane"),
+        (600, "hexactane"),
+        (700, "heptactane"),
+        (800, "octactane"),
+        (900, "nonactane"),
+        (1000, "kiliane"),
+        (2000, "diliane"),
+        (2567, "heptahexacontapentactadiliane"),
+        (3000, "triliane"),
+        (4000, "tetraliane"),
+        (5000, "pentaliane"),
+        (6000, "hexaliane"),
+        (7000, "heptaliane"),
+        (8000, "octaliane"),
+        (9000, "nonaliane"),
+        (9999, "nonanonacontanonactanonaliane"),
+    ];
+    for (n, expected) in table {
+        assert_eq!(
+            name_of(&"C".repeat(n)),
+            NameResult::Ok(expected.into()),
+            "C{n}"
+        );
+    }
+    assert!(matches!(
+        name_of(&"C".repeat(10000)),
+        NameResult::Unsupported(r) if r.contains("longer than 9999")
+    ));
+}
+
+/// Thiols (P-63.1.5): the suffix "thiol" (the "e" of the parent kept), the prefix "sulfanyl"
+/// when an alcohol or a higher group is principal (OH > SH, P-41 class 17; "mercapto" is no
+/// longer used). IUPAC 2013 examples are marked.
+#[test]
+fn thiols() {
+    check_names(&[
+        ("CS", "methanethiol"),
+        ("CCS", "ethanethiol"),
+        ("CC(C)S", "propane-2-thiol"),    // P-63.1.5
+        ("SCCCCS", "butane-1,4-dithiol"), // P-63.1.5
+        ("SC1=CC=CC=C1", "benzenethiol"), // P-63.1.5 (not thiophenol)
+        ("CC1=CC=C(S)C=C1", "4-methylbenzene-1-thiol"),
+        ("SC1CCCCC1", "cyclohexanethiol"),
+        ("SC1=CC=CC=N1", "pyridine-2-thiol"),
+        ("OC1=CC=CC=C1S", "2-sulfanylphenol"),     // P-63.1.5
+        ("OC(=O)CCS", "3-sulfanylpropanoic acid"), // P-63.1.5
+        ("OCCS", "2-sulfanylethan-1-ol"),
+        ("NCCS", "2-aminoethane-1-thiol"), // thiol > amine (P-41)
+        ("CC(=O)CCS", "4-sulfanylbutan-2-one"),
+    ]);
+    check_refused(&[
+        ("CSC", "sulfide"),
+        ("CSC1=CC=CC=C1", "sulfide"),
+        ("CSSC", "disulfide"),
+        ("CC(C)=S", "C=S"),
+        ("CC(=O)S", "thioacid"),
+        ("CS(C)=O", "valence"),
+    ]);
+}
+
+/// Acyl halides (P-65.5.1): the acyl group, then the halide(s) as separate words in
+/// alphabetical order. They rank after esters and before amides (P-41): an amide or a
+/// nitrile becomes a prefix, an acid or ester makes the halide a prefix, which is refused
+/// ("carbonochloridoyl" or "chloro…oxo", P-65.5.4). IUPAC 2013 examples are marked.
+#[test]
+fn acyl_halides() {
+    check_names(&[
+        ("CC(F)=O", "acetyl fluoride"),
+        ("CC(Cl)=O", "acetyl chloride"), // P-65.5.1
+        ("CC(Br)=O", "acetyl bromide"),
+        ("CC(I)=O", "acetyl iodide"),
+        ("O=CBr", "formyl bromide"), // P-65.5.1
+        ("CCC(Cl)=O", "propanoyl chloride"),
+        ("CCCCCC(F)=O", "hexanoyl fluoride"), // P-65.5.1
+        ("ClC(=O)CC(Cl)=O", "propanedioyl dichloride"), // P-65.5.1
+        ("ClC(=O)C(Cl)=O", "oxalyl dichloride"), // P-65.5.1
+        ("BrC(=O)CCC(Cl)=O", "butanedioyl bromide chloride"), // P-65.5.1
+        (
+            "ClC(=O)C1=CC=C(C=C1)C(Cl)=O",
+            "benzene-1,4-dicarbonyl dichloride", // P-65.5.1
+        ),
+        ("ClC(=O)C1=CC=CC=C1", "benzoyl chloride"),
+        ("ClC(=O)C1CCCCC1", "cyclohexanecarbonyl chloride"),
+        ("ClC(=O)C1=CC=CN=C1", "pyridine-3-carbonyl chloride"),
+        ("ClCC(Cl)=O", "chloroacetyl chloride"),
+        ("CC(C)C(Cl)=O", "2-methylpropanoyl chloride"),
+        ("OCCC(Cl)=O", "3-hydroxypropanoyl chloride"),
+        ("N#CCC(Cl)=O", "cyanoacetyl chloride"),
+        ("NC(=O)C1=CC=C(C=C1)C(Cl)=O", "4-carbamoylbenzoyl chloride"),
+        (
+            "ClC(=O)C1=CC=C(C=C1)[N+]([O-])=O",
+            "4-nitrobenzoyl chloride",
+        ),
+    ]);
+    check_refused(&[
+        ("OC(=O)CCC(Cl)=O", "acid halide group as a prefix"),
+        ("COC(=O)CCC(Cl)=O", "acid halide group as a prefix"),
+        ("ClC(Cl)=O", "carbonate"),
+    ]);
+}
+
+/// Acyclic anhydrides (P-65.7.1, P-65.7.2): symmetric ones replace "acid" by "anhydride",
+/// substituted or not; mixed ones cite both acids in alphanumerical order. IUPAC 2013
+/// examples are marked. Cyclic anhydrides (oxolane-2,5-dione) are refused with the lactones.
+#[test]
+fn anhydrides() {
+    check_names(&[
+        ("CC(=O)OC(C)=O", "acetic anhydride"), // P-65.7.1
+        ("CCC(=O)OC(=O)CC", "propanoic anhydride"),
+        ("CCCCCC(=O)OC(=O)CCCCC", "hexanoic anhydride"), // P-65.7.1
+        ("ClCC(=O)OC(=O)CCl", "chloroacetic anhydride"), // P-65.7.1
+        ("O=C(OC(=O)C1=CC=CC=C1)C1=CC=CC=C1", "benzoic anhydride"),
+        ("CC(=O)OC(=O)CC", "acetic propanoic anhydride"), // P-65.7.2
+        ("CC(=O)OC(=O)CCl", "acetic chloroacetic anhydride"), // P-65.7.2
+        ("CC(=O)OC(=O)C1=CC=CC=C1", "acetic benzoic anhydride"),
+        ("O=COC(C)=O", "acetic formic anhydride"),
+        (
+            "CC(O)C(=O)OC(=O)CC",
+            "2-hydroxypropanoic propanoic anhydride",
+        ),
+    ]);
+    check_refused(&[
+        ("O=C1CCC(=O)O1", "lactone"),
+        ("CC(=O)OC(=O)CC(O)=O", "anhydride group as a substituent"),
+        ("CC(=O)OC(=O)CCC(=O)OC(C)=O", "more than one anhydride"),
+    ]);
+}
+
+/// Salts of carboxylic acids (P-65.6.2): the cations in alphabetical order, then the anion.
+/// The cations are the alkali metals and ammonium, drawn as separate ions; a partly
+/// neutralised acid names its free acid groups as "carboxy" (P-65.6.2.3.1, method 1).
+/// IUPAC 2013 examples are marked.
+#[test]
+fn carboxylate_salts() {
+    check_names(&[
+        ("CCC(=O)[O-].[K+]", "potassium propanoate"),
+        ("[K+].CCCC([O-])=O", "potassium butanoate"), // P-65.6.2.1
+        ("[Na+].CC([O-])=O", "sodium acetate"),
+        ("[Li+].[O-]C(=O)C1=CC=CC=C1", "lithium benzoate"),
+        ("[Rb+].[O-]C=O", "rubidium formate"),
+        ("[Cs+].CC([O-])=O", "caesium acetate"),
+        ("[NH4+].CC([O-])=O", "ammonium acetate"),
+        ("[O-]C(=O)CCC([O-])=O.[Na+].[Na+]", "disodium butanedioate"),
+        ("[Na+].[O-]C(=O)C([O-])=O.[Na+]", "disodium oxalate"),
+        (
+            "[K+].[O-]C(=O)CCC([O-])=O.[Na+]",
+            "potassium sodium butanedioate", // P-65.6.2.1
+        ),
+        (
+            "[NH4+].[O-]C(=O)CCCCC([O-])=O.[K+]",
+            "ammonium potassium hexanedioate", // P-65.6.2.1
+        ),
+        ("[NH4+].OC(=O)CCC([O-])=O", "ammonium 3-carboxypropanoate"), // P-65.6.2.3.1
+        ("[K+].OC(=O)CCCCCC([O-])=O", "potassium 6-carboxyhexanoate"), // P-65.6.2.3.1
+        ("[Na+].[O-]C(=O)C1=CC=CC=C1O", "sodium 2-hydroxybenzoate"),
+        ("[Na+].[O-]C(=O)C1CCCCC1", "sodium cyclohexanecarboxylate"),
+        (
+            "[O-]C(=O)CC(CC([O-])=O)C([O-])=O.[Na+].[Na+].[Na+]",
+            "trisodium propane-1,2,3-tricarboxylate",
+        ),
+        // Two formula units drawn.
+        ("[Na+].CC([O-])=O.[Na+].CC([O-])=O", "sodium acetate"),
+        // A neutral compound beside the salt keeps its own name.
+        ("CCO.[Na+].CC([O-])=O", "ethanol; sodium acetate"),
+    ]);
+    check_refused(&[
+        ("CC([O-])=O", "charges do not balance"),
+        ("[Na+]", "charges do not balance"),
+        ("[Na+].CC([O-])=O.[Na+]", "charges do not balance"),
+        (
+            "[Na+].[Na+].CC([O-])=O.[O-]C=O",
+            "more than one kind of anion",
+        ),
+        ("CC(=O)O[Na]", "draw a salt as separate ions"),
+        ("C[NH3+].CC([O-])=O", "charged"),
+        ("[Ca+2].CC([O-])=O.CC([O-])=O", "element Ca"),
+        ("CC(=O)OCC(=O)[O-].[Na+]", "ester group as a substituent"),
+    ]);
+}
+
+/// More than two acid (nitrile, aldehyde…) groups: on one unbranched chain all are expressed
+/// by the "carboxylic acid" kind of suffix (P-65.1.2.2.1); otherwise two end the chain and the
+/// others are prefixes (P-65.1.2.2.3). IUPAC 2013 examples are marked.
+#[test]
+fn polycarboxylic_acids() {
+    check_names(&[
+        (
+            "OC(=O)CC(CC(O)=O)C(O)=O",
+            "propane-1,2,3-tricarboxylic acid",
+        ),
+        (
+            "OC(=O)CCC(CCC(O)=O)C(O)=O",
+            "pentane-1,3,5-tricarboxylic acid",
+        ), // P-65.1.2.2.1
+        (
+            "OC(=O)C(C(O)=O)C(C(O)=O)C(O)=O",
+            "ethane-1,1,2,2-tetracarboxylic acid", // P-65.1.2.2.1
+        ),
+        (
+            "OC(=O)CC(O)(CC(O)=O)C(O)=O",
+            "2-hydroxypropane-1,2,3-tricarboxylic acid", // P-65.1.1.2.3 (citric acid)
+        ),
+        (
+            "OC(=O)C(O)C(C(O)=O)C(=O)C(O)=O",
+            "1-hydroxy-3-oxopropane-1,2,3-tricarboxylic acid", // P-65.1.2.4
+        ),
+        ("OC(=O)C(C(O)=O)C(O)=O", "methanetricarboxylic acid"),
+        // P-65.1.2.2.3 (the structure is drawn in the source; this is the one its name fits).
+        (
+            "OC(=O)CC(CC(O)=O)CCCC(O)=O",
+            "3-(carboxymethyl)heptanedioic acid",
+        ),
+        (
+            "OC(=O)CCC(CC(O)=O)CCC(O)=O",
+            "4-(carboxymethyl)heptanedioic acid",
+        ),
+        (
+            "OC(=O)C(CC(O)=O)CCCCC(O)=O",
+            "hexane-1,2,6-tricarboxylic acid",
+        ),
+        (
+            "OC(=O)CC(C(O)=O)CCCC(O)=O",
+            "pentane-1,2,5-tricarboxylic acid",
+        ),
+        ("N#CCC(CC#N)C#N", "propane-1,2,3-tricarbonitrile"),
+        ("O=CCC(CC=O)C=O", "propane-1,2,3-tricarbaldehyde"),
+        ("OC(=O)CCC(O)=O", "butanedioic acid"),
+    ]);
+}
+
+/// Substituent groups drawn with attachment points ("*"), named with their free valences
+/// (P-29, P-63.2.2): alkyl, acyl and alkoxy groups — the contracted methoxy to butoxy,
+/// tert-butoxy and phenoxy, "pentyloxy" and longer ones by concatenation — and divalent
+/// groups: methylene and the phenylenes are retained (P-29.6.1), the others are "-diyl"
+/// ("propane-1,3-diyl", not trimethylene or propylene; "ethane-1,2-diyl", not ethylene).
+#[test]
+fn substituent_groups() {
+    check_names(&[
+        ("*C", "methyl"),
+        ("*CCCCC", "pentyl"),
+        ("*C(C)C", "propan-2-yl"),
+        ("*C(C)(C)C", "tert-butyl"),
+        ("*C=C", "ethenyl"),
+        ("*CC=C", "prop-2-en-1-yl"),
+        ("*=C", "methylidene"),
+        ("*C1=CC=CC=C1", "phenyl"),
+        ("*CC1=CC=CC=C1", "benzyl"),
+        ("*C1CCCCC1", "cyclohexyl"),
+        ("*C1=CC=NC=C1", "pyridin-4-yl"),
+        ("*C(=O)C", "acetyl"),
+        ("*C=O", "formyl"),
+        ("*C(=O)CCCCC", "hexanoyl"),
+        ("*C(=O)C1=CC=CC=C1", "benzoyl"),
+        ("*C(O)=O", "carboxy"),
+        ("*C#N", "cyano"),
+        ("*NC", "methylamino"),
+        ("*OC", "methoxy"),
+        ("*OCC", "ethoxy"),
+        ("*OCCC", "propoxy"),
+        ("*OCCCC", "butoxy"),
+        ("*OCCCCC", "pentyloxy"),
+        ("*OCCCCCC", "hexyloxy"),
+        ("*OC(C)(C)C", "tert-butoxy"),
+        ("*OC(C)C", "(propan-2-yl)oxy"),
+        ("*OC1=CC=CC=C1", "phenoxy"),
+        ("*CCS", "2-sulfanylethyl"),
+        ("*C(C)CCl", "1-chloropropan-2-yl"),
+        ("*C*", "methylene"),
+        ("*C(Br)*", "bromomethylene"),
+        ("*CC*", "ethane-1,2-diyl"),
+        ("*C(*)C", "ethane-1,1-diyl"),
+        ("*CCC*", "propane-1,3-diyl"),
+        ("*CC(C)*", "propane-1,2-diyl"),
+        ("*C(C)(*)C", "propane-2,2-diyl"),
+        ("*CCCC*", "butane-1,4-diyl"),
+        ("*CC=CC*", "but-2-ene-1,4-diyl"),
+        ("*CC(*)CC*", "butane-1,2,4-triyl"),
+        ("*C1=CC=CC=C1*", "1,2-phenylene"),
+        ("*C1=CC(*)=CC=C1", "1,3-phenylene"),
+        ("*C1=CC=C(*)C=C1", "1,4-phenylene"),
+        ("*C1=CC(Cl)=C(*)C=C1", "2-chloro-1,4-phenylene"),
+        ("*C1=CC(*)=CC(*)=C1", "benzene-1,3,5-triyl"),
+        ("*C1CCC(*)CC1", "cyclohexane-1,4-diyl"),
+        ("*C1=CC=C(C=C1)C1=CC=C(*)C=C1", "[1,1'-biphenyl]-4,4'-diyl"),
+    ]);
+    check_refused(&[
+        ("*OC(=O)C", "acyloxy"),
+        ("*SC", "free valence on sulfur"),
+        (
+            "*CCO*",
+            "several free valences other than single bonds on carbon",
+        ),
+        ("*C(=O)OC", "ester group as a substituent"),
+        ("*Cl", "no carbon"),
+    ]);
+}
+
+/// Alkoxy prefixes on whole molecules (P-63.2.2): contracted up to butoxy, "pentyloxy" and
+/// longer by concatenation, enclosed as compound prefixes.
+#[test]
+fn alkoxy_prefixes() {
+    check_names(&[
+        ("CCCOC1=CC=CC=C1", "propoxybenzene"),
+        ("CCCCOC1=CC=CC=C1", "butoxybenzene"),
+        ("CCCCCOC1=CC=CC=C1", "(pentyloxy)benzene"),
+        ("CCCCCCOC1=CC=CC=C1", "(hexyloxy)benzene"),
+        ("CCCCCOCC(O)=O", "(pentyloxy)acetic acid"),
+        ("CCCCCOCCO", "2-(pentyloxy)ethan-1-ol"),
+        ("CCCCCOCCCCC", "1-(pentyloxy)pentane"),
+    ]);
 }

@@ -19,7 +19,7 @@ pub(crate) enum El {
     C,
     N,
     O,
-    /// Sulfur, only as a ring atom of a heterocycle (thiophene, thiolane).
+    /// Sulfur: a ring atom of a heterocycle (thiophene, thiolane) or a thiol's –SH.
     S,
     F,
     Cl,
@@ -56,6 +56,17 @@ impl El {
             _ => unreachable!("not a halogen"),
         }
     }
+
+    /// The class name of a halide in a functional class name ("acetyl chloride").
+    pub(crate) fn halide_word(self) -> &'static str {
+        match self {
+            El::F => "fluoride",
+            El::Cl => "chloride",
+            El::Br => "bromide",
+            El::I => "iodide",
+            _ => unreachable!("not a halogen"),
+        }
+    }
 }
 
 /// One connected structure: heavy atoms, their charges and hydrogen counts, and bonds.
@@ -65,6 +76,9 @@ pub(crate) struct Graph {
     pub h: Vec<u8>,
     /// Neighbours with the bond order to each.
     pub adj: Vec<Vec<(usize, u8)>>,
+    /// Free valences drawn as attachment points ("*"): the atom and the order of the bond to
+    /// the point. A structure with any is named as a substituent group (P-29).
+    pub free: Vec<(usize, u8)>,
 }
 
 impl Graph {
@@ -87,29 +101,102 @@ impl Graph {
     fn bond_sum(&self, a: usize) -> i16 {
         self.adj[a].iter().map(|(_, o)| *o as i16).sum()
     }
+
+    /// The number of free valences on `a`.
+    pub(crate) fn free_on(&self, a: usize) -> usize {
+        self.free.iter().filter(|(f, _)| *f == a).count()
+    }
+
+    /// The net charge of the structure.
+    pub(crate) fn net_charge(&self) -> i32 {
+        self.charge.iter().map(|&c| c as i32).sum()
+    }
+
+    /// The structure on the far side of the bond `from`–`c` (everything reachable from `c`
+    /// without passing `from`), with a hydroxy group on `c` in place of `from`: the acid of
+    /// one acyl half of an anhydride.
+    pub(crate) fn acid_half(&self, c: usize, from: usize) -> Graph {
+        let mut index = vec![usize::MAX; self.len()];
+        let mut atoms = vec![c];
+        index[c] = 0;
+        let mut k = 0;
+        while k < atoms.len() {
+            let x = atoms[k];
+            k += 1;
+            for y in self.nbrs(x) {
+                if y != from && index[y] == usize::MAX {
+                    index[y] = atoms.len();
+                    atoms.push(y);
+                }
+            }
+        }
+        let mut adj: Vec<Vec<(usize, u8)>> = atoms
+            .iter()
+            .map(|&x| {
+                self.adj[x]
+                    .iter()
+                    .filter(|(y, _)| *y != from)
+                    .map(|&(y, o)| (index[y], o))
+                    .collect()
+            })
+            .collect();
+        let oh = atoms.len();
+        adj[0].push((oh, 1));
+        adj.push(vec![(0, 1)]);
+        let mut el: Vec<El> = atoms.iter().map(|&x| self.el[x]).collect();
+        let mut charge: Vec<i8> = atoms.iter().map(|&x| self.charge[x]).collect();
+        let mut h: Vec<u8> = atoms.iter().map(|&x| self.h[x]).collect();
+        el.push(El::O);
+        charge.push(0);
+        h.push(1);
+        Graph {
+            el,
+            charge,
+            h,
+            adj,
+            free: Vec::new(),
+        }
+    }
 }
 
 /// The principal characteristic groups the namer knows, least senior first, so that the
-/// derived `Ord` is seniority.
+/// derived `Ord` is seniority (P-41: anions > acids > anhydrides > esters > acid halides >
+/// amides > nitriles > aldehydes > ketones > alcohols > thiols > amines).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Class {
     Amine,
+    /// –SH: with the alcohols in class 17 of P-41, after them (O > S, P-63.1.5).
+    Thiol,
     Alcohol,
     Ketone,
     Aldehyde,
     Nitrile,
     Amide,
+    /// Acyl halides: "acetyl chloride", "butanedioyl dichloride".
+    AcidHalide,
     Ester,
+    /// Acyclic anhydrides of carboxylic acids, –C(=O)–O–C(=O)–: named by functional class
+    /// ("propanoic anhydride"), never as a suffix.
+    Anhydride,
     Acid,
+    /// Carboxylate anions, –C(=O)O⁻: "propanoate", the anion of a salt.
+    Carboxylate,
 }
 
 impl Class {
     /// Groups whose carbon atom belongs to the group (and so ends a chain, or is expressed by
-    /// a "-carbo…" suffix on a ring): acids, esters, amides, nitriles and aldehydes.
+    /// a "-carbo…" suffix on a ring): acids and their anions, esters, acid halides, amides,
+    /// nitriles and aldehydes.
     pub(crate) fn has_carbon(self) -> bool {
         matches!(
             self,
-            Class::Acid | Class::Ester | Class::Amide | Class::Nitrile | Class::Aldehyde
+            Class::Acid
+                | Class::Carboxylate
+                | Class::Ester
+                | Class::AcidHalide
+                | Class::Amide
+                | Class::Nitrile
+                | Class::Aldehyde
         )
     }
 }
@@ -122,6 +209,8 @@ pub(crate) struct Perceived {
     pub ketone: Vec<bool>,
     /// Hydroxy oxygens on a non-acyl carbon (alcohols and phenols).
     pub hydroxyl: Vec<bool>,
+    /// Sulfanyl sulfurs (–SH) on a non-acyl carbon.
+    pub thiol: Vec<bool>,
     /// Amine nitrogens (not amide, nitrile or nitro nitrogens).
     pub amine: Vec<bool>,
     /// Nitro nitrogens.
@@ -276,8 +365,7 @@ pub(crate) fn build(
 fn expand_labels(raw: &mut Raw, config: &Config) -> Result<(), Unsupported> {
     // A fragment may itself contain labels; a few rounds settle any sane nesting.
     for _ in 0..8 {
-        let Some(i) = (0..raw.label.len()).find(|&i| element_of_label(&raw.label[i]).is_none())
-        else {
+        let Some(i) = (0..raw.label.len()).find(|&i| !is_atom_label(&raw.label[i])) else {
             return Ok(());
         };
         let label = raw.label[i].clone();
@@ -305,10 +393,18 @@ fn expand_labels(raw: &mut Raw, config: &Config) -> Result<(), Unsupported> {
                 .push((map[fb.begin], map[fb.end], order_value(&fb.order)));
         }
     }
-    match raw.label.iter().find(|l| element_of_label(l).is_none()) {
+    match raw.label.iter().find(|l| !is_atom_label(l)) {
         Some(l) => Err(format!("unknown label \u{201c}{l}\u{201d}")),
         None => Ok(()),
     }
+}
+
+/// An attachment point of a substituent group drawn on its own.
+const ATTACHMENT: &str = "*";
+
+/// A label that stands for one atom: an element or an attachment point.
+fn is_atom_label(label: &str) -> bool {
+    label == ATTACHMENT || element_of_label(label).is_some()
 }
 
 /// Fold the hydrogens into their heavy atoms and check every element is one the namer knows.
@@ -320,11 +416,19 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
     let mut el = Vec::new();
     let mut charge = Vec::new();
     for (i, label) in raw.label.iter().enumerate() {
-        if label == "H" {
+        if label == "H" || label == ATTACHMENT {
             continue;
         }
-        let e =
-            El::from_symbol(label).ok_or_else(|| format!("element {label} is not supported"))?;
+        let e = El::from_symbol(label).ok_or_else(|| {
+            if super::ions::is_cation_element(label) {
+                format!(
+                    "element {label} other than as a lone cation {label}\u{207a} (draw a salt as \
+                     separate ions)"
+                )
+            } else {
+                format!("element {label} is not supported")
+            }
+        })?;
         heavy_index[i] = el.len();
         el.push(e);
         charge.push(raw.charge[i]);
@@ -333,9 +437,19 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
         return Err("no carbon atom".into());
     }
     let mut adj: Vec<Vec<(usize, u8)>> = vec![Vec::new(); el.len()];
+    let mut free = Vec::new();
     for &(a, b, o) in &raw.bonds {
         sum[a] += o as i16;
         sum[b] += o as i16;
+        let star = |x: usize| raw.label[x] == ATTACHMENT;
+        if star(a) || star(b) {
+            let (pt, atom) = if star(a) { (a, b) } else { (b, a) };
+            if star(atom) || raw.label[atom] == "H" || raw.charge[pt] != 0 {
+                return Err("attachment point not on a heavy atom".into());
+            }
+            free.push((heavy_index[atom], o));
+            continue;
+        }
         match (raw.label[a] == "H", raw.label[b] == "H") {
             (true, true) => return Err("hydrogen bonded to hydrogen".into()),
             (true, false) | (false, true) => {
@@ -358,16 +472,21 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
             }
         }
     }
-    // Every drawn hydrogen must hang on exactly one heavy atom.
+    // Every drawn hydrogen and attachment point must hang on exactly one heavy atom.
     for i in 0..n {
-        if raw.label[i] == "H" {
+        if raw.label[i] == "H" || raw.label[i] == ATTACHMENT {
             let bonds = raw
                 .bonds
                 .iter()
                 .filter(|(a, b, _)| *a == i || *b == i)
                 .count();
             if bonds != 1 {
-                return Err("unusual hydrogen".into());
+                return Err(if raw.label[i] == "H" {
+                    "unusual hydrogen"
+                } else {
+                    "attachment point with other than one bond"
+                }
+                .into());
             }
         }
     }
@@ -385,7 +504,13 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
         };
         h[k] = explicit_h[i] + implicit as u8;
     }
-    Ok(Graph { el, charge, h, adj })
+    Ok(Graph {
+        el,
+        charge,
+        h,
+        adj,
+        free,
+    })
 }
 
 /// Find the rings and the characteristic groups, rejecting anything outside the supported
@@ -396,9 +521,6 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         return Err("no carbon atom".into());
     }
     let (cycles, in_ring) = find_rings(g)?;
-    if (0..n).any(|a| g.el[a] == El::S && !in_ring[a]) {
-        return Err("element S is not supported outside heterocycles".into());
-    }
     let mut rings: Vec<Ring> = Vec::new();
     for atoms in cycles {
         let k = atoms.len();
@@ -507,8 +629,22 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             }
         }
     }
+    // Carboxylate anions: the O⁻ of a –C(=O)O⁻ group.
+    let mut carboxylate_o = vec![false; n];
+    for a in (0..n).filter(|&a| g.el[a] == El::O && g.charge[a] == -1) {
+        if let [(c, 1)] = g.adj[a][..]
+            && g.el[c] == El::C
+            && !in_ring[c]
+            && g.free_on(a) == 0
+            && g.adj[c]
+                .iter()
+                .any(|&(m, o)| o == 2 && g.el[m] == El::O && g.charge[m] == 0)
+        {
+            carboxylate_o[a] = true;
+        }
+    }
     for a in 0..n {
-        if nitro[a] || nitro_o[a] {
+        if nitro[a] || nitro_o[a] || carboxylate_o[a] {
             continue;
         }
         if g.charge[a] != 0 {
@@ -528,6 +664,7 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     let mut ctype: Vec<Option<Class>> = vec![None; n];
     let mut ketone = vec![false; n];
     let mut hydroxyl = vec![false; n];
+    let mut thiol = vec![false; n];
     let mut amine = vec![false; n];
 
     // Heteroatoms that may appear only in certain places.
@@ -541,6 +678,28 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             // A ring oxygen or sulfur has only its two ring bonds, which the heterocycle vouches
             // for (the O–N bond of 1,2-oxazole).
             El::O | El::S if in_ring[a] => {}
+            // Outside a ring, sulfur is only a thiol's –SH.
+            El::S => {
+                if g.free_on(a) > 0 {
+                    return Err("free valence on sulfur (sulfanyl substituent groups)".into());
+                }
+                const ONLY_THIOL: &str = "sulfur outside a ring is supported only as a thiol";
+                match g.adj[a][..] {
+                    [(c, 1)] if g.el[c] == El::C => thiol[a] = true,
+                    [(c, 2)] if g.el[c] == El::C => {
+                        return Err(format!("C=S double bond (thione, thial; {ONLY_THIOL})"));
+                    }
+                    [(c, 1), (d, 1)] if g.el[c] == El::C && g.el[d] == El::C => {
+                        return Err(format!("sulfide (thioether C–S–C; {ONLY_THIOL})"));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "sulfur bonded to an atom other than carbon or to several atoms \
+                             (disulfide, sulfoxide, sulfonic acid…; {ONLY_THIOL})"
+                        ));
+                    }
+                }
+            }
             El::O if !nitro_o[a] => {
                 if g.adj[a].iter().any(|&(m, _)| g.el[m] != El::C) {
                     return Err("O–O or O–N bond (peroxide, hydroxylamine, N-oxide)".into());
@@ -615,8 +774,12 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             .filter(|&&(m, o)| o == 1 && g.el[m] != El::C)
             .map(|&(m, _)| m)
             .collect();
-        if hetero.iter().any(|&m| g.el[m].is_halogen()) {
-            return Err("acyl halide".into());
+        if hetero.iter().any(|&m| g.el[m] == El::S) {
+            return Err(
+                "thioacid or thioester (sulfur on a C=O carbon; sulfur outside a ring is \
+                 supported only as a thiol)"
+                    .into(),
+            );
         }
         if !hetero.is_empty() && in_ring[c] {
             return Err("lactone or lactam (a ring C=O next to a ring heteroatom)".into());
@@ -631,15 +794,22 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
                     ketone[c] = true;
                 }
             }
+            [x] if g.el[*x].is_halogen() => ctype[c] = Some(Class::AcidHalide),
             [x] if g.el[*x] == El::O => {
-                if g.adj[*x].len() == 1 {
+                if g.free_on(*x) > 0 {
+                    return Err("free valence on the oxygen of an acid (acyloxy groups)".into());
+                }
+                if carboxylate_o[*x] {
+                    ctype[c] = Some(Class::Carboxylate);
+                } else if g.adj[*x].len() == 1 {
                     ctype[c] = Some(Class::Acid);
                 } else {
                     let other = g.nbrs(*x).find(|&m| m != c).unwrap();
-                    if !carbonyl_o(other).is_empty() {
-                        return Err("acid anhydride".into());
-                    }
-                    ctype[c] = Some(Class::Ester);
+                    ctype[c] = Some(if carbonyl_o(other).is_empty() {
+                        Class::Ester
+                    } else {
+                        Class::Anhydride
+                    });
                 }
             }
             [x] if g.el[*x] == El::N && in_ring[*x] => {
@@ -666,9 +836,16 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             _ => return Err("imide".into()),
         }
     }
-    // Oxygens: hydroxy groups (not those of an acid).
+    // Oxygens: hydroxy groups (not those of an acid or its anion, nor an alkoxy group's
+    // oxygen with its free valence).
     for a in 0..n {
-        if g.el[a] == El::O && !nitro_o[a] && g.adj[a].len() == 1 && g.adj[a][0].1 == 1 {
+        if g.el[a] == El::O
+            && !nitro_o[a]
+            && !carboxylate_o[a]
+            && g.free_on(a) == 0
+            && g.adj[a].len() == 1
+            && g.adj[a][0].1 == 1
+        {
             let c = g.adj[a][0].0;
             if ctype[c] != Some(Class::Acid) {
                 hydroxyl[a] = true;
@@ -677,6 +854,9 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     }
 
     let count = |k: Class| ctype.iter().filter(|t| **t == Some(k)).count();
+    if count(Class::Anhydride) > 2 {
+        return Err("more than one anhydride group".into());
+    }
     if count(Class::Ester) > 1 {
         return Err("more than one ester group".into());
     }
@@ -684,13 +864,17 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         return Err("ester together with a carboxylic acid".into());
     }
     let principal = [
+        (Class::Carboxylate, count(Class::Carboxylate) > 0),
         (Class::Acid, count(Class::Acid) > 0),
+        (Class::Anhydride, count(Class::Anhydride) > 0),
         (Class::Ester, count(Class::Ester) > 0),
+        (Class::AcidHalide, count(Class::AcidHalide) > 0),
         (Class::Amide, count(Class::Amide) > 0),
         (Class::Nitrile, count(Class::Nitrile) > 0),
         (Class::Aldehyde, count(Class::Aldehyde) > 0),
         (Class::Ketone, ketone.contains(&true)),
         (Class::Alcohol, hydroxyl.contains(&true)),
+        (Class::Thiol, thiol.contains(&true)),
         (Class::Amine, amine.contains(&true)),
     ]
     .into_iter()
@@ -701,6 +885,7 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         ctype,
         ketone,
         hydroxyl,
+        thiol,
         amine,
         nitro,
         rings,

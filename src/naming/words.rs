@@ -1,42 +1,65 @@
 //! Name fragments: numerical stems, multiplying prefixes, enclosing marks, alphanumerical keys.
 
-/// The stem of the saturated unbranched hydrocarbon with `n` carbons ("meth", "eth", …,
-/// "icos", "henicos", "triacont"), for 1 ≤ n ≤ 99.
-pub(crate) fn stem(n: usize) -> Option<String> {
-    const FIRST: [&str; 10] = [
-        "", "meth", "eth", "prop", "but", "pent", "hex", "hept", "oct", "non",
-    ];
+/// The largest number [`numerical_term`] spells: the terms run up to "nonalia" (9000).
+pub(crate) const MAX_NUMERAL: usize = 9999;
+
+/// The numerical term for `n` (P-14.2.1, Table 1.4), 5 ≤ n ≤ [`MAX_NUMERAL`]: "penta",
+/// "undeca", "henicosa", "docosa", "hentriaconta", "hecta", "pentacta", "kilia",
+/// "heptahexacontapentactadilia" (2567). The digits are cited from the units up; in
+/// combination 1 is "hen" (but 11 is "undeca") and 2 is "do" (but 200 "dicta", 2000 "dilia"),
+/// and the "i" of "icosa" is elided after a vowel ("docosa", "tricosa").
+fn numerical_term(n: usize) -> Option<String> {
     const UNITS: [&str; 10] = [
         "", "hen", "do", "tri", "tetra", "penta", "hexa", "hepta", "octa", "nona",
     ];
     const TENS: [&str; 10] = [
         "",
-        "dec",
-        "icos",
-        "triacont",
-        "tetracont",
-        "pentacont",
-        "hexacont",
-        "heptacont",
-        "octacont",
-        "nonacont",
+        "deca",
+        "icosa",
+        "triaconta",
+        "tetraconta",
+        "pentaconta",
+        "hexaconta",
+        "heptaconta",
+        "octaconta",
+        "nonaconta",
     ];
-    Some(match n {
-        0 | 100.. => return None,
-        1..=9 => FIRST[n].to_string(),
-        10 => "dec".into(),
-        11 => "undec".into(),
-        _ => {
-            let (t, u) = (n / 10, n % 10);
-            let unit = UNITS[u];
-            let mut tens = TENS[t].to_string();
-            // "icos" loses its "i" after a unit ending in a vowel: docos, tricos, tetracos.
-            if t == 2 && unit.ends_with(['a', 'i', 'o']) {
-                tens.remove(0);
-            }
-            format!("{unit}{tens}")
+    const HUNDREDS: [&str; 10] = [
+        "", "hecta", "dicta", "tricta", "tetracta", "pentacta", "hexacta", "heptacta", "octacta",
+        "nonacta",
+    ];
+    const THOUSANDS: [&str; 10] = [
+        "", "kilia", "dilia", "trilia", "tetralia", "pentalia", "hexalia", "heptalia", "octalia",
+        "nonalia",
+    ];
+    if !(5..=MAX_NUMERAL).contains(&n) {
+        return None;
+    }
+    let (u, t, h, k) = (n % 10, n / 10 % 10, n / 100 % 10, n / 1000);
+    let low = if (t, u) == (1, 1) {
+        "undeca".to_string()
+    } else {
+        let unit = UNITS[u];
+        let mut tens = TENS[t];
+        if t == 2 && unit.ends_with(['a', 'i', 'o']) {
+            tens = &tens[1..];
         }
-    })
+        format!("{unit}{tens}")
+    };
+    Some(format!("{low}{}{}", HUNDREDS[h], THOUSANDS[k]))
+}
+
+/// The stem of the saturated unbranched hydrocarbon with `n` carbons ("meth", "eth", …,
+/// "icos", "henicos", "triacont", "hect", "pentact", "kili"), for 1 ≤ n ≤ [`MAX_NUMERAL`]:
+/// the retained names up to butane, then the numerical term without its final "a" (P-21.2.1).
+pub(crate) fn stem(n: usize) -> Option<String> {
+    match n {
+        1..=4 => Some(["meth", "eth", "prop", "but"][n - 1].to_string()),
+        _ => numerical_term(n).map(|mut t| {
+            t.pop();
+            t
+        }),
+    }
 }
 
 /// The multiplying prefix for `n` identical simple features: "", "di", "tri", …
@@ -46,10 +69,7 @@ pub(crate) fn multiplier(n: usize) -> String {
         2 => "di".into(),
         3 => "tri".into(),
         4 => "tetra".into(),
-        11 => "undeca".into(),
-        // "pent" → "penta", "dec" → "deca", "dodec" → "dodeca".
-        5..=9 => ["penta", "hexa", "hepta", "octa", "nona"][n - 5].to_string(),
-        _ => stem(n).map_or_else(|| n.to_string(), |s| format!("{s}a")),
+        _ => numerical_term(n).unwrap_or_else(|| n.to_string()),
     }
 }
 
@@ -112,7 +132,99 @@ mod tests {
         for (n, s) in expect {
             assert_eq!(stem(n).unwrap(), s, "{n}");
         }
-        assert_eq!(stem(100), None);
+        assert_eq!(stem(0), None);
+        assert_eq!(stem(10000), None);
+    }
+
+    /// The table of numerical terms of Wikipedia (ja) "IUPAC命名法" and IUPAC 2013 Table 1.4,
+    /// row by row, with the other examples P-14.2.1.2 gives. Wikipedia's 1 and 2 ("mono"/"hen",
+    /// "di"/"do") are the forms used alone and in combination; [`multiplier`] gives the forms
+    /// alone (and none for 1, P-14.2.1.1.2), the combined forms are checked through 21, 22, 101.
+    #[test]
+    fn numerical_terms() {
+        let expect = [
+            (2, "di"),
+            (3, "tri"),
+            (4, "tetra"),
+            (5, "penta"),
+            (6, "hexa"),
+            (7, "hepta"),
+            (8, "octa"),
+            (9, "nona"),
+            (10, "deca"),
+            (11, "undeca"),
+            (12, "dodeca"),
+            (14, "tetradeca"),
+            (20, "icosa"),
+            (21, "henicosa"),
+            (22, "docosa"),
+            (23, "tricosa"),
+            (24, "tetracosa"),
+            (30, "triaconta"),
+            (40, "tetraconta"),
+            (41, "hentetraconta"),
+            (50, "pentaconta"),
+            (52, "dopentaconta"),
+            (60, "hexaconta"),
+            (70, "heptaconta"),
+            (80, "octaconta"),
+            (90, "nonaconta"),
+            (100, "hecta"),
+            (101, "henhecta"),
+            (102, "dohecta"),
+            (111, "undecahecta"),
+            (200, "dicta"),
+            (300, "tricta"),
+            (363, "trihexacontatricta"),
+            (400, "tetracta"),
+            (486, "hexaoctacontatetracta"),
+            (500, "pentacta"),
+            (600, "hexacta"),
+            (700, "heptacta"),
+            (800, "octacta"),
+            (900, "nonacta"),
+            (1000, "kilia"),
+            (1001, "henkilia"),
+            (2000, "dilia"),
+            (2567, "heptahexacontapentactadilia"),
+            (3000, "trilia"),
+            (4000, "tetralia"),
+            (5000, "pentalia"),
+            (6000, "hexalia"),
+            (7000, "heptalia"),
+            (8000, "octalia"),
+            (9000, "nonalia"),
+            (9999, "nonanonacontanonactanonalia"),
+        ];
+        for (n, term) in expect {
+            assert_eq!(multiplier(n), term, "{n}");
+        }
+        assert_eq!(multiplier(1), "");
+    }
+
+    /// Wikipedia's table of alkane names, as stems (the full names are checked on drawn chains
+    /// in `naming::tests`). Wikipedia writes 500 as "pentacane"; IUPAC 2013 (Table 1.4:
+    /// "pentacta") makes it "pentactane", like its neighbours "tetractane" and "hexactane".
+    #[test]
+    fn alkane_stems() {
+        let expect = [
+            (5, "pent"),
+            (9, "non"),
+            (19, "nonadec"),
+            (25, "pentacos"),
+            (29, "nonacos"),
+            (40, "tetracont"),
+            (100, "hect"),
+            (200, "dict"),
+            (500, "pentact"),
+            (1000, "kili"),
+            (2000, "dili"),
+            (9000, "nonali"),
+            (2567, "heptahexacontapentactadili"),
+        ];
+        for (n, s) in expect {
+            assert_eq!(stem(n).unwrap(), s, "{n}");
+        }
     }
 
     #[test]
