@@ -13,6 +13,7 @@ mod page_tests;
 mod render_tests;
 pub mod rich_text;
 pub mod scene;
+pub mod text_format;
 pub mod view;
 
 pub use view::{FitOptions, ViewTransform};
@@ -111,6 +112,28 @@ pub struct TextEditState {
     pub align: TextAlign,
     /// The markup typed so far, lines separated by `\n`.
     pub text: String,
+    /// The selection in [`text`](Self::text) (char indices, start ≤ end) as of the last frame
+    /// the box had the keyboard: what a format bar's changes apply to.
+    pub selection: Option<std::ops::Range<usize>>,
+    /// A selection to give the box on its next frame (set when formatting rewrote the text).
+    pub pending_selection: Option<std::ops::Range<usize>>,
+    /// Symbol typing: what is typed goes into ChemDraw's Symbol font (Ctrl+G).
+    pub symbol: bool,
+}
+
+impl TextEditState {
+    /// A new, empty text anchored at `pos`.
+    pub fn new(pos: [f32; 2]) -> Self {
+        Self {
+            id: None,
+            pos,
+            align: TextAlign::Left,
+            text: String::new(),
+            selection: None,
+            pending_selection: None,
+            symbol: false,
+        }
+    }
 }
 
 /// A reaction-table cell being typed into ([`ChemStructEditor::table_edit`]).
@@ -233,6 +256,14 @@ pub struct ChemStructEditor {
     /// labels; and the cells of each table.
     last_object_rects: std::collections::HashMap<u32, egui::Rect>,
     last_table_cells: std::collections::HashMap<u32, Vec<(crate::reaction::edit::CellRef, egui::Rect)>>,
+
+    /// The style new page texts are given where their characters set none (font, size, bold,
+    /// italic); follows the format bar ([`text_format`]).
+    pub new_text_style: rich_text::SpanStyle,
+
+    /// Rects a host's text UI (a format bar) covers, registered with
+    /// [`keep_text_edit_open_over`](Self::keep_text_edit_open_over) since the last frame.
+    text_ui_rects: Vec<egui::Rect>,
 }
 
 /// What [`ChemStructEditor::show`] hands back: the canvas response, for a host to attach a
@@ -283,6 +314,8 @@ impl Default for ChemStructEditor {
             table_edit: None,
             last_object_rects: std::collections::HashMap::new(),
             last_table_cells: std::collections::HashMap::new(),
+            new_text_style: rich_text::SpanStyle::default(),
+            text_ui_rects: Vec::new(),
         }
     }
 }
@@ -861,13 +894,13 @@ impl ChemStructEditor {
     pub fn edit_text(&mut self, id: u32) -> bool {
         match self.molecule.object_by_id(id) {
             Some(PageObject::Text(t)) => {
-                self.text_edit = Some(TextEditState { id: Some(id), pos: t.pos, align: t.align, text: t.text.clone() });
+                self.text_edit = Some(TextEditState { id: Some(id), align: t.align, text: t.text.clone(), ..TextEditState::new(t.pos) });
                 true
             }
             // A bracket's label is edited in the same box.
             Some(PageObject::Bracket(b)) => {
                 let Some(g) = crate::molecule::bracket::geometry(&self.molecule, b) else { return false };
-                self.text_edit = Some(TextEditState { id: Some(id), pos: g.label_at, align: TextAlign::Left, text: b.label.clone() });
+                self.text_edit = Some(TextEditState { id: Some(id), text: b.label.clone(), ..TextEditState::new(g.label_at) });
                 true
             }
             _ => false,
@@ -972,7 +1005,7 @@ impl ChemStructEditor {
             None if blank => false,
             None => {
                 self.push_undo();
-                let id = self.molecule.add_text(edit.pos, text);
+                let id = self.molecule.add_text(edit.pos, self.styled_new_text(&text));
                 if let Some(PageObject::Text(t)) = self.molecule.object_by_id_mut(id) {
                     t.align = edit.align;
                 }
@@ -1387,26 +1420,70 @@ impl ChemStructEditor {
         let anchor = self.mol_to_screen(edit.pos, center);
         let top_left = anchor - egui::vec2(4.0, size * 1.1);
         let rows = edit.text.lines().count().max(1);
+        // Ctrl+G: Symbol (ChemDraw's Greek font) for the selection, or Symbol typing on or off.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::G)) {
+            let format = self.text_format();
+            let on = match format.target {
+                text_format::FormatTarget::Editing { selection: true } => !format.style.is_symbol(),
+                _ => !format.symbol_typing,
+            };
+            self.apply_text_format(text_format::FormatChange::Symbol(on));
+        }
+        // The text as drawn, for a preview under the box (the markup does not show the Greek).
+        let preview: Vec<rich_text::RichText> = self.text_edit.as_ref().map_or_else(Vec::new, |edit| {
+            let text = if edit.id.is_none() { self.styled_new_text(&edit.text) } else { edit.text.clone() };
+            if text.contains("{@") { text.split('\n').map(rich_text::RichText::parse).collect() } else { Vec::new() }
+        });
         let Some(edit) = self.text_edit.as_mut() else { return false };
+        let box_id = egui::Id::unique("chembuilder_page_text_box");
+        if let Some(sel) = edit.pending_selection.take() {
+            let mut state = egui::TextEdit::load_state(ui.ctx(), box_id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(sel.start),
+                egui::text::CCursor::new(sel.end),
+            )));
+            egui::TextEdit::store_state(ui.ctx(), box_id, state);
+        }
+        let before = edit.text.clone();
+        let symbol = edit.symbol;
         let area = egui::Area::new(egui::Id::unique("chembuilder_page_text_edit"))
             .fixed_pos(top_left)
             .show(ui.ctx(), |ui| {
-                egui::TextEdit::multiline(&mut edit.text)
+                let output = egui::TextEdit::multiline(&mut edit.text)
+                    .id(box_id)
                     .desired_width((size * 12.0).max(120.0))
                     .desired_rows(rows)
                     .font(egui::FontId::proportional(size))
                     .hint_text("H_2O, 25 \u{b0}C")
                     .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))
-                    .show(ui)
-                    .response
+                    .show(ui);
+                if let Some(range) = output.cursor_range {
+                    let [a, b] = range.sorted_cursors();
+                    edit.selection = Some(usize::from(a.index)..usize::from(b.index));
+                }
+                if symbol {
+                    ui.label(egui::RichText::new("Symbol (Ctrl+G)").small().color(egui::Color32::from_rgb(40, 90, 200)));
+                }
+                for line in &preview {
+                    ui.add(rich_text::RichLabel::new(line.clone()).size(size));
+                }
+                output.response
             });
         let response = area.inner;
         response.request_focus();
+        if symbol && self.text_edit.as_ref().is_some_and(|e| e.text != before) {
+            self.symbol_typed(&before);
+        }
         let (enter, escape) = ui.input(|i| {
             (i.key_pressed(egui::Key::Enter) && !i.modifiers.shift, i.key_pressed(egui::Key::Escape))
         });
+        // A press on the host's format bar, or in a popup (its font list), is part of editing.
+        let keep = std::mem::take(&mut self.text_ui_rects);
+        let popup = egui::Popup::is_any_open(ui.ctx());
         let clicked_elsewhere = ui.input(|i| i.pointer.any_pressed())
-            && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !area.response.rect.contains(p));
+            && !popup
+            && ui.input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| !area.response.rect.contains(p) && !keep.iter().any(|r| r.contains(p)));
         if escape {
             self.text_edit = None;
             response.surrender_focus();

@@ -146,6 +146,21 @@ fn the_text_tool_types_a_text_and_enter_commits_it() {
     assert!(d.texts().is_empty());
 }
 
+/// Ctrl+G switches Symbol typing on: "p" goes in as ChemDraw's Symbol `p` (π), then off again.
+#[test]
+fn ctrl_g_types_greek_in_the_symbol_font() {
+    let mut d = Driver::new(Tool::Text);
+    d.click(at([1.0, 2.0]));
+    d.type_text("60 ");
+    d.key(egui::Key::G, egui::Modifiers::COMMAND);
+    assert!(d.editor.text_edit.as_ref().unwrap().symbol, "Symbol typing is on");
+    d.type_text("m");
+    d.key(egui::Key::G, egui::Modifiers::COMMAND);
+    d.type_text("L");
+    d.key(egui::Key::Enter, Default::default());
+    assert_eq!(d.texts()[0].text, "60 {@Symbol:m}L");
+}
+
 #[test]
 fn shift_enter_starts_a_new_line_and_escape_cancels() {
     let mut d = Driver::new(Tool::Text);

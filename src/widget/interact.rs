@@ -663,12 +663,7 @@ pub fn process_text_tool(
                 // baseline sits a little below it.
                 let size = editor.config.style.label_size / super::SCALE_FACTOR;
                 let at = editor.screen_to_mol(mouse, center);
-                editor.text_edit = Some(super::TextEditState {
-                    id: None,
-                    pos: [at[0], at[1] + size * 0.35],
-                    align: crate::molecule::TextAlign::Left,
-                    text: String::new(),
-                });
+                editor.text_edit = Some(super::TextEditState::new([at[0], at[1] + size * 0.35]));
             }
         }
     }
