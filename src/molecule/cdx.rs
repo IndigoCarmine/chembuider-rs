@@ -15,7 +15,8 @@
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
-use super::{cdx_bracket, cdx_fonts, cdx_page, cdx_table};
+use super::{cdx_bracket, cdx_colors, cdx_fonts, cdx_page, cdx_table};
+use super::cdx_colors::ColorTable;
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule, PageObject};
 use super::depict;
@@ -130,10 +131,15 @@ fn hex(s: &str) -> Vec<u8> {
 
 /// A CDXString: its style runs (start, font, face, size, colour), then the characters.
 pub(crate) fn cdx_string(runs: &[(u16, u16)], text: &str) -> Vec<u8> {
+    colored_cdx_string(runs, text, 0)
+}
+
+/// [`cdx_string`] with every run in colour index `color`.
+fn colored_cdx_string(runs: &[(u16, u16)], text: &str, color: u16) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(runs.len() as u16).to_le_bytes());
     for &(start, face) in runs {
-        for v in [start, LABEL_FONT, face, LABEL_SIZE, 0] {
+        for v in [start, LABEL_FONT, face, LABEL_SIZE, color] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -207,15 +213,15 @@ pub(super) fn label_geometry(at: (f64, f64), text: &str, right: bool) -> ((f64, 
 }
 
 /// The text object labelling an atom at `at` (CDX units): `label` with its style runs, aligned on
-/// the first character or the last.
-fn label_object(id: u32, at: (f64, f64), label: &NodeLabel) -> CdxObject {
+/// the first character or the last, its runs in colour index `color`.
+fn label_object(id: u32, at: (f64, f64), label: &NodeLabel, color: u16) -> CdxObject {
     let (origin, bbox) = label_geometry(at, &label.text, label.right);
     let mut t = CdxObject::new(OBJ_TEXT, id);
     t.set(PROP_2D_POSITION, point(origin.0, origin.1));
     t.set(PROP_BOUNDING_BOX, rect(bbox));
     t.set(PROP_LABEL_ALIGNMENT, vec![if label.right { ALIGN_RIGHT } else { ALIGN_LEFT }]);
-    t.set(PROP_TEXT, cdx_string(&label.runs, &label.text));
-    t.set(PROP_UTF8_TEXT, cdx_string(&label.runs, &label.text));
+    t.set(PROP_TEXT, colored_cdx_string(&label.runs, &label.text, color));
+    t.set(PROP_UTF8_TEXT, colored_cdx_string(&label.runs, &label.text, color));
     t
 }
 
@@ -347,8 +353,8 @@ pub(crate) fn compact_markup(rich: &RichText) -> String {
 
 /// The structures of `mol` as fragments (one per connected structure), with ids from `next`.
 /// Positions are moved by `shift` (CDX units).
-pub(crate) fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32) -> Vec<CdxObject> {
-    fragments_mapped(mol, shift, next, &mut WrittenIds::default())
+pub(crate) fn fragments(mol: &Molecule, shift: (f64, f64), next: &mut u32, colors: &mut ColorTable) -> Vec<CdxObject> {
+    fragments_mapped(mol, shift, next, &mut WrittenIds::default(), colors)
 }
 
 /// What the atoms and bonds of a molecule were written as: the fragment and the node of each
@@ -360,12 +366,14 @@ pub(crate) struct WrittenIds {
     pub bond_of: HashMap<u32, u32>,
 }
 
-/// [`fragments`], recording in `ids` what each atom and bond went into.
+/// [`fragments`], recording in `ids` what each atom and bond went into. A coloured atom (its
+/// node and label) or bond names its colour in `colors`, the document's colour table.
 pub(crate) fn fragments_mapped(
     mol: &Molecule,
     shift: (f64, f64),
     next: &mut u32,
     ids: &mut WrittenIds,
+    colors: &mut ColorTable,
 ) -> Vec<CdxObject> {
     let mut id = || {
         *next += 1;
@@ -433,8 +441,9 @@ pub(crate) fn fragments_mapped(
             if rules.charge != 0 {
                 node.set(PROP_ATOM_CHARGE, vec![rules.charge as u8]);
             }
+            cdx_colors::set_foreground(&mut node, atom.color, colors);
             if let Some(label) = &rules.label {
-                node.children.push(label_object(id(), at, label));
+                node.children.push(label_object(id(), at, label, colors.index_of(atom.color)));
             }
             frag.children.push(node);
         }
@@ -481,6 +490,7 @@ pub(crate) fn fragments_mapped(
             if let Some(position) = position {
                 b.set(PROP_BOND_DOUBLE_POSITION, position.to_le_bytes().to_vec());
             }
+            cdx_colors::set_foreground(&mut b, bond.color, colors);
             frag.children.push(b);
         }
         if let Some(bbox) = bbox {
@@ -553,11 +563,13 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
     });
     let shift = page_shift(mol);
     let mut ids = WrittenIds::default();
-    page.children = fragments_mapped(mol, shift, &mut next, &mut ids);
+    let mut colors = ColorTable::of(&doc);
+    page.children = fragments_mapped(mol, shift, &mut next, &mut ids, &mut colors);
     let mut owned = cdx_page::Owned::new();
     let mut fonts = cdx_fonts::FontTable::of(&doc);
-    let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts);
+    let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts, &mut colors);
     fonts.store(&mut doc);
+    colors.store(&mut doc);
     page.children.extend(objects);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut page.children);
     page.children.extend(brackets);
@@ -600,8 +612,9 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     let mut next = cdx_table::document_max_id(&doc);
     let mut owned = cdx_page::Owned::new();
     let mut fonts = cdx_fonts::FontTable::of(&doc);
+    let mut colors = ColorTable::of(&doc);
     for page in doc.children.iter_mut().filter(|c| c.tag == OBJ_PAGE) {
-        cdx_page::take_owned(page, &mut owned, &fonts);
+        cdx_page::take_owned(page, &mut owned, &fonts, &colors);
         strip_structures(page);
     }
     if !doc.children.iter().any(|c| c.tag == OBJ_PAGE) {
@@ -613,9 +626,10 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     // dragged off the page's top or left edge is moved back onto it.
     let shift = shift_onto_page(mol, 0.0);
     let mut ids = WrittenIds::default();
-    let mut new = fragments_mapped(mol, shift, &mut next, &mut ids);
-    new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts));
+    let mut new = fragments_mapped(mol, shift, &mut next, &mut ids, &mut colors);
+    new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts, &mut colors));
     fonts.store(&mut doc);
+    colors.store(&mut doc);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut new);
     new.extend(brackets);
     let page = doc.children.iter_mut().find(|c| c.tag == OBJ_PAGE).expect("a page");
@@ -635,14 +649,20 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
 }
 
 /// Read one fragment's own nodes and bonds into `mol` (not the hidden insides of an
-/// abbreviation, which ChemDraw keeps as a fragment inside its node).
-pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule) {
-    read_fragment_mapped(frag, mol, &mut HashMap::new());
+/// abbreviation, which ChemDraw keeps as a fragment inside its node). The colours they name are
+/// those of `colors`, the document's colour table.
+pub(crate) fn read_fragment(frag: &CdxObject, mol: &mut Molecule, colors: &ColorTable) {
+    read_fragment_mapped(frag, mol, &mut HashMap::new(), colors);
 }
 
 /// [`read_fragment`], recording in `atoms_of` the atom each node became (and, under the
 /// fragment's id, all of them): what a bracketed group's ids point at.
-fn read_fragment_mapped(frag: &CdxObject, mol: &mut Molecule, atoms_of: &mut HashMap<u32, Vec<u32>>) {
+fn read_fragment_mapped(
+    frag: &CdxObject,
+    mol: &mut Molecule,
+    atoms_of: &mut HashMap<u32, Vec<u32>>,
+    colors: &ColorTable,
+) {
     let mut atoms: HashMap<u32, u32> = HashMap::new();
     // Atoms ChemDraw gives a hydrogen count (NH4+, H2O on their own), with their position.
     let mut hydrogens: Vec<(u32, [f32; 2], usize)> = Vec::new();
@@ -664,13 +684,13 @@ fn read_fragment_mapped(frag: &CdxObject, mol: &mut Molecule, atoms_of: &mut Has
             None => (0.0, 0.0),
         };
         let charge = node.prop_int(PROP_ATOM_CHARGE).unwrap_or(0).clamp(-128, 127) as i8;
-        let label = node
-            .children
-            .iter()
-            .find(|c| c.tag == OBJ_TEXT)
-            .and_then(|t| t.prop(PROP_TEXT))
-            .and_then(parse_cdx_string)
-            .map(|(runs, text)| rich_of(&runs, &text));
+        let label_text = node.children.iter().find(|c| c.tag == OBJ_TEXT).and_then(|t| t.prop(PROP_TEXT));
+        let label = label_text.and_then(parse_cdx_string).map(|(runs, text)| rich_of(&runs, &text));
+        // The label's colour: the node's own, else its text's.
+        let color = cdx_colors::foreground(node, colors).or_else(|| {
+            let (runs, _) = cdx_fonts::parse_string(label_text?)?;
+            runs.iter().find(|r| r.color != 0).and_then(|r| colors.rgba(r.color))
+        });
         let element = match node.prop_i16(PROP_NODE_ELEMENT) {
             Some(z) if node_type == NODE_ELEMENT => elements::symbol(z as u16).unwrap_or("C").to_string(),
             None if node_type == NODE_ELEMENT => "C".to_string(),
@@ -694,6 +714,9 @@ fn read_fragment_mapped(frag: &CdxObject, mol: &mut Molecule, atoms_of: &mut Has
         };
         let pos = [x as f32, y as f32];
         let atom = mol.add_atom(element, pos, charge);
+        if let Some(a) = mol.atoms.last_mut() {
+            a.color = color;
+        }
         atoms.insert(node.id, atom);
         atoms_of.insert(node.id, vec![atom]);
         atoms_of.entry(frag.id).or_default().push(atom);
@@ -737,6 +760,7 @@ fn read_fragment_mapped(frag: &CdxObject, mol: &mut Molecule, atoms_of: &mut Has
             mol.push_bond(a, b, order, stereo);
             if let Some(last) = mol.bonds.last_mut() {
                 last.double_position = double_position;
+                last.color = cdx_colors::foreground(bond, colors);
             }
             bonded.extend([a, b]);
         }
@@ -801,17 +825,18 @@ fn read_container(
     taken: &HashSet<u32>,
     first_atom: &mut HashMap<u32, u32>,
     atoms_of: &mut HashMap<u32, Vec<u32>>,
+    colors: &ColorTable,
 ) {
     for child in &obj.children {
         match child.tag {
             OBJ_FRAGMENT => {
                 let before = mol.atoms.len();
-                read_fragment_mapped(child, mol, atoms_of);
+                read_fragment_mapped(child, mol, atoms_of, colors);
                 if let Some(a) = mol.atoms.get(before) {
                     first_atom.insert(child.id, a.id);
                 }
             }
-            OBJ_GROUP => read_container(child, mol, others, taken, first_atom, atoms_of),
+            OBJ_GROUP => read_container(child, mol, others, taken, first_atom, atoms_of, colors),
             _ if taken.contains(&child.id) => {}
             _ => *others += 1,
         }
@@ -857,6 +882,7 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
         return None;
     }
     let fonts = cdx_fonts::FontTable::of(doc);
+    let colors = ColorTable::of(doc);
     let mut molecule = Molecule::default();
     let mut other_objects = 0;
     let mut first_atom = HashMap::new();
@@ -864,9 +890,9 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     // The object each ChemDraw id became (an arrow's `arrow` and its graphic both name it).
     let mut object_of: HashMap<u32, u32> = HashMap::new();
     for page in pages() {
-        let converted = cdx_page::convert_page(page, &fonts);
+        let converted = cdx_page::convert_page(page, &fonts, &colors);
         let taken: HashSet<u32> = converted.iter().flat_map(|c| c.ids.iter().copied()).collect();
-        read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom, &mut atoms_of);
+        read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom, &mut atoms_of, &colors);
         for mut c in converted {
             // A bracket's ids are its nodes': it encloses the atoms they became, when there are any.
             if let PageObject::Bracket(b) = &mut c.object {

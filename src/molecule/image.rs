@@ -176,6 +176,22 @@ fn xml_escape(c: char) -> String {
     }
 }
 
+/// An SVG paint attribute (`fill` or `stroke`) for straight RGBA, `None` being black: `black`
+/// for opaque black (what everything was before colours), otherwise `rgb(…)` with an opacity
+/// attribute when it is translucent.
+fn svg_paint(attr: &str, rgba: Option<[u8; 4]>) -> String {
+    match rgba {
+        None | Some([0, 0, 0, 255]) => format!(r#"{attr}="black""#),
+        Some([r, g, b, 255]) => format!(r#"{attr}="rgb({r},{g},{b})""#),
+        Some([r, g, b, a]) => format!(r#"{attr}="rgb({r},{g},{b})" {attr}-opacity="{:.3}""#, a as f32 / 255.0),
+    }
+}
+
+/// [`svg_paint`] for a glyph's (premultiplied) egui colour.
+fn svg_glyph_fill(color: egui::Color32) -> String {
+    svg_paint("fill", Some(color.to_srgba_unmultiplied()))
+}
+
 /// Render the molecule to an SVG string from the shared scene: ring-fill polygons, then bond
 /// strokes / wedge fills (with a hole cut under each label), then each label glyph placed at
 /// egui's exact layout position. The background stays transparent. `x`/`y` translate the scene so its bounding box sits at `MARGIN_PX`.
@@ -207,6 +223,20 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
     let mut s = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.0} {h:.0}"><g transform="translate({dx:.3},{dy:.3})">"#
     );
+
+    // The drop shadow: the structures (ring fills, bonds, labels) drawn in one group, which
+    // casts it. Page objects cast none.
+    if let Some(shadow) = &scene.shadow {
+        let (x, y) = (bounds.min.x - MARGIN_PX, bounds.min.y - MARGIN_PX);
+        let [r, g, b, a] = shadow.rgba;
+        s.push_str(&format!(
+            r#"<defs><filter id="shadow" filterUnits="userSpaceOnUse" x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}"><feDropShadow dx="{:.3}" dy="{:.3}" stdDeviation="{:.3}" flood-color="rgb({r},{g},{b})" flood-opacity="{:.3}"/></filter></defs><g filter="url(#shadow)">"#,
+            shadow.offset.x,
+            shadow.offset.y,
+            shadow.blur * 0.5,
+            a as f32 / 255.0
+        ));
+    }
 
     // Labels cut a hole through the ring fills and bonds under them (rather than covering them
     // with white), so the background stays transparent around the labels.
@@ -241,21 +271,23 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
         ));
     }
 
-    // Bonds: stroked lines + filled (black) stereo wedges.
+    // Bonds: stroked lines + filled stereo wedges, in the bond's colour (black by default).
     for bond in &scene.bonds {
+        let stroke = svg_paint("stroke", bond.color);
         for st in &bond.strokes {
             s.push_str(&format!(
-                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="black" stroke-width="{:.3}" stroke-linecap="round"/>"#,
+                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" {stroke} stroke-width="{:.3}" stroke-linecap="round"/>"#,
                 st.a.x, st.a.y, st.b.x, st.b.y, st.width
             ));
         }
+        let fill_attr = svg_paint("fill", bond.color);
         for fill in &bond.fills {
             let pts = fill
                 .iter()
                 .map(|p| format!("{:.2},{:.2}", p.x, p.y))
                 .collect::<Vec<_>>()
                 .join(" ");
-            s.push_str(&format!(r#"<polygon points="{pts}" fill="black"/>"#));
+            s.push_str(&format!(r#"<polygon points="{pts}" {fill_attr}/>"#));
         }
     }
 
@@ -270,9 +302,10 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
             let x = base.x + g.x;
             let y = base.y + g.baseline_y;
             let family = families(g.font);
+            let fill = svg_glyph_fill(g.color);
             let mut emit = |gx: f32| {
                 s.push_str(&format!(
-                    r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} fill="black" xml:space="preserve">{ch}</text>"#,
+                    r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} {fill} xml:space="preserve">{ch}</text>"#,
                     g.size
                 ));
             };
@@ -281,6 +314,9 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
                 emit(x + dxb); // faux-bold double strike, as egui does on-screen
             }
         }
+    }
+    if scene.shadow.is_some() {
+        s.push_str("</g>");
     }
 
     // Page objects (arrows, texts) over everything else.
@@ -302,9 +338,10 @@ fn molecule_to_svg_styled(mol: &Molecule, style: &StyleConfig) -> Option<String>
                 let style_attr = if g.italic { r#" font-style="italic""# } else { "" };
                 let y = base.y + g.baseline_y;
                 let family = families(g.font);
+                let fill = svg_glyph_fill(g.color);
                 let mut emit = |gx: f32| {
                     s.push_str(&format!(
-                        r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} fill="black" xml:space="preserve">{ch}</text>"#,
+                        r#"<text x="{gx:.3}" y="{y:.3}" font-size="{:.3}" font-family="{family}"{style_attr} {fill} xml:space="preserve">{ch}</text>"#,
                         g.size
                     ));
                 };
@@ -399,51 +436,76 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         // Shown labels, centered on their atoms (the anchor point of the on-screen label).
         let r = (style.label_size * 0.75).round() as i32;
         let index = MolIndex::new(mol);
-        let labels: Vec<(i32, i32, String)> = mol
+        let labels: Vec<(i32, i32, String, Option<[u8; 4]>)> = mol
             .atoms
             .iter()
             .filter(|atom| depict::should_show_label(&index, atom.id))
             .map(|atom| {
                 let c = egui::pos2(atom.pos[0] * SCALE_FACTOR, atom.pos[1] * SCALE_FACTOR);
-                (tx(c.x), ty(c.y), flatten_label(&index, atom))
+                (tx(c.x), ty(c.y), flatten_label(&index, atom), atom.color)
             })
             .collect();
+
+        // GDI has no blur and no alpha: the shadow is a sharp copy in its colour over white.
+        let shadow = scene.shadow.map(|s| (s.offset.x.round() as i32, s.offset.y.round() as i32, over_white(s.rgba)));
 
         // Ring fills and bonds are clipped out around each label (rather than covered with
         // white), so the background stays transparent there.
         let saved = SaveDC(hdc);
-        for &(cx, cy, _) in &labels {
+        for &(cx, cy, _, _) in &labels {
             ExcludeClipRect(hdc, cx - r, cy - r, cx + r, cy + r);
         }
 
-        // Ring fills (backmost): filled polygons, no outline.
-        for poly in &scene.ring_fills {
-            let brush = CreateSolidBrush(over_white(poly.rgba));
-            SelectObject(hdc, brush);
-            SelectObject(hdc, no_pen);
-            let pts: Vec<Point_> = poly.points.iter().map(|p| Point_ { x: tx(p.x), y: ty(p.y) }).collect();
-            Polygon(hdc, pts.as_ptr(), pts.len() as i32);
-            SelectObject(hdc, pen);
-            DeleteObject(brush);
-        }
-
-        // Bonds: stroked lines + filled (black) stereo wedges.
-        SelectObject(hdc, pen);
-        for bond in &scene.bonds {
-            for st in &bond.strokes {
-                MoveToEx(hdc, tx(st.a.x), ty(st.a.y), std::ptr::null_mut());
-                LineTo(hdc, tx(st.b.x), ty(st.b.y));
-            }
-            for fill in &bond.fills {
-                SelectObject(hdc, black_brush);
+        // Ring fills and bonds, moved by `(sx, sy)` pixels, in their own colours or all in `tint`
+        // (the shadow).
+        let draw_structure = |sx: i32, sy: i32, tint: Option<u32>| {
+            let pt = |p: &egui::Pos2| Point_ { x: tx(p.x) + sx, y: ty(p.y) + sy };
+            // Ring fills (backmost): filled polygons, no outline.
+            for poly in &scene.ring_fills {
+                let brush = CreateSolidBrush(tint.unwrap_or_else(|| over_white(poly.rgba)));
+                SelectObject(hdc, brush);
                 SelectObject(hdc, no_pen);
-                let pts: Vec<Point_> = fill.iter().map(|p| Point_ { x: tx(p.x), y: ty(p.y) }).collect();
+                let pts: Vec<Point_> = poly.points.iter().map(pt).collect();
                 Polygon(hdc, pts.as_ptr(), pts.len() as i32);
                 SelectObject(hdc, pen);
+                DeleteObject(brush);
             }
-        }
 
-        // Labels: centered plain text (flattened rich label), unclipped.
+            // Bonds: stroked lines + filled stereo wedges, black unless coloured.
+            SelectObject(hdc, pen);
+            for bond in &scene.bonds {
+                let color = tint.or(bond.color.map(over_white));
+                let (bond_pen, bond_brush) = match color {
+                    Some(c) => (CreatePen(0, pen_width, c), CreateSolidBrush(c)),
+                    None => (pen, black_brush),
+                };
+                if color.is_some() {
+                    SelectObject(hdc, bond_pen);
+                }
+                for st in &bond.strokes {
+                    MoveToEx(hdc, tx(st.a.x) + sx, ty(st.a.y) + sy, std::ptr::null_mut());
+                    LineTo(hdc, tx(st.b.x) + sx, ty(st.b.y) + sy);
+                }
+                for fill in &bond.fills {
+                    SelectObject(hdc, bond_brush);
+                    SelectObject(hdc, no_pen);
+                    let pts: Vec<Point_> = fill.iter().map(pt).collect();
+                    Polygon(hdc, pts.as_ptr(), pts.len() as i32);
+                    SelectObject(hdc, bond_pen);
+                }
+                if color.is_some() {
+                    SelectObject(hdc, pen);
+                    DeleteObject(bond_pen);
+                    DeleteObject(bond_brush);
+                }
+            }
+        };
+        if let Some((sx, sy, tint)) = shadow {
+            draw_structure(sx, sy, Some(tint));
+        }
+        draw_structure(0, 0, None);
+
+        // Labels: centered plain text (flattened rich label), unclipped, their shadow first.
         RestoreDC(hdc, saved);
         let face: Vec<u16> = "Arial\0".encode_utf16().collect();
         let font_h = -(style.label_size.round() as i32);
@@ -451,9 +513,23 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
         let old_font = SelectObject(hdc, font);
         SetTextColor(hdc, BLACK);
         SetTextAlign(hdc, 6); // TA_CENTER
-        for (cx, cy, text) in &labels {
+        if let Some((sx, sy, tint)) = shadow {
+            SetTextColor(hdc, tint);
+            for (cx, cy, text, _) in &labels {
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                TextOutW(hdc, cx + sx, cy + font_h / 2 + sy, utf16.as_ptr(), utf16.len() as i32);
+            }
+            SetTextColor(hdc, BLACK);
+        }
+        for (cx, cy, text, color) in &labels {
+            if let Some(c) = color {
+                SetTextColor(hdc, over_white(*c));
+            }
             let utf16: Vec<u16> = text.encode_utf16().collect();
             TextOutW(hdc, *cx, cy + font_h / 2, utf16.as_ptr(), utf16.len() as i32);
+            if color.is_some() {
+                SetTextColor(hdc, BLACK);
+            }
         }
 
         // Page objects: arrow shafts and heads, then text lines (flattened, as the labels).
@@ -486,6 +562,7 @@ pub fn molecule_to_emf(mol: &Molecule) -> Option<isize> {
                     SelectObject(hdc, part_font);
                     let x = line.rect.min.x + part.offset.x;
                     let baseline = line.rect.min.y + part.offset.y + part.baseline();
+                    SetTextColor(hdc, over_white(part.color.to_srgba_unmultiplied()));
                     TextOutW(hdc, tx(x), ty(baseline), utf16.as_ptr(), utf16.len() as i32);
                     SelectObject(hdc, font);
                     DeleteObject(part_font);
@@ -708,6 +785,81 @@ mod tests {
         let svg = molecule_to_svg(&ring).unwrap();
         assert!(svg.contains("fill-opacity"), "ring fill is a translucent polygon");
         assert!(svg.contains("rgb(0,200,0)"), "ring fill keeps its color");
+    }
+
+    /// Ethanol, its C–O bond red and its O blue, beside a translucent green text.
+    fn coloured() -> Molecule {
+        let mut mol = Molecule::default();
+        let c1 = mol.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c2 = mol.add_atom("C".to_string(), [1.3, 0.75], 0);
+        let o = mol.add_atom("O".to_string(), [2.6, 0.0], 0);
+        mol.add_bond(c1, c2, BondOrder::Single);
+        let co = mol.add_bond(c2, o, BondOrder::Single);
+        mol.bond_by_id_mut(co).unwrap().color = Some([220, 20, 30, 255]);
+        mol.atom_by_id_mut(o).unwrap().color = Some([10, 40, 230, 255]);
+        let t = mol.add_text([0.0, 3.0], "THF");
+        if let Some(crate::molecule::PageObject::Text(t)) = mol.object_by_id_mut(t) {
+            t.color = Some([0, 128, 0, 128]);
+        }
+        mol
+    }
+
+    #[test]
+    fn svg_draws_line_and_text_colours_independently() {
+        let svg = molecule_to_svg(&coloured()).unwrap();
+        assert!(svg.contains(r#"stroke="rgb(220,20,30)""#), "the red bond's lines: {svg}");
+        let mut wedged = coloured();
+        let co = wedged.bonds.iter().find(|b| b.color.is_some()).unwrap().id;
+        wedged.bond_by_id_mut(co).unwrap().stereo = BondStereo::WedgeUp;
+        let wedge = molecule_to_svg(&wedged).unwrap();
+        assert!(wedge.contains(r#"fill="rgb(220,20,30)"/>"#), "the red bond's wedge: {wedge}");
+        assert!(svg.contains(r#"stroke="black""#), "the C–C bond stays black");
+        let glyphs = |ch: char| -> Vec<&str> {
+            svg.split("<text ").filter(|t| t.contains(&format!(">{ch}</text>"))).collect()
+        };
+        assert!(glyphs('O').iter().all(|t| t.contains(r#"fill="rgb(10,40,230)""#)), "the O is blue: {svg}");
+        // The label's H (THF's H is the text's).
+        assert_eq!(glyphs('H').iter().filter(|t| t.contains(r#"fill="rgb(10,40,230)""#)).count(), 1, "and its H: {svg}");
+        assert!(!svg.contains(r#"stroke="rgb(10,40,230)""#), "the label's colour is not the bond's");
+        assert!(
+            glyphs('T').iter().all(|t| t.contains(r#"fill="rgb(0,128,0)" fill-opacity="0.502""#)),
+            "the translucent green text: {svg}"
+        );
+        assert!(!svg.contains("feDropShadow"), "no shadow unless set");
+    }
+
+    #[test]
+    fn svg_casts_the_shadow_of_the_structures_only() {
+        let mut mol = coloured();
+        let plain = molecule_to_svg(&mol).unwrap();
+        mol.shadow = Some(crate::molecule::Shadow { color: [40, 50, 60, 128], offset: [0.2, 0.1], blur: 0.1 });
+        let svg = molecule_to_svg(&mol).unwrap();
+        assert!(
+            svg.contains(r#"<feDropShadow dx="10.000" dy="5.000" stdDeviation="2.500" flood-color="rgb(40,50,60)" flood-opacity="0.502"/>"#),
+            "{svg}"
+        );
+        // The group casting it holds the bonds and labels; the page text comes after it.
+        let group = svg.find(r#"<g filter="url(#shadow)">"#).expect("a shadowed group");
+        assert!(group < svg.find("<line").unwrap());
+        let text = svg.find(">T</text>").unwrap();
+        // Between them close the label mask's group and the shadowed one.
+        assert_eq!(svg[group..text].matches("</g>").count(), 2, "the text casts no shadow: {svg}");
+        // The picture grows to hold the shadow.
+        let width = |s: &str| s.split("width=\"").nth(1).unwrap().split('"').next().unwrap().parse::<f32>().unwrap();
+        assert!(width(&svg) > width(&plain), "{} vs {}", width(&svg), width(&plain));
+        // And the raster shows it.
+        assert!(render_pixmap(&mol, None).is_some());
+    }
+
+    #[test]
+    fn emf_draws_colours_and_the_shadow() {
+        unsafe extern "system" {
+            fn DeleteEnhMetaFile(h: isize) -> i32;
+        }
+        let mut mol = coloured();
+        mol.shadow = Some(crate::molecule::Shadow::default());
+        let h = molecule_to_emf(&mol).expect("a metafile");
+        unsafe { DeleteEnhMetaFile(h) };
     }
 
     #[test]

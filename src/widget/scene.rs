@@ -91,6 +91,49 @@ pub struct SceneBond {
     pub bond_id: u32,
     pub strokes: Vec<SceneStroke>,
     pub fills: Vec<Vec<Pos2>>,
+    /// The bond's own line colour (straight RGBA, [`Bond::color`](crate::molecule::Bond::color));
+    /// `None` is the backend's default (black).
+    pub color: Option<[u8; 4]>,
+}
+
+/// The drop shadow of a scene ([`Molecule::shadow`]) in target pixels: its ring fills, bonds
+/// and labels drawn again in `color`, moved by `offset` and blurred by `blur` (the blur radius,
+/// twice the Gaussian's standard deviation), behind everything else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SceneShadow {
+    pub offset: Vec2,
+    pub blur: f32,
+    /// Premultiplied, for the `Painter` backend.
+    pub color: Color32,
+    /// Straight RGBA, for the SVG/EMF backends.
+    pub rgba: [u8; 4],
+}
+
+impl SceneShadow {
+    /// How far past what casts it the shadow reaches, in pixels: its offset plus three standard
+    /// deviations of blur.
+    pub fn reach(&self) -> f32 {
+        self.offset.length() + 1.5 * self.blur
+    }
+}
+
+/// The shadow `mol` casts under `xf`, if it has one: lengths in molecule units scaled like
+/// atom positions, so it keeps its proportion to the drawing at any zoom.
+pub fn build_shadow(mol: &Molecule, xf: RenderTransform) -> Option<SceneShadow> {
+    let s = mol.shadow?;
+    let [r, g, b, a] = s.color;
+    Some(SceneShadow {
+        offset: Vec2::new(s.offset[0], s.offset[1]) * xf.coord_scale,
+        blur: s.blur.max(0.0) * xf.coord_scale,
+        color: Color32::from_rgba_unmultiplied(r, g, b, a),
+        rgba: s.color,
+    })
+}
+
+/// Straight RGBA as egui's (premultiplied) colour.
+pub fn color32(rgba: [u8; 4]) -> Color32 {
+    let [r, g, b, a] = rgba;
+    Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
 /// A colored fill polygon (a ring interior), drawn behind everything else. `color` is the
@@ -113,6 +156,8 @@ pub struct MoleculeScene {
     pub label_bg_pad: f32,
     /// Arrows and texts on the page ([`Molecule::objects`]), drawn over the structures.
     pub objects: Vec<SceneObject>,
+    /// The drop shadow of the ring fills, bonds and labels, drawn behind them.
+    pub shadow: Option<SceneShadow>,
 }
 
 /// One laid-out line of a page text: the galley and the rect it is painted in.
@@ -146,12 +191,14 @@ impl MoleculeScene {
         let bonds = build_bonds(mol, style, xf, &labels);
         let ring_fills = build_ring_fills(mol, xf);
         let objects = build_objects(mol, style, xf, &mut layout);
-        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale, objects }
+        let shadow = build_shadow(mol, xf);
+        MoleculeScene { ring_fills, bonds, labels, label_bg_pad: style.label_bg_pad * xf.visual_scale, objects, shadow }
     }
 
     /// The pixel rect covering everything drawn: every atom position of `mol` (under `xf`, the
     /// transform this scene was built with — bare atoms have no primitive of their own), the ring
-    /// fills, bond strokes / wedge fills and label rects. `None` when there is nothing to cover.
+    /// fills, bond strokes / wedge fills and label rects, and how far their shadow reaches past
+    /// them. `None` when there is nothing to cover.
     pub fn bounds(&self, mol: &Molecule, xf: RenderTransform) -> Option<Rect> {
         let mut r = Rect::NOTHING;
         for a in &mol.atoms {
@@ -173,6 +220,13 @@ impl MoleculeScene {
             r.extend_with(l.rect.min);
             r.extend_with(l.rect.max);
         }
+        if let Some(shadow) = &self.shadow
+            && r.min.x <= r.max.x
+        {
+            // The structures' shadow: what they cover, moved and blurred.
+            let cast = r.translate(shadow.offset).expand(1.5 * shadow.blur);
+            r = r.union(cast);
+        }
         for o in self.objects.iter().filter(|o| o.rect.is_finite()) {
             r.extend_with(o.rect.min);
             r.extend_with(o.rect.max);
@@ -193,6 +247,7 @@ pub fn build_labels(
     mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
 ) -> HashMap<u32, SceneLabel> {
     let text_style = RichTextStyle::new(style.label_size * xf.visual_scale, Color32::BLACK);
+    let colored = |c: Option<[u8; 4]>| c.map(|c| RichTextStyle { color: color32(c), ..text_style.clone() });
     let index = MolIndex::new(mol);
     let mut map = HashMap::new();
     for atom in &mol.atoms {
@@ -200,7 +255,7 @@ pub fn build_labels(
             continue;
         }
         let label = atom_label(&index, atom);
-        let galley = label.rich.layout_with(&text_style, |job| layout(job));
+        let galley = label.rich.layout_with(colored(atom.color).as_ref().unwrap_or(&text_style), |job| layout(job));
         let anchor = galley
             .char_range_rect(label.anchor_chars)
             .map(|r| r.center().to_vec2())
@@ -461,7 +516,7 @@ fn text_lines(
     mut layout: impl FnMut(LayoutJob) -> Arc<egui::Galley>,
 ) -> Vec<SceneText> {
     let size = style.label_size * xf.visual_scale;
-    let text_style = RichTextStyle::new(size, Color32::BLACK);
+    let text_style = RichTextStyle::new(size, t.color.map_or(Color32::BLACK, color32));
     let anchor = xf.apply(t.pos);
     let mut out = Vec::new();
     for (k, line) in t.lines().iter().enumerate() {
@@ -640,7 +695,7 @@ pub fn build_bonds(
             BondStereo::HollowWedge => push_wedge_hollow(&mut strokes, tp1, tp2, style.wedge_width * vs, width),
             BondStereo::Dative => push_dative(&mut strokes, &mut fills, tp1, tp2, style.wedge_width * vs, width),
         }
-        out.push(SceneBond { bond_id: bond.id, strokes, fills });
+        out.push(SceneBond { bond_id: bond.id, strokes, fills, color: bond.color });
     }
     out
 }

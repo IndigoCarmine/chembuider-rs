@@ -446,6 +446,7 @@ impl RichText {
             size: f32,
             italic: bool,
             font: Option<FontName>,
+            color: Color32,
         }
         let mut parts: Vec<RichGalleyPart> = Vec::with_capacity(self.spans.len());
         let mut pen_x = 0.0_f32;
@@ -465,9 +466,10 @@ impl RichText {
                 Script::Sub => (SCRIPT_SCALE, SUBSCRIPT_DROP * base),
             };
             let family = span.style.font.map_or_else(|| style.family.clone(), |f| f.family(&style.family));
+            let color = span.style.color.unwrap_or(style.color);
             let format = TextFormat {
                 font_id: FontId::new(base * scale, family),
-                color: span.style.color.unwrap_or(style.color),
+                color,
                 italics: span.style.italic,
                 ..Default::default()
             };
@@ -487,6 +489,7 @@ impl RichText {
                 size: base * scale,
                 italic: span.style.italic,
                 font: span.style.font.filter(|f| !f.is_symbol()),
+                color,
             });
             pen_x += advance;
         }
@@ -511,6 +514,7 @@ impl RichText {
                 size: p.size,
                 italic: p.italic,
                 font: p.font,
+                color: p.color,
             });
         }
         RichGalley { parts, size: Vec2::new(pen_x, height) }
@@ -636,6 +640,8 @@ pub struct RichGalleyPart {
     /// The named font the span is drawn in, `None` for the base font. Symbol text is drawn
     /// as Unicode in the base font, so it has none here.
     pub font: Option<FontName>,
+    /// The colour the span is drawn in: its own, or the style's (SVG export needs it).
+    pub color: Color32,
 }
 
 impl RichGalleyPart {
@@ -659,6 +665,8 @@ pub struct PlacedGlyph {
     pub bold_offset: Option<f32>,
     /// The named font of the glyph's span ([`RichGalleyPart::font`]).
     pub font: Option<FontName>,
+    /// The colour of the glyph's span ([`RichGalleyPart::color`]).
+    pub color: Color32,
 }
 
 /// The result of laying out a [`RichText`]: ready to paint, knows its size.
@@ -695,6 +703,18 @@ impl RichGalley {
         }
     }
 
+    /// Paint with the text's top-left corner at `top_left`, every span in `color` whatever its
+    /// own colour (a shadow of the text).
+    pub fn paint_in(&self, painter: &egui::Painter, top_left: Pos2, color: Color32) {
+        for part in &self.parts {
+            let pos = top_left + part.offset;
+            painter.galley_with_override_text_color(pos, part.galley.clone(), color);
+            if let Some(dx) = part.bold_offset {
+                painter.galley_with_override_text_color(pos + Vec2::new(dx, 0.0), part.galley.clone(), color);
+            }
+        }
+    }
+
     /// Paint anchored to `anchor` (e.g. `Align2::CENTER_CENTER` to center on an atom).
     /// Returns the rect the text occupies.
     pub fn paint_anchored(&self, painter: &egui::Painter, anchor: Pos2, align: Align2) -> Rect {
@@ -719,6 +739,7 @@ impl RichGalley {
                         italic: part.italic,
                         bold_offset: part.bold_offset,
                         font: part.font,
+                        color: part.color,
                     });
                 }
             }

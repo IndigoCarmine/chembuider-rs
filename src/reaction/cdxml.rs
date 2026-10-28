@@ -27,6 +27,7 @@ use crate::molecule::cdx::{
     OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT,
 };
 use crate::molecule::cdx_codec::{self, CdxObject};
+use crate::molecule::cdx_colors::ColorTable;
 use crate::widget::ChemStructEditor;
 use crate::widget::rich_text::RichText;
 
@@ -150,11 +151,14 @@ struct Writer<'a> {
     style: &'a ReactionStyle,
     next: u32,
     page: CdxObject,
+    /// The document's colour table, which coloured atoms and bonds add to.
+    colors: ColorTable,
 }
 
 impl<'a> Writer<'a> {
     fn new(style: &'a ReactionStyle) -> Self {
-        Self { style, next: 1, page: CdxObject::new(OBJ_PAGE, 1) }
+        let colors = ColorTable::of(&cdx::new_document());
+        Self { style, next: 1, page: CdxObject::new(OBJ_PAGE, 1), colors }
     }
 
     fn id(&mut self) -> u32 {
@@ -228,6 +232,7 @@ impl<'a> Writer<'a> {
         self.steps(layout, &written);
 
         let mut doc = cdx::new_document();
+        self.colors.store(&mut doc);
         let mut page = std::mem::take(&mut self.page);
         if let Some(bbox) = page.children.iter().filter_map(cdx::bounding_box).reduce(|a, b| cdx::union(Some(a), b)) {
             page.props.insert(0, (PROP_BOUNDING_BOX, cdx::rect(bbox)));
@@ -241,7 +246,7 @@ impl<'a> Writer<'a> {
     /// its nodes and bonds.
     fn structure(&mut self, mol: &Molecule, origin: Vec2) -> Vec<(u32, Vec<u32>)> {
         let shift = ((origin.x + PAGE_MARGIN_PT) as f64 * PT, (origin.y + PAGE_MARGIN_PT) as f64 * PT);
-        let frags = cdx::fragments(mol, shift, &mut self.next);
+        let frags = cdx::fragments(mol, shift, &mut self.next, &mut self.colors);
         let out = frags
             .iter()
             .map(|f| (f.id, f.children.iter().filter(|c| matches!(c.tag, OBJ_NODE | OBJ_BOND)).map(|c| c.id).collect()))
@@ -420,8 +425,9 @@ pub fn scheme_from_document(doc: &CdxObject) -> Option<ReactionScheme> {
     let mut objects = Objects::default();
     let mut superseded: HashMap<u32, u32> = HashMap::new();
     let mut arrow_objects: Vec<ReadArrow> = Vec::new();
+    let colors = ColorTable::of(doc);
     for page in doc.children.iter().filter(|c| c.tag == OBJ_PAGE) {
-        collect(page, &mut objects, &mut superseded, &mut arrow_objects);
+        collect(page, &mut objects, &mut superseded, &mut arrow_objects, &colors);
     }
     // A graphic superseded by an arrow object is the same arrow: keep the arrow's geometry,
     // answer to both ids.
@@ -440,13 +446,19 @@ pub fn scheme_from_document(doc: &CdxObject) -> Option<ReactionScheme> {
     (!scheme.is_empty()).then_some(scheme)
 }
 
-fn collect(obj: &CdxObject, out: &mut Objects, superseded: &mut HashMap<u32, u32>, arrow_objects: &mut Vec<ReadArrow>) {
+fn collect(
+    obj: &CdxObject,
+    out: &mut Objects,
+    superseded: &mut HashMap<u32, u32>,
+    arrow_objects: &mut Vec<ReadArrow>,
+    colors: &ColorTable,
+) {
     for child in &obj.children {
         match child.tag {
-            OBJ_GROUP => collect(child, out, superseded, arrow_objects),
+            OBJ_GROUP => collect(child, out, superseded, arrow_objects, colors),
             OBJ_FRAGMENT => {
                 let mut molecule = Molecule::default();
-                cdx::read_fragment(child, &mut molecule);
+                cdx::read_fragment(child, &mut molecule, colors);
                 if molecule.atoms.is_empty() {
                     continue;
                 }

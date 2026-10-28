@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod smiles;
 pub mod cdx;
 pub mod cdx_codec;
+pub(crate) mod cdx_colors;
 pub(crate) mod cdx_fonts;
 pub(crate) mod cdx_page;
 pub(crate) mod cdx_table;
@@ -221,6 +222,10 @@ pub struct Atom {
     /// always drawn. Meaningless on anything that is not a hydrogen.
     #[serde(default)]
     pub group_h: bool,
+    /// The colour of the atom's label (straight RGBA); `None` draws it in the style's colour,
+    /// as before colours existed. Independent of the colour of its bonds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,6 +238,33 @@ pub struct Bond {
     pub stereo: BondStereo,
     /// Where a double bond's second line goes; meaningless on any other order.
     pub double_position: DoublePosition,
+    /// The colour of the bond's lines and wedges (straight RGBA); `None` draws it in the
+    /// style's colour, as before colours existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 4]>,
+}
+
+/// A drop shadow cast by a molecule's structures: their ring fills, bonds and atom labels (not
+/// the arrows and texts on the page), drawn behind everything else.
+///
+/// Lengths are molecule units (a bond is 1.5, y grows downward), so the shadow keeps its
+/// proportion to the drawing at any zoom and in the exported picture.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Shadow {
+    /// Straight (un-premultiplied) RGBA; the alpha is the shadow's opacity.
+    pub color: [u8; 4],
+    /// How far the shadow is moved from what casts it.
+    pub offset: [f32; 2],
+    /// How soft its edge is: the blur radius (twice the standard deviation of the Gaussian
+    /// blur); 0 is a hard-edged copy.
+    pub blur: f32,
+}
+
+impl Default for Shadow {
+    /// A soft grey shadow to the lower right.
+    fn default() -> Self {
+        Self { color: [0, 0, 0, 90], offset: [0.12, 0.12], blur: 0.1 }
+    }
 }
 
 /// A colored fill painted inside a ring, *behind* the bond lines (ChemDraw's ring shading).
@@ -261,6 +293,8 @@ pub struct Molecule {
     /// Reaction arrows and text on the page beside the structures ([`page`]). Their ids come
     /// from the same allocator as atoms and bonds, so one id never names two things.
     pub objects: Vec<PageObject>,
+    /// The drop shadow the structures cast; `None` (the default) casts none.
+    pub shadow: Option<Shadow>,
     next_id: u32,
 }
 
@@ -276,6 +310,9 @@ struct MoleculeData {
     /// Written only when there are any, so a plain structure saves as it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     objects: Vec<PageObject>,
+    /// Written only when there is one, for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shadow: Option<Shadow>,
 }
 
 impl From<MoleculeData> for Molecule {
@@ -293,6 +330,7 @@ impl From<MoleculeData> for Molecule {
             bonds: d.bonds,
             ring_fills: d.ring_fills,
             objects: d.objects,
+            shadow: d.shadow,
             next_id: max_id.map_or(1, |m| m + 1),
         }
     }
@@ -300,7 +338,7 @@ impl From<MoleculeData> for Molecule {
 
 impl From<Molecule> for MoleculeData {
     fn from(m: Molecule) -> Self {
-        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills, objects: m.objects }
+        Self { name: m.name, atoms: m.atoms, bonds: m.bonds, ring_fills: m.ring_fills, objects: m.objects, shadow: m.shadow }
     }
 }
 
@@ -312,6 +350,7 @@ impl Default for Molecule {
             bonds: Vec::new(),
             ring_fills: Vec::new(),
             objects: Vec::new(),
+            shadow: None,
             next_id: 1,
         }
     }
@@ -326,7 +365,7 @@ impl Molecule {
 
     pub fn add_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
         let id = self.alloc_id();
-        self.atoms.push(Atom { id, element, pos, charge, group_h: false });
+        self.atoms.push(Atom { id, element, pos, charge, group_h: false, color: None });
         id
     }
 
@@ -335,7 +374,7 @@ impl Molecule {
     fn add_fragment_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
         let id = self.alloc_id();
         let group_h = element == "H";
-        self.atoms.push(Atom { id, element, pos, charge, group_h });
+        self.atoms.push(Atom { id, element, pos, charge, group_h, color: None });
         id
     }
 
@@ -350,7 +389,7 @@ impl Molecule {
     /// [`add_bond`](Self::add_bond)'s search through every bond would make reading quadratic).
     fn push_bond(&mut self, begin: u32, end: u32, order: BondOrder, stereo: BondStereo) -> u32 {
         let id = self.alloc_id();
-        self.bonds.push(Bond { id, begin, end, order, stereo, double_position: DoublePosition::Auto });
+        self.bonds.push(Bond { id, begin, end, order, stereo, double_position: DoublePosition::Auto, color: None });
         id
     }
 
@@ -365,7 +404,7 @@ impl Molecule {
     /// `text` is markup, one line per newline (see [`PageText`]).
     pub fn add_text(&mut self, pos: [f32; 2], text: impl Into<String>) -> u32 {
         let id = self.alloc_id();
-        self.objects.push(PageObject::Text(PageText { id, pos, text: text.into(), align: TextAlign::Left, source: None }));
+        self.objects.push(PageObject::Text(PageText { id, pos, text: text.into(), align: TextAlign::Left, source: None, color: None }));
         id
     }
 
