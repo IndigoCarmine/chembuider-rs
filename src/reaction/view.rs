@@ -60,11 +60,31 @@ impl Default for ReactionView {
     }
 }
 
+/// How a figure draws its structures by default: in its own pixel sizes, labels as large as
+/// its 13 px text and lines as wide as its 1.5 px arrows beside a 40 px bond
+/// ([`ReactionStyle::default`]). The editor's style ([`StyleConfig::default`]) is ChemDraw's
+/// proportions to the editor's 75 px bond, which would dwarf a figure's bonds.
+fn figure_structure_style() -> StyleConfig {
+    StyleConfig {
+        label_size: 13.0,
+        bond_width: 1.5,
+        double_bond_offset: 3.5,
+        atom_bg_radius: 9.0,
+        wedge_width: 5.0,
+        bold_width: 4.0,
+        dash_len: 5.0,
+        dash_gap: 4.0,
+        wavy_amplitude: 3.0,
+        label_trim_pad: 2.0,
+        label_bg_pad: 1.0,
+    }
+}
+
 impl ReactionView {
     pub fn new() -> Self {
         Self {
             style: ReactionStyle::default(),
-            structure_style: StyleConfig::default(),
+            structure_style: figure_structure_style(),
             scratch: ChemStructEditor::default(),
         }
     }
@@ -161,7 +181,7 @@ impl ReactionView {
     /// view's style (see [`cdxml`](super::cdxml)). Write it with [`ReactionView::scheme_cdxml`]
     /// or [`ReactionView::scheme_cdx`]; the table is not part of it.
     pub fn scheme_document(&mut self, painter: &Painter, scheme: &ReactionScheme) -> CdxObject {
-        super::cdxml::scheme_document(scheme, painter, &self.style, &self.structure_style, &mut self.scratch)
+        super::cdxml::scheme_document(scheme, painter, &self.style, &mut self.scratch)
     }
 
     /// The figure's scheme as CDXML text.
@@ -457,7 +477,7 @@ mod tests {
     /// A structure-drawing style with *every* field moved off its default, so a figure that
     /// ignored [`ReactionView::structure_style`] would paint differently.
     fn non_default_structure_style() -> StyleConfig {
-        let d = StyleConfig::default();
+        let d = figure_structure_style();
         let s = StyleConfig {
             label_size: 17.0,
             bond_width: 2.25,

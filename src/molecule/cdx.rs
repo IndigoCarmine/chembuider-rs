@@ -833,12 +833,12 @@ pub fn read_cdxml(xml: &str) -> Option<CdxImport> {
 
 /// A CDXML document as the object tree a CDX file holds.
 pub fn cdxml_document(xml: &str) -> Option<CdxObject> {
-    cdx_file_rs::cdxml::parse_cdxml(xml).ok().map(CdxObject::from)
+    cdx_file_rs::cdxml::parse_cdxml(&cdx_table::widths_from_cdxml(xml)).ok().map(CdxObject::from)
 }
 
 /// A CDX object tree written as CDXML.
 pub fn cdxml_of_document(doc: &CdxObject) -> String {
-    cdx_file_rs::cdxml::write_cdxml(&doc.clone().into())
+    cdx_table::widths_to_cdxml(cdx_file_rs::cdxml::write_cdxml(&doc.clone().into()))
 }
 
 /// The structures of a document object tree; see [`read_cdx`].

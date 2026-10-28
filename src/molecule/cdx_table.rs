@@ -233,6 +233,197 @@ pub(crate) fn grid_extent(grid: &CdxObject) -> Option<[f64; 4]> {
     Some([x, y, right, y + (TABLE_FRAME_TOP as f64 + ROWS * TABLE_ROW_HEIGHT as f64) * PT])
 }
 
+// ─── CDXML ───────────────────────────────────────────────────────────────────
+
+/// CDXML spells a component's `Width` its own way: ChemDraw writes it as an integer in CDX
+/// units (`Width="5534515"`, the 84.45 pt label column of its `ReactionAnalysis` document),
+/// where every other coordinate, a page's `Width` among them, is written in points. The CDXML
+/// codec knows `Width` only as a coordinate, so a component's width is turned from points
+/// into CDX units after writing, and back before reading. ChemDraw reads a width in points as
+/// CDX units — nearly nothing — and stacks every column on the first.
+const COMPONENT_ELEMENT: &str = "sgcomponent";
+const WIDTH_ATTRIBUTE: &str = "Width";
+
+/// `xml` written by the codec with each component's width in CDX units, as ChemDraw writes it.
+pub(crate) fn widths_to_cdxml(xml: String) -> String {
+    rewrite_component_widths(&xml, |v| {
+        let pt: f64 = v.trim().parse().ok()?;
+        Some(((pt * PT).round() as i64).to_string())
+    })
+    .unwrap_or(xml)
+}
+
+/// A component's `Width` whose size is below this may be in points, from it up it is in CDX
+/// units. ChemDraw writes CDX units; earlier versions of this crate wrote points, as the codec
+/// writes every coordinate (trailing zeros trimmed: the minimum column went out as
+/// `Width="40"`), and a coordinate is an `i32` of CDX units, so those stay below 32768 pt. A
+/// width from here up read as points would run past the `i32` and be cut to its end, so it is
+/// read as CDX units, the one way it holds. Below, the file does not say which it is: a width
+/// is taken for points, as every earlier file's is, and a CDX width of 1 to 32767 units (under
+/// half a point) is read as that many points. Zero, a hidden column, is zero either way.
+const POINTS_BELOW: f64 = 32768.0;
+
+/// `xml` with each component's width in points, for the codec to read: a width in CDX units
+/// is turned into points, one in points already ([`POINTS_BELOW`]) stays as it is.
+pub(crate) fn widths_from_cdxml(xml: &str) -> std::borrow::Cow<'_, str> {
+    match rewrite_component_widths(xml, |v| {
+        let units: f64 = v.trim().parse().ok()?;
+        (units.is_finite() && units.abs() >= POINTS_BELOW).then(|| format!("{}", units / PT))
+    }) {
+        Some(s) => std::borrow::Cow::Owned(s),
+        None => std::borrow::Cow::Borrowed(xml),
+    }
+}
+
+/// `xml` with the `Width` of every `sgcomponent` start tag replaced by what `f` makes of its
+/// value as XML reads it ([`attribute_value`]), left as it is where `f` gives nothing; `None`
+/// when nothing changed. Tags are found as XML has them: not inside comments, CDATA sections,
+/// processing instructions or declarations, and their attributes with whitespace around `=`
+/// and either quote.
+fn rewrite_component_widths(xml: &str, f: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let mut out = String::with_capacity(xml.len() + 64);
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(n) = xml[i..].find('<') {
+        let at = i + n;
+        let markup = &xml[at..];
+        if let Some(end) = non_element_end(markup) {
+            i = at + end;
+            continue;
+        }
+        let name_end = markup[1..].find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>').map_or(markup.len(), |n| 1 + n);
+        let is_component = &markup[1..name_end] == COMPONENT_ELEMENT;
+        let end = start_tag_attributes(markup, name_end, |name, value| {
+            if !is_component || name != WIDTH_ATTRIBUTE {
+                return;
+            }
+            if let Some(v) = attribute_value(&markup[value.clone()]).and_then(|v| f(&v)) {
+                out.push_str(&xml[copied..at + value.start]);
+                out.push_str(&v);
+                copied = at + value.end;
+            }
+        });
+        i = at + end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&xml[copied..]);
+    Some(out)
+}
+
+/// Where `markup` (from its `<`) ends, past its `>`, when it holds no element: a comment, a
+/// CDATA section, a processing instruction or a declaration (`<!DOCTYPE …>`, its internal
+/// subset in brackets among it). `None` for a tag.
+fn non_element_end(markup: &str) -> Option<usize> {
+    let to = |open: &str, close: &str| markup.strip_prefix(open).map(|r| r.find(close).map_or(markup.len(), |n| open.len() + n + close.len()));
+    if let Some(end) = to("<!--", "-->").or_else(|| to("<![CDATA[", "]]>")).or_else(|| to("<?", "?>")) {
+        return Some(end);
+    }
+    if !markup.starts_with("<!") {
+        return None;
+    }
+    // A declaration: its `>` outside quotes, brackets and the comments of an internal subset.
+    let mut depth = 0usize;
+    let mut i = 2;
+    while i < markup.len() {
+        let rest = &markup[i..];
+        if rest.starts_with("<!--") {
+            i += rest.find("-->").map_or(rest.len(), |n| n + 3);
+            continue;
+        }
+        match rest.as_bytes()[0] {
+            q @ (b'"' | b'\'') => i +=1 + rest[1..].find(q as char).map_or(rest.len() - 1, |n| n + 1),
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'>' if depth == 0 => return Some(i + 1),
+            _ => i += rest.chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    Some(markup.len())
+}
+
+/// Each attribute of the tag `markup` (from its `<`, its name ending at `from`) given to
+/// `visit` as its name and the byte range of its value, as XML spells an attribute: `name`,
+/// optional whitespace, `=`, optional whitespace, a value in `"` or `'`. Returns where the tag
+/// ends, past its `>`; a quoted `>` does not end it. What is not an attribute is passed over.
+fn start_tag_attributes(markup: &str, from: usize, mut visit: impl FnMut(&str, std::ops::Range<usize>)) -> usize {
+    let skip_space = |i: usize| markup[i..].find(|c: char| !c.is_ascii_whitespace()).map_or(markup.len(), |n| i + n);
+    // Where the value quoted at `i` closes.
+    let quoted = |i: usize| -> Option<usize> {
+        let q = markup[i..].chars().next().filter(|q| *q == '"' || *q == '\'')?;
+        Some(markup[i + 1..].find(q).map_or(markup.len(), |n| i + 1 + n))
+    };
+    let mut i = skip_space(from);
+    while i < markup.len() {
+        if markup[i..].starts_with('>') {
+            return i + 1;
+        }
+        if let Some(close) = quoted(i) {
+            i = skip_space((close + 1).min(markup.len()));
+            continue;
+        }
+        let name_end = markup[i..].find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '>' | '/' | '"' | '\'')).map_or(markup.len(), |n| i + n);
+        if name_end == i {
+            // A `/` or a stray `=`.
+            i = skip_space(i + 1);
+            continue;
+        }
+        let name = &markup[i..name_end];
+        let eq = skip_space(name_end);
+        i = eq;
+        if !markup[eq..].starts_with('=') {
+            continue;
+        }
+        let value_at = skip_space(eq + 1);
+        i = value_at;
+        let Some(close) = quoted(value_at) else { continue };
+        visit(name, value_at + 1..close);
+        i = skip_space((close + 1).min(markup.len()));
+    }
+    markup.len()
+}
+
+/// The attribute value `raw` as XML reads it, as the codec does: its character references
+/// (`&#53;`, `&#x35;`) and predefined entities (`&lt;`, `&gt;`, `&amp;`, `&apos;`, `&quot;`)
+/// replaced by what they stand for. `None` where a reference is not one of these or names no
+/// character.
+fn attribute_value(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !raw.contains('&') {
+        return Some(std::borrow::Cow::Borrowed(raw));
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let end = at + rest[at..].find(';')?;
+        out.push(match &rest[at + 1..end] {
+            "lt" => '<',
+            "gt" => '>',
+            "amp" => '&',
+            "apos" => '\'',
+            "quot" => '"',
+            name => {
+                let number = name.strip_prefix('#')?;
+                let (digits, radix) = number.strip_prefix('x').map_or((number, 10), |hex| (hex, 16));
+                if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                    return None;
+                }
+                char::from_u32(u32::from_str_radix(digits, radix).ok()?)?
+            }
+        });
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(std::borrow::Cow::Owned(out))
+}
+
 // ─── Writing ─────────────────────────────────────────────────────────────────
 
 /// Width of `text` in 10 pt Arial (CDX units) times `scale`, a little wider when bold.
@@ -880,6 +1071,300 @@ mod tests {
         let doc = cdx_codec::parse(&merged).unwrap();
         let read = cdx_file_rs::cdxml::parse_cdxml_with_warnings(&cdxml_of_document(&doc)).unwrap();
         assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+    }
+
+    /// Each component's `Width`, in CDX units.
+    fn widths(grid: &CdxObject) -> Vec<i32> {
+        grid.children.iter().filter(|c| c.tag == OBJ_SG_COMPONENT).map(|c| c.prop_int(PROP_WIDTH).unwrap()).collect()
+    }
+
+    fn grid_of(doc: &CdxObject) -> CdxObject {
+        fn walk(o: &CdxObject) -> Option<CdxObject> {
+            if o.tag == OBJ_STOICHIOMETRY_GRID {
+                return Some(o.clone());
+            }
+            o.children.iter().find_map(walk)
+        }
+        walk(doc).expect("a grid")
+    }
+
+    /// The `Width` attribute of every `sgcomponent` in a CDXML text, as written.
+    fn cdxml_widths(xml: &str) -> Vec<String> {
+        xml.split("<sgcomponent").skip(1).map(|s| s.split("Width=\"").nth(1).unwrap().split('"').next().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn only_a_components_width_is_rewritten_and_nothing_else_changes() {
+        let xml = "<page Width=\"540\"><sgcomponentx Width=\"1\"/><sgcomponent id=\"1\" Name='a>b' Width=\"84.45\" = ComponentIsHeader=\"yes\"/></page>";
+        let out = widths_to_cdxml(xml.to_string());
+        assert_eq!(out, xml.replace("Width=\"84.45\"", &format!("Width=\"{}\"", (84.45 * PT).round())));
+        assert_eq!(widths_from_cdxml(&out), xml.replace("84.45", &format!("{}", (84.45 * PT).round() / PT)));
+        // A width in points (with a fraction) is read as it is.
+        assert_eq!(widths_from_cdxml(xml), xml);
+    }
+
+    #[test]
+    fn a_width_is_read_as_points_only_where_points_can_hold_it() {
+        // An earlier version wrote points; ChemDraw writes CDX units. Points reach no further
+        // than 32768 either way, an `i32` of CDX units; from there on a width is CDX units.
+        for (w, pt) in [
+            ("40", "40"),
+            ("40.02", "40.02"),
+            ("-40", "-40"),
+            ("32767", "32767"),
+            ("-32767", "-32767"),
+            ("32768", "0.5"),
+            ("-32768", "-0.5"),
+            ("65535", "0.9999847412109375"),
+            ("65536", "1"),
+            ("-65536", "-1"),
+            ("5534515", "84.44999694824219"),
+        ] {
+            let xml = format!("<sgcomponent Width=\"{w}\"/>");
+            assert_eq!(widths_from_cdxml(&xml), format!("<sgcomponent Width=\"{pt}\"/>"), "{w}");
+        }
+    }
+
+    #[test]
+    fn a_width_of_a_few_cdx_units_is_taken_for_points() {
+        // What stays ambiguous: a width under half a point in CDX units, 1 to 32767, reads as
+        // that many points, as an earlier version's would. A hidden column, 0, is 0 either way.
+        for (w, units) in [("1", 65536), ("40", 40 * 65536), ("32767", 32767 * 65536), ("0", 0), ("-0", 0)] {
+            let grid = grid_of(&cdx::cdxml_document(&analysis_with_first_width(&format!("Width=\"{w}\""))).unwrap());
+            assert_eq!(widths(&grid)[0], units, "{w}");
+        }
+        assert_eq!(widths_from_cdxml("<sgcomponent Width=\"0\"/>"), "<sgcomponent Width=\"0\"/>");
+    }
+
+    #[test]
+    fn a_width_points_cannot_hold_is_never_saturated() {
+        // Read as points, 32768 and up would run past an `i32` of CDX units and stop at its end.
+        for w in [32768, 65535, -32768, -40000, -65536, i32::MAX, i32::MIN + 1] {
+            let xml = analysis_with_first_width(&format!("Width=\"{w}\""));
+            let grid = grid_of(&cdx::cdxml_document(&xml).unwrap());
+            assert_eq!(widths(&grid)[0], w, "{w}");
+            let again = cdxml_of_document(&cdx::cdxml_document(&xml).unwrap());
+            assert_eq!(cdxml_widths(&again)[0], w.to_string(), "{w} written again");
+        }
+    }
+
+    #[test]
+    fn a_widths_character_references_are_read_as_xml_reads_them() {
+        for (w, pt) in [
+            ("&#53;534515", "84.44999694824219"),
+            ("&#x35;534515", "84.44999694824219"),
+            ("&#x35;&#53;3451&#x0035;", "84.44999694824219"),
+            ("&#32;65536&#x9;", "1"),
+            ("&#52;0", "&#52;0"),
+            ("&amp;65536", "&amp;65536"),
+            ("&unknown;65536", "&unknown;65536"),
+        ] {
+            let xml = format!("<sgcomponent Width='{w}'/>");
+            assert_eq!(widths_from_cdxml(&xml), format!("<sgcomponent Width='{pt}'/>"), "{w}");
+        }
+        assert_eq!(attribute_value("&lt;&gt;&amp;&apos;&quot;&#60;&#x3E;").as_deref(), Some("<>&'\"<>"));
+        for bad in ["&#;", "&#x;", "&#+53;", "&#x+35;", "&#xD800;", "&#1114112;", "&#53", "&nbsp;", "&#X35;"] {
+            assert_eq!(attribute_value(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_components_width_written_with_character_references_imports_and_saves_as_chemdraws() {
+        let chemdraw = [5534515, 5639372, 3968204, 3968204];
+        for spelling in ["Width='&#53;534515'", "Width=\"&#x35;534515\"", "Width = '&#x35;&#53;&#51;4515'"] {
+            let xml = analysis_with_first_width(spelling);
+            assert_eq!(widths(&grid_of(&cdx::cdxml_document(&xml).unwrap())), chemdraw, "{spelling} read");
+            // Opened and saved again, through the document the file was.
+            let original = cdx_codec::write(&cdx::cdxml_document(&xml).unwrap());
+            let read = read_cdxml(&xml).unwrap().molecule;
+            let saved = cdxml_of_document(&cdx_codec::parse(&merge_into_cdx(&original, &read)).unwrap());
+            assert_eq!(cdxml_widths(&saved), ["5534515", "5639372", "3968204", "3968204"], "{spelling} saved");
+        }
+        // An earlier version's points, spelled with references, stay points.
+        let grid = grid_of(&cdx::cdxml_document(&analysis_with_first_width("Width='&#52;&#x30;'")).unwrap());
+        assert_eq!(widths(&grid)[0], 40 * 65536);
+    }
+
+    #[test]
+    fn widths_are_found_as_xml_spells_attributes_and_nowhere_else() {
+        // Spaces around `=`, either quote, and markup that holds no element.
+        let xml = "<?pi <sgcomponent Width=\"65536\"?><!-- <sgcomponent Width=\"65536\"/> --><!DOCTYPE CDXML [<!ENTITY e \"<sgcomponent Width='65536'>\">]>\
+                   <page><![CDATA[<sgcomponent Width=\"65536\"/>]]><sgcomponent id = '1' Width = '131072'\n/><sgcomponent\tWidth\n=\t\"196608\">x</sgcomponent></page>";
+        let out = widths_from_cdxml(xml);
+        assert_eq!(out, xml.replace("'131072'", "'2'").replace("\"196608\"", "\"3\""));
+        assert_eq!(widths_to_cdxml(out.into_owned()), xml);
+    }
+
+    #[test]
+    fn chemdraws_cdxml_grid_widths_are_cdx_units() {
+        // ChemDraw writes a component's Width in CDXML as an integer in CDX units (1/65536 pt),
+        // not in points as other coordinates: `Width="5534515"` is the 84.45 pt label column.
+        let xml = String::from_utf8(fixture("chemdraw25_reaction_analysis.cdxml")).unwrap();
+        assert_eq!(cdxml_widths(&xml), ["5534515", "5639372", "3968204", "3968204"]);
+        let grid = grid_of(&cdx::cdxml_document(&xml).unwrap());
+        assert_eq!(widths(&grid), [5534515, 5639372, 3968204, 3968204]);
+        // Read so, the grid covers what ChemDraw drew: from 50.36 pt to the right edge of the
+        // product column (the label at 290.84 pt plus its 7.5 pt pad, plus 60.55 pt).
+        let extent = grid_extent(&grid).unwrap();
+        assert!((extent[2] / PT - 343.89).abs() < 0.2, "{}", extent[2] / PT);
+    }
+
+    #[test]
+    fn grid_widths_go_to_cdxml_in_cdx_units_and_back() {
+        let m = drawn();
+        let doc = cdx_codec::parse(&molecule_to_cdx_document(&m)).unwrap();
+        let written = widths(&grid_of(&doc));
+        assert!(written.iter().all(|&w| w > 20 * 65536), "every column is tens of points wide: {written:?}");
+        let xml = molecule_to_cdxml(&m);
+        let expected: Vec<String> = written.iter().map(|w| w.to_string()).collect();
+        assert_eq!(cdxml_widths(&xml), expected, "as ChemDraw spells them");
+        assert_eq!(widths(&grid_of(&cdx::cdxml_document(&xml).unwrap())), written, "and read back the same");
+        // ChemDraw's own document, read and written again, keeps its widths.
+        let chemdraw = String::from_utf8(fixture("chemdraw25_reaction_analysis.cdxml")).unwrap();
+        let again = cdxml_of_document(&cdx::cdxml_document(&chemdraw).unwrap());
+        assert_eq!(cdxml_widths(&again), ["5534515", "5639372", "3968204", "3968204"]);
+    }
+
+    /// [`drawn`] with hydrogen (H2) as a second reactant: its column is the narrowest a
+    /// value column gets, [`TABLE_MIN_COLUMN`] points, a whole number.
+    fn drawn_with_hydrogen() -> Molecule {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".into(), [5.0, 5.0], 0);
+        let b = m.add_atom("C".into(), [6.3, 5.0], 0);
+        m.add_bond(a, b, BondOrder::Single);
+        let h = m.add_atom("H".into(), [8.0, 5.0], 0);
+        let h2 = m.add_atom("H".into(), [9.3, 5.0], 0);
+        m.add_bond(h, h2, BondOrder::Single);
+        m.add_arrow([11.0, 5.0], [15.0, 5.0], ArrowKind::Reaction);
+        let c = m.add_atom("C".into(), [16.0, 5.0], 0);
+        let d = m.add_atom("C".into(), [17.3, 5.0], 0);
+        m.add_bond(c, d, BondOrder::Single);
+        let t = new_table(&m, None).unwrap();
+        m.push_object(PageObject::Table(t));
+        m
+    }
+
+    #[test]
+    fn grid_widths_saved_in_points_by_earlier_versions_still_read() {
+        // Before ChemDraw's spelling was followed, the codec wrote the widths in points as it
+        // writes every coordinate, trailing zeros trimmed: the minimum column went out as
+        // `Width="40"`. Those files read as they were meant, and are saved as ChemDraw spells
+        // them.
+        let m = drawn_with_hydrogen();
+        let doc = cdx_codec::parse(&molecule_to_cdx_document(&m)).unwrap();
+        let written = widths(&grid_of(&doc));
+        let old = cdx_file_rs::cdxml::write_cdxml(&doc.clone().into());
+        let min = (TABLE_MIN_COLUMN as f64).to_string();
+        assert!(cdxml_widths(&old).contains(&min), "a column at the minimum, {min} pt: {:?}", cdxml_widths(&old));
+        let close = |read: &[i32], what: &str| {
+            assert_eq!(read.len(), written.len(), "{what}");
+            for (a, b) in read.iter().zip(&written) {
+                assert!((a - b).abs() <= 1, "{what}: {read:?} vs {written:?}");
+            }
+        };
+        close(&widths(&grid_of(&cdx::cdxml_document(&old).unwrap())), "read");
+        // Opened and saved again, through the document the file was.
+        let original = cdx_codec::write(&cdx::cdxml_document(&old).unwrap());
+        let read = read_cdxml(&old).unwrap().molecule;
+        let saved = cdxml_of_document(&cdx_codec::parse(&merge_into_cdx(&original, &read)).unwrap());
+        let units: Vec<i32> = cdxml_widths(&saved).iter().map(|w| w.parse().unwrap()).collect();
+        close(&units, "saved");
+        close(&widths(&grid_of(&cdx::cdxml_document(&saved).unwrap())), "saved and read");
+    }
+
+    /// The ChemDraw document with its first component's `Width="5534515"` written as `width`.
+    fn analysis_with_first_width(width: &str) -> String {
+        let xml = String::from_utf8(fixture("chemdraw25_reaction_analysis.cdxml")).unwrap();
+        assert!(xml.contains("Width=\"5534515\""));
+        xml.replacen("Width=\"5534515\"", width, 1)
+    }
+
+    #[test]
+    fn a_components_width_reads_however_the_xml_spells_the_attribute() {
+        let chemdraw = [5534515, 5639372, 3968204, 3968204];
+        for spelling in ["Width = \"5534515\"", "Width= '5534515'", "Width\t=\n\"5534515\"", "Width='5534515'", "Width=\" 5534515 \""] {
+            let grid = grid_of(&cdx::cdxml_document(&analysis_with_first_width(spelling)).unwrap());
+            assert_eq!(widths(&grid), chemdraw, "{spelling:?}");
+        }
+        // Width first, before the id.
+        let xml = analysis_with_first_width("").replacen("<sgcomponent", "<sgcomponent Width = '5534515'", 1);
+        assert!(xml.contains("<sgcomponent Width = '5534515'\n id=\"1\"") || xml.contains("<sgcomponent Width = '5534515'\r\n id=\"1\""));
+        assert_eq!(widths(&grid_of(&cdx::cdxml_document(&xml).unwrap())), chemdraw, "attribute order");
+        // An earlier version's whole-point width, however spelled.
+        for spelling in ["Width = \"40\"", "Width='40'", "Width =\t'40.0'"] {
+            let grid = grid_of(&cdx::cdxml_document(&analysis_with_first_width(spelling)).unwrap());
+            assert_eq!(widths(&grid)[0], 40 * 65536, "{spelling:?}");
+        }
+    }
+
+    /// The components of a grid in the order ChemDraw lays their columns out: each block's
+    /// header column, then its value columns.
+    fn in_column_order(grid: &CdxObject) -> Vec<&CdxObject> {
+        let components: Vec<&CdxObject> = grid.children.iter().filter(|c| c.tag == OBJ_SG_COMPONENT).collect();
+        let mut out = Vec::new();
+        for reactant in [true, false] {
+            for header in [true, false] {
+                out.extend(components.iter().filter(|c| {
+                    flag(c, PROP_COMPONENT_IS_REACTANT) == reactant && flag(c, PROP_COMPONENT_IS_HEADER) == header
+                }));
+            }
+        }
+        out
+    }
+
+    /// The x ranges (points) of the columns ChemDraw lays out from a CDXML text: the widths as
+    /// it reads them (integers in CDX units), side by side from the grid's corner, the blocks
+    /// [`TABLE_BLOCK_GAP`] apart.
+    fn column_ranges(xml: &str, grid: &CdxObject) -> Vec<(f64, f64)> {
+        let widths: Vec<f64> = cdxml_widths(xml).iter().map(|w| w.parse::<f64>().unwrap().trunc() / PT).collect();
+        let by_id: HashMap<u32, f64> = grid.children.iter().filter(|c| c.tag == OBJ_SG_COMPONENT).map(|c| c.id).zip(widths).collect();
+        let (x0, _) = point_2d(grid).unwrap();
+        let mut x = x0 / PT;
+        let mut out = Vec::new();
+        let mut was_reactant = true;
+        for c in in_column_order(grid) {
+            if was_reactant && !flag(c, PROP_COMPONENT_IS_REACTANT) {
+                x += TABLE_BLOCK_GAP as f64;
+                was_reactant = false;
+            }
+            out.push((x, x + by_id[&c.id]));
+            x += by_id[&c.id];
+        }
+        out
+    }
+
+    #[test]
+    fn cells_stay_inside_their_columns_and_rows() {
+        let m = drawn();
+        let xml = molecule_to_cdxml(&m);
+        let grid = grid_of(&cdx::cdxml_document(&xml).unwrap());
+        let columns = column_ranges(&xml, &grid);
+        assert_eq!(columns.len(), 5, "two headers, two reactants, one product");
+        for w in columns.windows(2) {
+            assert!(w[0].1 <= w[1].0 + 1e-6, "columns do not overlap: {columns:?}");
+        }
+        // Every shown text lies inside its column (right of the pad) and inside its row, and
+        // the rows do not overlap.
+        let (_, y0) = point_2d(&grid).unwrap();
+        let frame_top = y0 / PT + TABLE_FRAME_TOP as f64;
+        for (c, &(left, right)) in in_column_order(&grid).into_iter().zip(&columns) {
+            let mut row = 0;
+            let mut last_bottom = f64::NEG_INFINITY;
+            for d in c.children.iter().filter(|d| d.tag == OBJ_SG_DATUM) {
+                if d.prop_i16(PROP_SG_PROPERTY_TYPE) == Some(LIMIT_MOLES) {
+                    continue;
+                }
+                let t = &d.children[0].children[0];
+                let b = cdx::bounding_box(t).unwrap().map(|v| v / PT);
+                let top = frame_top + row as f64 * TABLE_ROW_HEIGHT as f64;
+                let bottom = top + TABLE_ROW_HEIGHT as f64;
+                assert!(b[0] >= left + TABLE_CELL_PAD as f64 - 0.01 && b[2] <= right + 0.01, "{b:?} in {left}..{right}");
+                assert!(b[1] >= top - 0.01 && b[3] <= bottom + 0.01, "{b:?} in row {top}..{bottom}");
+                assert!(b[1] >= last_bottom - 0.01, "rows do not overlap");
+                last_bottom = b[3];
+                row += 1;
+            }
+        }
     }
 
     #[test]

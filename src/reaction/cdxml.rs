@@ -102,23 +102,37 @@ impl ReactionStyle {
 /// `scheme` as a ChemDraw document (write it with [`cdx_codec::write`] or
 /// [`cdx::cdxml_of_document`]). The
 /// painter measures text; `scratch` is a drawing context for structures, as for
-/// [`measure_scheme`].
+/// [`measure_scheme`]. The structures are measured as ChemDraw draws them, whatever style the
+/// figure draws them in: their atom labels are written at ChemDraw's 10 pt.
 pub fn scheme_document(
     scheme: &ReactionScheme,
     painter: &Painter,
     style: &ReactionStyle,
-    structure_style: &StyleConfig,
     scratch: &mut ChemStructEditor,
 ) -> CdxObject {
     let pt_style = style.chemdraw();
-    // Atom labels in proportion to the bonds, as in the figure.
-    let mut structure_style = structure_style.clone();
-    let to_pt = 14.4 / style.bond_length;
-    structure_style.label_size *= to_pt;
-    structure_style.label_bg_pad *= to_pt;
-    structure_style.label_trim_pad *= to_pt;
-    let layout = measure_scheme(scheme, painter, &pt_style, &structure_style, scratch);
+    let layout = measure_scheme(scheme, painter, &pt_style, &chemdraw_points(), scratch);
     Writer::new(&pt_style).document(scheme, &layout)
+}
+
+/// ChemDraw's structure style ([`StyleConfig::chemdraw`]) in points, the unit of a figure laid
+/// out in [`ReactionStyle::chemdraw`].
+fn chemdraw_points() -> StyleConfig {
+    let s = StyleConfig::chemdraw();
+    let k = 14.4 / (crate::widget::DEFAULT_BOND_LENGTH * crate::widget::SCALE_FACTOR);
+    StyleConfig {
+        label_size: s.label_size * k,
+        bond_width: s.bond_width * k,
+        double_bond_offset: s.double_bond_offset * k,
+        atom_bg_radius: s.atom_bg_radius * k,
+        wedge_width: s.wedge_width * k,
+        bold_width: s.bold_width * k,
+        dash_len: s.dash_len * k,
+        dash_gap: s.dash_gap * k,
+        wavy_amplitude: s.wavy_amplitude * k,
+        label_trim_pad: s.label_trim_pad * k,
+        label_bg_pad: s.label_bg_pad * k,
+    }
 }
 
 /// What one scheme item became: the objects that stand for it in a step.

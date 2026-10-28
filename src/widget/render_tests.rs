@@ -249,10 +249,10 @@ fn fingerprints_are_reproducible() {
 const VALENCE_RING_ORDER: &str = r#"
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-line (500.000,400.000) (561.390,400.000) stroke=1.500/#000000ff
-line (500.000,407.000) (561.390,407.000) stroke=1.500/#000000ff
-line (500.000,393.000) (561.390,393.000) stroke=1.500/#000000ff
-rect (562.390,382.000)-(587.609,418.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (500.000,400.000) (548.594,400.000) stroke=3.125/#000000ff
+line (500.000,413.542) (548.594,413.542) stroke=3.125/#000000ff
+line (500.000,386.458) (548.594,386.458) stroke=3.125/#000000ff
+rect (550.677,365.833)-(599.323,434.167) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 circle c=(575.000,400.000) r=18.000 fill=#00000000 stroke=2.000/#ff8c00ff
 circle c=(575.000,400.000) r=14.000 fill=#00000000 stroke=2.000/#5082ffff
 circle c=(575.000,400.000) r=11.000 fill=#00000000 stroke=1.500/#32b432ff
@@ -266,46 +266,46 @@ line (562.056,390.595) (565.595,387.056) stroke=1.500/#dc1e1eff
 line (570.056,384.783) (575.000,384.000) stroke=1.500/#dc1e1eff
 line (579.944,384.783) (584.405,387.056) stroke=1.500/#dc1e1eff
 line (587.944,390.595) (590.217,395.056) stroke=1.500/#dc1e1eff
-text "O" at=(563.390,383.000) sections=["O":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "O" at=(554.844,370.000) sections=["O":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 "#;
 
 const STEREO_BONDS: &str = r#"
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-path closed=true fill=#000000ff stroke=0.000/#00000000 pts=[(500.000,400.000) (575.000,405.000) (575.000,395.000)] kind=Middle
-path closed=true fill=#32b432ff stroke=0.000/#00000000 pts=[(500.000,400.000) (458.169,462.501) (466.831,467.499)] kind=Middle
-line (496.088,392.039) (495.066,392.628) stroke=1.500/#000000ff
-line (492.176,384.077) (490.132,385.256) stroke=1.500/#000000ff
-line (488.263,376.116) (485.198,377.884) stroke=1.500/#000000ff
-line (484.351,368.155) (480.264,370.512) stroke=1.500/#000000ff
-line (480.439,360.193) (475.330,363.140) stroke=1.500/#000000ff
-line (476.527,352.232) (470.397,355.768) stroke=1.500/#000000ff
-rect (429.890,317.000)-(475.859,353.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-text "HO" at=(430.890,318.000) sections=["HO":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+path closed=true fill=#000000ff stroke=0.000/#00000000 pts=[(500.000,400.000) (575.000,406.771) (575.000,393.229)] kind=Middle
+path closed=true fill=#32b432ff stroke=0.000/#00000000 pts=[(500.000,400.000) (456.635,461.616) (468.365,468.384)] kind=Middle
+line (497.668,394.959) (496.803,395.458) stroke=3.125/#000000ff
+line (495.336,389.918) (493.606,390.916) stroke=3.125/#000000ff
+line (493.004,384.877) (490.410,386.373) stroke=3.125/#000000ff
+line (490.672,379.836) (487.213,381.831) stroke=3.125/#000000ff
+line (488.340,374.795) (484.016,377.289) stroke=3.125/#000000ff
+line (486.008,369.753) (480.819,372.747) stroke=3.125/#000000ff
+rect (402.177,300.833)-(486.854,369.167) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "HO" at=(406.344,305.000) sections=["HO":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 "#;
 
 const DECORATED_ATOMS: &str = r#"
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 path closed=true fill=#00640080 stroke=0.000/#00000000 pts=[(500.000,400.000) (575.000,400.000) (462.500,465.000)] kind=Middle
-line (500.000,400.000) (562.365,400.000) stroke=1.500/#000000ff
-line (496.968,398.251) (470.430,444.251) stroke=1.500/#000000ff
-line (503.032,401.749) (476.493,447.749) stroke=1.500/#000000ff
-line (500.000,400.000) (462.500,335.000) stroke=1.500/#000000ff
-line (462.500,335.000) (401.109,335.000) stroke=1.500/#000000ff
-line (462.500,328.000) (401.109,328.000) stroke=1.500/#000000ff
-line (462.500,342.000) (401.109,342.000) stroke=1.500/#000000ff
-rect (374.890,317.000)-(400.109,353.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (449.890,447.000)-(475.109,483.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (563.365,379.600)-(631.084,421.800) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (500.000,400.000) (550.286,400.000) stroke=3.125/#000000ff
+line (494.135,396.616) (477.549,425.366) stroke=3.125/#000000ff
+line (505.865,403.384) (489.278,432.134) stroke=3.125/#000000ff
+line (500.000,400.000) (462.500,335.000) stroke=3.125/#000000ff
+line (462.500,335.000) (413.906,335.000) stroke=3.125/#000000ff
+line (462.500,321.458) (413.906,321.458) stroke=3.125/#000000ff
+line (462.500,348.542) (413.906,348.542) stroke=3.125/#000000ff
+rect (363.177,300.833)-(411.823,369.167) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (438.177,430.833)-(486.823,499.167) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (552.370,361.042)-(674.797,439.500) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 circle c=(500.000,400.000) r=14.000 fill=#00000000 stroke=2.000/#5082ffff
 circle c=(575.000,400.000) r=18.000 fill=#00000000 stroke=2.000/#ff8c00ff
 circle c=(575.000,400.000) r=14.000 fill=#00000000 stroke=2.000/#5082ffff
 circle c=(575.000,400.000) r=11.000 fill=#00000000 stroke=1.500/#32b432ff
-text "NH" at=(564.365,383.000) sections=["NH":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
-text "3" at=(606.396,396.800) sections=["3":#000000ff@21.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
-text "+" at=(618.240,380.600) sections=["+":#000000ff@21.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
-text "O" at=(450.890,448.000) sections=["O":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "NH" at=(556.536,370.000) sections=["NH":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "3" at=(629.505,393.333) sections=["3":#000000ff@36.458] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "+" at=(650.068,365.208) sections=["+":#000000ff@36.458] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "O" at=(442.344,435.000) sections=["O":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 line (403.500,335.000) (402.717,339.944) stroke=1.500/#dc1e1eff
 line (400.444,344.405) (396.905,347.944) stroke=1.500/#dc1e1eff
 line (392.444,350.217) (387.500,351.000) stroke=1.500/#dc1e1eff
@@ -316,30 +316,30 @@ line (374.556,325.595) (378.095,322.056) stroke=1.500/#dc1e1eff
 line (382.556,319.783) (387.500,319.000) stroke=1.500/#dc1e1eff
 line (392.444,319.783) (396.905,322.056) stroke=1.500/#dc1e1eff
 line (400.444,325.595) (402.717,330.056) stroke=1.500/#dc1e1eff
-text "O" at=(375.890,318.000) sections=["O":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+text "O" at=(367.344,305.000) sections=["O":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 "#;
 
 const HOVERED_BOND: &str = r#"
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-line (407.500,390.000) (520.000,446.250) stroke=2.250/#32b432ff
-line (412.196,380.609) (507.821,428.421) stroke=2.250/#32b432ff
-line (520.000,446.250) (610.263,401.119) stroke=2.250/#000000ff
-rect (611.763,362.500)-(653.638,417.500) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-text "Cl" at=(613.263,364.000) sections=["Cl":#000000ff@45.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+line (407.500,390.000) (520.000,446.250) stroke=4.688/#32b432ff
+line (416.584,371.832) (512.209,419.644) stroke=4.688/#32b432ff
+line (520.000,446.250) (589.664,411.418) stroke=4.688/#000000ff
+rect (592.789,338.750)-(672.789,441.250) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "Cl" at=(599.039,345.000) sections=["Cl":#000000ff@78.125] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 "#;
 
 const OVERLAYS: &str = r#"
 # bond preview
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (489.865,382.000)-(510.146,418.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-text "C" at=(490.865,383.000) sections=["C":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+rect (479.974,365.833)-(520.026,434.167) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "C" at=(484.141,370.000) sections=["C":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 line (500.000,400.000) (590.000,430.000) stroke=1.500/#3863b4b4
 # lasso
 clip (100.000,100.000)-(900.000,700.000)
 rect (100.000,100.000)-(900.000,700.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (487.390,382.000)-(512.609,418.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-text "O" at=(488.390,383.000) sections=["O":#000000ff@30.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
+rect (475.677,365.833)-(524.323,434.167) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+text "O" at=(479.844,370.000) sections=["O":#000000ff@52.083] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 path closed=true fill=#0c121e1e stroke=1.500/#5082ffff pts=[(380.000,310.000) (420.000,310.000) (460.000,320.000) (440.000,380.000)] kind=Middle
 "#;

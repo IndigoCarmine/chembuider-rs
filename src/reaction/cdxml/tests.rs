@@ -18,7 +18,6 @@ fn document(scheme: &ReactionScheme) -> CdxObject {
             scheme,
             ui.painter(),
             &ReactionStyle::default(),
-            &StyleConfig::default(),
             &mut ChemStructEditor::default(),
         ));
     });
@@ -186,4 +185,90 @@ fn line_breaks_and_labels_survive_the_reaction_file() {
     let plain = demo::williamson_ether_synthesis().to_json();
     assert!(!plain.contains("\"label\""), "{plain}");
     assert!(Reaction::from_json(&plain).is_ok());
+}
+
+/// `scheme` written as the reaction figure writes it: a [`ReactionView`](crate::reaction::ReactionView)
+/// with its default styles.
+fn figure_document(scheme: &ReactionScheme) -> CdxObject {
+    let ctx = egui::Context::default();
+    let raw = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+        ..Default::default()
+    };
+    let mut out = None;
+    let _ = crate::testkit::run_ui(&ctx, raw, |ui| {
+        out = Some(crate::reaction::ReactionView::new().scheme_document(ui.painter(), scheme));
+    });
+    out.unwrap()
+}
+
+/// The x range (points) each object on a row covers as ChemDraw draws it: a fragment its atoms
+/// and their 10 pt labels, an arrow its shaft, a text its box. Riders over and under arrows are
+/// left out (they sit off the line).
+fn row_extents(doc: &CdxObject) -> Vec<(f64, f64, f64, String)> {
+    let page = &doc.children[0];
+    let riders: HashSet<u32> = page
+        .children
+        .iter()
+        .filter(|c| c.tag == OBJ_REACTION_SCHEME)
+        .flat_map(|s| s.children.iter())
+        .flat_map(|step| [ids(step, PROP_STEP_ABOVE_ARROW), ids(step, PROP_STEP_BELOW_ARROW)].concat())
+        .collect();
+    let labels: HashSet<u32> = page.children.iter().filter(|c| c.tag == OBJ_CHEMICAL_PROPERTY).flat_map(|p| ids(p, PROP_CHEMICAL_PROPERTY_DISPLAY_ID)).collect();
+    let mut out = Vec::new();
+    for c in &page.children {
+        if riders.contains(&c.id) || labels.contains(&c.id) {
+            continue;
+        }
+        let b = match c.tag {
+            OBJ_FRAGMENT => {
+                let mut b: Option<B> = None;
+                for n in c.children.iter().filter(|n| n.tag == OBJ_NODE) {
+                    let (x, y) = position(n).unwrap();
+                    b = Some(cdx::union(b, [x, y, x, y]));
+                    for t in n.children.iter().filter(|t| t.tag == OBJ_TEXT) {
+                        b = Some(cdx::union(b, cdx::bounding_box(t).unwrap()));
+                    }
+                }
+                b.unwrap()
+            }
+            OBJ_GRAPHIC | OBJ_TEXT => cdx::bounding_box(c).unwrap(),
+            _ => continue,
+        };
+        let (l, r) = (b[0].min(b[2]) / PT, b[0].max(b[2]) / PT);
+        out.push((l, r, (b[1] + b[3]) * 0.5 / PT, format!("{:04x}#{}", c.tag, c.id)));
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
+}
+
+/// The figure lays a scheme out for ChemDraw with the atom labels ChemDraw draws (10 pt, as
+/// they are written), so a structure's labels keep the whole gap to the `+` or the arrow beside
+/// it, as everything else on the row does.
+#[test]
+fn written_row_items_keep_their_gaps_as_chemdraw_draws_them() {
+    let gap_pt = ReactionStyle::default().chemdraw().item_gap as f64;
+    for scheme in [demo::williamson_ether_synthesis().scheme, demo::multi_step_scheme().scheme] {
+        let doc = figure_document(&scheme);
+        // Rows: the arrows' heights.
+        let mut lines: Vec<f64> = Vec::new();
+        for c in doc.children[0].children.iter().filter(|c| c.tag == OBJ_GRAPHIC) {
+            let y = cdx::bounding_box(c).unwrap()[1] / PT;
+            if lines.iter().all(|l| (l - y).abs() > 20.0) {
+                lines.push(y);
+            }
+        }
+        let row_of = |y: f64| lines.iter().enumerate().min_by(|a, b| (a.1 - y).abs().total_cmp(&(b.1 - y).abs())).unwrap().0;
+        let extents = row_extents(&doc);
+        for row in 0..lines.len() {
+            let on_row: Vec<_> = extents.iter().filter(|e| row_of(e.2) == row).collect();
+            assert!(on_row.len() >= 3, "{on_row:?}");
+            for w in on_row.windows(2) {
+                let gap = w[1].0 - w[0].1;
+                // Within a point: the layout measures labels in egui's font, the written boxes
+                // are Arial's widths.
+                assert!(gap >= gap_pt - 1.0, "{} to {}: {gap:.2} pt, not the {gap_pt} pt gap", w[0].3, w[1].3);
+            }
+        }
+    }
 }
