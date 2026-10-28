@@ -369,9 +369,11 @@ pub(crate) const ABBREVIATION_SYMBOLS: [&str; 2] = ["Ar", "Pr"];
 /// hydrogen, a wrong weight with nothing to show it is wrong.
 ///
 /// `None` for a plain element (counted as such by the caller), a label with a superscript
-/// (a charge), and anything that is not a formula (`OMe`, `Ts`, `NBS`).
+/// (a charge), and anything that is not a formula (`OMe`, `Ts`, `NBS`) — nor a label with
+/// more than [`MAX_GROUP_DEPTH`] braces: every markup group opens at a `{`, so that bounds
+/// how deeply groups nest, and with it the rich-text parser's per-character work.
 fn label_formula(label: &str) -> Option<MolecularFormula> {
-    if atomic_weight(label).is_some() {
+    if atomic_weight(label).is_some() || label.matches('{').count() > MAX_GROUP_DEPTH {
         return None;
     }
     let rich = RichText::parse(label);
@@ -821,6 +823,33 @@ mod tests {
         assert_eq!(result.2.as_deref(), Some("C"), "nesting up to the limit still counts");
         assert_eq!(result.3, None, "one level more is refused");
         assert_eq!(MolecularFormula::parse("Ca((OH)2)3").map(|f| f.plain()).as_deref(), Some("CaH6O6"));
+    }
+
+    /// Markup groups nested past [`MAX_GROUP_DEPTH`] (`_{C_{C…}}`) leave a label unknown
+    /// before it reaches the rich-text parser, whose cost grows with nesting depth; markup
+    /// up to the limit, and ordinary subscripts, still count.
+    #[test]
+    fn deeply_nested_markup_labels_are_unknown() {
+        let lone = |label: &str| {
+            let mut m = Molecule::default();
+            m.add_atom(label.into(), [0.0, 0.0], 0);
+            MolecularFormula::of(&m)
+        };
+        let nested = |n: usize| format!("{}{}", "_{C".repeat(n), "}".repeat(n));
+
+        let deep = nested(16_000);
+        let f = lone(&deep);
+        assert_eq!(f.weight(), None, "no MW");
+        assert_eq!(f.unknown_elements(), vec![deep.as_str()], "the label stays unknown");
+        assert_eq!(lone(&nested(MAX_GROUP_DEPTH + 1)).weight(), None, "one level more is refused");
+        assert_eq!(
+            label_formula(&nested(MAX_GROUP_DEPTH)).map(|f| f.plain()),
+            Some(format!("C{MAX_GROUP_DEPTH}")),
+            "nesting up to the limit still counts"
+        );
+        assert_eq!(lone("H_{2}O").plain(), "H2O");
+        assert_eq!(lone("CH_{3}").plain(), "CH3");
+        assert_eq!(label_formula("NH_{4}^{+}"), None, "a charge is still refused");
     }
 
     /// Every element up to uranium that has an IUPAC standard atomic weight has one in the
