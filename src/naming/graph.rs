@@ -4,6 +4,9 @@
 //! Everything the namer does not support is rejected here with a reason, so the naming code
 //! itself only ever meets structures it knows how to name.
 
+use std::cmp::Reverse;
+
+use super::hetero::{self, Hetero};
 use crate::config::Config;
 use crate::label_chain::resolve_label;
 use crate::molecule::elements::element_of_label;
@@ -16,6 +19,8 @@ pub(crate) enum El {
     C,
     N,
     O,
+    /// Sulfur, only as a ring atom of a heterocycle (thiophene, thiolane).
+    S,
     F,
     Cl,
     Br,
@@ -28,6 +33,7 @@ impl El {
             "C" => El::C,
             "N" => El::N,
             "O" => El::O,
+            "S" => El::S,
             "F" => El::F,
             "Cl" => El::Cl,
             "Br" => El::Br,
@@ -136,9 +142,28 @@ pub(crate) struct Ring {
     pub atoms: Vec<usize>,
     /// A benzene ring (six carbons, alternating double bonds).
     pub benzene: bool,
-    /// Its seniority as a parent (P-44.2.1, P-44.4.1.1): more ring atoms, then more multiple
-    /// bonds (benzene counts three), then more double bonds.
-    pub rank: (usize, usize, usize),
+    /// For a heterocycle: which one, and how it may be numbered.
+    pub hetero: Option<Hetero>,
+    /// Its seniority as a parent.
+    pub rank: Rank,
+}
+
+/// The seniority of a ring as a parent, greatest first (P-44.2.1.2, then P-44.4.1.1): a
+/// nitrogenous heterocycle; without nitrogen, a heteroatom early in the order O > S; more ring
+/// atoms; more heteroatoms; more kinds of heteroatom; more O, then S, then N atoms; lower
+/// locants for the heteroatoms; then more multiple bonds (benzene counts three) and more
+/// double bonds. Carbocycles tie on every heteroatom criterion.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Rank {
+    nitrogen: bool,
+    first_hetero: u8,
+    size: usize,
+    heteroatoms: usize,
+    variety: usize,
+    by_element: [usize; 3],
+    hetero_locants: Reverse<Vec<usize>>,
+    pub multiple: usize,
+    double: usize,
 }
 
 /// A ring parent: one ring, or an unbranched assembly of identical rings joined by single
@@ -371,36 +396,84 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         return Err("no carbon atom".into());
     }
     let (cycles, in_ring) = find_rings(g)?;
-    if cycles.iter().flatten().any(|&a| g.el[a] != El::C) {
-        return Err("heterocycle".into());
+    if (0..n).any(|a| g.el[a] == El::S && !in_ring[a]) {
+        return Err("element S is not supported outside heterocycles".into());
     }
-    let rings: Vec<Ring> = cycles
-        .into_iter()
-        .map(|atoms| {
-            let k = atoms.len();
-            let orders: Vec<u8> = (0..k)
-                .map(|i| g.order(atoms[i], atoms[(i + 1) % k]))
-                .collect();
-            let benzene = k == 6
-                && atoms
-                    .iter()
-                    .all(|&a| atoms.iter().filter(|&&b| g.order(a, b) == 2).count() == 1);
-            let (multiple, double) = if benzene {
-                (3, 3)
-            } else {
-                (
-                    orders.iter().filter(|&&o| o > 1).count(),
-                    orders.iter().filter(|&&o| o == 2).count(),
-                )
-            };
-            Ring {
-                atoms,
-                benzene,
-                rank: (k, multiple, double),
-            }
-        })
-        .collect();
+    let mut rings: Vec<Ring> = Vec::new();
+    for atoms in cycles {
+        let k = atoms.len();
+        let orders: Vec<u8> = (0..k)
+            .map(|i| g.order(atoms[i], atoms[(i + 1) % k]))
+            .collect();
+        let hetero = if atoms.iter().any(|&a| g.el[a] != El::C) {
+            Some(hetero::recognise(g, &atoms)?)
+        } else {
+            None
+        };
+        let benzene = hetero.is_none()
+            && k == 6
+            && atoms
+                .iter()
+                .all(|&a| atoms.iter().filter(|&&b| g.order(a, b) == 2).count() == 1);
+        let (multiple, double) = if benzene {
+            (3, 3)
+        } else {
+            (
+                orders.iter().filter(|&&o| o > 1).count(),
+                orders.iter().filter(|&&o| o == 2).count(),
+            )
+        };
+        let els: Vec<El> = atoms
+            .iter()
+            .map(|&a| g.el[a])
+            .filter(|&e| e != El::C)
+            .collect();
+        let count = |e: El| els.iter().filter(|&&x| x == e).count();
+        let nitrogen = count(El::N) > 0;
+        // Criterion (b) applies only to rings without nitrogen.
+        let first_hetero = if nitrogen {
+            0
+        } else if count(El::O) > 0 {
+            2
+        } else if count(El::S) > 0 {
+            1
+        } else {
+            0
+        };
+        let variety = [El::O, El::S, El::N]
+            .iter()
+            .filter(|&&e| count(e) > 0)
+            .count();
+        rings.push(Ring {
+            rank: Rank {
+                nitrogen,
+                first_hetero,
+                size: k,
+                heteroatoms: els.len(),
+                variety,
+                by_element: [count(El::O), count(El::S), count(El::N)],
+                hetero_locants: Reverse(
+                    hetero
+                        .as_ref()
+                        .map_or_else(Vec::new, |h| h.kind.hetero_locants()),
+                ),
+                multiple,
+                double,
+            },
+            atoms,
+            benzene,
+            hetero,
+        });
+    }
     let parents = ring_parents(g, &rings)?;
+    let mut ring_of = vec![usize::MAX; n];
+    for (i, r) in rings.iter().enumerate() {
+        for &a in &r.atoms {
+            ring_of[a] = i;
+        }
+    }
+    // A bond of a ring (rather than one leaving it); the heterocycle checks vouch for these.
+    let ring_bond = |a: usize, b: usize| ring_of[a] != usize::MAX && ring_of[a] == ring_of[b];
 
     // Nitro groups first: they are the only charged atoms allowed, and their nitrogen may be
     // drawn with five bonds.
@@ -444,7 +517,7 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         let valence = match g.el[a] {
             El::C => 4,
             El::N => 3,
-            El::O => 2,
+            El::O | El::S => 2,
             _ => 1,
         };
         if g.bond_sum(a) > valence {
@@ -465,9 +538,24 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
                     return Err("halogen not bonded to carbon".into());
                 }
             }
+            // A ring oxygen or sulfur has only its two ring bonds, which the heterocycle vouches
+            // for (the O–N bond of 1,2-oxazole).
+            El::O | El::S if in_ring[a] => {}
             El::O if !nitro_o[a] => {
                 if g.adj[a].iter().any(|&(m, _)| g.el[m] != El::C) {
                     return Err("O–O or O–N bond (peroxide, hydroxylamine, N-oxide)".into());
+                }
+            }
+            El::N if in_ring[a] => {
+                if g.adj[a]
+                    .iter()
+                    .any(|&(m, o)| !ring_bond(a, m) && (o != 1 || g.el[m] != El::C))
+                {
+                    return Err(
+                        "ring nitrogen bonded to an atom other than carbon, or by a \
+                         multiple bond (N-oxide, N-amino…)"
+                            .into(),
+                    );
                 }
             }
             El::N if !nitro[a] => {
@@ -495,12 +583,17 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             continue;
         }
         let triple_n = g.adj[c].iter().any(|&(m, o)| g.el[m] == El::N && o == 3);
-        if g.adj[c].iter().any(|&(m, o)| g.el[m] == El::N && o == 2) {
+        if g.adj[c]
+            .iter()
+            .any(|&(m, o)| g.el[m] == El::N && o == 2 && !ring_bond(c, m))
+        {
             return Err("C=N double bond (imine)".into());
         }
         if triple_n {
-            let others: Vec<&(usize, u8)> =
-                g.adj[c].iter().filter(|(m, _)| g.el[*m] != El::N).collect();
+            let others: Vec<&(usize, u8)> = g.adj[c]
+                .iter()
+                .filter(|&&(m, o)| !(g.el[m] == El::N && o == 3))
+                .collect();
             if others.iter().any(|(m, o)| g.el[*m] != El::C || *o != 1) {
                 return Err("unsupported nitrile (cyanate, cyanamide…)".into());
             }
@@ -525,6 +618,9 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         if hetero.iter().any(|&m| g.el[m].is_halogen()) {
             return Err("acyl halide".into());
         }
+        if !hetero.is_empty() && in_ring[c] {
+            return Err("lactone or lactam (a ring C=O next to a ring heteroatom)".into());
+        }
         match hetero.as_slice() {
             [] => {
                 if in_ring[c] {
@@ -546,6 +642,9 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
                     ctype[c] = Some(Class::Ester);
                 }
             }
+            [x] if g.el[*x] == El::N && in_ring[*x] => {
+                return Err("amide whose nitrogen is a ring atom (1-acylpiperidine…)".into());
+            }
             [x] if g.el[*x] == El::N && !nitro[*x] => {
                 ctype[c] = Some(Class::Amide);
             }
@@ -554,7 +653,7 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     }
     // Nitrogens: an amine unless it carries an acyl group.
     for a in 0..n {
-        if g.el[a] != El::N || nitro[a] || g.adj[a].iter().any(|&(_, o)| o == 3) {
+        if g.el[a] != El::N || nitro[a] || in_ring[a] || g.adj[a].iter().any(|&(_, o)| o == 3) {
             continue;
         }
         let acyls = g
@@ -705,7 +804,12 @@ fn ring_parents(g: &Graph, rings: &[Ring]) -> Result<Vec<RingParent>, Unsupporte
             ring_of[a] = i;
         }
     }
-    let saturated = |r: &Ring| r.rank.1 == 0;
+    let saturated = |r: &Ring| r.hetero.is_none() && r.rank.multiple == 0;
+    let benzene = |r: &Ring| r.benzene;
+    let same_hetero = |a: &Ring, b: &Ring| match (&a.hetero, &b.hetero) {
+        (Some(x), Some(y)) => std::ptr::eq(x.kind, y.kind),
+        _ => false,
+    };
     // links[i]: (the other ring, the atom in ring i, the atom in the other ring)
     let mut links: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); rings.len()];
     for a in 0..g.len() {
@@ -718,9 +822,15 @@ fn ring_parents(g: &Graph, rings: &[Ring]) -> Result<Vec<RingParent>, Unsupporte
             if ri.atoms.len() != rj.atoms.len() {
                 continue;
             }
-            if (ri.benzene && rj.benzene) || (saturated(ri) && saturated(rj)) {
+            if (benzene(ri) && benzene(rj))
+                || (saturated(ri) && saturated(rj))
+                || same_hetero(ri, rj)
+            {
                 links[i].push((j, a, b));
-            } else if !(ri.benzene || saturated(ri)) || !(rj.benzene || saturated(rj)) {
+            } else if ri.hetero.is_none()
+                && rj.hetero.is_none()
+                && (!(benzene(ri) || saturated(ri)) || !(benzene(rj) || saturated(rj)))
+            {
                 // A cyclohexene ring on a benzene or cyclohexene ring: whether to name it as a
                 // hydrogenated ring assembly is not decided here.
                 return Err("directly bonded rings of one size, partly unsaturated \
@@ -753,6 +863,16 @@ fn ring_parents(g: &Graph, rings: &[Ring]) -> Result<Vec<RingParent>, Unsupporte
         }
         if order.len() > MAX_ASSEMBLY {
             return Err(format!("ring assembly of more than {MAX_ASSEMBLY} rings"));
+        }
+        if order.len() > 1
+            && let Some(h) = &rings[start].hetero
+            && (!h.kind.mancude || h.kind.indicated)
+        {
+            return Err(
+                "ring assembly of saturated heterocycles or of heterocycles with \
+                 indicated hydrogen (bipiperidine, bipyrrole)"
+                    .into(),
+            );
         }
         let atoms = order
             .iter()

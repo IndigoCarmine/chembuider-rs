@@ -12,6 +12,16 @@
 //!   rings (1,1'-biphenyl, 1,1':4',1''-terphenyl, [1,1'-biphenyl]-4-carboxylic acid,
 //!   [1,1'-biphenyl]-4-yl) and saturated rings (1,1'-bi(cyclohexane), with prefixes only);
 //!   primed locants are written with ASCII apostrophes;
+//! - monocyclic heterocycles with N, O and S (see `hetero.rs` for the table), fully
+//!   unsaturated in Kekulé form or saturated: pyridine, the diazines, 1,3,5-triazine, furan,
+//!   thiophene, 1H-pyrrole, 1H-imidazole, 1H-pyrazole, 1,3- and 1,2-oxazole and -thiazole,
+//!   oxirane, oxetane, oxolane, oxane, pyrrolidine, piperidine, piperazine, morpholine,
+//!   1,4-dioxane and others. They keep their fixed numbering and cite every locant
+//!   (2-methylpyridine, pyridin-3-ol, 1-methyl-1H-pyrrole, piperidin-1-yl). A heterocycle is
+//!   senior to a carbocycle (P-44.2.1.2: nitrogen first, then O before S, then ring size,
+//!   then the heteroatoms, then hydrogenation): 2-phenylpyridine, 1-phenylpiperidine.
+//!   Assemblies of identical fully unsaturated heterocycles take the lowest locants for their
+//!   bonds (2,2'-bipyridine, 2,3'-bipyridine, 2,2'-bithiophene), with prefixes only;
 //! - the principal characteristic groups, in order of seniority: carboxylic acid > ester >
 //!   amide > nitrile > aldehyde > ketone > alcohol (phenol) > amine, as suffixes; the junior
 //!   ones and any that cannot sit on the parent as prefixes (carboxy, carbamoyl, cyano, formyl,
@@ -23,8 +33,12 @@
 //! bridged, spiro), branched ring assemblies, suffixes or free valences on assemblies of
 //! rings other than benzene, directly bonded rings of one size with partial unsaturation
 //! (cyclohexenylbenzene: a hydrogenated biphenyl?), an assembly competing with a larger or
-//! less saturated ring for parent, heterocycles, elements other than C, H,
-//! N, O and the halogens, charged species other than nitro groups, isotopes, and other
+//! less saturated ring for parent, heterocycles outside the table, partly hydrogenated ones
+//! (2,3-dihydrofuran) and those with indicated hydrogen on carbon (2H-pyran) or an exocyclic
+//! double bond on a fully unsaturated ring (pyridin-2(1H)-one), lactones and lactams, amides
+//! on a ring nitrogen (1-acetylpiperidine), assemblies of saturated heterocycles or of those
+//! with indicated hydrogen (bipiperidine, bipyrrole), sulfur outside a ring, elements other
+//! than C, H, N, O, S and the halogens, charged species other than nitro groups, isotopes, and other
 //! functional groups (imines, azo, peroxides, acid halides, anhydrides, carbonates, ureas…).
 //! Stereodescriptors (E/Z, R/S) are not generated: the name describes the constitution only;
 //! see [`has_stereo_marks`].
@@ -44,6 +58,11 @@
 //!   parents): "propan-2-one", "prop-1-ene", "3-methylcyclohex-1-ene", "2-methylcyclohexan-1-ol".
 //! - Enclosing marks follow P-16.5: "4-(propan-2-yl)benzoic acid", "di(propan-2-yl)",
 //!   "bis(2-chloroethyl)", "dichloro(fluoro)methane".
+//! - Heterocycles take the 2013 preferred names: Hantzsch–Widman names where the older
+//!   retained names are no longer preferred (oxolane, not tetrahydrofuran; oxane, not
+//!   tetrahydropyran; 1,3-oxazole and 1,2-oxazole, not oxazole and isoxazole; 1,3-thiazole),
+//!   and the retained pyrrolidine, piperidine, piperazine and morpholine. On a heterocycle
+//!   every locant is cited, a fully substituted one included ("2,3,4,5,6-pentachloropyridine").
 //! - Multiplicative names (the preferred names of some symmetrical compounds, e.g.
 //!   2,2′-oxydi(ethan-1-ol), 1,1'-methylenedibenzene) and the retained names of α-amino acids
 //!   are not produced; the substitutive name given instead ("benzylbenzene",
@@ -51,6 +70,7 @@
 
 mod engine;
 mod graph;
+mod hetero;
 mod words;
 
 #[cfg(test)]

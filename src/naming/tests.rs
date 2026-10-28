@@ -458,8 +458,8 @@ fn table_of_names() {
 const UNSUPPORTED: &[(&str, &str)] = &[
     ("C1CCC2CCCCC2C1", "more than one ring"),
     ("C1=CC=C2C=CC=CC2=C1", "more than one ring"),
-    ("C1CCOC1", "heterocycle"),
-    ("C1=CC=NC=C1", "heterocycle"),
+    ("C1=COCC1", "heterocycle"),
+    ("O=C1NC=CC=C1", "heterocycle"),
     ("CS", "element S"),
     ("CC(=O)Cl", "acyl halide"),
     ("CC(=O)OC(C)=O", "anhydride"),
@@ -501,11 +501,11 @@ fn unsupported_structures_say_why() {
 #[test]
 fn several_structures_are_named_each() {
     assert_eq!(name_of("CCO.C"), NameResult::Ok("ethanol; methane".into()));
-    let names = iupac_names(&parse("CCO.C1CCOC1").0);
+    let names = iupac_names(&parse("CCO.C1=COCC1").0);
     assert_eq!(names[0], NameResult::Ok("ethanol".into()));
     assert!(matches!(&names[1], NameResult::Unsupported(r) if r.contains("heterocycle")));
     assert!(
-        matches!(name_of("CCO.C1CCOC1"), NameResult::Unsupported(r) if r.starts_with("structure 2: "))
+        matches!(name_of("CCO.C1=COCC1"), NameResult::Unsupported(r) if r.starts_with("structure 2: "))
     );
     assert!(matches!(
         iupac_name(&Molecule::default()),
@@ -760,9 +760,222 @@ fn unsupported_ring_combinations_say_why() {
             "C1CCC(CC1)C1CCCCC1C1=CC=CC=C1",
             "seniority of a ring assembly",
         ),
-        ("C1=CC=NC(=C1)C1=CC=CC=N1", "heterocycle"),
-        ("C1=CC=C(N=C1)C1=CC=CC=C1", "heterocycle"),
         ("C1CCC2(CC1)CCCC2", "more than one ring"),
+    ];
+    for (smiles, reason) in cases {
+        match name_of(smiles) {
+            NameResult::Unsupported(r) => assert!(
+                r.contains(reason),
+                "{smiles}: reason {r:?} lacks {reason:?}"
+            ),
+            other => panic!("{smiles}: expected unsupported ({reason}), got {other:?}"),
+        }
+    }
+}
+
+/// Monocyclic heterocycles (P-22.2): retained and Hantzsch–Widman names, their fixed
+/// numbering, indicated hydrogen, suffixes, prefixes, seniority over carbocycles (P-44.2.1.2)
+/// and ring assemblies of heterocycles (P-28).
+const HETEROCYCLES: &[(&str, &str)] = &[
+    // Six-membered, fully unsaturated.
+    ("C1=CC=NC=C1", "pyridine"),
+    ("CC1=CC=CC=N1", "2-methylpyridine"),
+    ("CC1=CC=NC=C1", "4-methylpyridine"),
+    ("CC1=CC=CC(C)=N1", "2,6-dimethylpyridine"),
+    ("OC1=CN=CC=C1", "pyridin-3-ol"),
+    ("NC1=CC=CC=N1", "pyridin-2-amine"),
+    ("CN(C)C1=CC=NC=C1", "N,N-dimethylpyridin-4-amine"),
+    ("OC(=O)C1=CN=CC=C1", "pyridine-3-carboxylic acid"),
+    ("NC(=O)C1=CN=CC=C1", "pyridine-3-carboxamide"),
+    ("COC(=O)C1=CN=CC=C1", "methyl pyridine-3-carboxylate"),
+    ("N#CC1=CC=NC=C1", "pyridine-4-carbonitrile"),
+    ("O=CC1=CC=CC=N1", "pyridine-2-carbaldehyde"),
+    (
+        "OC(=O)C1=CC=CC(=N1)C(O)=O",
+        "pyridine-2,6-dicarboxylic acid",
+    ),
+    (
+        "ClC1=CC=C(C=N1)C(O)=O",
+        "6-chloropyridine-3-carboxylic acid",
+    ),
+    ("ClC1=CC=CC=N1", "2-chloropyridine"),
+    ("C1=CC=NN=C1", "pyridazine"),
+    ("C1=CN=CN=C1", "pyrimidine"),
+    ("NC1=NC=CC=N1", "pyrimidin-2-amine"),
+    ("C1=CN=CC=N1", "pyrazine"),
+    ("CC1=CN=CC=N1", "2-methylpyrazine"),
+    ("C1=NC=NC=N1", "1,3,5-triazine"),
+    ("NC1=NC=NC=N1", "1,3,5-triazin-2-amine"),
+    ("NC1=NC(N)=NC(N)=N1", "1,3,5-triazine-2,4,6-triamine"),
+    // Five-membered, fully unsaturated.
+    ("C1=COC=C1", "furan"),
+    ("OC(=O)C1=CC=CO1", "furan-2-carboxylic acid"),
+    ("O=CC1=CC=CO1", "furan-2-carbaldehyde"),
+    ("C1=CSC=C1", "thiophene"),
+    ("ClC1=CC=CS1", "2-chlorothiophene"),
+    ("CC1=CSC=C1", "3-methylthiophene"),
+    ("C1=CNC=C1", "1H-pyrrole"),
+    ("CN1C=CC=C1", "1-methyl-1H-pyrrole"),
+    ("CC1=CC=CN1", "2-methyl-1H-pyrrole"),
+    ("OC(=O)C1=CC=CN1", "1H-pyrrole-2-carboxylic acid"),
+    ("C1=CN=CN1", "1H-imidazole"),
+    ("CN1C=CN=C1", "1-methyl-1H-imidazole"),
+    ("CC1=NC=CN1", "2-methyl-1H-imidazole"),
+    ("C1=CNN=C1", "1H-pyrazole"),
+    ("C1=COC=N1", "1,3-oxazole"),
+    ("CC1=NC=CO1", "2-methyl-1,3-oxazole"),
+    ("C1=CON=C1", "1,2-oxazole"),
+    ("C1=CSC=N1", "1,3-thiazole"),
+    ("NC1=NC=CS1", "1,3-thiazol-2-amine"),
+    ("C1=CSN=C1", "1,2-thiazole"),
+    // Saturated.
+    ("C1CO1", "oxirane"),
+    ("CC1CO1", "2-methyloxirane"),
+    ("C1CN1", "aziridine"),
+    ("C1CS1", "thiirane"),
+    ("C1COC1", "oxetane"),
+    ("C1CNC1", "azetidine"),
+    ("C1CCOC1", "oxolane"),
+    ("C1CCNC1", "pyrrolidine"),
+    ("C1CCSC1", "thiolane"),
+    ("C1COCO1", "1,3-dioxolane"),
+    ("C1CCOCC1", "oxane"),
+    ("OC1CCOCC1", "oxan-4-ol"),
+    ("C1CCNCC1", "piperidine"),
+    ("CN1CCCCC1", "1-methylpiperidine"),
+    ("CC1CCCCN1", "2-methylpiperidine"),
+    ("O=C1CCNCC1", "piperidin-4-one"),
+    ("CN1CCC(=O)CC1", "1-methylpiperidin-4-one"),
+    ("OC(=O)C1CCCCN1", "piperidine-2-carboxylic acid"),
+    ("C1CCSCC1", "thiane"),
+    ("C1COCCN1", "morpholine"),
+    ("CN1CCOCC1", "4-methylmorpholine"),
+    ("C1CNCCN1", "piperazine"),
+    ("CN1CCNCC1", "1-methylpiperazine"),
+    ("C1COCCO1", "1,4-dioxane"),
+    ("C1COCOC1", "1,3-dioxane"),
+    ("C1CCCNCC1", "azepane"),
+    ("C1CCCOCC1", "oxepane"),
+    // Heterocycles as substituents.
+    ("OCC1CCCO1", "(oxolan-2-yl)methanol"),
+    ("OCC1=CC=CC=N1", "(pyridin-2-yl)methanol"),
+    ("CC(=O)C1=CC=CC=N1", "1-(pyridin-2-yl)ethan-1-one"),
+    ("CC(=O)NC1=CC=NC=C1", "N-(pyridin-4-yl)acetamide"),
+    ("CC(=O)OC1=CN=CC=C1", "pyridin-3-yl acetate"),
+    (
+        "OC(=O)C1=CC=C(C=C1)N1CCCCC1",
+        "4-(piperidin-1-yl)benzoic acid",
+    ),
+    ("OC(=O)C1=CC=C(C=C1)C1=CC=CO1", "4-(furan-2-yl)benzoic acid"),
+    (
+        "OC(=O)C1=CC=C(C=C1)N1C=CN=C1",
+        "4-(1H-imidazol-1-yl)benzoic acid",
+    ),
+    (
+        "OC(=O)C1=CC=C(C=C1)N1CCOCC1",
+        "4-(morpholin-4-yl)benzoic acid",
+    ),
+    (
+        "OC(=O)C1=CC=C(C=C1)C1=CC=CS1",
+        "4-(thiophen-2-yl)benzoic acid",
+    ),
+    (
+        "COC1=CC=C(C=C1)C1=NC=CS1",
+        "2-(4-methoxyphenyl)-1,3-thiazole",
+    ),
+    ("NC1=CC=C(C=C1)N1CCNCC1", "4-(piperazin-1-yl)aniline"),
+    // Seniority: a heterocycle before a carbocycle, nitrogen first, then O before S, then
+    // the larger ring, then the less hydrogenated one.
+    ("C1=CC=C(C=C1)C1=CC=CC=N1", "2-phenylpyridine"),
+    ("C1CCN(CC1)C1=CC=CC=C1", "1-phenylpiperidine"),
+    ("C1=CC=C(C=C1)N1CCOCC1", "4-phenylmorpholine"),
+    ("C1=CC=C(C=C1)C1=CC=CS1", "2-phenylthiophene"),
+    ("C1=CN(C=N1)C1=CC=CC=C1", "1-phenyl-1H-imidazole"),
+    ("C1CCC(O1)C1=CC=CC=C1", "2-phenyloxolane"),
+    ("C1CCC(CC1)N1CCCCC1", "1-cyclohexylpiperidine"),
+    ("C(C1=CC=CC=N1)C1=CC=CC=C1", "2-benzylpyridine"),
+    ("C1=CC=C(N=C1)OC1=CC=CC=C1", "2-phenoxypyridine"),
+    ("C1CCN(C1)C1=CC=NC=C1", "4-(pyrrolidin-1-yl)pyridine"),
+    ("C1CCN(CC1)C1=CC=CC=N1", "2-(piperidin-1-yl)pyridine"),
+    ("C1=COC(=C1)C1=CC=CS1", "2-(thiophen-2-yl)furan"),
+    ("C1=CC=C(N=C1)C1=CC=CS1", "2-(thiophen-2-yl)pyridine"),
+    ("C1=CN=C(N=C1)C1=CC=CC=N1", "2-(pyridin-2-yl)pyrimidine"),
+    // Ring assemblies of heterocycles.
+    ("C1=CC=NC(=C1)C1=CC=CC=N1", "2,2'-bipyridine"),
+    ("C1=CN=CC=C1C1=CC=NC=C1", "4,4'-bipyridine"),
+    ("C1=CC(=CN=C1)C1=CC=CC=N1", "2,3'-bipyridine"),
+    ("C1=CSC(=C1)C1=CC=CS1", "2,2'-bithiophene"),
+    (
+        "CC1=CC=NC(=C1)C1=NC=CC(C)=C1",
+        "4,4'-dimethyl-2,2'-bipyridine",
+    ),
+    (
+        "C1=CC=NC(=C1)C1=CC=CC(=N1)C1=CC=CC=N1",
+        "2,2':6',2''-terpyridine",
+    ),
+];
+
+#[test]
+fn heterocycles() {
+    let mut failures = Vec::new();
+    for (smiles, expected) in HETEROCYCLES {
+        match name_of(smiles) {
+            NameResult::Ok(name) if name == *expected => {}
+            other => failures.push(format!("{smiles}: expected {expected:?}, got {other:?}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} names wrong:\n{}",
+        failures.len(),
+        HETEROCYCLES.len(),
+        failures.join("\n")
+    );
+}
+
+/// Heterocycles outside the supported ones are refused with a reason, never misnamed.
+#[test]
+fn unsupported_heterocycles_say_why() {
+    let cases = [
+        // Fused heterocycles: indole, quinoline.
+        ("C1=CC=C2NC=CC2=C1", "more than one ring"),
+        ("C1=CC=C2N=CC=CC2=C1", "more than one ring"),
+        // Partly hydrogenated rings and exocyclic double bonds on mancude rings.
+        ("C1=COCC1", "partly hydrogenated"),
+        ("C1CC=CNC1", "partly hydrogenated"),
+        ("O=C1NC=CC=C1", "partly hydrogenated"),
+        ("C1=COCC=C1", "partly hydrogenated"),
+        // Indicated hydrogen on carbon.
+        ("C1C=CC=N1", "indicated hydrogen on a ring carbon"),
+        // Rings not in the table.
+        ("C1CSCS1", "not among the supported monocycles"),
+        ("C1=CN=NN1", "not among the supported monocycles"),
+        ("C1COOC1", "not among the supported monocycles"),
+        // Lactones, lactams, amides on a ring nitrogen.
+        ("O=C1CCCO1", "lactone or lactam"),
+        ("O=C1CCCCN1", "lactone or lactam"),
+        ("CC(=O)N1CCCCC1", "amide whose nitrogen is a ring atom"),
+        // Ring nitrogen bonded to O or N, charged rings, oxidised sulfur.
+        ("ON1CCCC1", "O–N"),
+        ("NN1CCCCC1", "hydrazine"),
+        ("C1=CC=[N+]([O-])C=C1", "charged"),
+        ("O=S1CCCC1", "valence"),
+        // A nitrile carbon on a ring nitrogen (a cyanamide).
+        ("N#CN1CCCCC1", "cyanamide"),
+        ("CN(C)C#N", "cyanamide"),
+        // Sulfur outside a ring.
+        ("CSC1=CC=CC=N1", "element S"),
+        // Assemblies of saturated heterocycles or of rings with indicated hydrogen.
+        (
+            "C1CCNC(C1)C1CCCCN1",
+            "ring assembly of saturated heterocycles",
+        ),
+        ("C1=CNC(=C1)C1=CC=CN1", "indicated hydrogen"),
+        // Suffixes on a heterocyclic assembly.
+        (
+            "OC(=O)C1=CC=NC(=C1)C1=CC=CC=N1",
+            "ring assembly of rings other than benzene",
+        ),
     ];
     for (smiles, reason) in cases {
         match name_of(smiles) {

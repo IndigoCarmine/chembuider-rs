@@ -24,6 +24,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use super::graph::{Class, El, Graph, Perceived, RingParent, Unsupported};
+use super::hetero::HeteroRing;
 use super::words::{alpha_key, enclose, multiplier, multiplier_complex, starts_with_vowel, stem};
 
 /// A named unit: the molecule's name, or a substituent prefix ("2-chloroethyl").
@@ -107,11 +108,14 @@ enum Shape {
     Chain,
     Ring {
         benzene: bool,
+        /// A heterocycle, named and numbered from its table entry.
+        hetero: Option<&'static HeteroRing>,
     },
     /// A ring assembly of `rings` identical rings joined by single bonds.
     Assembly {
         rings: usize,
         benzene: bool,
+        hetero: Option<&'static HeteroRing>,
     },
 }
 
@@ -451,7 +455,7 @@ impl<'a> Namer<'a> {
         &self,
         rings: Vec<&'r RingParent>,
     ) -> Result<Vec<&'r RingParent>, Unsupported> {
-        let rank = |r: &RingParent| self.p.rings[r.rings[0]].rank;
+        let rank = |r: &RingParent| &self.p.rings[r.rings[0]].rank;
         let top = rings.iter().map(|r| rank(r)).max();
         let most = rings
             .iter()
@@ -469,11 +473,13 @@ impl<'a> Namer<'a> {
             .collect())
     }
 
-    /// Every numbering of a ring parent. A ring is numbered from any atom in either
-    /// direction. An assembly (P-28.3) is numbered ring by ring from one end, the rings getting
-    /// unprimed, primed, double-primed … locants; each ring is numbered from its bond to the
-    /// previous ring (the first ring: to the next one), and an inner ring in the direction
-    /// that gives its bond to the next ring the lower locant.
+    /// Every numbering of a ring parent. A carbocycle is numbered from any atom in either
+    /// direction, a heterocycle in the ways its table entry allows. An assembly (P-28.3) is
+    /// numbered ring by ring from one end, the rings getting unprimed, primed, double-primed …
+    /// locants; each carbocycle is numbered from its bond to the previous ring (the first ring:
+    /// to the next one), and an inner ring in the direction that gives its bond to the next
+    /// ring the lower locant. Heterocycles keep their own numbering, and the bonds between them
+    /// take the lowest locants (2,2'-bipyridine, 2,3'-bipyridine).
     fn ring_numberings(&self, rp: &RingParent) -> Vec<Numbering> {
         let rings = &self.p.rings;
         let walks = |ring: usize, start: usize| -> Vec<Vec<usize>> {
@@ -488,14 +494,22 @@ impl<'a> Namer<'a> {
                 .into()
         };
         let first = &rings[rp.rings[0]];
+        let hetero = first.hetero.as_ref().map(|h| h.kind);
         if rp.rings.len() == 1 {
             let shape = Shape::Ring {
                 benzene: first.benzene,
+                hetero,
             };
-            return first
-                .atoms
-                .iter()
-                .flat_map(|&s| walks(rp.rings[0], s))
+            let all: Vec<Vec<usize>> = match &first.hetero {
+                Some(h) => h.numberings.clone(),
+                None => first
+                    .atoms
+                    .iter()
+                    .flat_map(|&s| walks(rp.rings[0], s))
+                    .collect(),
+            };
+            return all
+                .into_iter()
                 .map(|atoms| Numbering {
                     locs: (1..=atoms.len()).map(loc).collect(),
                     atoms,
@@ -507,6 +521,7 @@ impl<'a> Namer<'a> {
         let shape = Shape::Assembly {
             rings: rp.rings.len(),
             benzene: first.benzene,
+            hetero,
         };
         let mut out = Vec::new();
         for reverse in [false, true] {
@@ -522,6 +537,9 @@ impl<'a> Namer<'a> {
             // The ways of numbering each ring, given where its numbering starts.
             let options: Vec<Vec<Vec<usize>>> = (0..k)
                 .map(|i| {
+                    if let Some(h) = &rings[order[i]].hetero {
+                        return h.numberings.clone();
+                    }
                     let start = if i == 0 { joins[0].0 } else { joins[i - 1].1 };
                     let mut w = walks(order[i], start);
                     if i > 0 && i + 1 < k {
@@ -563,6 +581,16 @@ impl<'a> Namer<'a> {
                     locs,
                     shape,
                 });
+            }
+        }
+        if hetero.is_some() {
+            let join_locs = |n: &Numbering| {
+                let mut l: Vec<u32> = n.joins.iter().flat_map(|&(a, b)| [a, b]).collect();
+                l.sort_unstable();
+                l
+            };
+            if let Some(lowest) = out.iter().map(join_locs).min() {
+                out.retain(|n| join_locs(n) == lowest);
             }
         }
         out
@@ -620,7 +648,14 @@ impl<'a> Namer<'a> {
 
         let mut mults = Vec::new();
         // Benzene rings have no "ene" endings; an assembly's rings are benzene or saturated.
-        if matches!(shape, Shape::Chain | Shape::Ring { benzene: false }) {
+        if matches!(
+            shape,
+            Shape::Chain
+                | Shape::Ring {
+                    benzene: false,
+                    hetero: None
+                }
+        ) {
             let n = atoms.len();
             let bonds = if ring { n } else { n.saturating_sub(1) };
             for i in 0..bonds {
@@ -704,8 +739,32 @@ impl<'a> Namer<'a> {
             named.push((loc, self.sub(q, from)?));
         }
         let groups = group_prefixes(named);
-        if let Shape::Assembly { rings, benzene } = e.shape {
-            let (mut text, depth, order) = assembly_name(e, rings, benzene, suffix, &groups)?;
+        if let Shape::Ring {
+            hetero: Some(h), ..
+        } = e.shape
+        {
+            let (mut text, depth, order) = hetero_name(e, h, suffix, &groups);
+            if mode == Mode::Molecule {
+                text = self.with_ester(e, region, text)?;
+            }
+            return Ok((
+                order,
+                Prefix {
+                    text,
+                    compound: !groups.is_empty(),
+                    depth,
+                    oxy: false,
+                },
+            ));
+        }
+        if let Shape::Assembly {
+            rings,
+            benzene,
+            hetero,
+        } = e.shape
+        {
+            let (mut text, depth, order) =
+                assembly_name(e, rings, benzene, hetero, suffix, &groups)?;
             if mode == Mode::Molecule {
                 text = self.with_ester(e, region, text)?;
             }
@@ -723,7 +782,7 @@ impl<'a> Namer<'a> {
         let len = e.atoms.len();
         let chain = e.shape == Shape::Chain;
         let ring = !chain;
-        let benzene = e.shape == Shape::Ring { benzene: true };
+        let benzene = matches!(e.shape, Shape::Ring { benzene: true, .. });
         let nsuf = e.suffix.len();
         let n_c_prefix = e.prefixes.iter().filter(|(l, _, _)| *l != Loc::N).count();
         let n_feat = nsuf + n_c_prefix;
@@ -952,6 +1011,11 @@ impl<'a> Namer<'a> {
                     _ => Err("internal error: oxygen with three bonds".into()),
                 }
             }
+            // A ring nitrogen: the free valence of its ring (piperidin-1-yl).
+            El::N if p.in_ring[q] => self.unit(
+                Mode::FreeValence { atom: q, order },
+                &self.region_from(q, from),
+            ),
             El::N => {
                 if p.nitro[q] {
                     return Ok(Prefix::simple("nitro"));
@@ -1108,6 +1172,7 @@ fn assembly_name(
     e: &Eval,
     rings: usize,
     benzene: bool,
+    hetero: Option<&HeteroRing>,
     suffix: Suffix,
     groups: &[(Prefix, Vec<Loc>)],
 ) -> Result<(String, usize, Vec<Loc>), Unsupported> {
@@ -1125,6 +1190,8 @@ fn assembly_name(
         .ok_or("internal error: ring assembly size")?;
     let ring = if benzene {
         "phenyl".to_string()
+    } else if let Some(h) = hetero {
+        h.name.to_string()
     } else {
         let size = e.atoms.len() / rings;
         format!(
@@ -1154,6 +1221,39 @@ fn assembly_name(
         Suffix::Yl(_) => format!("{prefixes}[{hydride}]-{locs}-yl"),
     };
     Ok((text, depth, order))
+}
+
+/// The name of a heterocyclic parent (P-22.2, P-31.1.4.2.4): "pyridine", "1H-pyrrole",
+/// "2-methylpyridine", "1-methyl-1H-pyrrole", "pyridin-3-ol", "pyridine-3-carboxylic acid",
+/// "piperidin-1-yl". Every locant is cited, even for a single prefix: the ring is not
+/// homogeneous. The final "e" of the ring name is elided before a vowel.
+fn hetero_name(
+    e: &Eval,
+    h: &HeteroRing,
+    suffix: Suffix,
+    groups: &[(Prefix, Vec<Loc>)],
+) -> (String, usize, Vec<Loc>) {
+    let indicated = if h.indicated { "1H-" } else { "" };
+    let core = match suffix {
+        Suffix::None => format!("{indicated}{}", h.name),
+        _ => {
+            let word = multiplied(e.suffix.len(), suffix_word(suffix, true));
+            let mut stem = h.name;
+            if starts_with_vowel(&word) {
+                stem = stem.strip_suffix('e').unwrap_or(stem);
+            }
+            format!("{indicated}{stem}-{}-{word}", loc_list(&e.suffix))
+        }
+    };
+    let (prefixes, depth, order) = compose(groups, false);
+    let text = if prefixes.is_empty() {
+        core
+    } else if core.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("{prefixes}-{core}")
+    } else {
+        format!("{prefixes}{core}")
+    };
+    (text, depth, order)
 }
 
 /// The hydride name with its unsaturation: "butane", "but-2-ene", "buta-1,3-diene",
