@@ -71,10 +71,13 @@ fn convert_font_text(text: &str, from: Option<FontName>, to: Option<FontName>) -
     }
 }
 
-/// `rich` with `change` applied to the characters in `range`.
+/// `rich` with `change` applied to the characters in `range`. A font change leaves Symbol
+/// text in Symbol (as ChemDraw keeps Greek Greek when a caption's font changes); only
+/// [`FormatChange::Symbol`] or choosing Symbol itself moves text in or out of it.
 pub fn apply_to(rich: &RichText, range: Range<usize>, change: FormatChange) -> RichText {
     rich.map_range(range, |text, style| {
         let font = match change {
+            FormatChange::Font(f) if style.is_symbol() && !f.is_some_and(|f| f.is_symbol()) => None,
             FormatChange::Font(f) => Some(f),
             FormatChange::Symbol(true) => Some(Some(FontName::symbol())),
             FormatChange::Symbol(false) if style.is_symbol() => Some(None),
@@ -349,6 +352,13 @@ mod tests {
         e.apply_text_format(FormatChange::Symbol(true));
         assert!(e.text_edit.as_ref().unwrap().symbol);
         assert!(e.text_format().symbol_typing);
+    }
+
+    #[test]
+    fn a_font_change_keeps_symbol_text_in_symbol() {
+        let rich = RichText::parse("heat {@Symbol:D}");
+        let out = apply_to(&rich, 0..rich.char_count(), FormatChange::Font(Some(FontName::new("Georgia"))));
+        assert_eq!(out.to_compact_markup(), "{@Georgia:heat }{@Symbol:D}");
     }
 
     #[test]
