@@ -17,8 +17,12 @@
 //! ```
 //!
 //! See `examples/editor.rs` for a complete host application (toolbar, status bar, MOL2 export).
+//!
+//! The widgets' labels and menus come in eleven languages; pick one with
+//! [`i18n::set_language`] (see [`i18n`]).
 
 pub mod config;
+pub mod i18n;
 pub mod label_chain;
 pub mod molecule;
 pub mod naming;
@@ -44,5 +48,5 @@ pub use egui;
 pub use config::Config;
 pub use molecule::{Atom, Bond, BondOrder, BondStereo, DoublePosition, Molecule};
 pub use widget::rich_text::{RichGalley, RichLabel, RichSpan, RichText, RichTextStyle, Script, SpanStyle};
-pub use widget::bond_menu::{bond_menu, BondMenuAction};
+pub use widget::bond_menu::{bond_menu, bond_menu_in, BondMenuAction};
 pub use widget::{ChemStructEditor, EditorResponse, Tool};

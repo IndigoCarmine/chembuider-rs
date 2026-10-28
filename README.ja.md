@@ -160,6 +160,27 @@ RichText::parse("SO_4^{2-}")                            // あるいは Painter 
     .paint(&painter, pos, egui::Align2::CENTER_CENTER, &style);
 ```
 
+## 表示言語
+
+ウィジェットのラベル・メニュー・メッセージ（解析パネル、結合メニュー、ibisOffice 用エディタ）は、
+日本語・英語・簡体字中国語・繁体字中国語・スペイン語・フランス語・ドイツ語・ポルトガル語（ブラジル）・
+韓国語・ロシア語・イタリア語で表示できます。言語はプロセス全体で一度設定します。
+
+```rust
+use chembuider_rs::i18n::{self, Language};
+
+i18n::set_language(Language::Ko);
+// BCP-47 タグや POSIX ロケールから
+i18n::set_language(Language::from_tag("zh-TW").unwrap_or(Language::En));
+```
+
+設定しない限り表示は変わりません（英語。従来のフラグ `AnalysisPanel::ja` や
+`bond_menu(ui, bond, true)` を指定した箇所は日本語）。IUPAC 名はどの言語でも英語です。
+中国語・日本語・韓国語の表示にはそれらの字形を持つフォントが必要で、
+`widget::fonts::add_cjk_ui_font(&mut fonts, language)` がシステムのフォントを追加します
+（簡体字・繁体字・韓国語では YaHei / JhengHei / Malgun Gothic、PingFang SC / TC /
+Apple SD Gothic Neo、Noto Sans CJK SC / TC / KR を優先し、それ以外では日本語フォント）。
+
 ## 設定
 
 `Config` はキーボードショートカット、描画スタイル（ラベルサイズ、結合の太さ、破線間隔 …）、

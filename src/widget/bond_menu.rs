@@ -22,6 +22,7 @@
 //! ```
 
 use super::ChemStructEditor;
+use crate::i18n::{self, Language, Msg, tr_in};
 use crate::molecule::{Bond, BondOrder, BondStereo, DoublePosition};
 
 /// What the user picked from [`bond_menu`].
@@ -35,24 +36,24 @@ pub enum BondMenuAction {
     Delete,
 }
 
-/// The single-bond styles, in ChemDraw's menu order: (English, Japanese, stereo).
-const SINGLE_STYLES: [(&str, &str, BondStereo); 9] = [
-    ("Plain", "実線", BondStereo::None),
-    ("Dashed", "破線", BondStereo::Dashed),
-    ("Hashed", "ハッシュ", BondStereo::Hashed),
-    ("Hashed Wedged", "ハッシュくさび", BondStereo::WedgeDown),
-    ("Bold", "太線", BondStereo::Bold),
-    ("Bold Wedged", "太線くさび", BondStereo::WedgeUp),
-    ("Hollow Wedged", "中抜きくさび", BondStereo::HollowWedge),
-    ("Dative", "配位結合", BondStereo::Dative),
-    ("Wavy", "波線", BondStereo::Wavy),
+/// The single-bond styles, in ChemDraw's menu order.
+const SINGLE_STYLES: [(Msg, BondStereo); 9] = [
+    (Msg::StylePlain, BondStereo::None),
+    (Msg::StyleDashed, BondStereo::Dashed),
+    (Msg::StyleHashed, BondStereo::Hashed),
+    (Msg::StyleHashedWedged, BondStereo::WedgeDown),
+    (Msg::StyleBold, BondStereo::Bold),
+    (Msg::StyleBoldWedged, BondStereo::WedgeUp),
+    (Msg::StyleHollowWedged, BondStereo::HollowWedge),
+    (Msg::StyleDative, BondStereo::Dative),
+    (Msg::StyleWavy, BondStereo::Wavy),
 ];
 
-const POSITIONS: [(&str, &str, DoublePosition); 4] = [
-    ("Auto", "自動", DoublePosition::Auto),
-    ("Left", "左", DoublePosition::Left),
-    ("Center", "中央", DoublePosition::Center),
-    ("Right", "右", DoublePosition::Right),
+const POSITIONS: [(Msg, DoublePosition); 4] = [
+    (Msg::PositionAuto, DoublePosition::Auto),
+    (Msg::PositionLeft, DoublePosition::Left),
+    (Msg::PositionCenter, DoublePosition::Center),
+    (Msg::PositionRight, DoublePosition::Right),
 ];
 
 /// A menu entry with ChemDraw's check mark in front when it is the bond's current value.
@@ -62,26 +63,32 @@ fn item(ui: &mut egui::Ui, checked: bool, label: &str) -> bool {
 }
 
 /// Draw the bond menu's entries into `ui` (the inside of a context menu) for `bond`, checking
-/// the bond's current order, style and double-bond position. Labels are Japanese when `ja`.
+/// the bond's current order, style and double-bond position. Labels are in the language set
+/// with [`i18n::set_language`], or while none is, Japanese when `ja` and English otherwise.
 /// Returns the entry clicked this frame, closing the menu when there is one.
 pub fn bond_menu(ui: &mut egui::Ui, bond: &Bond, ja: bool) -> Option<BondMenuAction> {
-    let t = |en: &'static str, jp: &'static str| if ja { jp } else { en };
+    bond_menu_in(ui, bond, i18n::language_or(if ja { Language::Ja } else { Language::En }))
+}
+
+/// [`bond_menu`] with its labels in `language`, whatever language is set.
+pub fn bond_menu_in(ui: &mut egui::Ui, bond: &Bond, language: Language) -> Option<BondMenuAction> {
+    let t = |msg| tr_in(language, msg);
     let mut action = None;
 
     let single = bond.order == BondOrder::Single;
-    ui.menu_button(format!("{} {}", if single { "✔" } else { "   " }, t("Single", "一重結合")), |ui| {
-        for (en, jp, stereo) in SINGLE_STYLES {
-            if item(ui, single && bond.stereo == stereo, t(en, jp)) {
+    ui.menu_button(format!("{} {}", if single { "✔" } else { "   " }, t(Msg::BondSingle)), |ui| {
+        for (msg, stereo) in SINGLE_STYLES {
+            if item(ui, single && bond.stereo == stereo, t(msg)) {
                 action = Some(BondMenuAction::SetType(BondOrder::Single, stereo));
             }
         }
     });
-    for (en, jp, order) in [
-        ("Double", "二重結合", BondOrder::Double),
-        ("Triple", "三重結合", BondOrder::Triple),
-        ("Quadruple", "四重結合", BondOrder::Quadruple),
+    for (msg, order) in [
+        (Msg::BondDouble, BondOrder::Double),
+        (Msg::BondTriple, BondOrder::Triple),
+        (Msg::BondQuadruple, BondOrder::Quadruple),
     ] {
-        if item(ui, bond.order == order, t(en, jp)) {
+        if item(ui, bond.order == order, t(msg)) {
             action = Some(BondMenuAction::SetType(order, BondStereo::None));
         }
     }
@@ -89,9 +96,9 @@ pub fn bond_menu(ui: &mut egui::Ui, bond: &Bond, ja: bool) -> Option<BondMenuAct
     ui.separator();
     // Only a double bond has a second line to place.
     ui.add_enabled_ui(bond.order == BondOrder::Double, |ui| {
-        ui.menu_button(format!("    {}", t("Bond Position", "二重結合の位置")), |ui| {
-            for (en, jp, position) in POSITIONS {
-                if item(ui, bond.double_position == position, t(en, jp)) {
+        ui.menu_button(format!("    {}", t(Msg::BondPosition)), |ui| {
+            for (msg, position) in POSITIONS {
+                if item(ui, bond.double_position == position, t(msg)) {
                     action = Some(BondMenuAction::SetDoublePosition(position));
                 }
             }
@@ -99,7 +106,7 @@ pub fn bond_menu(ui: &mut egui::Ui, bond: &Bond, ja: bool) -> Option<BondMenuAct
     });
 
     ui.separator();
-    if item(ui, false, t("Delete Bond", "結合を削除")) {
+    if item(ui, false, t(Msg::DeleteBond)) {
         action = Some(BondMenuAction::Delete);
     }
 
@@ -241,6 +248,11 @@ mod tests {
         for ja in [false, true] {
             let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
                 assert_eq!(bond_menu(ui, &bond, ja), None);
+            });
+        }
+        for language in Language::ALL {
+            let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
+                assert_eq!(bond_menu_in(ui, &bond, language), None);
             });
         }
     }

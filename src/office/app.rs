@@ -4,8 +4,9 @@
 use super::content;
 use super::message::{EditorMsg, HostMsg, OleContent};
 use super::session::{self, Args, Sender};
+use crate::i18n::{tr_in, trf, Language, Msg};
 use crate::molecule::cdx;
-use crate::{bond_menu, BondStereo, ChemStructEditor, Config, Molecule, Tool};
+use crate::{bond_menu_in, BondStereo, ChemStructEditor, Config, Molecule, Tool};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -55,7 +56,7 @@ struct Tab {
 }
 
 impl Tab {
-    fn new(object: u64, title: String, source: Source, cdx_bytes: Option<&[u8]>, ja: bool) -> Tab {
+    fn new(object: u64, title: String, source: Source, cdx_bytes: Option<&[u8]>, lang: Language) -> Tab {
         let mut editor = ChemStructEditor::default();
         editor.config = Config::load();
         // The whole drawing in view (zoomed out if it is larger than the window) on the
@@ -66,14 +67,10 @@ impl Tab {
             Some(Some(import)) => {
                 editor.molecule = import.molecule;
                 if import.other_objects > 0 {
-                    note = Some(if ja {
-                        format!("構造式以外の {} 個のオブジェクト（矢印・文字など）はそのまま保持されます", import.other_objects)
-                    } else {
-                        format!("{} other objects (arrows, text, …) are kept as they are", import.other_objects)
-                    });
+                    note = Some(trf(lang, Msg::OtherObjectsKept, &[("n", &import.other_objects)]));
                 }
             }
-            Some(None) => unreadable = Some(if ja { "ChemDraw (CDX) の図として読めません".to_string() } else { "Not a ChemDraw (CDX) drawing".to_string() }),
+            Some(None) => unreadable = Some(tr_in(lang, Msg::NotCdx).to_string()),
             None => {}
         }
         let sent = editor.molecule.clone();
@@ -81,17 +78,17 @@ impl Tab {
     }
 
     /// A CDX file opened by hand.
-    fn open_file(path: PathBuf, ja: bool) -> Tab {
+    fn open_file(path: PathBuf, lang: Language) -> Tab {
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match std::fs::read(&path) {
-            Ok(bytes) => Tab::new(0, title, Source::File { path, original: Some(bytes.clone()), on_disk: Some(bytes.clone()) }, Some(&bytes), ja),
+            Ok(bytes) => Tab::new(0, title, Source::File { path, original: Some(bytes.clone()), on_disk: Some(bytes.clone()) }, Some(&bytes), lang),
             // Nothing there yet: a new drawing, written on the first edit.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tab::new(0, title, Source::File { path, original: None, on_disk: None }, None, ja),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tab::new(0, title, Source::File { path, original: None, on_disk: None }, None, lang),
             // There but not readable (locked, no access, …): shown as such and never written
             // over, or the first edit would replace the file with a drawing that is not it.
             Err(e) => {
-                let mut tab = Tab::new(0, title, Source::File { path, original: None, on_disk: None }, None, ja);
-                tab.unreadable = Some(if ja { format!("ファイルを読めません: {e}") } else { format!("Cannot read the file: {e}") });
+                let mut tab = Tab::new(0, title, Source::File { path, original: None, on_disk: None }, None, lang);
+                tab.unreadable = Some(trf(lang, Msg::CannotReadFile, &[("error", &e)]));
                 tab
             }
         }
@@ -99,8 +96,8 @@ impl Tab {
 
     /// The drawing started without a file: `untitled.cdx` in `dir`. One left by an earlier
     /// session is opened, so its drawing is shown and edited rather than silently replaced.
-    fn untitled(dir: &Path, ja: bool) -> Tab {
-        Tab::open_file(dir.join(UNTITLED), ja)
+    fn untitled(dir: &Path, lang: Language) -> Tab {
+        Tab::open_file(dir.join(UNTITLED), lang)
     }
 
     fn original_cdx(&self) -> Option<&[u8]> {
@@ -111,8 +108,8 @@ impl Tab {
     }
 
     /// What becomes of an edit, for the status bar.
-    fn edits_status(&self, ja: bool) -> &'static str {
-        edits_status(matches!(self.source, Source::Office { .. }), self.unreadable.is_some() || self.changed_outside, ja)
+    fn edits_status(&self, lang: Language) -> &'static str {
+        edits_status(matches!(self.source, Source::Office { .. }), self.unreadable.is_some() || self.changed_outside, lang)
     }
 
     /// The drawing as it is now, sent back (to ibisOffice, or written to its file). A file
@@ -179,8 +176,8 @@ pub struct OfficeApp {
     tabs: Vec<Tab>,
     active: usize,
     events: mpsc::Receiver<Event>,
-    /// Japanese UI (the locale ibisOffice asked for).
-    ja: bool,
+    /// The UI's language (the locale ibisOffice asked for).
+    lang: Language,
     status: String,
     /// The window closes when its last object does (not when it was opened by hand).
     office: bool,
@@ -232,11 +229,19 @@ pub fn serve_object(args: Args, object: u64, events: mpsc::Sender<Event>, waker:
     });
 }
 
-/// A font with Japanese in it, from the system, behind egui's own (titles are file names).
-fn add_japanese_font(ctx: &egui::Context) {
+/// A font with Japanese (or the Chinese or Korean of `lang`) in it, from the system, behind
+/// egui's own (titles are file names, and the labels may be CJK).
+fn add_cjk_font(ctx: &egui::Context, lang: Language) {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-    let candidates = ["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"];
-    let Some(data) = candidates.iter().find_map(|f| std::fs::read(PathBuf::from(&windir).join("Fonts").join(f)).ok()) else { return };
+    // Microsoft YaHei, Microsoft JhengHei or Malgun Gothic first; else a Japanese font.
+    let preferred = match lang {
+        Language::ZhHans => Some("msyh.ttc"),
+        Language::ZhHant => Some("msjh.ttc"),
+        Language::Ko => Some("malgun.ttf"),
+        _ => None,
+    };
+    let mut candidates = preferred.into_iter().chain(["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"]);
+    let Some(data) = candidates.find_map(|f| std::fs::read(PathBuf::from(&windir).join("Fonts").join(f)).ok()) else { return };
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert("japanese".into(), Arc::new(egui::FontData::from_owned(data)));
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
@@ -247,29 +252,33 @@ fn add_japanese_font(ctx: &egui::Context) {
 
 impl OfficeApp {
     pub fn new(ctx: &egui::Context, events: mpsc::Receiver<Event>, office: bool, file: Option<PathBuf>) -> OfficeApp {
-        add_japanese_font(ctx);
-        let ja = std::env::var("LANG").map(|l| l.starts_with("ja")).unwrap_or(false);
-        let mut app = OfficeApp { tabs: Vec::new(), active: 0, events, ja, status: String::new(), office, script: std::env::var("CHEMBUILDER_OFFICE_TEST_SCRIPT").ok() };
+        let lang = std::env::var("LANG").ok().and_then(|l| Language::from_tag(&l)).unwrap_or(Language::En);
+        add_cjk_font(ctx, lang);
+        let mut app = OfficeApp { tabs: Vec::new(), active: 0, events, lang, status: String::new(), office, script: std::env::var("CHEMBUILDER_OFFICE_TEST_SCRIPT").ok() };
         if let Some(path) = file {
-            app.tabs.push(Tab::open_file(path, app.ja));
+            app.tabs.push(Tab::open_file(path, app.lang));
         } else if !office {
             // In the current directory, as `untitled.cdx` always was.
-            app.tabs.push(Tab::untitled(Path::new(""), app.ja));
+            app.tabs.push(Tab::untitled(Path::new(""), app.lang));
         }
         app
     }
 
-    fn t(&self, ja: &'static str, en: &'static str) -> &'static str {
-        if self.ja { ja } else { en }
+    fn t(&self, msg: Msg) -> &'static str {
+        tr_in(self.lang, msg)
     }
 
     fn take_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Opened { object, content, title, locale, sender } => {
-                    self.ja = locale == "ja";
+                    let lang = Language::from_tag(&locale).unwrap_or(Language::En);
+                    if lang != self.lang {
+                        self.lang = lang;
+                        add_cjk_font(ctx, lang);
+                    }
                     let bytes = content.stream(content::CONTENTS).map(<[u8]>::to_vec);
-                    let mut tab = Tab::new(object, title, Source::Office { sender, original: content }, Some(bytes.as_deref().unwrap_or(b"")), self.ja);
+                    let mut tab = Tab::new(object, title, Source::Office { sender, original: content }, Some(bytes.as_deref().unwrap_or(b"")), self.lang);
                     if let Some(script) = &self.script {
                         run_script(script, &mut tab);
                     }
@@ -309,10 +318,10 @@ impl OfficeApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let (select, bond, eraser) = (self.t("選択", "Select"), self.t("結合", "Bond"), self.t("消しゴム", "Eraser"));
-        let (wedge, hash, plain) = (self.t("くさび", "Wedge"), self.t("破線くさび", "Hash"), self.t("通常", "Plain"));
-        let (undo, redo, clean) = (self.t("元に戻す", "Undo"), self.t("やり直し", "Redo"), self.t("整形", "Clean Up"));
-        let paste = self.t("貼り付け", "Paste");
+        let (select, bond, eraser) = (self.t(Msg::ToolSelect), self.t(Msg::ToolBond), self.t(Msg::ToolEraser));
+        let (wedge, hash, plain) = (self.t(Msg::NewBondWedge), self.t(Msg::NewBondHash), self.t(Msg::NewBondPlain));
+        let (undo, redo, clean) = (self.t(Msg::Undo), self.t(Msg::Redo), self.t(Msg::CleanUp));
+        let paste = self.t(Msg::Paste);
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let ed = &mut tab.editor;
         ui.horizontal_wrapped(|ui| {
@@ -348,17 +357,14 @@ impl OfficeApp {
 /// to a file. An unreadable drawing (or a file another program changed) can still be drawn
 /// on, but its edits are never sent or written (see [`Tab::flush`]) and are lost with the tab,
 /// so it must not say they are kept.
-fn edits_status(to_office: bool, unreadable: bool, ja: bool) -> &'static str {
-    match (to_office, unreadable, ja) {
-        (true, false, true) => "編集は自動的に反映されます",
-        (true, false, false) => "Edits are sent back automatically",
-        (true, true, true) => "編集は反映されません",
-        (true, true, false) => "Edits are not sent back",
-        (false, false, true) => "編集は自動的に保存されます",
-        (false, false, false) => "Edits are saved automatically",
-        (false, true, true) => "編集は保存されません",
-        (false, true, false) => "Edits are not saved",
-    }
+fn edits_status(to_office: bool, unreadable: bool, lang: Language) -> &'static str {
+    let msg = match (to_office, unreadable) {
+        (true, false) => Msg::EditsSentBack,
+        (true, true) => Msg::EditsNotSentBack,
+        (false, false) => Msg::EditsSaved,
+        (false, true) => Msg::EditsNotSaved,
+    };
+    tr_in(lang, msg)
 }
 
 /// The interop tests' edit: one carbon added beside the drawing.
@@ -418,11 +424,8 @@ impl eframe::App for OfficeApp {
                 ui.label(&self.status);
                 return;
             };
-            let what = tab.edits_status(self.ja);
-            let outside = tab.changed_outside.then_some(self.t(
-                "ファイルが別のアプリで変更されたため上書きしません",
-                "The file was changed by another program and is not written over",
-            ));
+            let what = tab.edits_status(self.lang);
+            let outside = tab.changed_outside.then_some(self.t(Msg::ChangedOutside));
             let text = [tab.unreadable.as_deref(), outside, tab.note.as_deref(), Some(what), Some(self.status.as_str())]
                 .into_iter()
                 .flatten()
@@ -433,7 +436,7 @@ impl eframe::App for OfficeApp {
         });
 
         let pressed = ctx.input(|i| i.pointer.any_down());
-        let ja = self.ja;
+        let lang = self.lang;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else { return };
             let out = tab.editor.show(ui);
@@ -442,9 +445,9 @@ impl eframe::App for OfficeApp {
             let mut chosen = None;
             let menu = out.response.context_menu(|ui| {
                 match tab.editor.context_bond().and_then(|id| tab.editor.molecule.bond_by_id(id)) {
-                    Some(bond) => chosen = bond_menu(ui, bond, ja),
+                    Some(bond) => chosen = bond_menu_in(ui, bond, lang),
                     None => {
-                        ui.label(if ja { "結合を右クリックすると変更できます" } else { "Right-click a bond to change it." });
+                        ui.label(tr_in(lang, Msg::RightClickBond));
                     }
                 }
             });
@@ -522,7 +525,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("chembuilder-office-file-{}.cdx", std::process::id()));
         std::fs::write(&path, &original).unwrap();
 
-        let mut tab = Tab::open_file(path.clone(), false);
+        let mut tab = Tab::open_file(path.clone(), Language::En);
         assert!(tab.note.is_some(), "the caption is announced as kept");
         for added in 1..=2 {
             let first = tab.editor.molecule.atoms[0].id;
@@ -568,7 +571,7 @@ mod tests {
         let path = dir.0.join("drawing.cdx");
         std::fs::create_dir(&path).unwrap();
 
-        let mut tab = Tab::open_file(path.clone(), false);
+        let mut tab = Tab::open_file(path.clone(), Language::En);
         assert!(tab.unreadable.is_some(), "the read error is shown, not an empty new drawing");
         add_oxygen(&mut tab);
         assert_eq!(tab.flush(), Ok(()), "nothing is written");
@@ -581,22 +584,22 @@ mod tests {
         let path = dir.0.join("drawing.cdx");
         std::fs::create_dir(&path).unwrap();
 
-        let tab = Tab::open_file(path, false);
+        let tab = Tab::open_file(path, Language::En);
         assert!(tab.unreadable.is_some());
-        assert_eq!(tab.edits_status(false), "Edits are not saved");
-        assert_eq!(tab.edits_status(true), "編集は保存されません");
+        assert_eq!(tab.edits_status(Language::En), "Edits are not saved");
+        assert_eq!(tab.edits_status(Language::Ja), "編集は保存されません");
 
         // One that can be read still says its edits are saved.
-        let readable = Tab::open_file(dir.0.join("new.cdx"), false);
-        assert_eq!(readable.edits_status(false), "Edits are saved automatically");
+        let readable = Tab::open_file(dir.0.join("new.cdx"), Language::En);
+        assert_eq!(readable.edits_status(Language::En), "Edits are saved automatically");
     }
 
     #[test]
     fn an_office_object_that_cannot_be_read_says_its_edits_are_not_sent_back() {
         // A tab for ibisOffice needs its connection, so the wording is checked on its own.
-        assert_eq!(edits_status(true, true, false), "Edits are not sent back");
-        assert_eq!(edits_status(true, true, true), "編集は反映されません");
-        assert_eq!(edits_status(true, false, false), "Edits are sent back automatically");
+        assert_eq!(edits_status(true, true, Language::En), "Edits are not sent back");
+        assert_eq!(edits_status(true, true, Language::Ja), "編集は反映されません");
+        assert_eq!(edits_status(true, false, Language::En), "Edits are sent back automatically");
     }
 
     #[test]
@@ -604,7 +607,7 @@ mod tests {
         let dir = TempDir::new("missing");
         let path = dir.0.join("new.cdx");
 
-        let mut tab = Tab::open_file(path.clone(), false);
+        let mut tab = Tab::open_file(path.clone(), Language::En);
         assert!(tab.unreadable.is_none());
         assert!(tab.editor.molecule.atoms.is_empty());
         add_oxygen(&mut tab);
@@ -617,7 +620,7 @@ mod tests {
         let dir = TempDir::new("changed-outside");
         let path = dir.0.join("drawing.cdx");
         std::fs::write(&path, include_bytes!("../../tests/fixtures/chemdraw26_benzene.cdx")).unwrap();
-        let mut tab = Tab::open_file(path.clone(), false);
+        let mut tab = Tab::open_file(path.clone(), Language::En);
         add_oxygen(&mut tab);
         tab.flush().unwrap();
         assert!(!tab.changed_outside, "its own save is not taken for another program's");
@@ -629,14 +632,14 @@ mod tests {
         assert_eq!(tab.flush(), Ok(()));
         assert!(std::fs::read(&path).unwrap() == theirs, "their save is kept");
         assert!(tab.changed_outside, "the change is noticed");
-        assert_eq!(tab.edits_status(false), "Edits are not saved");
+        assert_eq!(tab.edits_status(Language::En), "Edits are not saved");
         add_oxygen(&mut tab);
         tab.flush().unwrap();
         assert!(std::fs::read(&path).unwrap() == theirs, "nor written over later");
 
         // A new drawing whose file another program created in the meantime.
         let new = dir.0.join("new.cdx");
-        let mut tab = Tab::open_file(new.clone(), false);
+        let mut tab = Tab::open_file(new.clone(), Language::En);
         std::fs::write(&new, &theirs).unwrap();
         add_oxygen(&mut tab);
         tab.flush().unwrap();
@@ -650,7 +653,7 @@ mod tests {
         let original = include_bytes!("../../tests/fixtures/chemdraw26_benzene.cdx");
         std::fs::write(dir.0.join(UNTITLED), original).unwrap();
 
-        let mut tab = Tab::untitled(&dir.0, false);
+        let mut tab = Tab::untitled(&dir.0, Language::En);
         assert_eq!(tab.title, UNTITLED);
         assert_eq!(tab.editor.molecule.atoms.len(), 6, "the earlier drawing is shown");
         add_oxygen(&mut tab);
@@ -703,14 +706,14 @@ mod tests {
         let dir = TempDir::new("fit-file");
         let path = dir.0.join("wide.cdx");
         std::fs::write(&path, wide_cdx()).unwrap();
-        assert_whole_drawing_shown(&mut Tab::open_file(path, false));
+        assert_whole_drawing_shown(&mut Tab::open_file(path, Language::En));
     }
 
     #[test]
     fn an_earlier_untitled_drawing_opens_with_the_whole_drawing_in_view() {
         let dir = TempDir::new("fit-untitled");
         std::fs::write(dir.0.join(UNTITLED), wide_cdx()).unwrap();
-        assert_whole_drawing_shown(&mut Tab::untitled(&dir.0, false));
+        assert_whole_drawing_shown(&mut Tab::untitled(&dir.0, Language::En));
     }
 
     #[test]
@@ -726,7 +729,7 @@ mod tests {
         let _host = listener.accept().unwrap();
 
         let (events, rx) = mpsc::channel();
-        let mut app = OfficeApp { tabs: Vec::new(), active: 0, events: rx, ja: false, status: String::new(), office: true, script: None };
+        let mut app = OfficeApp { tabs: Vec::new(), active: 0, events: rx, lang: Language::En, status: String::new(), office: true, script: None };
         let content = content::new_content(wide_cdx());
         events.send(Event::Opened { object: 1, content, title: "wide".into(), locale: "en".into(), sender }).unwrap();
         app.take_events(&egui::Context::default());

@@ -23,6 +23,7 @@
 
 use std::collections::HashSet;
 
+use crate::i18n::{self, Language, Msg, tr_in, trf};
 use crate::molecule::Molecule;
 use crate::molecule::bracket::expand;
 use crate::naming::{has_stereo_marks, iupac_name, NameResult};
@@ -52,16 +53,13 @@ pub struct AnalysisPanel {
     pub custom_name: String,
     pub custom_formula: String,
     pub custom_charge: i32,
-    /// Show the labels in Japanese (the numbers and notation are the same either way).
+    /// Show the labels in Japanese while no language is set with [`i18n::set_language`]
+    /// (which, once called, decides for every widget). The numbers and notation are the same
+    /// in every language.
     pub ja: bool,
     cache: Option<(MolecularFormula, Option<Ion>, FormulaAnalysis)>,
     /// The structures last named, and their name (naming is too slow to redo every frame).
     name_cache: Option<(Molecule, NameResult)>,
-}
-
-/// `en`, or `ja` when the panel is in Japanese.
-fn t<'a>(ja: bool, en: &'a str, ja_text: &'a str) -> &'a str {
-    if ja { ja_text } else { en }
 }
 
 impl Default for AnalysisPanel {
@@ -81,6 +79,12 @@ impl Default for AnalysisPanel {
 }
 
 impl AnalysisPanel {
+    /// The language the panel is shown in: the one set with [`i18n::set_language`], or else
+    /// Japanese with [`ja`](Self::ja) and English without.
+    pub fn language(&self) -> Language {
+        i18n::language_or(if self.ja { Language::Ja } else { Language::En })
+    }
+
     /// The ion the current choice describes: `Ok(None)` for the neutral molecule, `Err` when
     /// the choice makes no ion (zero charge, a charge the adduct cannot reach, a bad formula).
     pub fn ion(&self) -> Result<Option<Ion>, IonError> {
@@ -121,13 +125,13 @@ impl AnalysisPanel {
 
     /// Draw the panel. Returns `true` when the user copied the report to the clipboard.
     pub fn ui(&mut self, ui: &mut egui::Ui, mol: &Molecule, selection: &HashSet<u32>) -> bool {
-        let ja = self.ja;
+        let lang = self.language();
         let scope = if selection.is_empty() {
-            t(ja, "Whole drawing", "図全体")
+            tr_in(lang, Msg::WholeDrawing)
         } else {
-            t(ja, "Selected structures", "選択した構造")
+            tr_in(lang, Msg::SelectedStructures)
         };
-        ui.heading(t(ja, "Analysis", "解析"));
+        ui.heading(tr_in(lang, Msg::Analysis));
         ui.weak(scope);
         ui.separator();
 
@@ -145,18 +149,18 @@ impl AnalysisPanel {
         };
         match ion_result {
             Ok(a) if a.formula.is_empty() => {
-                ui.weak(t(ja, "Nothing drawn yet.", "まだ何も描かれていません"));
+                ui.weak(tr_in(lang, Msg::NothingDrawn));
             }
             Ok(a) => {
                 let name = self.iupac_name(mol, selection).clone();
                 let stereo = has_stereo_marks(&analysis_target(mol, selection));
-                if show_values(ui, &a, polymer.as_ref(), &name, stereo, ja) {
+                if show_values(ui, &a, polymer.as_ref(), &name, stereo, lang) {
                     copied = true;
                 }
                 ui.add_space(4.0);
                 let copy = ui
-                    .button(t(ja, "📋 Copy", "📋 コピー"))
-                    .on_hover_text(t(ja, "Copy the analysis as text", "解析結果をテキストでコピー"));
+                    .button(format!("📋 {}", tr_in(lang, Msg::Copy)))
+                    .on_hover_text(tr_in(lang, Msg::CopyAnalysis));
                 if copy.clicked() {
                     let mut report = a.report();
                     if let Some(p) = &polymer {
@@ -173,22 +177,22 @@ IUPAC name: {}", report, name_text(&name)));
                 }
             }
             Err(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, format!("{}: {e}", t(ja, "Ion", "イオン")));
+                ui.colored_label(ui.visuals().error_fg_color, format!("{}: {e}", tr_in(lang, Msg::Ion)));
             }
         }
         copied
     }
 
     fn ion_controls(&mut self, ui: &mut egui::Ui) {
-        let ja = self.ja;
+        let lang = self.language();
         let presets = Adduct::presets();
         let label = |choice: &AdductChoice| match choice {
-            AdductChoice::Neutral => t(ja, "Neutral (M)", "中性 (M)").to_string(),
+            AdductChoice::Neutral => tr_in(lang, Msg::Neutral).to_string(),
             AdductChoice::Preset(i) => adduct_label(&presets[*i]),
-            AdductChoice::Custom => t(ja, "Custom…", "カスタム…").to_string(),
+            AdductChoice::Custom => tr_in(lang, Msg::CustomAdduct).to_string(),
         };
         egui::Grid::new("analysis_ion").num_columns(2).show(ui, |ui| {
-            ui.label(t(ja, "Adduct", "付加イオン"));
+            ui.label(tr_in(lang, Msg::Adduct));
             let before = self.adduct.clone();
             egui::ComboBox::from_id_salt("analysis_adduct")
                 .selected_text(label(&self.adduct))
@@ -207,27 +211,27 @@ IUPAC name: {}", report, name_text(&name)));
             ui.end_row();
 
             if self.adduct == AdductChoice::Custom {
-                ui.label(t(ja, "Name", "名前"));
+                ui.label(tr_in(lang, Msg::AdductName));
                 ui.add(egui::TextEdit::singleline(&mut self.custom_name).desired_width(80.0));
                 ui.end_row();
-                ui.label(t(ja, "Formula", "組成式"));
+                ui.label(tr_in(lang, Msg::AdductFormula));
                 ui.add(egui::TextEdit::singleline(&mut self.custom_formula).desired_width(80.0));
                 ui.end_row();
-                ui.label(t(ja, "Charge / unit", "1 単位の電荷"));
+                ui.label(tr_in(lang, Msg::ChargePerUnit));
                 ui.add(egui::DragValue::new(&mut self.custom_charge).range(-3..=3));
                 ui.end_row();
             }
 
             if self.adduct != AdductChoice::Neutral {
-                ui.label(t(ja, "Charge", "電荷"));
+                ui.label(tr_in(lang, Msg::Charge));
                 ui.add(egui::DragValue::new(&mut self.charge).range(-10..=10).custom_formatter(
                     |z, _| if z > 0.0 { format!("+{z}") } else { format!("{z}") },
                 ));
                 ui.end_row();
-                ui.label(t(ja, "Molecules", "分子数"));
+                ui.label(tr_in(lang, Msg::Molecules));
                 ui.add(egui::DragValue::new(&mut self.multimer).range(1..=10).prefix("n = "));
                 ui.end_row();
-                ui.label(t(ja, "Ion", "イオン"));
+                ui.label(tr_in(lang, Msg::Ion));
                 match self.ion() {
                     Ok(Some(ion)) => ui.strong(ion.notation()),
                     Ok(None) => ui.label("—"),
@@ -270,22 +274,22 @@ fn show_values(
     polymer: Option<&PolymerFormula>,
     name: &NameResult,
     stereo: bool,
-    ja: bool,
+    lang: Language,
 ) -> bool {
     let mut copied = false;
     let unknown = || {
-        format!("— ({}: {})", t(ja, "unknown", "不明"), a.formula.unknown_elements().join(", "))
+        format!("— ({})", trf(lang, Msg::UnknownElements, &[("elements", &a.formula.unknown_elements().join(", "))]))
     };
     let mass = |m: Option<f64>| m.map_or_else(unknown, |m| format!("{m:.4}"));
     egui::Grid::new("analysis_values").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label(t(ja, "Chemical formula", "分子式"));
+        ui.label(tr_in(lang, Msg::ChemicalFormula));
         match polymer {
             Some(p) => {
                 ui.vertical(|ui| {
                     ui.add(RichLabel::new(p.rich()));
                     ui.weak(format!(
                         "{} ({})",
-                        t(ja, "Values for n = 1", "数値は n = 1 の値"),
+                        tr_in(lang, Msg::ValuesForN1),
                         a.formula.plain()
                     ));
                 });
@@ -310,11 +314,11 @@ fn show_values(
                 }
             }
         };
-        ui.label(t(ja, "Exact mass", "精密質量"));
+        ui.label(tr_in(lang, Msg::ExactMass));
         with_n(ui, a.exact_mass, MolecularFormula::exact_mass);
         ui.end_row();
 
-        ui.label(t(ja, "Molecular weight", "分子量"));
+        ui.label(tr_in(lang, Msg::MolecularWeight));
         with_n(ui, a.molecular_weight, MolecularFormula::weight);
         ui.end_row();
 
@@ -336,7 +340,7 @@ fn show_values(
         }
         ui.end_row();
 
-        ui.label(t(ja, "Elemental analysis", "元素分析"));
+        ui.label(tr_in(lang, Msg::ElementalAnalysis));
         match &a.elemental_analysis {
             Some(ea) => {
                 ui.vertical(|ui| {
@@ -351,25 +355,25 @@ fn show_values(
         }
         ui.end_row();
 
-        ui.label(t(ja, "IUPAC name", "IUPAC 名"));
+        ui.label(tr_in(lang, Msg::IupacName));
         ui.vertical(|ui| match name {
             NameResult::Ok(n) => {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(n);
                     let copy = ui
                         .small_button("📋")
-                        .on_hover_text(t(ja, "Copy the name", "名前をコピー"));
+                        .on_hover_text(tr_in(lang, Msg::CopyName));
                     if copy.clicked() {
                         ui.ctx().copy_text(n.clone());
                         copied = true;
                     }
                 });
                 if stereo {
-                    ui.weak(t(ja, "(stereodescriptors not included)", "（立体表記は含まれません）"));
+                    ui.weak(tr_in(lang, Msg::StereoNotIncluded));
                 }
             }
             NameResult::Unsupported(reason) => {
-                ui.weak(format!("— ({}: {reason})", t(ja, "unsupported", "未対応")));
+                ui.weak(format!("— ({})", trf(lang, Msg::Unsupported, &[("reason", reason)])));
             }
         });
         ui.end_row();

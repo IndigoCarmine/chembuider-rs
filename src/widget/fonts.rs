@@ -24,6 +24,12 @@
 //! back to ChemDraw as it came. Only drawing maps the characters, with [`symbol_to_unicode`]
 //! (the Adobe Symbol encoding), and draws the result in the text's base font; nothing depends on
 //! a legacy Symbol font being installed.
+//!
+//! # CJK labels
+//!
+//! egui's own fonts have no Chinese, Japanese or Korean. [`add_cjk_ui_font`] adds a system font
+//! that has, picked for the [UI language](crate::i18n): a Simplified Chinese, Traditional
+//! Chinese or Korean font first for those languages, a Japanese font first otherwise.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -31,6 +37,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use egui::epaint::text::{FontInsert, FontProvider, InsertFontFamily};
 use egui::{FontData, FontFamily, FontPriority};
+
+use crate::i18n::Language;
 
 /// The name of ChemDraw's Greek font.
 pub const SYMBOL: &str = "Symbol";
@@ -306,6 +314,70 @@ pub fn is_installed(name: &str) -> bool {
     name.eq_ignore_ascii_case(SYMBOL) || system_families().iter().any(|f| f.eq_ignore_ascii_case(name))
 }
 
+// ─── CJK UI font ─────────────────────────────────────────────────────────────
+
+/// Simplified Chinese UI fonts: Windows, macOS, Linux.
+const CJK_SC: [&str; 5] = ["Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC"];
+/// Traditional Chinese UI fonts.
+const CJK_TC: [&str; 5] = ["Microsoft JhengHei", "PingFang TC", "Noto Sans CJK TC", "Noto Sans TC", "Source Han Sans TC"];
+/// Korean UI fonts.
+const CJK_KR: [&str; 5] = ["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR"];
+/// Japanese UI fonts.
+const CJK_JP: [&str; 8] = [
+    "Yu Gothic",
+    "Meiryo",
+    "MS Gothic",
+    "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN",
+    "Noto Sans CJK JP",
+    "Noto Sans JP",
+    "Source Han Sans JP",
+];
+
+/// The font data key [`add_cjk_ui_font`] installs its font under.
+pub const CJK_UI_FONT: &str = "chembuilder-cjk-ui";
+
+/// System font families with CJK glyphs, in the order to try for labels in `language`: its
+/// own fonts first for Simplified Chinese, Traditional Chinese and Korean (Microsoft YaHei /
+/// JhengHei / Malgun Gothic on Windows, PingFang SC / TC and Apple SD Gothic Neo on macOS,
+/// Noto Sans CJK SC / TC / KR on Linux), then Japanese fonts, then the other CJK ones.
+/// Japanese fonts come first for every other language.
+pub fn cjk_ui_font_families(language: Language) -> Vec<&'static str> {
+    let groups: [&[&'static str]; 4] = match language {
+        Language::ZhHans => [&CJK_SC, &CJK_JP, &CJK_TC, &CJK_KR],
+        Language::ZhHant => [&CJK_TC, &CJK_JP, &CJK_SC, &CJK_KR],
+        Language::Ko => [&CJK_KR, &CJK_JP, &CJK_SC, &CJK_TC],
+        _ => [&CJK_JP, &CJK_SC, &CJK_TC, &CJK_KR],
+    };
+    groups.concat()
+}
+
+/// Add the first installed font of [`cjk_ui_font_families`]`(language)` to `fonts` (as
+/// [`CJK_UI_FONT`]), behind egui's own proportional and monospace fonts so it draws only what
+/// they lack. Calling it again (with another language) replaces the font. Returns the family
+/// used, `None` when the system has none of them (or on the web) and `fonts` is unchanged.
+///
+/// It reads the system's font list the first time, which can take a moment; then
+/// `ctx.set_fonts(fonts)`. Optional: the widgets work without it, but CJK labels need a font
+/// that has them.
+pub fn add_cjk_ui_font(fonts: &mut egui::FontDefinitions, language: Language) -> Option<&'static str> {
+    #[cfg(not(target_arch = "wasm32"))]
+    for family in cjk_ui_font_families(language) {
+        if let Some(data) = system_font_data(family) {
+            fonts.font_data.insert(CJK_UI_FONT.to_owned(), Arc::new(data));
+            for list in [FontFamily::Proportional, FontFamily::Monospace] {
+                let list = fonts.families.entry(list).or_default();
+                list.retain(|f| f != CJK_UI_FONT);
+                list.push(CJK_UI_FONT.to_owned());
+            }
+            return Some(family);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (fonts, language);
+    None
+}
+
 /// The regular face of the system font `name`, loaded once and shared.
 #[cfg(not(target_arch = "wasm32"))]
 fn system_font_data(name: &str) -> Option<FontData> {
@@ -388,6 +460,38 @@ pub fn standalone_fonts() -> egui::epaint::text::Fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cjk_fonts_follow_the_language() {
+        assert_eq!(cjk_ui_font_families(Language::ZhHans)[0], "Microsoft YaHei");
+        assert_eq!(cjk_ui_font_families(Language::ZhHant)[0], "Microsoft JhengHei");
+        assert_eq!(cjk_ui_font_families(Language::Ko)[0], "Malgun Gothic");
+        for language in [Language::Ja, Language::En, Language::De] {
+            assert_eq!(cjk_ui_font_families(language)[0], "Yu Gothic", "Japanese first, as before");
+        }
+        // Every language falls back to a Japanese font after its own.
+        let sc = cjk_ui_font_families(Language::ZhHans);
+        assert_eq!(sc[CJK_SC.len()], "Yu Gothic");
+        assert!(sc.contains(&"PingFang SC") && sc.contains(&"Noto Sans CJK SC"));
+        assert_eq!(sc.len(), CJK_SC.len() + CJK_TC.len() + CJK_KR.len() + CJK_JP.len());
+    }
+
+    #[test]
+    fn a_cjk_font_is_added_behind_eguis_once() {
+        let mut fonts = egui::FontDefinitions::default();
+        let before = fonts.families[&FontFamily::Proportional].clone();
+        match add_cjk_ui_font(&mut fonts, Language::Ko) {
+            Some(_) => {
+                add_cjk_ui_font(&mut fonts, Language::ZhHans);
+                let after = &fonts.families[&FontFamily::Proportional];
+                assert_eq!(after[..before.len()], before[..], "egui's fonts first");
+                assert_eq!(after.iter().filter(|f| *f == CJK_UI_FONT).count(), 1);
+                assert_eq!(after.last().map(String::as_str), Some(CJK_UI_FONT));
+            }
+            // A system without CJK fonts: nothing changes.
+            None => assert_eq!(fonts.families[&FontFamily::Proportional], before),
+        }
+    }
 
     #[test]
     fn names_are_interned_and_compare_by_content() {
