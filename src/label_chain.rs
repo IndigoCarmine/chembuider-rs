@@ -2,9 +2,10 @@
 //!
 //! An atom label is normally *one* fragment name — `OMe`, `NO2`, `Boc` — which
 //! [`Config::resolve_fragment`] looks up by exact name. This module adds the second reading:
-//! when the label is not a name of its own, it is split into a **sequence** of fragment names
-//! and those fragments are welded head-to-tail into one composite [`Fragment`], which the
-//! caller then inserts exactly as it would insert any other fragment.
+//! when the label is not a name of its own, it is split into a **sequence** of tokens — fragment
+//! names and element symbols — and those are welded head-to-tail into one composite
+//! [`Fragment`], which the caller then inserts exactly as it would insert any other fragment.
+//! An element token is a lone atom of that element, so `NaH` reads as Na–H.
 //!
 //! The entry point is [`resolve_label`]. It tries the exact name **first**, so every label
 //! that resolved before resolves to the identical fragment now; the chain reading is only ever
@@ -12,6 +13,7 @@
 //!
 //! ```text
 //!   "MeOPh"  →  ["Me", "O", "Ph"]  →  CH3–O–C6H5
+//!   "NaOMe"  →  ["Na", "OMe"]       →  Na–O–CH3
 //!   "NO2"    →  exact fragment name, never split
 //!   "Qq"     →  no reading at all → the label is left alone
 //! ```
@@ -89,14 +91,15 @@ pub fn resolve_label(config: &Config, label: &str) -> Option<Fragment> {
 
     let names = tokenize(config, label)?;
     // A one-token split means the label *is* a fragment name, which the branch above already
-    // took. Reaching here with one token would mean the two lookups disagree.
+    // took, or a bare element symbol (`Na`), which stays the plain atom it already is.
     if names.len() < 2 {
         return None;
     }
 
+    // A name that is both a fragment and an element symbol is the fragment (see `tokenize`).
     let parts: Vec<Fragment> = names
         .iter()
-        .map(|n| config.resolve_fragment(n))
+        .map(|n| config.resolve_fragment(n).or_else(|| element_atom(n)))
         .collect::<Option<Vec<_>>>()?;
 
     let mut composite = compose(&parts)?;
@@ -108,7 +111,8 @@ pub fn resolve_label(config: &Config, label: &str) -> Option<Fragment> {
 // Tokenizer
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Split `label` into a sequence of fragment names, or `None` if no split covers it exactly.
+/// Split `label` into a sequence of tokens — fragment names and element symbols — or `None` if
+/// no split covers it exactly.
 ///
 /// **Longest match first, with backtracking.** At each position the candidate names are tried
 /// longest-first (ties broken lexicographically, so the result never depends on the order
@@ -125,6 +129,22 @@ pub fn resolve_label(config: &Config, label: &str) -> Option<Fragment> {
 ///
 /// Matching is **case-sensitive**, so `Ph` (phenyl) and `PH2` (phosphino) stay distinct and
 /// `ME` is not `Me`.
+///
+/// **Element symbols** ([`element_tokens`]) are candidates on the same footing, under the same
+/// longest-first order, which settles the element/fragment ambiguities one way throughout:
+///
+/// * a fragment name longer than a symbol it starts with wins: `MgBr` is the fragment, not
+///   `Mg` + `Br`, and `OMe` is not `O` + `Me`;
+/// * a two-letter symbol beats its first letter — but only when the second letter matches, and
+///   case decides that: `Co` is cobalt, `CO` is `C` + `O`;
+/// * a name that is **both** a fragment and a symbol (`H`, `Cl`, `Li`) is the fragment — the
+///   two readings are the same atom for every built-in one, and a user's fragment of that name
+///   is what the user means.
+///
+/// A symbol carries no count: `H4` is not a token, so `LiAlH4`, `H2O` and `CH3` have no chain
+/// reading, just as before. Counted labels are formulas, which
+/// [`MolecularFormula`](crate::reaction::MolecularFormula) reads; a chain of single bonds is
+/// no way to spell them.
 pub fn tokenize(config: &Config, label: &str) -> Option<Vec<String>> {
     if label.is_empty() {
         return None;
@@ -135,7 +155,8 @@ pub fn tokenize(config: &Config, label: &str) -> Option<Vec<String>> {
     walk(label, 0, &names, &mut hopeless, &mut out).then_some(out)
 }
 
-/// Candidate token names: every fragment the config knows, longest first.
+/// Candidate token names: every fragment the config knows and every [element
+/// symbol](element_tokens), longest first.
 ///
 /// Generated names (`ring6`, …) are deliberately excluded — they are a shortcut mechanism, not
 /// label vocabulary, and admitting them would widen the ambiguity surface for no gain. Anything
@@ -147,8 +168,37 @@ fn token_names(config: &Config) -> Vec<&str> {
         .map(|f| f.name.as_str())
         .filter(|n| !n.is_empty())
         .collect();
+    // Pushed one by one: `extend` would demand the fragment names be `'static` as well.
+    for symbol in element_tokens() {
+        names.push(symbol);
+    }
     names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    names.dedup();
     names
+}
+
+/// Element symbols that may be a token: every element, except the symbols a label means as a
+/// group — `Ac` (acetyl) and `Ts` (tosyl), the editor's [group
+/// labels](crate::molecule::elements::GROUP_LABELS), and `Ar` (aryl) and `Pr` (propyl), the
+/// [abbreviations](crate::reaction::formula::ABBREVIATION_SYMBOLS) arrow text refuses too.
+/// So `OPr` stays unread rather than becoming praseodymium oxide.
+fn element_tokens() -> impl Iterator<Item = &'static str> {
+    use crate::molecule::elements;
+    (1..=118)
+        .filter_map(elements::symbol)
+        .filter(|s| elements::element_of_label(s).is_some())
+        .filter(|s| !crate::reaction::formula::ABBREVIATION_SYMBOLS.contains(s))
+}
+
+/// A lone atom of element `symbol`, as the fragment an element token stands for, or `None`
+/// when `symbol` is not an [element token](element_tokens).
+fn element_atom(symbol: &str) -> Option<Fragment> {
+    element_tokens().any(|s| s == symbol).then(|| Fragment {
+        name: symbol.to_string(),
+        atoms: vec![FragAtom { element: symbol.to_string(), pos: [0.0, 0.0], charge: 0 }],
+        bonds: Vec::new(),
+        attach_idx: 0,
+    })
 }
 
 fn walk(
@@ -588,6 +638,84 @@ mod tests {
             1,
             "the N=O survives",
         );
+    }
+
+    // ── Element symbols as tokens ────────────────────────────────────────────
+
+    /// A label spelled from element symbols is a single-bonded chain of those atoms: `NaH`
+    /// is Na–H, the reagent written over an arrow.
+    #[test]
+    fn element_symbols_are_tokens_too() {
+        assert_eq!(names("NaH"), ["Na", "H"]);
+        let f = resolve_label(&cfg(), "NaH").expect("NaH expands");
+        assert_eq!(f.atoms.iter().map(|a| a.element.as_str()).collect::<Vec<_>>(), ["Na", "H"]);
+        assert_eq!(f.atoms[f.attach_idx].element, "Na", "the leftmost token leads");
+        assert_eq!(f.bonds.len(), 1);
+        assert_eq!(f.bonds[0].order, BondOrder::Single);
+        let mw = crate::reaction::MolecularFormula::of(&f.to_molecule()).weight().unwrap();
+        assert!((mw - 24.00).abs() < 0.01, "Na–H weighs {mw:.2}");
+    }
+
+    /// Element symbols and fragment names mix freely in one chain.
+    #[test]
+    fn elements_and_fragments_mix_in_one_chain() {
+        assert_eq!(names("NaOMe"), ["Na", "OMe"]);
+        let f = resolve_label(&cfg(), "NaOMe").expect("NaOMe expands");
+        assert_eq!(formula(&f.to_molecule()), ["C", "Na", "O"]);
+        assert_eq!(f.bonds.len(), 2, "Na–O–C");
+        assert!(f.bonds.iter().all(|b| b.order == BondOrder::Single));
+        assert_eq!(f.atoms[f.attach_idx].element, "Na");
+
+        assert_eq!(names("MeMgBr"), ["Me", "MgBr"]);
+        assert_eq!(names("LiAlH"), ["Li", "Al", "H"]);
+    }
+
+    /// A count is not a token: `H4` is no element and no fragment, so `LiAlH4` — like `H2O`
+    /// and `CH3` — has no chain reading, and the label is left alone.
+    #[test]
+    fn counted_element_labels_still_have_no_split() {
+        for label in ["LiAlH4", "NaBH4", "H2O", "CH3", "K2CO3"] {
+            assert!(split(label).is_none(), "{label:?} must not tokenize");
+            assert!(resolve_label(&cfg(), label).is_none(), "{label:?} must not expand");
+        }
+    }
+
+    /// The ambiguity rules. Longest match first, as for fragments; a name that is both a
+    /// fragment and an element symbol is the fragment; matching stays case-sensitive.
+    #[test]
+    fn element_and_fragment_ambiguity_is_settled_consistently() {
+        // Longest first: the fragment `MgBr` beats `Mg` + `Br`, `OMe` beats `O` + `Me`, and the
+        // two-letter symbol `Co` (cobalt) beats nothing shorter, since `o` is no token.
+        assert_eq!(names("MgBr"), ["MgBr"]);
+        assert_eq!(names("Co"), ["Co"]);
+        // Case decides `Co` (cobalt) against `CO` (C + O).
+        assert_eq!(names("CO"), ["C", "O"]);
+        assert_eq!(names("MeCo"), ["Me", "Co"]);
+        // `Ac` and `Ts` are acetyl and tosyl, never actinium and tennessine.
+        let ac = resolve_label(&cfg(), "MeAc").expect("MeAc expands");
+        assert!(ac.atoms.len() > 2, "Ac is the acetyl fragment, not one actinium atom");
+        let mut config = cfg();
+        config.fragments.clear();
+        assert!(tokenize(&config, "Ac").is_none(), "Ac is a group label even with no fragment");
+        assert!(tokenize(&config, "Ts").is_none(), "Ts is a group label even with no fragment");
+        // `Ar` and `Pr` are aryl and propyl in a label, as `MolecularFormula::parse` reads them.
+        for label in ["OAr", "OPr", "ArH", "PrOH"] {
+            assert!(split(label).is_none(), "{label:?}: Ar/Pr are abbreviations, not elements");
+        }
+        // `B` + `u` is no reading of `Bu`: lowercase `u` starts no token.
+        assert!(split("Bu").is_none());
+    }
+
+    /// A label that is a fragment name is still never split, element symbols or not.
+    #[test]
+    fn exact_fragment_labels_are_not_split_into_elements() {
+        for label in ["NO2", "OMe", "CO2Me", "OH", "NH2", "SiH3", "CF3", "MgBr", "Cl"] {
+            assert_eq!(names(label), [label], "{label}");
+            let before = cfg().resolve_fragment(label).unwrap();
+            let after = resolve_label(&cfg(), label).unwrap();
+            assert_eq!(after.atoms.len(), before.atoms.len(), "{label}");
+            assert_eq!(after.bonds.len(), before.bonds.len(), "{label}");
+        }
     }
 
     // ── Non-regression ───────────────────────────────────────────────────────

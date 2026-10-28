@@ -496,6 +496,26 @@ mod tests {
         assert!(t.reactants[0].limiting && !t.reactants[1].limiting);
     }
 
+    /// `NaH` written over the arrow as an atom label is sodium hydride in the table: a formula
+    /// of real elements and an MW, so its equivalents turn into moles and a mass (OPE-5).
+    #[test]
+    fn a_reagent_label_over_the_arrow_has_a_weight() {
+        let mut m = Molecule::default();
+        chain(&mut m, [0.0, 0.0], 2);
+        m.add_atom("NaH".into(), [9.0, -1.0], 0);
+        m.add_arrow([7.0, 0.0], [11.0, 0.0], ArrowKind::Reaction);
+        chain(&mut m, [13.0, 0.0], 4);
+        let mut table = new_table(&m, None).unwrap();
+        table = edit_cell(&m, &table, CellRef::new(BlockKind::Reactants, 0, 4), "1 g").unwrap().unwrap();
+        table = edit_cell(&m, &table, CellRef::new(BlockKind::Reactants, 1, 3), "1.2").unwrap().unwrap();
+        let [r, _] = TableState::of(&m, &table).blocks();
+        let flat = |c: &crate::reaction::Cell| c.plain();
+        assert_eq!(flat(&r.columns[1][0]), "HNa");
+        assert_eq!(flat(&r.columns[1][1]), "24.00");
+        assert_eq!(flat(&r.columns[1][9]), "39.91mmol", "1.2 eq of 33.26 mmol");
+        assert_eq!(flat(&r.columns[1][10]), "957.69mg");
+    }
+
     #[test]
     fn a_new_table_goes_under_the_captions_too() {
         let (mut m, _) = scheme();

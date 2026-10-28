@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::molecule::Molecule;
 use crate::molecule::depict::{displayed_h_count, is_folded_h};
-use crate::widget::rich_text::{RichText, SpanStyle};
+use crate::widget::rich_text::{RichText, Script, SpanStyle};
 
 /// Standard atomic weight in g/mol (IUPAC conventional values, 2021), or `None` for a symbol
 /// that is not a plain element — a group label such as `OMe`, `Ts` or `CO2Et`, which the atom
@@ -137,6 +137,10 @@ impl MolecularFormula {
     /// the brackets, the end groups, always count: a bare carbon at a crossing bond's end is a
     /// methyl (see [`PolymerFormula`] for writing the formula `CH3(C2H4)nCH3`'s way,
     /// `C2H6(C2H4)n`).
+    ///
+    /// An atom labelled with a written formula rather than an element (`NaH`, `CN`, `CH_3`)
+    /// counts as the atoms its label spells — see [`label_formula`]. Any other label (`OMe`,
+    /// `Ts`) stays a symbol with no weight.
     pub fn of(mol: &Molecule) -> Self {
         Self::from_counts(counts_of(mol, |_| true))
     }
@@ -168,9 +172,8 @@ impl MolecularFormula {
     /// `DCC` is D-C-C, `Ar` is argon, not aryl); those are refused rather than given a
     /// meaningless weight.
     pub fn parse(text: &str) -> Option<Self> {
-        const ABBREVIATIONS: [&str; 10] =
-            ["NBS", "NCS", "NIS", "DCC", "DIC", "PCC", "PDC", "NMO", "Ar", "Pr"];
-        if ABBREVIATIONS.contains(&text) {
+        const ABBREVIATIONS: [&str; 8] = ["NBS", "NCS", "NIS", "DCC", "DIC", "PCC", "PDC", "NMO"];
+        if ABBREVIATIONS.contains(&text) || ABBREVIATION_SYMBOLS.contains(&text) {
             return None;
         }
         let chars: Vec<char> = text.chars().collect();
@@ -201,7 +204,7 @@ impl MolecularFormula {
     /// Styled text with the counts as true subscripts (`C₆H₆O`). `style` is applied to the
     /// element symbols; the counts get the same style plus [`Script::Sub`](crate::Script::Sub).
     pub fn rich_styled(&self, style: SpanStyle) -> RichText {
-        let sub = SpanStyle { script: crate::widget::rich_text::Script::Sub, ..style };
+        let sub = SpanStyle { script: Script::Sub, ..style };
         let mut rich = RichText::new();
         for (el, n) in &self.counts {
             rich = rich.span(el.clone(), style);
@@ -257,6 +260,12 @@ fn counts_of(mol: &Molecule, keep: impl Fn(u32) -> bool) -> BTreeMap<String, usi
             continue;
         }
         let times = if has_brackets { multiplicity(mol, atom.id) } else { 1 };
+        if let Some(label) = label_formula(&atom.element) {
+            for (el, n) in label.counts {
+                *counts.entry(el).or_default() += n * times;
+            }
+            continue;
+        }
         *counts.entry(atom.element.clone()).or_default() += times;
         let h = displayed_h_count(mol, atom.id) as usize;
         if h > 0 {
@@ -325,6 +334,34 @@ impl PolymerFormula {
         }
         rich
     }
+}
+
+/// Element symbols that a reagent or an atom label means as a group, not an element: `Ar` is
+/// aryl and `Pr` propyl. [`MolecularFormula::parse`] refuses them as a whole formula, and
+/// [`label_chain`](crate::label_chain) never reads them as an element token.
+pub(crate) const ABBREVIATION_SYMBOLS: [&str; 2] = ["Ar", "Pr"];
+
+/// The formula an atom label spells, when the label is a written formula rather than an
+/// element symbol: `NaH` → HNa, `CH_3` (a label with a subscript count) → CH3.
+///
+/// The label is read by the same rules as arrow text ([`MolecularFormula::parse`]), and what
+/// it spells is all it counts — no implicit hydrogens are added, because a label writes its
+/// hydrogens out. That is what keeps `CN` a nitrile and `CHO` a formyl group: reading them as
+/// single-bonded chains (C–N, C–H–O) and filling valences would give CH2NH2 and a divalent
+/// hydrogen, a wrong weight with nothing to show it is wrong.
+///
+/// `None` for a plain element (counted as such by the caller), a label with a superscript
+/// (a charge), and anything that is not a formula (`OMe`, `Ts`, `NBS`).
+fn label_formula(label: &str) -> Option<MolecularFormula> {
+    if atomic_weight(label).is_some() {
+        return None;
+    }
+    let rich = RichText::parse(label);
+    if rich.spans.iter().any(|s| s.style.script == Script::Super) {
+        return None;
+    }
+    let plain: String = rich.spans.iter().map(|s| s.text.as_str()).collect();
+    MolecularFormula::parse(&plain)
 }
 
 /// One level of [`MolecularFormula::parse`]: element symbols with counts, and `( … )n`
@@ -643,6 +680,43 @@ mod tests {
         let f = MolecularFormula::of(&m);
         assert_eq!(f.weight(), None);
         assert_eq!(f.unknown_elements(), vec!["OMe"]);
+    }
+
+    /// An atom label that reads as a written formula (`NaH`, `CN`, `CH_3`) counts as the atoms
+    /// it spells, exactly as [`MolecularFormula::parse`] reads arrow text — and, like a label,
+    /// carries no implicit hydrogen: the hydrogens it has are the ones it writes.
+    #[test]
+    fn formula_labels_count_as_the_atoms_they_spell() {
+        let lone = |label: &str| {
+            let mut m = Molecule::default();
+            m.add_atom(label.into(), [0.0, 0.0], 0);
+            MolecularFormula::of(&m)
+        };
+        let on_methyl = |label: &str| {
+            let mut m = Molecule::default();
+            let c = m.add_atom("C".into(), [0.0, 0.0], 0);
+            let g = m.add_atom(label.into(), [1.5, 0.0], 0);
+            m.add_bond(c, g, BondOrder::Single);
+            MolecularFormula::of(&m)
+        };
+        let weight = |f: &MolecularFormula| format!("{:.2}", f.weight().unwrap());
+
+        let nah = lone("NaH");
+        assert_eq!(nah.plain(), "HNa");
+        assert_eq!(weight(&nah), "24.00");
+        assert_eq!(weight(&lone("LiAlH4")), "37.95");
+        // H3C–CN is acetonitrile and H3C–CHO acetaldehyde — not CH2–NH2 or C–H–OH.
+        assert_eq!(on_methyl("CN").plain(), "C2H3N");
+        assert_eq!(weight(&on_methyl("CN")), "41.05");
+        assert_eq!(on_methyl("CHO").plain(), "C2H4O");
+        assert_eq!(weight(&on_methyl("CHO")), "44.05");
+        // Counts written as subscripts (the markup a CDX label is read into) count too.
+        assert_eq!(on_methyl("CH_3").plain(), "C2H6");
+        assert_eq!(on_methyl("CH3").plain(), "C2H6");
+        // A label that is no formula stays unknown, as `group_labels_have_no_weight` requires.
+        assert_eq!(lone("NaOMe").weight(), None);
+        assert_eq!(lone("NaOMe").unknown_elements(), vec!["NaOMe"]);
+        assert_eq!(lone("NBS").weight(), None, "an abbreviation, as for arrow text");
     }
 
     /// Every element up to uranium that has an IUPAC standard atomic weight has one in the

@@ -1240,6 +1240,31 @@ mod tests {
         assert!(!reaction.set_scheme_arrow_structure(0, SchemePart::ArrowAbove, demo::benzene()));
     }
 
+    /// `NaH` drawn over the arrow as an atom label (by hand, or read from a ChemDraw file) is
+    /// sodium hydride in the table: its column has a formula of real elements and an MW, so
+    /// equivalents turn into a mass (OPE-5).
+    #[test]
+    fn a_reagent_label_drawn_over_the_arrow_has_a_weight() {
+        let mut nah = Molecule::default();
+        nah.add_atom("NaH".into(), [0.0, 0.0], 0);
+        let scheme = ReactionScheme::new()
+            .structure(demo::phenol())
+            .arrow(Arrow::new().above_structure(nah))
+            .structure(demo::anisole());
+        let analysis = Analysis::new()
+            .reactant(Reactant::new(demo::phenol()).limiting().sample_mass(Mass::grams(1.0)))
+            .reactant(Reactant::new(Molecule::default()).equivalents(1.2))
+            .product(Product::new(demo::anisole()));
+        let mut reaction = Reaction::new(scheme, analysis);
+        reaction.sync_structures_from_scheme();
+
+        let a = reaction.analysis.compute();
+        assert_eq!(a.reactants[1].formula.plain(), "HNa");
+        let mw = a.reactants[1].mw.expect("NaH has a molecular weight");
+        assert!((mw - 24.00).abs() < 0.01, "MW {mw:.2}");
+        assert!(a.reactants[1].mass.is_some(), "1.2 eq of NaH is a mass");
+    }
+
     /// Two arrow reagents number in scheme order (above before below), so their columns are
     /// stable and distinct (課題C).
     #[test]
