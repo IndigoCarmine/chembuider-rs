@@ -82,13 +82,17 @@ impl Bounds {
     }
 
     /// Whether the boxes share some area (more than a rounding error); boxes that only touch do
-    /// not. A box of no height (an arrow measured as its shaft) overlaps what it runs through.
+    /// not. A box of no height (an arrow measured as its shaft) overlaps what it runs through,
+    /// and a box of no width (a lone atom, an arrow down the page measured as its shaft) what it
+    /// lies on: two such sides at the same place meet.
     pub fn overlaps(&self, other: &Bounds) -> bool {
         const SLACK: f32 = 1e-4;
-        self.min[0] < other.max[0] - SLACK
-            && other.min[0] < self.max[0] - SLACK
-            && self.min[1] < other.max[1] - SLACK
-            && other.min[1] < self.max[1] - SLACK
+        let meet = |axis: usize| {
+            let (a, b) = ([self.min[axis], self.max[axis]], [other.min[axis], other.max[axis]]);
+            let flat = |r: [f32; 2]| r[1] - r[0] <= SLACK;
+            (a[0] < b[1] - SLACK && b[0] < a[1] - SLACK) || (flat(a) && flat(b) && (a[0] - b[0]).abs() <= SLACK)
+        };
+        meet(0) && meet(1)
     }
 }
 
@@ -103,60 +107,54 @@ pub struct LineItem {
     pub center_y: f32,
     /// Arrows stay where they are; everything else is placed around them.
     pub arrow: bool,
-    /// For an arrow, the heights its own drawing spans, `[top, bottom]` (shaft and head, not
-    /// what rides on it); unused for anything else.
-    pub band: [f32; 2],
 }
 
 /// Where each item goes, as a move `[dx, dy]` per item (in order): arrows stay, everything else
 /// is centred on its reaction line and spaced evenly along it, in its present left-to-right
 /// order.
 ///
-/// * **Lines.** Two arrows are on one line when their shafts are at most [`LINE_TOLERANCE`]
-///   (half a bond) apart in height or the arrows themselves ([`LineItem::band`]) overlap in
-///   height, and so on through every arrow joined that way. Every other item joins the line
-///   with an arrow nearest to its height — however far that is: text far from every line (a
-///   title, a footnote) is pulled onto the nearest one too. With no arrow nothing moves.
+/// * **Lines.** Arrows are taken left to right; each joins a line when its shaft is at most
+///   [`LINE_TOLERANCE`] (half a bond) from the shaft of *every* arrow already on that line and
+///   it overlaps none of them across the page (two arrows one over the other are never one
+///   line) — the nearest such line, else it starts a new one. So the shafts of one line are
+///   all within half a bond of each other: a staircase of arrows, each a little lower than the
+///   last, is not chained into one line, and a second row is never joined to the first through
+///   it. Every other item joins the line with an arrow nearest to its height — however far
+///   that is: text far from every line (a title, a footnote) is pulled onto the nearest one
+///   too. With no arrow nothing moves.
 /// * **Stretches.** A line's arrows, left to right, cut it into stretches: before the first
 ///   arrow, between each two neighbouring arrows, after the last. Every arrow of the line is a
 ///   fixed end, so an item never goes over an arrow of its line or past it to another stretch.
 /// * **Height.** The items of a stretch are centred on the shaft of the arrow leading into it
 ///   (the one on its left, as a product sits on the arrow that makes it); before the first
-///   arrow, on the first arrow's shaft. That is always a real shaft, never a height between two.
+///   arrow, on the first arrow's shaft. That is always a real shaft, never a height between
+///   two, and at most half a bond from the shaft nearest to where the item was.
 /// * **Spacing.** Between two arrows, the items share the room the arrows leave in equal gaps
 ///   (both ends are fixed, so the gap is whatever that room allows). Before the first arrow and
 ///   after the last, items are laid out from the arrow outward with the line's gap — the mean
 ///   of the gaps between neighbours on the line now, at least [`MIN_GAP`].
-/// * **Left as drawn.** A stretch is left exactly as it is when it cannot be laid out without
-///   an item over an arrow: between two arrows too narrow for its items even with no gaps
-///   (spreading them would push them over the arrows or past them, and lining them up would
-///   pile them onto the arrows and each other, so the room has to be widened by hand), or
-///   laid out onto an arrow of another line. [`plan_reaction`] tells which items these are.
+/// * **Left as drawn.** A stretch is left exactly as it is when it cannot be laid out between
+///   two arrows too narrow for its items even with no gaps (spreading them would push them over
+///   the arrows or past them, and lining them up would pile them onto the arrows and each
+///   other, so the room has to be widened by hand), or when, laid out, one of its items would
+///   overlap an arrow of any line or an item of another stretch where that ends up. Where
+///   two stretches laid out would overlap each other, the one on the upper line (or further
+///   left on one line) is laid out and the other left as drawn. [`plan_reaction`] tells which
+///   items these are.
 pub fn arrange_reaction(items: &[LineItem]) -> Vec<[f32; 2]> {
-    plan_reaction(items).into_iter().map(|d| d.unwrap_or([0.0; 2])).collect()
+    plan_reaction(items, &[]).into_iter().map(|d| d.unwrap_or([0.0; 2])).collect()
 }
 
 /// [`arrange_reaction`], telling apart the items left as drawn (`None`) because their stretch
-/// cannot be laid out, from those placed (`Some`, perhaps where they already are).
-pub fn plan_reaction(items: &[LineItem]) -> Vec<Option<[f32; 2]>> {
-    let mut moves = vec![Some([0.0; 2]); items.len()];
-    let one_line = |a: &LineItem, b: &LineItem| {
-        (a.center_y - b.center_y).abs() <= LINE_TOLERANCE || (a.band[0] <= b.band[1] && b.band[0] <= a.band[1])
-    };
-    let mut lines: Vec<Vec<usize>> = Vec::new();
-    for i in (0..items.len()).filter(|&i| items[i].arrow) {
-        // The arrow joins every line it is level with, and so they become one.
-        let mut line = vec![i];
-        for l in (0..lines.len()).rev() {
-            if lines[l].iter().any(|&j| one_line(&items[i], &items[j])) {
-                line.extend(lines.remove(l));
-            }
-        }
-        lines.push(line);
-    }
+/// cannot be laid out, from those placed (`Some`, perhaps where they already are). Nothing is
+/// put over `obstacles` either (arrows running up or down the page, which make no line).
+pub fn plan_reaction(items: &[LineItem], obstacles: &[Bounds]) -> Vec<Option<[f32; 2]>> {
+    let mut lines = reaction_lines(items);
     if lines.is_empty() {
-        return moves;
+        return vec![Some([0.0; 2]); items.len()];
     }
+    // Upper lines first: where two lines' stretches collide, the upper one is laid out.
+    lines.sort_by(|a, b| items[a[0]].center_y.total_cmp(&items[b[0]].center_y));
     let mut rows = lines.clone();
     for i in (0..items.len()).filter(|&i| !items[i].arrow) {
         let off = |l: usize| {
@@ -165,17 +163,84 @@ pub fn plan_reaction(items: &[LineItem]) -> Vec<Option<[f32; 2]>> {
         let nearest = (0..lines.len()).min_by(|&a, &b| off(a).total_cmp(&off(b))).unwrap_or(0);
         rows[nearest].push(i);
     }
-    for (l, row) in rows.into_iter().enumerate() {
-        let others: Vec<usize> =
-            lines.iter().enumerate().filter(|&(m, _)| m != l).flat_map(|(_, a)| a.iter().copied()).collect();
-        arrange_line(items, row, &others, &mut moves);
+    let stretches: Vec<Stretch> = rows.into_iter().flat_map(|row| arrange_line(items, row)).collect();
+
+    // Each stretch is laid out unless that puts one of its items over an obstacle, an arrow or
+    // an item of another stretch: one left as drawn, or one laid out ahead of it. A stretch
+    // after it gives way instead, and when that leaves its items as drawn in the way, the
+    // next round puts this one back too; rounds go on until nothing changes.
+    // Each item's stretch and its place in it.
+    let mut slot: Vec<Option<(usize, usize)>> = vec![None; items.len()];
+    for (s, stretch) in stretches.iter().enumerate() {
+        for (n, &k) in stretch.items.iter().enumerate() {
+            slot[k] = Some((s, n));
+        }
+    }
+    let mut placed: Vec<bool> = stretches.iter().map(|s| s.moves.is_some()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (s, stretch) in stretches.iter().enumerate() {
+            let Some(ds) = stretch.moves.as_ref().filter(|_| placed[s]) else { continue };
+            let clear = stretch.items.iter().zip(ds).all(|(&k, &d)| {
+                let b = items[k].bounds.translate(d);
+                // Where item `j` is in the way, if at all.
+                let now = |j: usize| match slot[j] {
+                    Some((t, _)) if t == s || (placed[t] && t > s) => None,
+                    Some((t, n)) if placed[t] => Some(items[j].bounds.translate(stretches[t].moves.as_ref()?[n])),
+                    _ => Some(items[j].bounds),
+                };
+                obstacles.iter().all(|o| !b.overlaps(o)) && (0..items.len()).filter_map(now).all(|o| !b.overlaps(&o))
+            });
+            if !clear {
+                placed[s] = false;
+                changed = true;
+            }
+        }
+    }
+
+    let mut moves = vec![Some([0.0; 2]); items.len()];
+    for (s, stretch) in stretches.iter().enumerate() {
+        for (n, &k) in stretch.items.iter().enumerate() {
+            moves[k] = stretch.moves.as_ref().filter(|_| placed[s]).map(|ds| ds[n]);
+        }
     }
     moves
 }
 
-/// Lay out one reaction line, stretch by stretch: `row` holds its arrows and items, `others`
-/// the arrows of the other lines, which nothing may be put over either.
-fn arrange_line(items: &[LineItem], mut row: Vec<usize>, others: &[usize], moves: &mut [Option<[f32; 2]>]) {
+/// The arrows of `items` gathered into reaction lines (see [`arrange_reaction`]), each line's
+/// arrows left to right.
+fn reaction_lines(items: &[LineItem]) -> Vec<Vec<usize>> {
+    let mut arrows: Vec<usize> = (0..items.len()).filter(|&i| items[i].arrow).collect();
+    arrows.sort_by(|&a, &b| items[a].bounds.center()[0].total_cmp(&items[b].bounds.center()[0]));
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    for i in arrows {
+        let a = &items[i];
+        let dy = |j: usize| (a.center_y - items[j].center_y).abs();
+        let beside = |j: usize| {
+            const SLACK: f32 = 1e-4;
+            let b = &items[j].bounds;
+            a.bounds.min[0] >= b.max[0] - SLACK || b.min[0] >= a.bounds.max[0] - SLACK
+        };
+        let joins = |l: &usize| lines[*l].iter().all(|&j| dy(j) <= LINE_TOLERANCE && beside(j));
+        let off = |l: usize| lines[l].iter().map(|&j| dy(j)).fold(f32::INFINITY, f32::min);
+        match (0..lines.len()).filter(joins).min_by(|&l, &m| off(l).total_cmp(&off(m))) {
+            Some(l) => lines[l].push(i),
+            None => lines.push(vec![i]),
+        }
+    }
+    lines
+}
+
+/// A stretch of a line: its items, and their moves when laid out (`None`: no room).
+struct Stretch {
+    items: Vec<usize>,
+    moves: Option<Vec<[f32; 2]>>,
+}
+
+/// Lay out one reaction line, stretch by stretch: `row` holds its arrows and items. Whether a
+/// stretch so laid out keeps clear of the rest of the drawing is [`plan_reaction`]'s to say.
+fn arrange_line(items: &[LineItem], mut row: Vec<usize>) -> Vec<Stretch> {
     row.sort_by(|&a, &b| items[a].bounds.center()[0].total_cmp(&items[b].bounds.center()[0]));
     let at = |k: usize| &items[row[k]];
     let gaps: Vec<f32> = (1..row.len()).map(|k| at(k).bounds.min[0] - at(k - 1).bounds.max[0]).collect();
@@ -184,23 +249,15 @@ fn arrange_line(items: &[LineItem], mut row: Vec<usize>, others: &[usize], moves
         n => (gaps.iter().sum::<f32>() / n as f32).max(MIN_GAP),
     };
     let arrows: Vec<usize> = (0..row.len()).filter(|&k| at(k).arrow).collect();
-    let (Some(&first), Some(&last)) = (arrows.first(), arrows.last()) else { return };
-    // The stretch `ks` placed at `lefts` (`None`: no room) on the shaft of arrow `shaft`, unless
-    // that puts one of them over another line's arrow; otherwise all left as drawn.
+    let (Some(&first), Some(&last)) = (arrows.first(), arrows.last()) else { return Vec::new() };
+    let mut stretches = Vec::new();
+    // The stretch `ks` placed at `lefts` (`None`: no room) on the shaft of arrow `shaft`.
     let mut settle = |ks: std::ops::Range<usize>, shaft: usize, lefts: Option<Vec<f32>>| {
         let y = at(shaft).center_y;
-        let placed: Option<Vec<[f32; 2]>> = lefts.map(|lefts| {
+        let moves = lefts.map(|lefts| {
             ks.clone().zip(lefts).map(|(k, left)| [left - at(k).bounds.min[0], y - at(k).center_y]).collect()
         });
-        let placed = placed.filter(|placed| {
-            ks.clone().zip(placed).all(|(k, &d)| {
-                let b = at(k).bounds.translate(d);
-                others.iter().all(|&o| !b.overlaps(&items[o].bounds))
-            })
-        });
-        for (n, k) in ks.enumerate() {
-            moves[row[k]] = placed.as_ref().map(|placed| placed[n]);
-        }
+        stretches.push(Stretch { items: ks.map(|k| row[k]).collect(), moves });
     };
     // Lefts laid out from `left` rightward with `gap` for the items `ks`.
     let rightward = |ks: std::ops::Range<usize>, mut left: f32, gap: f32| -> Vec<f32> {
@@ -230,6 +287,7 @@ fn arrange_line(items: &[LineItem], mut row: Vec<usize>, others: &[usize], moves
         let gap = (room - widths) / (b - a) as f32;
         settle(a + 1..b, a, (gap >= 0.0).then(|| rightward(a + 1..b, at(a).bounds.max[0], gap)));
     }
+    stretches
 }
 
 /// Boxes measured on the drawing, in molecule units: the drawn label of each atom that shows
@@ -397,15 +455,10 @@ impl Molecule {
         }
         let mut members: Vec<Member> = Vec::new();
         let mut items: Vec<LineItem> = Vec::new();
+        let mut obstacles: Vec<Bounds> = Vec::new();
         for &i in &arrows {
-            // Only an arrow running across the page makes a reaction line; one running up or
-            // down (to the next row) stays where it is with what rides on it, and that is all.
             let PageObject::Arrow(a) = &self.objects[i] else { continue };
-            if (a.head[0] - a.tail[0]).abs() < (a.head[1] - a.tail[1]).abs() {
-                continue;
-            }
-            let own = self.object_bounds(i, &after);
-            let mut bounds = own;
+            let mut bounds = self.object_bounds(i, &after);
             for (s, b) in structure_boxes.iter().enumerate() {
                 if structure_roles[s].0 == Role::OnArrow(i) {
                     bounds = bounds.union(*b);
@@ -416,9 +469,15 @@ impl Molecule {
                     bounds = bounds.union(*b);
                 }
             }
+            // Only an arrow running across the page makes a reaction line; one running up or
+            // down (to the next row) stays where it is with what rides on it, and nothing is
+            // put over it.
+            if (a.head[0] - a.tail[0]).abs() < (a.head[1] - a.tail[1]).abs() {
+                obstacles.push(bounds);
+                continue;
+            }
             members.push(Member::Arrow);
-            let band = [own.min[1], own.max[1]];
-            items.push(LineItem { bounds, center_y: (a.tail[1] + a.head[1]) * 0.5, arrow: true, band });
+            items.push(LineItem { bounds, center_y: (a.tail[1] + a.head[1]) * 0.5, arrow: true });
         }
         for (s, b) in structure_boxes.iter().enumerate() {
             if structure_roles[s].0 != Role::Free {
@@ -428,20 +487,20 @@ impl Molecule {
                 .filter(|&t| text_roles[t] == Role::Caption(s))
                 .fold(*b, |acc, t| acc.union(text_boxes[t]));
             members.push(Member::Structure(s));
-            items.push(LineItem { bounds, center_y: b.center()[1], arrow: false, band: [b.min[1], b.max[1]] });
+            items.push(LineItem { bounds, center_y: b.center()[1], arrow: false });
         }
         for (t, b) in text_boxes.iter().enumerate() {
             if text_roles[t] != Role::Free {
                 continue;
             }
             members.push(Member::Text(t));
-            items.push(LineItem { bounds: *b, center_y: b.center()[1], arrow: false, band: [b.min[1], b.max[1]] });
+            items.push(LineItem { bounds: *b, center_y: b.center()[1], arrow: false });
         }
 
         // The layout is worked out on the cleaned-up structures, since their size sets the
         // spacing; a stretch that cannot be laid out with them is put back as it was drawn —
         // its structures uncleaned, their captions unmoved — rather than left half done.
-        let moves = plan_reaction(&items);
+        let moves = plan_reaction(&items, &obstacles);
         for (member, d) in members.iter().zip(moves) {
             match (member, d) {
                 (Member::Arrow, _) => {}
@@ -510,8 +569,7 @@ mod tests {
 
     fn item(min_x: f32, max_x: f32, center_y: f32, height: f32, arrow: bool) -> LineItem {
         let h = height * 0.5;
-        let bounds = Bounds::new([min_x, center_y - h], [max_x, center_y + h]);
-        LineItem { bounds, center_y, arrow, band: [center_y - h, center_y + h] }
+        LineItem { bounds: Bounds::new([min_x, center_y - h], [max_x, center_y + h]), center_y, arrow }
     }
 
     /// The items moved as `moves` says.
@@ -736,6 +794,154 @@ mod tests {
         assert!(after[4].center_y.abs() < EPS, "the rest of the line is still tidied");
     }
 
+    /// No two items (other than arrows) overlap after the moves unless they did before: laying
+    /// out one line never puts its items onto another line's.
+    fn assert_no_new_overlaps(items: &[LineItem], after: &[LineItem]) {
+        for i in 0..items.len() {
+            for j in i + 1..items.len() {
+                if items[i].arrow || items[j].arrow || overlap(&items[i].bounds, &items[j].bounds) {
+                    continue;
+                }
+                assert!(!overlap(&after[i].bounds, &after[j].bounds), "items {i} and {j} now overlap: {after:?}");
+            }
+        }
+    }
+
+    /// Every item is either where it was or on a shaft at most [`LINE_TOLERANCE`] from the shaft
+    /// nearest to where it was: never carried along a chain of arrows to a far one.
+    fn assert_near_its_nearest_shaft(items: &[LineItem], after: &[LineItem]) {
+        for (it, now) in items.iter().zip(after).filter(|(it, _)| !it.arrow) {
+            if now.bounds == it.bounds {
+                continue;
+            }
+            let nearest = items
+                .iter()
+                .filter(|a| a.arrow)
+                .map(|a| a.center_y)
+                .min_by(|a, b| (a - it.center_y).abs().total_cmp(&(b - it.center_y).abs()))
+                .unwrap();
+            assert!(
+                (now.center_y - nearest).abs() <= LINE_TOLERANCE + 1e-5,
+                "{it:?} went to {} off its nearest shaft {nearest}: {after:?}",
+                now.center_y
+            );
+        }
+    }
+
+    /// The reviewer's probe: two nearby lines (arrows 0.9 apart in height). Laying out the second
+    /// would put C on top of B, laid out on the first; C is left as drawn instead.
+    #[test]
+    fn a_line_never_puts_an_item_onto_another_lines_item() {
+        let items = [
+            item(0.0, 3.0, 0.0, 0.4, true),    // arrow 1
+            item(4.0, 8.0, 0.2, 2.0, false),   // B, on arrow 1's line
+            item(8.5, 9.5, 0.8, 1.0, false),   // C, on arrow 2's line
+            item(10.0, 13.0, 0.9, 0.4, true),  // arrow 2
+            item(16.0, 18.0, 0.9, 2.0, false), // D
+        ];
+        let moves = plan_reaction(&items, &[]);
+        let after = moved(&items, &arrange_reaction(&items));
+        assert_no_new_overlaps(&items, &after);
+        assert_clear_of_arrows(&after);
+        assert_eq!(moves[2], None, "C is left as drawn: {moves:?}");
+        assert!(after[1].center_y.abs() < EPS && (after[4].center_y - 0.9).abs() < EPS, "the rest is tidied");
+    }
+
+    /// Arrows `0.7` apart in height, one after another along the page (a scheme drifting down),
+    /// each product just after its arrow on that arrow's shaft; `row` adds the arrow of a real
+    /// second row at 3.5 over the first arrow, with its product.
+    fn staircase(steps: usize, row: bool) -> Vec<LineItem> {
+        let mut items = vec![item(-4.0, -2.0, 0.1, 2.0, false)]; // the reactant
+        for k in 0..steps {
+            let (x, y) = (10.0 * k as f32, 0.7 * k as f32);
+            items.push(item(x, x + 3.0, y, 0.4, true));
+            items.push(item(x + 5.0, x + 7.0, y, 2.0, false));
+        }
+        if row {
+            items.push(item(0.0, 3.0, 3.5, 0.4, true));
+            items.push(item(5.0, 7.0, 3.6, 2.0, false));
+        }
+        items
+    }
+
+    /// A staircase is not chained into one line: every item stays within half a bond of the
+    /// shaft it was nearest to, with nothing over an arrow or another item.
+    #[test]
+    fn a_staircase_of_arrows_is_not_chained_into_one_line() {
+        for steps in [3, 5, 8] {
+            let items = staircase(steps, false);
+            let after = moved(&items, &arrange_reaction(&items));
+            assert_near_its_nearest_shaft(&items, &after);
+            assert_clear_of_arrows(&after);
+            assert_no_new_overlaps(&items, &after);
+            assert!(after[0].center_y.abs() < EPS, "the reactant on the first shaft: {after:?}");
+        }
+        // The Codex probe: an item exactly on the third shaft stays on it.
+        let items = [
+            item(0.0, 2.0, 0.0, 0.4, true),
+            item(10.0, 12.0, 0.7, 0.4, true),
+            item(20.0, 22.0, 1.4, 0.4, true),
+            item(4.0, 6.0, 1.4, 0.4, false),
+        ];
+        let moves = arrange_reaction(&items);
+        assert!(moves[3][1].abs() < EPS, "kept on its own shaft: {moves:?}");
+    }
+
+    /// A staircase beside a real second row: the second row's arrow (over the first one) is
+    /// never joined with the first row, its product stays on its shaft and the first row's
+    /// reactant on the first.
+    #[test]
+    fn a_staircase_leaves_a_second_row_alone() {
+        for steps in [4, 5] {
+            let items = staircase(steps, true);
+            let after = moved(&items, &arrange_reaction(&items));
+            assert_near_its_nearest_shaft(&items, &after);
+            assert_clear_of_arrows(&after);
+            assert_no_new_overlaps(&items, &after);
+            let n = items.len();
+            assert!(after[0].center_y.abs() < EPS, "the reactant stays on row 1 (steps {steps}): {after:?}");
+            assert!((after[n - 1].center_y - 3.5).abs() < EPS, "row 2's product on row 2 (steps {steps}): {after:?}");
+        }
+        // Clear of the staircase (2.1 is more than half a bond from 3.5), row 2 is laid out on
+        // its own: its product is just after its arrow, at the line's own gap.
+        let items = staircase(4, true);
+        let after = moved(&items, &arrange_reaction(&items));
+        let n = items.len();
+        assert!((after[n - 1].bounds.min[0] - 5.0).abs() < EPS, "row 2's product in place: {after:?}");
+    }
+
+    /// Nothing is put over an obstacle (an arrow down the page): the stretch that would be is
+    /// left as drawn, the rest is laid out.
+    #[test]
+    fn a_stretch_laid_out_onto_an_obstacle_is_left_as_drawn() {
+        let items = [
+            item(-6.0, -4.0, 1.0, 2.0, false), // before the arrow
+            item(0.0, 3.0, 0.0, 0.4, true),
+            item(5.0, 7.0, 3.0, 2.0, false), // after it, laid out at 5..7 on the shaft
+        ];
+        let down = Bounds::new([5.8, -1.0], [6.2, 1.0]);
+        let moves = plan_reaction(&items, &[down]);
+        assert_eq!(moves[2], None, "would cover the arrow down: {moves:?}");
+        assert!(moves[0].is_some_and(|d| (d[1] + 1.0).abs() < EPS), "the reactant is laid out: {moves:?}");
+        let clear = plan_reaction(&items, &[Bounds::new([5.8, 2.0], [6.2, 4.0])]);
+        assert!(clear[2].is_some(), "an obstacle not in the way changes nothing: {clear:?}");
+    }
+
+    /// Two arrows one over the other are never one line, however close in height: what is
+    /// before them goes on the nearer one's shaft, not on the first one's.
+    #[test]
+    fn arrows_one_over_the_other_are_never_one_line() {
+        let items = [
+            item(0.0, 3.0, 0.0, 0.4, true),
+            item(0.5, 3.5, 0.5, 0.4, true),
+            item(-3.0, -1.0, 0.6, 1.0, false),
+        ];
+        let moves = arrange_reaction(&items);
+        let after = moved(&items, &moves);
+        assert!((after[2].center_y - 0.5).abs() < EPS, "on the nearest shaft: {after:?}");
+        assert_clear_of_arrows(&after);
+    }
+
     #[test]
     fn nothing_moves_without_an_arrow() {
         let items = [item(0.0, 2.0, 0.0, 2.0, false), item(5.0, 6.0, 3.0, 1.0, false)];
@@ -921,6 +1127,36 @@ mod tests {
         assert_eq!(mol.object_by_id(down).unwrap().key_points(), vec![[16.0, 2.0], [16.0, 8.0]]);
         assert_eq!(object_box(&mol, condition), condition_box, "rides on the arrow down");
         assert!(atoms_box(&mol, &p).center()[1].abs() < EPS, "on the line across, not at 5");
+    }
+
+    /// An arrow running down the page is never covered: the structure that would be laid out onto
+    /// it (after the arrow across, at the line's gap) is left exactly as drawn.
+    #[test]
+    fn nothing_is_put_onto_an_arrow_down_the_page() {
+        let mut mol = Molecule::default();
+        mol.add_arrow([0.0, 0.0], [4.0, 0.0], ArrowKind::Reaction);
+        let down = mol.add_arrow([9.0, -1.0], [9.0, 1.0], ArrowKind::Reaction);
+        let p = sloppy_chain(&mut mol, [7.0, 5.0], 3);
+        cleaned_shape(&mol, &p);
+        let before = mol.clone();
+
+        assert!(mol.cleanup_reaction_scheme(fake_extents));
+
+        let down_box = object_box(&mol, down);
+        for &id in &p {
+            let at = mol.atom_by_id(id).unwrap().pos;
+            assert_eq!(at, before.atom_by_id(id).unwrap().pos, "atom {id} as drawn");
+            assert!(!Bounds::new(at, at).overlaps(&down_box) && !overlap(&atoms_box(&mol, &p), &down_box));
+        }
+
+        // The Codex probe: a lone carbon below the arrow down the page is not put onto its shaft.
+        let mut mol = Molecule::default();
+        mol.add_arrow([0.0, 0.0], [4.0, 0.0], ArrowKind::Reaction);
+        let down = mol.add_arrow([8.5, -1.0], [8.5, 1.0], ArrowKind::Reaction);
+        let c = mol.add_atom("C".into(), [8.5, 5.0], 0);
+        assert!(mol.cleanup_reaction_scheme(fake_extents));
+        let at = mol.atom_by_id(c).unwrap().pos;
+        assert_eq!(at, [8.5, 5.0], "left as drawn, not on the shaft {:?}", object_box(&mol, down));
     }
 
     /// A structure that fitted between two arrows as drawn but no longer does once cleaned up is
