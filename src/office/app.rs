@@ -349,6 +349,9 @@ impl OfficeApp {
             if ui.button(clean).clicked() {
                 ed.toggle_cleanup();
             }
+            if ui.button(clean_reaction).clicked() {
+                ed.cleanup_reaction();
+            }
         });
     }
 }

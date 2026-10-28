@@ -20,6 +20,7 @@ pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
 use crate::molecule::{ArrowKind, BondOrder, BondStereo, DoublePosition, Molecule, PageObject, TextAlign};
+use crate::molecule::reaction_cleanup::{Bounds, Extents};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
@@ -785,6 +786,41 @@ impl ChemStructEditor {
         if job.is_done() {
             job.join();
         }
+        true
+    }
+
+    /// Clean up the reaction scheme on the page (Ctrl+Shift+K): every arrow stays where it is,
+    /// each structure is redrawn by the 2-D cleanup, and the structures, `+` signs and other
+    /// text are centred on the arrows' height and spaced evenly in their left-to-right order.
+    /// Conditions over and under an arrow stay with it; a caption under a structure goes with
+    /// it. See [`Molecule::cleanup_reaction_scheme`].
+    ///
+    /// Unlike [`toggle_cleanup`](Self::toggle_cleanup) this runs to the end at once: the layout
+    /// needs every structure's final shape, and a scheme's structures are small. It is one undo
+    /// step. A plain cleanup still running is stopped first (keeping the layout it reached).
+    /// Returns `false`, changing nothing, when there is no arrow on the page.
+    pub fn cleanup_reaction(&mut self) -> bool {
+        self.cancel_cleanup();
+        let mut fonts = fonts::standalone_fonts();
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let style = &self.config.style;
+        let mut cleaned = self.molecule.clone();
+        let changed = cleaned.cleanup_reaction_scheme(|mol| {
+            let xf = scene::RenderTransform { coord_scale: SCALE_FACTOR, offset: egui::Vec2::ZERO, visual_scale: 1.0 };
+            let built = scene::MoleculeScene::build(mol, style, xf, |job| view.layout_job(job));
+            let to_mol = |r: egui::Rect| {
+                Bounds::new([r.min.x / SCALE_FACTOR, r.min.y / SCALE_FACTOR], [r.max.x / SCALE_FACTOR, r.max.y / SCALE_FACTOR])
+            };
+            Extents {
+                atoms: built.labels.iter().map(|(&id, l)| (id, to_mol(l.rect))).collect(),
+                objects: built.objects.iter().filter(|o| o.rect.is_finite()).map(|o| (o.object_id, to_mol(o.rect))).collect(),
+            }
+        });
+        if !changed || cleaned == self.molecule {
+            return false;
+        }
+        self.push_undo();
+        self.molecule = cleaned;
         true
     }
 
@@ -1729,9 +1765,16 @@ impl ChemStructEditor {
         }
 
         // Ctrl+K: toggle background clean-up (start, or stop if already running).
-        let cleanup_toggle = ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl);
+        // Ctrl+Shift+K: clean up the reaction scheme around its arrows.
+        let (cleanup_toggle, reaction_cleanup) = ui.input(|i| {
+            let k = i.key_pressed(egui::Key::K) && i.modifiers.ctrl;
+            (k && !i.modifiers.shift, k && i.modifiers.shift)
+        });
         if cleanup_toggle {
             self.toggle_cleanup();
+        }
+        if reaction_cleanup {
+            self.cleanup_reaction();
         }
         // Pump the background job: live-preview positions, finalize when done.
         let was_cleaning = self.is_cleaning();
