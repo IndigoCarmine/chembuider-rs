@@ -253,31 +253,33 @@ pub(crate) fn widths_to_cdxml(xml: String) -> String {
     .unwrap_or(xml)
 }
 
-/// A component's `Width` below this is in points, from it up in CDX units. ChemDraw writes CDX
-/// units, and no column is narrower than a point, 65536 units; earlier versions of this crate
-/// wrote points (as the codec writes every coordinate, trailing zeros trimmed: the minimum
-/// column went out as `Width="40"`), and those never reach 65536, since a coordinate is an
-/// `i32` of CDX units and so stops short of 32768 pt. Whole number or not, the two never meet.
-/// A width under a point written in CDX units, which no column of a real table is, reads as
-/// points too.
-const WIDTH_IN_UNITS_FROM: f64 = PT;
+/// A component's `Width` whose size is below this may be in points, from it up it is in CDX
+/// units. ChemDraw writes CDX units; earlier versions of this crate wrote points, as the codec
+/// writes every coordinate (trailing zeros trimmed: the minimum column went out as
+/// `Width="40"`), and a coordinate is an `i32` of CDX units, so those stay below 32768 pt. A
+/// width from here up read as points would run past the `i32` and be cut to its end, so it is
+/// read as CDX units, the one way it holds. Below, the file does not say which it is: a width
+/// is taken for points, as every earlier file's is, and a CDX width of 1 to 32767 units (under
+/// half a point) is read as that many points. Zero, a hidden column, is zero either way.
+const POINTS_BELOW: f64 = 32768.0;
 
 /// `xml` with each component's width in points, for the codec to read: a width in CDX units
-/// is turned into points, one in points already ([`WIDTH_IN_UNITS_FROM`]) stays as it is.
+/// is turned into points, one in points already ([`POINTS_BELOW`]) stays as it is.
 pub(crate) fn widths_from_cdxml(xml: &str) -> std::borrow::Cow<'_, str> {
     match rewrite_component_widths(xml, |v| {
         let units: f64 = v.trim().parse().ok()?;
-        (units.is_finite() && units.abs() >= WIDTH_IN_UNITS_FROM).then(|| format!("{}", units / PT))
+        (units.is_finite() && units.abs() >= POINTS_BELOW).then(|| format!("{}", units / PT))
     }) {
         Some(s) => std::borrow::Cow::Owned(s),
         None => std::borrow::Cow::Borrowed(xml),
     }
 }
 
-/// `xml` with the `Width` of every `sgcomponent` start tag replaced by what `f` makes of it
-/// (left as it is where `f` gives nothing); `None` when nothing changed. Tags are found as XML
-/// has them: not inside comments, CDATA sections, processing instructions or declarations,
-/// and their attributes with whitespace around `=` and either quote.
+/// `xml` with the `Width` of every `sgcomponent` start tag replaced by what `f` makes of its
+/// value as XML reads it ([`attribute_value`]), left as it is where `f` gives nothing; `None`
+/// when nothing changed. Tags are found as XML has them: not inside comments, CDATA sections,
+/// processing instructions or declarations, and their attributes with whitespace around `=`
+/// and either quote.
 fn rewrite_component_widths(xml: &str, f: impl Fn(&str) -> Option<String>) -> Option<String> {
     let mut out = String::with_capacity(xml.len() + 64);
     let mut copied = 0;
@@ -295,7 +297,7 @@ fn rewrite_component_widths(xml: &str, f: impl Fn(&str) -> Option<String>) -> Op
             if !is_component || name != WIDTH_ATTRIBUTE {
                 return;
             }
-            if let Some(v) = f(&markup[value.clone()]) {
+            if let Some(v) = attribute_value(&markup[value.clone()]).and_then(|v| f(&v)) {
                 out.push_str(&xml[copied..at + value.start]);
                 out.push_str(&v);
                 copied = at + value.end;
@@ -386,6 +388,40 @@ fn start_tag_attributes(markup: &str, from: usize, mut visit: impl FnMut(&str, s
         i = skip_space((close + 1).min(markup.len()));
     }
     markup.len()
+}
+
+/// The attribute value `raw` as XML reads it, as the codec does: its character references
+/// (`&#53;`, `&#x35;`) and predefined entities (`&lt;`, `&gt;`, `&amp;`, `&apos;`, `&quot;`)
+/// replaced by what they stand for. `None` where a reference is not one of these or names no
+/// character.
+fn attribute_value(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !raw.contains('&') {
+        return Some(std::borrow::Cow::Borrowed(raw));
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let end = at + rest[at..].find(';')?;
+        out.push(match &rest[at + 1..end] {
+            "lt" => '<',
+            "gt" => '>',
+            "amp" => '&',
+            "apos" => '\'',
+            "quot" => '"',
+            name => {
+                let number = name.strip_prefix('#')?;
+                let (digits, radix) = number.strip_prefix('x').map_or((number, 10), |hex| (hex, 16));
+                if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                    return None;
+                }
+                char::from_u32(u32::from_str_radix(digits, radix).ok()?)?
+            }
+        });
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(std::borrow::Cow::Owned(out))
 }
 
 // ─── Writing ─────────────────────────────────────────────────────────────────
@@ -1068,13 +1104,85 @@ mod tests {
     }
 
     #[test]
-    fn a_width_under_a_point_in_cdx_units_is_read_as_points() {
-        // An earlier version wrote points; ChemDraw writes CDX units. No column is narrower
-        // than a point (65536 units), and no width in points reaches 65536.
-        for (w, pt) in [("40", "40"), ("40.02", "40.02"), ("1", "1"), ("65535", "65535"), ("65536", "1"), ("5534515", "84.44999694824219")] {
+    fn a_width_is_read_as_points_only_where_points_can_hold_it() {
+        // An earlier version wrote points; ChemDraw writes CDX units. Points reach no further
+        // than 32768 either way, an `i32` of CDX units; from there on a width is CDX units.
+        for (w, pt) in [
+            ("40", "40"),
+            ("40.02", "40.02"),
+            ("-40", "-40"),
+            ("32767", "32767"),
+            ("-32767", "-32767"),
+            ("32768", "0.5"),
+            ("-32768", "-0.5"),
+            ("65535", "0.9999847412109375"),
+            ("65536", "1"),
+            ("-65536", "-1"),
+            ("5534515", "84.44999694824219"),
+        ] {
             let xml = format!("<sgcomponent Width=\"{w}\"/>");
             assert_eq!(widths_from_cdxml(&xml), format!("<sgcomponent Width=\"{pt}\"/>"), "{w}");
         }
+    }
+
+    #[test]
+    fn a_width_of_a_few_cdx_units_is_taken_for_points() {
+        // What stays ambiguous: a width under half a point in CDX units, 1 to 32767, reads as
+        // that many points, as an earlier version's would. A hidden column, 0, is 0 either way.
+        for (w, units) in [("1", 65536), ("40", 40 * 65536), ("32767", 32767 * 65536), ("0", 0), ("-0", 0)] {
+            let grid = grid_of(&cdx::cdxml_document(&analysis_with_first_width(&format!("Width=\"{w}\""))).unwrap());
+            assert_eq!(widths(&grid)[0], units, "{w}");
+        }
+        assert_eq!(widths_from_cdxml("<sgcomponent Width=\"0\"/>"), "<sgcomponent Width=\"0\"/>");
+    }
+
+    #[test]
+    fn a_width_points_cannot_hold_is_never_saturated() {
+        // Read as points, 32768 and up would run past an `i32` of CDX units and stop at its end.
+        for w in [32768, 65535, -32768, -40000, -65536, i32::MAX, i32::MIN + 1] {
+            let xml = analysis_with_first_width(&format!("Width=\"{w}\""));
+            let grid = grid_of(&cdx::cdxml_document(&xml).unwrap());
+            assert_eq!(widths(&grid)[0], w, "{w}");
+            let again = cdxml_of_document(&cdx::cdxml_document(&xml).unwrap());
+            assert_eq!(cdxml_widths(&again)[0], w.to_string(), "{w} written again");
+        }
+    }
+
+    #[test]
+    fn a_widths_character_references_are_read_as_xml_reads_them() {
+        for (w, pt) in [
+            ("&#53;534515", "84.44999694824219"),
+            ("&#x35;534515", "84.44999694824219"),
+            ("&#x35;&#53;3451&#x0035;", "84.44999694824219"),
+            ("&#32;65536&#x9;", "1"),
+            ("&#52;0", "&#52;0"),
+            ("&amp;65536", "&amp;65536"),
+            ("&unknown;65536", "&unknown;65536"),
+        ] {
+            let xml = format!("<sgcomponent Width='{w}'/>");
+            assert_eq!(widths_from_cdxml(&xml), format!("<sgcomponent Width='{pt}'/>"), "{w}");
+        }
+        assert_eq!(attribute_value("&lt;&gt;&amp;&apos;&quot;&#60;&#x3E;").as_deref(), Some("<>&'\"<>"));
+        for bad in ["&#;", "&#x;", "&#+53;", "&#x+35;", "&#xD800;", "&#1114112;", "&#53", "&nbsp;", "&#X35;"] {
+            assert_eq!(attribute_value(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_components_width_written_with_character_references_imports_and_saves_as_chemdraws() {
+        let chemdraw = [5534515, 5639372, 3968204, 3968204];
+        for spelling in ["Width='&#53;534515'", "Width=\"&#x35;534515\"", "Width = '&#x35;&#53;&#51;4515'"] {
+            let xml = analysis_with_first_width(spelling);
+            assert_eq!(widths(&grid_of(&cdx::cdxml_document(&xml).unwrap())), chemdraw, "{spelling} read");
+            // Opened and saved again, through the document the file was.
+            let original = cdx_codec::write(&cdx::cdxml_document(&xml).unwrap());
+            let read = read_cdxml(&xml).unwrap().molecule;
+            let saved = cdxml_of_document(&cdx_codec::parse(&merge_into_cdx(&original, &read)).unwrap());
+            assert_eq!(cdxml_widths(&saved), ["5534515", "5639372", "3968204", "3968204"], "{spelling} saved");
+        }
+        // An earlier version's points, spelled with references, stay points.
+        let grid = grid_of(&cdx::cdxml_document(&analysis_with_first_width("Width='&#52;&#x30;'")).unwrap());
+        assert_eq!(widths(&grid)[0], 40 * 65536);
     }
 
     #[test]
