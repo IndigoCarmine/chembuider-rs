@@ -102,6 +102,9 @@ pub struct LineItem {
     /// The room it takes on the line, with whatever moves with it (an arrow's conditions, a
     /// structure's caption).
     pub bounds: Bounds,
+    /// The room it takes as drawn, where it stays if its stretch is left as drawn (for a
+    /// structure the cleanup redraws, other than `bounds`).
+    pub drawn: Bounds,
     /// The height that goes on the reaction line: an arrow's shaft, the middle of a structure
     /// or a text.
     pub center_y: f32,
@@ -137,7 +140,8 @@ pub struct LineItem {
 ///   two arrows too narrow for its items even with no gaps (spreading them would push them over
 ///   the arrows or past them, and lining them up would pile them onto the arrows and each
 ///   other, so the room has to be widened by hand), or when, laid out, one of its items would
-///   overlap an arrow of any line or an item of another stretch where that ends up. Where
+///   overlap an arrow of any line or an item of another stretch where that ends up (one left
+///   as drawn: where and as it was drawn, not cleaned up). Where
 ///   two stretches laid out would overlap each other, the one on the upper line (or further
 ///   left on one line) is laid out and the other left as drawn. [`plan_reaction`] tells which
 ///   items these are.
@@ -147,26 +151,37 @@ pub fn arrange_reaction(items: &[LineItem]) -> Vec<[f32; 2]> {
 
 /// [`arrange_reaction`], telling apart the items left as drawn (`None`) because their stretch
 /// cannot be laid out, from those placed (`Some`, perhaps where they already are). Nothing is
-/// put over `obstacles` either (arrows running up or down the page, which make no line).
+/// put over `obstacles` either (arrows running up or down the page, which make no line), nor
+/// over an item left as drawn where it really is ([`LineItem::drawn`]). With no line, each item
+/// stays where it is unless that is over an obstacle or another item: then it is left as drawn.
 pub fn plan_reaction(items: &[LineItem], obstacles: &[Bounds]) -> Vec<Option<[f32; 2]>> {
     let mut lines = reaction_lines(items);
-    if lines.is_empty() {
-        return vec![Some([0.0; 2]); items.len()];
-    }
-    // Upper lines first: where two lines' stretches collide, the upper one is laid out.
-    lines.sort_by(|a, b| items[a[0]].center_y.total_cmp(&items[b[0]].center_y));
-    let mut rows = lines.clone();
-    for i in (0..items.len()).filter(|&i| !items[i].arrow) {
-        let off = |l: usize| {
-            lines[l].iter().map(|&a| (items[i].center_y - items[a].center_y).abs()).fold(f32::INFINITY, f32::min)
-        };
-        let nearest = (0..lines.len()).min_by(|&a, &b| off(a).total_cmp(&off(b))).unwrap_or(0);
-        rows[nearest].push(i);
-    }
-    let stretches: Vec<Stretch> = rows.into_iter().flat_map(|row| arrange_line(items, row)).collect();
+    let stretches: Vec<Stretch> = if lines.is_empty() {
+        // No line: each item stays where it is (upper ones, then left ones, first), unless even
+        // that puts it in the way, as below.
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (a, b) = (items[a].bounds.center(), items[b].bounds.center());
+            a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0]))
+        });
+        order.into_iter().map(|i| Stretch { items: vec![i], moves: Some(vec![[0.0; 2]]) }).collect()
+    } else {
+        // Upper lines first: where two lines' stretches collide, the upper one is laid out.
+        lines.sort_by(|a, b| items[a[0]].center_y.total_cmp(&items[b[0]].center_y));
+        let mut rows = lines.clone();
+        for i in (0..items.len()).filter(|&i| !items[i].arrow) {
+            let off = |l: usize| {
+                lines[l].iter().map(|&a| (items[i].center_y - items[a].center_y).abs()).fold(f32::INFINITY, f32::min)
+            };
+            let nearest = (0..lines.len()).min_by(|&a, &b| off(a).total_cmp(&off(b))).unwrap_or(0);
+            rows[nearest].push(i);
+        }
+        rows.into_iter().flat_map(|row| arrange_line(items, row)).collect()
+    };
 
     // Each stretch is laid out unless that puts one of its items over an obstacle, an arrow or
-    // an item of another stretch: one left as drawn, or one laid out ahead of it. A stretch
+    // an item of another stretch: one left as drawn (where it was drawn, its drawn shape), or
+    // one laid out ahead of it. A stretch
     // after it gives way instead, and when that leaves its items as drawn in the way, the
     // next round puts this one back too; rounds go on until nothing changes.
     // Each item's stretch and its place in it.
@@ -188,7 +203,7 @@ pub fn plan_reaction(items: &[LineItem], obstacles: &[Bounds]) -> Vec<Option<[f3
                 let now = |j: usize| match slot[j] {
                     Some((t, _)) if t == s || (placed[t] && t > s) => None,
                     Some((t, n)) if placed[t] => Some(items[j].bounds.translate(stretches[t].moves.as_ref()?[n])),
-                    _ => Some(items[j].bounds),
+                    _ => Some(items[j].drawn),
                 };
                 obstacles.iter().all(|o| !b.overlaps(o)) && (0..items.len()).filter_map(now).all(|o| !b.overlaps(&o))
             });
@@ -383,7 +398,7 @@ impl Molecule {
         // Who rides on which arrow, and which text is whose caption, from the drawing as it is.
         let before = measure(self);
         let boxes_before: Vec<Bounds> = groups.iter().map(|g| self.structure_bounds(g, &before)).collect();
-        let text_boxes: Vec<Bounds> = texts.iter().map(|&i| self.object_bounds(i, &before)).collect();
+        let drawn_text_boxes: Vec<Bounds> = texts.iter().map(|&i| self.object_bounds(i, &before)).collect();
         let on_arrow = |b: &Bounds| {
             arrows.iter().copied().find_map(|i| riding_on(self.objects[i].as_arrow()?, b).map(|near| (i, near)))
         };
@@ -391,7 +406,7 @@ impl Molecule {
             .iter()
             .map(|b| on_arrow(b).map_or((Role::Free, 0.0), |(i, near)| (Role::OnArrow(i), near)))
             .collect();
-        let text_roles: Vec<Role> = text_boxes
+        let text_roles: Vec<Role> = drawn_text_boxes
             .iter()
             .map(|b| {
                 if let Some((i, _)) = on_arrow(b) {
@@ -477,24 +492,25 @@ impl Molecule {
                 continue;
             }
             members.push(Member::Arrow);
-            items.push(LineItem { bounds, center_y: (a.tail[1] + a.head[1]) * 0.5, arrow: true });
+            items.push(LineItem { bounds, drawn: bounds, center_y: (a.tail[1] + a.head[1]) * 0.5, arrow: true });
         }
         for (s, b) in structure_boxes.iter().enumerate() {
             if structure_roles[s].0 != Role::Free {
                 continue;
             }
-            let bounds = (0..texts.len())
-                .filter(|&t| text_roles[t] == Role::Caption(s))
-                .fold(*b, |acc, t| acc.union(text_boxes[t]));
+            let captions = || (0..texts.len()).filter(|&t| text_roles[t] == Role::Caption(s));
+            let bounds = captions().fold(*b, |acc, t| acc.union(text_boxes[t]));
+            // As drawn, should it be left so: its uncleaned atoms and unmoved captions.
+            let drawn = captions().fold(boxes_before[s], |acc, t| acc.union(drawn_text_boxes[t]));
             members.push(Member::Structure(s));
-            items.push(LineItem { bounds, center_y: b.center()[1], arrow: false });
+            items.push(LineItem { bounds, drawn, center_y: b.center()[1], arrow: false });
         }
         for (t, b) in text_boxes.iter().enumerate() {
             if text_roles[t] != Role::Free {
                 continue;
             }
             members.push(Member::Text(t));
-            items.push(LineItem { bounds: *b, center_y: b.center()[1], arrow: false });
+            items.push(LineItem { bounds: *b, drawn: drawn_text_boxes[t], center_y: b.center()[1], arrow: false });
         }
 
         // The layout is worked out on the cleaned-up structures, since their size sets the
@@ -569,7 +585,8 @@ mod tests {
 
     fn item(min_x: f32, max_x: f32, center_y: f32, height: f32, arrow: bool) -> LineItem {
         let h = height * 0.5;
-        LineItem { bounds: Bounds::new([min_x, center_y - h], [max_x, center_y + h]), center_y, arrow }
+        let bounds = Bounds::new([min_x, center_y - h], [max_x, center_y + h]);
+        LineItem { bounds, drawn: bounds, center_y, arrow }
     }
 
     /// The items moved as `moves` says.
@@ -1183,6 +1200,159 @@ mod tests {
         }
         assert_eq!(mol.object_by_id(caption), before.object_by_id(caption), "caption as drawn");
         assert!(atoms_box(&mol, &product).center()[1].abs() < EPS, "the product is still put on the line");
+    }
+
+    /// A bond or an arrow's shaft, end to end.
+    type Segment = [[f32; 2]; 2];
+
+    /// Whether segments `p` and `q` cross (touching at an end does not count).
+    fn cross(p: Segment, q: Segment) -> bool {
+        let side = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        let (d1, d2) = (side(q[0], q[1], p[0]), side(q[0], q[1], p[1]));
+        let (d3, d4) = (side(p[0], p[1], q[0]), side(p[0], p[1], q[1]));
+        d1 * d2 < 0.0 && d3 * d4 < 0.0
+    }
+
+    /// The structures, each with its box (atoms only) and its bonds as segments, and the
+    /// arrows' shafts.
+    fn layout(mol: &Molecule) -> (Vec<(Bounds, Vec<Segment>)>, Vec<Segment>) {
+        let pos = |id: u32| mol.atom_by_id(id).unwrap().pos;
+        let structures = structures(mol)
+            .iter()
+            .map(|s| {
+                let bonds =
+                    mol.bonds.iter().filter(|b| s.contains(&b.begin)).map(|b| [pos(b.begin), pos(b.end)]).collect();
+                (atoms_box(mol, s), bonds)
+            })
+            .collect();
+        let shafts = mol.objects.iter().filter_map(|o| o.as_arrow()).map(|a| [a.tail, a.head]).collect();
+        (structures, shafts)
+    }
+
+    /// No two structures that were apart overlap after the cleanup, no bond crosses a bond of
+    /// another structure or an arrow it did not cross before.
+    fn assert_no_new_collisions(before: &Molecule, after: &Molecule) {
+        let ((was, shafts), (now, _)) = (layout(before), layout(after));
+        for i in 0..now.len() {
+            for &shaft in &shafts {
+                for k in 0..now[i].1.len() {
+                    if !cross(was[i].1[k], shaft) {
+                        assert!(!cross(now[i].1[k], shaft), "structure {i} now crosses an arrow: {now:?}");
+                    }
+                }
+            }
+            for j in i + 1..now.len() {
+                if !overlap(&was[i].0, &was[j].0) {
+                    assert!(!overlap(&now[i].0, &now[j].0), "structures {i} and {j} now overlap: {now:?}");
+                }
+                for (k, &p) in now[i].1.iter().enumerate() {
+                    for (l, &q) in now[j].1.iter().enumerate() {
+                        if !cross(was[i].1[k], was[j].1[l]) {
+                            assert!(!cross(p, q), "bonds of structures {i} and {j} now cross: {now:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether structure `ids` is exactly as in `before`.
+    fn as_drawn(mol: &Molecule, before: &Molecule, ids: &[u32]) -> bool {
+        ids.iter().all(|&id| mol.atom_by_id(id).unwrap().pos == before.atom_by_id(id).unwrap().pos)
+    }
+
+    /// A stretch is checked against what is left as drawn where it really is: the drawn shape,
+    /// not the cleaned-up one centred there. A product laid out onto a structure that is
+    /// left as drawn (it would cover an arrow down the page) is left as drawn too.
+    #[test]
+    fn a_stretch_keeps_clear_of_a_structure_left_as_drawn_as_it_was_drawn() {
+        let mut mol = Molecule::default();
+        mol.add_arrow([6.0, 0.0], [9.0, 0.0], ArrowKind::Reaction);
+        let product = sloppy_chain(&mut mol, [10.0, -1.5], 3);
+        mol.add_arrow([5.0, 3.0], [9.0, 3.0], ArrowKind::Reaction);
+        mol.add_arrow([11.0, 2.0], [11.0, 4.0], ArrowKind::Reaction);
+        let lower: Vec<u32> = [[10.0, 4.0], [12.0, 0.3], [14.0, 4.0]].map(|p| mol.add_atom("C".into(), p, 0)).to_vec();
+        for w in lower.windows(2) {
+            mol.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        let before = mol.clone();
+
+        assert!(mol.cleanup_reaction_scheme(fake_extents));
+
+        assert!(as_drawn(&mol, &before, &lower), "the lower structure would cover the arrow down");
+        assert_no_new_collisions(&before, &mol);
+        let (pb, lb) = (atoms_box(&mol, &product), atoms_box(&mol, &lower));
+        assert!(!overlap(&pb, &lb), "the product is not put onto it: {pb:?} {lb:?}");
+        if !as_drawn(&mol, &before, &product) {
+            assert_same_shape(&shape(&mol, &product), &cleaned_shape(&before, &product));
+        }
+    }
+
+    /// The same in [`plan_reaction`] alone: an item whose stretch cannot be laid out is in the
+    /// way where it was drawn, not where its cleaned-up box would be.
+    #[test]
+    fn plan_reaction_checks_against_the_drawn_box_of_what_is_left_as_drawn() {
+        let mut items = [
+            item(0.0, 3.0, 0.0, 0.4, true),
+            item(5.0, 7.0, 3.0, 2.0, false), // laid out where it is, before the second arrow
+            item(10.0, 13.0, 3.0, 0.4, true),
+            item(16.0, 18.0, 3.0, 1.0, false), // after it, onto the obstacle: left as drawn
+        ];
+        let down = Bounds::new([16.8, 2.0], [17.2, 4.0]);
+        // Cleaned up it was small and out of the way; drawn it reaches up onto the first line.
+        items[3].drawn = Bounds::new([3.0, 0.1], [6.0, 4.0]);
+        let moves = plan_reaction(&items, &[down]);
+        assert_eq!(moves[3], None, "{moves:?}");
+        assert_eq!(moves[1], None, "would land on the drawn box: {moves:?}");
+    }
+
+    /// With only arrows down the page there is no line, yet a structure the cleanup makes
+    /// bigger is not left over the arrow: it stays as drawn.
+    #[test]
+    fn with_only_an_arrow_down_the_page_nothing_is_cleaned_up_onto_it() {
+        let mut mol = Molecule::default();
+        mol.add_arrow([10.0, -2.0], [10.0, 2.0], ArrowKind::Reaction);
+        let chain: Vec<u32> =
+            (0..8).map(|k| mol.add_atom("C".into(), [4.5 + 0.3 * k as f32, if k % 2 == 0 { 0.0 } else { 0.15 }], 0)).collect();
+        for w in chain.windows(2) {
+            mol.add_bond(w[0], w[1], BondOrder::Single);
+        }
+        let mut cleaned = mol.substructure(&chain);
+        cleanup_2d(&mut cleaned);
+        let grown = atoms_box(&cleaned, &chain);
+        assert!(grown.width() > 6.0, "the cleanup makes it reach the arrow from where it is: {grown:?}");
+        let before = mol.clone();
+
+        mol.cleanup_reaction_scheme(fake_extents);
+
+        assert!(as_drawn(&mol, &before, &chain), "left as drawn: {:?}", atoms_box(&mol, &chain));
+        assert_no_new_collisions(&before, &mol);
+    }
+
+    /// The Codex probe, through the editor with its real fonts: A cleaned up and laid out must
+    /// not cross B, which is left as drawn; and it is one undo step.
+    #[test]
+    fn the_editor_never_lays_a_structure_across_one_left_as_drawn() {
+        let mut editor = crate::widget::ChemStructEditor::default();
+        let mol = &mut editor.molecule;
+        mol.add_arrow([0.0, 0.0], [3.0, 0.0], ArrowKind::Reaction);
+        mol.add_arrow([10.0, 0.9], [13.0, 0.9], ArrowKind::Reaction);
+        mol.add_arrow([8.5, -1.0], [8.5, 1.0], ArrowKind::Reaction);
+        for (p, q) in [([5.806, 2.787], [13.306, 1.491]), ([5.190, 1.473], [11.482, -0.711]), ([15.494, 0.519], [23.450, 0.441])] {
+            let a = mol.add_atom("C".into(), p, 0);
+            let b = mol.add_atom("C".into(), q, 0);
+            mol.add_bond(a, b, BondOrder::Single);
+        }
+        let before = editor.molecule.clone();
+        let depth = editor.undo_stack.len();
+
+        assert!(editor.cleanup_reaction(), "D is still tidied");
+        assert_eq!(editor.undo_stack.len(), depth + 1, "one undo step");
+        assert_no_new_collisions(&before, &editor.molecule);
+        let b = crate::molecule::reaction_table::structures(&before);
+        assert!(as_drawn(&editor.molecule, &before, &b[1]), "B is left as drawn (it is in the way of the arrows)");
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before, "one Undo is the drawing before the cleanup");
     }
 
     #[test]
