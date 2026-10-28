@@ -158,6 +158,12 @@ pub struct ChemStructEditor {
     pub pan: egui::Vec2,
 
     pub selected_atoms: HashSet<u32>,
+    /// Bonds selected on their own, by clicking them with the Select tool. A selected bond
+    /// stands for its two atoms where the selection is laid out (Cleanup moves them) and for
+    /// itself where it is deleted (Delete removes just the bond). A lasso or a click on empty
+    /// canvas replaces the selection, dropping these; a bond whose two atoms are selected is
+    /// covered through them without being listed here.
+    pub selected_bonds: HashSet<u32>,
 
     pub dragging_atom: Option<u32>,
     pub drag_start_mol: Option<[f32; 2]>,
@@ -284,6 +290,7 @@ impl Default for ChemStructEditor {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             selected_atoms: HashSet::new(),
+            selected_bonds: HashSet::new(),
             dragging_atom: None,
             drag_start_mol: None,
             bond_start: None,
@@ -642,6 +649,7 @@ impl ChemStructEditor {
             }
         }
         self.selected_atoms = new_ids.into_iter().collect();
+        self.selected_bonds.clear();
         true
     }
 
@@ -680,6 +688,7 @@ impl ChemStructEditor {
             }
         }
         self.selected_atoms = map.values().copied().collect();
+        self.selected_bonds.clear();
         true
     }
 
@@ -752,8 +761,9 @@ impl ChemStructEditor {
     /// With part of the drawing selected only the selected atoms are cleaned up, laid out
     /// against the unselected ones, which do not move at all
     /// ([`CleanupEngine::start_partial`](crate::molecule::cleanup::CleanupEngine::start_partial)).
-    /// A selected bond is selected through its two atoms.  With nothing selected, or every
-    /// atom, the whole drawing is cleaned up.
+    /// A selected bond ([`selected_bonds`](Self::selected_bonds)) brings its two atoms into the
+    /// cleanup, so selecting just one bond cleans up just its two ends.  With nothing selected,
+    /// or every atom, the whole drawing is cleaned up.
     ///
     /// Stopping this way only asks the run to stop: the next [`poll_cleanup`](Self::poll_cleanup)
     /// still copies in the positions the run ended on, so the layout reached so far is kept.
@@ -771,6 +781,10 @@ impl ChemStructEditor {
                     .selected_atoms
                     .iter()
                     .copied()
+                    .chain(self.selected_bonds.iter().filter_map(|&id| {
+                        let b = self.molecule.bond_by_id(id)?;
+                        Some([b.begin, b.end])
+                    }).flatten())
                     .filter(|&id| self.molecule.atom_by_id(id).is_some())
                     .collect();
                 let whole = movable.is_empty() || movable.len() == self.molecule.atoms.len();
@@ -922,6 +936,7 @@ impl ChemStructEditor {
     /// lost (undo, redo).
     fn clear_transient_state(&mut self) {
         self.selected_atoms.clear();
+        self.selected_bonds.clear();
         self.selected_objects.clear();
         self.hotspot_atom = None;
         self.label_edit = None;
@@ -930,13 +945,19 @@ impl ChemStructEditor {
         self.object_drag = None;
     }
 
-    /// Delete everything selected, atoms and page objects, in one undo step. Returns false
-    /// when nothing is selected.
+    /// Delete everything selected, atoms, bonds and page objects, in one undo step. Returns
+    /// false when nothing is selected.
     pub fn delete_selection(&mut self) -> bool {
-        if self.selected_atoms.is_empty() && self.selected_objects.is_empty() {
+        if self.selected_atoms.is_empty()
+            && self.selected_bonds.is_empty()
+            && self.selected_objects.is_empty()
+        {
             return false;
         }
         self.push_undo();
+        for id in std::mem::take(&mut self.selected_bonds) {
+            self.molecule.remove_bond(id);
+        }
         for id in std::mem::take(&mut self.selected_atoms) {
             self.molecule.remove_atom(id);
         }
@@ -1084,6 +1105,7 @@ impl ChemStructEditor {
         self.push_undo();
         let id = self.molecule.push_object(PageObject::Table(table));
         self.selected_atoms.clear();
+        self.selected_bonds.clear();
         self.selected_objects = [id].into_iter().collect();
         Some(id)
     }
@@ -1680,6 +1702,11 @@ impl ChemStructEditor {
         if !self.selected_objects.is_empty() {
             let mol = &self.molecule;
             self.selected_objects.retain(|id| mol.object_by_id(*id).is_some());
+        }
+        // Likewise selected bonds that a deletion (of the bond or of one of its atoms) removed.
+        if !self.selected_bonds.is_empty() {
+            let mol = &self.molecule;
+            self.selected_bonds.retain(|id| mol.bond_by_id(*id).is_some());
         }
 
         // A keyboard bond target is only meaningful while that bond exists, and undo, redo,

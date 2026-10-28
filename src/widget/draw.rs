@@ -86,10 +86,13 @@ pub fn draw_bonds(
         labels,
     );
     for bond in bonds {
-        // A hovered bond is tinted green, and so is the bond a context menu is open on; the
-        // geometry is identical to the exported picture.
+        // A hovered bond is tinted green, and so is the bond a context menu is open on; a bond
+        // selected on its own is blue, like a selected atom's ring. The geometry is identical
+        // to the exported picture.
         let color = if editor.hovered_bond == Some(bond.bond_id) || editor.context_bond == Some(bond.bond_id) {
             egui::Color32::from_rgb(50, 180, 50)
+        } else if editor.selected_bonds.contains(&bond.bond_id) {
+            egui::Color32::from_rgb(80, 130, 255)
         } else {
             egui::Color32::BLACK
         };

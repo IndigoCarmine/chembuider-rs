@@ -298,7 +298,7 @@ impl CleanupState {
 
     fn build(mol: &Molecule, selection: Option<&HashSet<u32>>) -> Self {
         let atom_ids: Vec<u32> = mol.atoms.iter().map(|a| a.id).collect();
-        let pos: HashMap<u32, [f32; 2]> = mol.atoms.iter().map(|a| (a.id, a.pos)).collect();
+        let mut pos: HashMap<u32, [f32; 2]> = mol.atoms.iter().map(|a| (a.id, a.pos)).collect();
         let vel: HashMap<u32, [f32; 2]> = atom_ids.iter().map(|&id| (id, [0.0_f32; 2])).collect();
         let mut forces: HashMap<u32, [f32; 2]> =
             atom_ids.iter().map(|&id| (id, [0.0_f32; 2])).collect();
@@ -336,6 +336,7 @@ impl CleanupState {
                 cycles.retain(|ring| ring.iter().all(|id| sel.contains(id)));
                 movable = atom_ids.iter().copied().filter(|id| sel.contains(id)).collect();
                 free_groups = Some(free_groups_of(&adj, &movable, sel, &pos));
+                separate_coincident(&mut pos, &adj, &atom_ids, &movable);
             }
         }
 
@@ -582,20 +583,25 @@ impl CleanupState {
         false
     }
 
-    /// Write the current relaxed positions back to the molecule.
+    /// Write the current relaxed positions of the atoms that move back to the molecule (every
+    /// atom for a whole-page cleanup, the selected ones for a selection cleanup).
     /// Used through `CleanupSchedule::apply` by the synchronous `cleanup_2d`; the interactive
     /// path streams positions through `CleanupJob` instead.
     pub fn apply(&self, mol: &mut Molecule) {
-        for (&id, &p) in &self.pos {
+        for &id in &self.movable {
             if let Some(atom) = mol.atom_by_id_mut(id) {
-                atom.pos = p;
+                atom.pos = self.pos[&id];
             }
         }
     }
 
-    /// Snapshot of the current positions (atom_ids order) for live preview / publishing.
+    /// Snapshot of the current positions of the atoms that move (atom_ids order) for live
+    /// preview / publishing.  A selection cleanup leaves the unselected atoms out: the editor
+    /// copies these into the live molecule every frame, so listing an atom the run holds still
+    /// would snap it back to where it was when the run started — undoing, say, a drag of it
+    /// made while the run goes on.
     pub fn positions(&self) -> Vec<(u32, [f32; 2])> {
-        self.atom_ids.iter().map(|&id| (id, self.pos[&id])).collect()
+        self.movable.iter().map(|&id| (id, self.pos[&id])).collect()
     }
 }
 
@@ -774,8 +780,10 @@ const JOB_PHASE_BUDGET: usize = 100_000;
 ///
 /// Contract for implementors:
 ///   * `latest` returns `(atom id, position)` pairs for atoms of the molecule the run was
-///     started from.  It may also advance the computation (the wasm run does all its work
-///     there, one chunk per call).
+///     started from — for a run from `CleanupEngine::start_partial`, only the atoms it may
+///     move, since the editor writes every listed position into the live molecule.  It may
+///     also advance the computation (the wasm run does all its work there, one chunk per
+///     call).
 ///   * Once `is_done` returns `true`, `latest` returns the final positions.
 ///   * After `cancel`, the run must still reach `is_done` (soon), so the editor can finish.
 ///   * The run may be dropped without `join` (e.g. when the editor holding it is dropped, or
@@ -894,8 +902,13 @@ mod job_native {
         pub fn start(mol: &Molecule, movable: Option<&HashSet<u32>>) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
+            // Until the worker publishes, the preview is the atoms it will move, where they are.
             let shared = Arc::new(Mutex::new(
-                mol.atoms.iter().map(|a| (a.id, a.pos)).collect::<Vec<_>>(),
+                mol.atoms
+                    .iter()
+                    .filter(|a| movable.is_none_or(|m| m.contains(&a.id)))
+                    .map(|a| (a.id, a.pos))
+                    .collect::<Vec<_>>(),
             ));
 
             let snapshot = mol.clone();
@@ -1301,6 +1314,47 @@ fn free_groups_of(
         }
     }
     groups
+}
+
+/// Two atoms closer than this (in each coordinate) count as drawn on top of each other.
+const COINCIDENT: f32 = 1e-4;
+
+/// Selection cleanup: move each selected atom drawn on top of another atom a short way off it,
+/// so the relaxation can pull the two apart.  At zero separation every force between them has
+/// no direction (the bond's, the repulsion's and the angle terms' tangents all vanish); in a
+/// whole-page cleanup the other bonds of the pair shift them off each other, but an unselected
+/// atom never moves, so a selected one sitting exactly on it would stay stuck there.  The
+/// selected atom is moved away from the other atom's remaining neighbours (where a new bond
+/// would be drawn), or, with none to go by, along a direction set by its place in `movable`:
+/// deterministic, so the job and `cleanup_2d_partial` agree.
+fn separate_coincident(
+    pos: &mut HashMap<u32, [f32; 2]>,
+    adj: &HashMap<u32, Vec<u32>>,
+    atom_ids: &[u32],
+    movable: &[u32],
+) {
+    for (k, &id) in movable.iter().enumerate() {
+        let p = pos[&id];
+        let Some(&other) = atom_ids.iter().find(|&&o| {
+            let q = pos[&o];
+            o != id && (q[0] - p[0]).abs() < COINCIDENT && (q[1] - p[1]).abs() < COINCIDENT
+        }) else {
+            continue;
+        };
+        let q = pos[&other];
+        let (sx, sy) = adj[&other].iter().filter(|&&nb| nb != id).fold((0.0_f32, 0.0_f32), |(x, y), nb| {
+            (x + pos[nb][0] - q[0], y + pos[nb][1] - q[1])
+        });
+        let len = (sx * sx + sy * sy).sqrt();
+        let dir = if len > COINCIDENT {
+            [-sx / len, -sy / len]
+        } else {
+            // The golden angle spreads several such atoms apart.
+            let a = 2.399_963 * (k + 1) as f32;
+            [a.cos(), a.sin()]
+        };
+        pos.insert(id, [q[0] + dir[0] * L * 0.1, q[1] + dir[1] * L * 0.1]);
+    }
 }
 
 /// Project out rigid-body motion (net translation + net rotation) from the velocities.
@@ -2452,7 +2506,8 @@ mod tests {
         assert_eq!(editor.molecule, mol);
     }
 
-    /// Selecting one bond selects its two atoms; Cleanup then moves just those two.
+    /// With one bond selected and no atom, Cleanup moves just that bond's two atoms.  (The
+    /// Select-tool click that selects the bond is tested in `widget::interact`.)
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn selection_cleanup_of_one_bond_moves_its_two_atoms() {
@@ -2463,7 +2518,7 @@ mod tests {
         let selected: HashSet<u32> = [chain[2], chain[3]].into_iter().collect();
         let mut editor = crate::widget::ChemStructEditor::default();
         editor.molecule = mol.clone();
-        editor.selected_atoms = selected.clone();
+        editor.selected_bonds = [mol.bond_between(chain[2], chain[3]).unwrap().id].into_iter().collect();
 
         run_editor_cleanup(&mut editor);
 
@@ -2494,7 +2549,7 @@ mod tests {
     }
 
     /// The background job of a selection cleanup lands on the coordinates of the one-shot
-    /// `cleanup_2d_partial`.
+    /// `cleanup_2d_partial`, and reports the selected atoms only.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn partial_job_matches_cleanup_2d_partial() {
@@ -2502,7 +2557,99 @@ mod tests {
         let mut expected = mol.clone();
         cleanup_2d_partial(&mut expected, &selected);
         let from_job = position_bits(&run_polled(DefaultCleanupEngine.start_partial(&mol, &selected)));
-        assert_eq!(from_job, coord_bits(&expected));
+        let expected_selected: Vec<_> =
+            coord_bits(&expected).into_iter().filter(|(id, _)| selected.contains(id)).collect();
+        assert_eq!(from_job, expected_selected);
+    }
+
+    /// While a selection cleanup runs, the editor writes back only the atoms it moves: an
+    /// unselected atom dragged meanwhile stays where it was dragged instead of snapping back to
+    /// where it was when Cleanup started.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn partial_job_leaves_an_unselected_atom_moved_during_the_run() {
+        let (mol, chain, selected) = chain_with_distorted_end();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol;
+        editor.selected_atoms = selected;
+
+        editor.toggle_cleanup();
+        let dragged = [-3.0, 2.0];
+        editor.molecule.atom_by_id_mut(chain[0]).unwrap().pos = dragged;
+        while editor.poll_cleanup() {
+            std::thread::yield_now();
+        }
+        assert_eq!(editor.molecule.atom_by_id(chain[0]).unwrap().pos, dragged);
+    }
+
+    /// A selected atom drawn exactly on an unselected neighbour (every force between the two
+    /// has no direction there) is moved off it and laid out at bond length, the other atoms
+    /// untouched — both when that neighbour has other bonds to steer by and when it has none.
+    #[test]
+    fn selection_cleanup_separates_an_atom_drawn_on_its_fixed_neighbour() {
+        for n in [4, 2] {
+            let mut mol = Molecule::default();
+            let chain = zigzag_chain(&mut mol, n, [0.0, 0.0]);
+            let (on, under) = (chain[n - 1], chain[n - 2]);
+            mol.atom_by_id_mut(on).unwrap().pos = mol.atom_by_id(under).unwrap().pos;
+            let selected: HashSet<u32> = [on].into_iter().collect();
+
+            let mut m = mol.clone();
+            cleanup_2d_partial(&mut m, &selected);
+
+            assert_eq!(unselected_bits(&m, &selected), unselected_bits(&mol, &selected), "{n} atoms");
+            let d = bond_length(&m, under, on);
+            assert!((d - L).abs() < 0.05, "{n} atoms: the bond is {d}");
+            if n == 4 {
+                // Steered away from the fixed atom's other neighbour: the chain's 120° angle.
+                let p = |id| m.atom_by_id(id).unwrap().pos;
+                let (a, b, c) = (p(chain[1]), p(under), p(on));
+                let ang = ((a[0] - b[0]) * (c[0] - b[0]) + (a[1] - b[1]) * (c[1] - b[1]))
+                    / (bond_length(&m, chain[1], under) * d);
+                assert!((ang.acos().to_degrees() - 120.0).abs() < 2.0, "angle {}", ang.acos().to_degrees());
+            }
+        }
+    }
+
+    /// A lone atom selected on its own has nothing to lay it out against: it stays put, and so
+    /// does everything else.
+    #[test]
+    fn selection_cleanup_of_a_single_free_atom_moves_nothing() {
+        let mut mol = Molecule::default();
+        zigzag_chain(&mut mol, 4, [0.0, 0.0]);
+        let lone = mol.add_atom("O".to_string(), [3.0, 4.0], 0);
+        let selected: HashSet<u32> = [lone].into_iter().collect();
+        let mut m = mol.clone();
+        cleanup_2d_partial(&mut m, &selected);
+        assert_eq!(unselected_bits(&m, &selected), unselected_bits(&mol, &selected));
+        let p = m.atom_by_id(lone).unwrap().pos;
+        assert!((p[0] - 3.0).abs() < 1e-5 && (p[1] - 4.0).abs() < 1e-5, "moved to {p:?}");
+    }
+
+    /// Undo while a selection cleanup runs drops the run and restores the drawing from before
+    /// Cleanup; stopping it with Cleanup again keeps the unselected atoms exactly where they
+    /// were.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn selection_cleanup_can_be_undone_or_stopped_mid_run() {
+        let (mol, _, selected) = chain_with_distorted_end();
+        let mut editor = crate::widget::ChemStructEditor::default();
+        editor.molecule = mol.clone();
+        editor.selected_atoms = selected.clone();
+        editor.toggle_cleanup();
+        editor.poll_cleanup();
+        assert!(editor.undo());
+        assert!(!editor.poll_cleanup(), "undo ends the run");
+        assert_eq!(editor.molecule, mol);
+
+        editor.selected_atoms = selected.clone();
+        editor.toggle_cleanup();
+        editor.poll_cleanup();
+        editor.toggle_cleanup();
+        while editor.poll_cleanup() {
+            std::thread::yield_now();
+        }
+        assert_eq!(unselected_bits(&editor.molecule, &selected), unselected_bits(&mol, &selected));
     }
 
     /// An engine that records which of its entry points the editor called, and with what.
