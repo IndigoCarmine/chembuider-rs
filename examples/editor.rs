@@ -189,7 +189,7 @@ impl App for EditorApp {
                     self.status = if self.editor.cleanup_reaction() {
                         "Reaction cleaned up.".to_string()
                     } else {
-                        "No reaction arrow to line up on.".to_string()
+                        "Nothing to clean up (no reaction arrow, or already tidy).".to_string()
                     };
                 }
 

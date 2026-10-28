@@ -798,8 +798,12 @@ impl ChemStructEditor {
     /// Unlike [`toggle_cleanup`](Self::toggle_cleanup) this runs to the end at once: the layout
     /// needs every structure's final shape, and a scheme's structures are small. It is one undo
     /// step. A plain cleanup still running is stopped first (keeping the layout it reached).
-    /// Returns `false`, changing nothing, when there is no arrow on the page.
+    /// Returns `false`, changing nothing (a plain cleanup running goes on), when there is no
+    /// arrow on the page; also `false` when the scheme is already tidy.
     pub fn cleanup_reaction(&mut self) -> bool {
+        if !self.molecule.has_reaction_arrow() {
+            return false;
+        }
         self.cancel_cleanup();
         let mut fonts = fonts::standalone_fonts();
         let mut view = fonts.with_pixels_per_point(1.0);

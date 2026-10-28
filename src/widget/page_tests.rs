@@ -542,6 +542,20 @@ fn the_reaction_cleanup_needs_an_arrow() {
     assert!(editor.undo_stack.is_empty());
 }
 
+/// With no arrow on the page the reaction cleanup has nothing to do, so a plain cleanup
+/// running at the time goes on.
+#[test]
+fn the_reaction_cleanup_without_an_arrow_leaves_a_plain_cleanup_running() {
+    let mut editor = ChemStructEditor::default();
+    let a = editor.molecule.add_atom("C".into(), [0.0, 0.0], 0);
+    let b = editor.molecule.add_atom("C".into(), [3.0, 0.4], 0);
+    editor.molecule.add_bond(a, b, BondOrder::Single);
+    editor.toggle_cleanup();
+    assert!(editor.is_cleaning());
+    assert!(!editor.cleanup_reaction());
+    assert!(editor.is_cleaning(), "the plain cleanup was not stopped");
+}
+
 /// Ctrl+Shift+K runs the reaction cleanup (at once, not in the background); Ctrl+K alone still
 /// starts the plain cleanup.
 #[test]

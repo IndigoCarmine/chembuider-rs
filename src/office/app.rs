@@ -321,7 +321,7 @@ impl OfficeApp {
         let (select, bond, eraser) = (self.t(Msg::ToolSelect), self.t(Msg::ToolBond), self.t(Msg::ToolEraser));
         let (wedge, hash, plain) = (self.t(Msg::NewBondWedge), self.t(Msg::NewBondHash), self.t(Msg::NewBondPlain));
         let (undo, redo, clean) = (self.t(Msg::Undo), self.t(Msg::Redo), self.t(Msg::CleanUp));
-        let paste = self.t(Msg::Paste);
+        let (paste, clean_reaction) = (self.t(Msg::Paste), self.t(Msg::CleanUpReaction));
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let ed = &mut tab.editor;
         ui.horizontal_wrapped(|ui| {

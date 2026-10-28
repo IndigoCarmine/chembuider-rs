@@ -21,8 +21,10 @@ use super::page::{PageArrow, PageObject};
 use super::reaction_table::structures;
 use super::Molecule;
 
-/// Arrows whose shafts are at most this far apart in height (molecule units) are on one line.
-const ROW_TOLERANCE: f32 = 1.5;
+/// Arrows whose shafts are at most this far apart in height (molecule units) are on one line:
+/// drawn at the same height, give or take rounding. Arrows any further apart are separate
+/// lines, since an item between them could not be centred on both.
+const ROW_TOLERANCE: f32 = 0.05;
 /// The smallest gap left between neighbours outside the arrows.
 const MIN_GAP: f32 = 0.75;
 /// The gap used when a line has nothing to measure it from (an arrow alone with one item).
@@ -91,14 +93,17 @@ pub struct LineItem {
 /// is centred on its reaction line and spaced evenly along it, in its present left-to-right
 /// order.
 ///
-/// * Arrows at about the same height ([`ROW_TOLERANCE`]) make a line; every other item joins the
-///   line nearest to its height. With no arrow nothing moves.
+/// * Arrows at the same height ([`ROW_TOLERANCE`]) make a line, and its height (their shafts')
+///   is where its items are centred; arrows at different heights are different lines. Every
+///   other item joins the line nearest to its height. With no arrow nothing moves.
 /// * Between two arrows of a line, the items share the room the arrows leave in equal gaps
-///   (both ends are fixed, so the gap is whatever that room allows) and are centred halfway
-///   between the two shafts' heights.
+///   (both ends are fixed, so the gap is whatever that room allows). When the room is too
+///   narrow for them even with no gaps, they are left exactly as they are: spreading them
+///   would push them over the arrows or past them, and lining them up on the shaft would
+///   pile them onto the arrows and each other, so the room has to be widened by hand.
 /// * Before the first arrow and after the last, items are laid out from the arrow outward with
 ///   the line's gap — the mean of the gaps between neighbours on the line now, at least
-///   [`MIN_GAP`] — at that arrow's height.
+///   [`MIN_GAP`].
 pub fn arrange_reaction(items: &[LineItem]) -> Vec<[f32; 2]> {
     let mut moves = vec![[0.0; 2]; items.len()];
     let mut arrows: Vec<usize> = (0..items.len()).filter(|&i| items[i].arrow).collect();
@@ -120,14 +125,14 @@ pub fn arrange_reaction(items: &[LineItem]) -> Vec<[f32; 2]> {
         let nearest = (0..rows.len()).min_by(|&a, &b| off(a).total_cmp(&off(b))).unwrap_or(0);
         rows[nearest].push(i);
     }
-    for row in rows {
-        arrange_row(items, row, &mut moves);
+    for (row, y) in rows.into_iter().zip(row_y) {
+        arrange_row(items, row, y, &mut moves);
     }
     moves
 }
 
-/// Lay out one reaction line: `row` holds at least one arrow.
-fn arrange_row(items: &[LineItem], mut row: Vec<usize>, moves: &mut [[f32; 2]]) {
+/// Lay out one reaction line at height `y`: `row` holds at least one arrow.
+fn arrange_row(items: &[LineItem], mut row: Vec<usize>, y: f32, moves: &mut [[f32; 2]]) {
     row.sort_by(|&a, &b| items[a].bounds.center()[0].total_cmp(&items[b].bounds.center()[0]));
     let at = |k: usize| &items[row[k]];
     let gaps: Vec<f32> = (1..row.len()).map(|k| at(k).bounds.min[0] - at(k - 1).bounds.max[0]).collect();
@@ -137,7 +142,7 @@ fn arrange_row(items: &[LineItem], mut row: Vec<usize>, moves: &mut [[f32; 2]]) 
     };
     let arrows: Vec<usize> = (0..row.len()).filter(|&k| at(k).arrow).collect();
     let (Some(&first), Some(&last)) = (arrows.first(), arrows.last()) else { return };
-    let mut place = |k: usize, left: f32, y: f32| {
+    let mut place = |k: usize, left: f32| {
         let item = at(k);
         moves[row[k]] = [left - item.bounds.min[0], y - item.center_y];
     };
@@ -146,12 +151,12 @@ fn arrange_row(items: &[LineItem], mut row: Vec<usize>, moves: &mut [[f32; 2]]) 
     let mut right = at(first).bounds.min[0];
     for k in (0..first).rev() {
         right -= gap + at(k).bounds.width();
-        place(k, right, at(first).center_y);
+        place(k, right);
     }
     // After the last arrow: left to right from it.
     let mut left = at(last).bounds.max[0];
     for k in last + 1..row.len() {
-        place(k, left + gap, at(last).center_y);
+        place(k, left + gap);
         left += gap + at(k).bounds.width();
     }
     // Between two arrows: the room they leave, shared out in equal gaps.
@@ -163,10 +168,12 @@ fn arrange_row(items: &[LineItem], mut row: Vec<usize>, moves: &mut [[f32; 2]]) 
         let room = at(b).bounds.min[0] - at(a).bounds.max[0];
         let widths: f32 = (a + 1..b).map(|k| at(k).bounds.width()).sum();
         let gap = (room - widths) / (b - a) as f32;
-        let y = (at(a).center_y + at(b).center_y) * 0.5;
+        if gap < 0.0 {
+            continue; // Too crowded: left as it is.
+        }
         let mut left = at(a).bounds.max[0];
         for k in a + 1..b {
-            place(k, left + gap, y);
+            place(k, left + gap);
             left += gap + at(k).bounds.width();
         }
     }
@@ -236,6 +243,12 @@ enum Role {
 }
 
 impl Molecule {
+    /// Whether the page has an arrow (of some length) for
+    /// [`cleanup_reaction_scheme`](Self::cleanup_reaction_scheme) to line things up on.
+    pub fn has_reaction_arrow(&self) -> bool {
+        self.objects.iter().any(|o| o.as_arrow().and_then(arrow_frame).is_some())
+    }
+
     /// Clean up the reaction scheme on the page: keep every arrow where it is, redraw each
     /// structure with the 2-D cleanup, and line up and space everything else along the arrows
     /// (see the [module docs](self) and [`arrange_reaction`]). `measure` gives the drawing's
@@ -511,6 +524,47 @@ mod tests {
         assert_all_close(&[after[1].bounds.min[0] - after[0].bounds.max[0]], 2.0, "first line's own gap");
         let second: Vec<LineItem> = vec![after[2], after[3], after[4]];
         assert_all_close(&gaps(&second), 2.0, "second line's gaps (2, 2)");
+    }
+
+    /// Arrows at different heights, even close ones, are separate lines: an item between them
+    /// goes on one arrow's shaft, never halfway between the two.
+    #[test]
+    fn arrows_at_different_heights_are_separate_lines() {
+        let items = [
+            item(0.0, 3.0, 0.0, 0.4, true),
+            item(4.0, 6.0, 0.6, 2.0, false),
+            item(8.0, 11.0, 1.0, 0.4, true),
+            item(12.0, 14.0, 0.4, 2.0, false),
+        ];
+        let after = moved(&items, &arrange_reaction(&items));
+        for it in &after {
+            let on_a_shaft = [0.0, 1.0].iter().any(|y| (it.center_y - y).abs() < EPS);
+            assert!(on_a_shaft, "every item on one arrow's shaft: {after:?}");
+        }
+        assert!((after[1].center_y - 1.0).abs() < EPS, "the nearer line: {after:?}");
+        assert!(after[3].center_y.abs() < EPS, "the nearer line: {after:?}");
+    }
+
+    /// A room between two arrows too narrow for what is in it is left as drawn: nothing is put
+    /// over an arrow or past it, and the order stays.
+    #[test]
+    fn a_crowded_room_between_arrows_is_left_alone() {
+        let items = [
+            item(1.0, 3.0, 0.0, 0.4, true),    // arrow, centre 2
+            item(5.5, 6.5, 0.5, 0.6, false),   // centre 6
+            item(0.1, 12.1, -2.0, 2.0, false), // centre 6.1, wider than the room
+            item(6.0, 8.0, 0.0, 0.4, true),    // arrow, centre 7
+            item(10.0, 12.0, 1.0, 2.0, false), // after the last arrow: still laid out
+        ];
+        let moves = arrange_reaction(&items);
+        let after = moved(&items, &moves);
+        let x = |it: &LineItem| it.bounds.center()[0];
+        assert!(x(&after[1]) < x(&after[2]), "order kept: {after:?}");
+        for it in &after[1..3] {
+            assert!(x(it) > 2.0 && x(it) < 7.0, "not across a fixed arrow: {after:?}");
+        }
+        assert_eq!((moves[1], moves[2]), ([0.0; 2], [0.0; 2]), "left as drawn");
+        assert!(after[4].center_y.abs() < EPS, "the rest of the line is still tidied");
     }
 
     #[test]
