@@ -9,7 +9,10 @@
 //!
 //! 1. most principal characteristic groups (or the free valence) on the parent;
 //! 2. a ring rather than a chain (P-44.1.2.2, 2013 rule: rings are always senior);
-//! 3. for chains: the most skeletal atoms, then the most multiple bonds, then double bonds;
+//! 3. for rings: the most ring atoms, then the most multiple bonds (P-44.2.1, P-44.4.1.1) —
+//!    benzene before cyclohexene before cyclohexane — a ring assembly of identical rings
+//!    (biphenyl) being one parent; for chains: the most skeletal atoms, then the most
+//!    multiple bonds, then double bonds;
 //! 4. lowest locants for the principal groups / free valence;
 //! 5. lowest locants for all multiple bonds together, then for double bonds;
 //! 6. most substituent prefixes, then lowest locants for them all together;
@@ -20,7 +23,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use super::graph::{Class, El, Graph, Perceived, Unsupported};
+use super::graph::{Class, El, Graph, Perceived, RingParent, Unsupported};
 use super::words::{alpha_key, enclose, multiplier, multiplier_complex, starts_with_vowel, stem};
 
 /// A named unit: the molecule's name, or a substituent prefix ("2-chloroethyl").
@@ -61,6 +64,27 @@ impl Prefix {
     }
 }
 
+/// Skeletal locants are stored as `number * PRIMES + primes`, so that they sort the way IUPAC
+/// compares them: 1 < 1' < 1'' < 2 (P-31.1.4). Only ring assemblies have primed locants.
+const PRIMES: u32 = 16;
+
+/// The locant `n` (unprimed).
+fn loc(n: usize) -> u32 {
+    n as u32 * PRIMES
+}
+
+/// A locant as written: "4", "4'", "1''".
+fn loc_text(l: u32) -> String {
+    format!("{}{}", l / PRIMES, "'".repeat((l % PRIMES) as usize))
+}
+
+fn loc_list(locs: &[u32]) -> String {
+    locs.iter()
+        .map(|&l| loc_text(l))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// A locant: the nitrogen of an amine or amide, or a numbered skeletal atom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Loc {
@@ -72,9 +96,34 @@ impl std::fmt::Display for Loc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Loc::N => write!(f, "N"),
-            Loc::C(n) => write!(f, "{n}"),
+            Loc::C(n) => write!(f, "{}", loc_text(*n)),
         }
     }
+}
+
+/// The kind of a candidate parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Chain,
+    Ring {
+        benzene: bool,
+    },
+    /// A ring assembly of `rings` identical rings joined by single bonds.
+    Assembly {
+        rings: usize,
+        benzene: bool,
+    },
+}
+
+/// One numbering of a candidate parent.
+struct Numbering {
+    /// Its atoms, in the order of their locants.
+    atoms: Vec<usize>,
+    /// The locant of each atom.
+    locs: Vec<u32>,
+    shape: Shape,
+    /// For an assembly: the locants of each ring-to-ring bond.
+    joins: Vec<(u32, u32)>,
 }
 
 /// What the unit being named is.
@@ -124,7 +173,8 @@ type Key = (
 /// One numbered candidate parent, evaluated.
 struct Eval {
     atoms: Vec<usize>,
-    ring: bool,
+    shape: Shape,
+    joins: Vec<(u32, u32)>,
     suffix: Vec<u32>,
     mults: Vec<(u32, u8)>,
     prefixes: Vec<(Loc, usize, usize)>,
@@ -282,35 +332,57 @@ impl<'a> Namer<'a> {
     fn unit(&self, mode: Mode, region: &[bool]) -> Result<Prefix, Unsupported> {
         let p = self.p;
         let pgs = self.principal_groups(mode, region);
-        let ring = p.ring.as_ref().filter(|r| r.iter().all(|&a| region[a]));
+        // A substituent whose free valence is on a ring is named from that ring (or assembly).
+        let rings: Vec<&RingParent> = match mode {
+            Mode::FreeValence { atom, .. } => p
+                .parents
+                .iter()
+                .filter(|r| r.atoms.contains(&atom))
+                .collect(),
+            _ => p
+                .parents
+                .iter()
+                .filter(|r| r.atoms.iter().all(|&a| region[a]))
+                .collect(),
+        };
         let chains = match mode {
             Mode::FreeValence { atom, .. } if p.in_ring[atom] => vec![],
             _ => self.chains(mode, region),
         };
         let chain_max = chains.iter().map(|c| self.counts(&pgs, c, false)).max();
-        let ring_count = ring.map(|r| self.counts(&pgs, r, true));
+        let ring_max = rings
+            .iter()
+            .map(|r| self.counts(&pgs, &r.atoms, true))
+            .max();
         let pick_ring = match mode {
             Mode::FreeValence { atom, .. } => p.in_ring[atom],
-            _ => match (ring_count, chain_max) {
+            _ => match (ring_max, chain_max) {
                 (Some(rc), Some(cm)) => rc >= cm,
                 (Some(_), None) => true,
                 _ => false,
             },
         };
-        let numberings: Vec<(Vec<usize>, bool)> = if pick_ring {
-            let r = ring.ok_or("internal error: ring parent outside the region")?;
-            let n = r.len();
-            (0..n)
-                .flat_map(|s| {
-                    [1, n - 1].map(|step| ((0..n).map(|k| r[(s + k * step) % n]).collect(), true))
-                })
+        let numberings: Vec<Numbering> = if pick_ring {
+            let best = ring_max.ok_or("internal error: ring parent outside the region")?;
+            let rings: Vec<&RingParent> = rings
+                .into_iter()
+                .filter(|r| self.counts(&pgs, &r.atoms, true) == best)
+                .collect();
+            self.senior_rings(rings)?
+                .into_iter()
+                .flat_map(|r| self.ring_numberings(r))
                 .collect()
         } else {
             let best = chain_max.ok_or("internal error: no parent chain")?;
             chains
                 .into_iter()
                 .filter(|c| self.counts(&pgs, c, false) == best)
-                .map(|c| (c, false))
+                .map(|atoms| Numbering {
+                    locs: (1..=atoms.len()).map(loc).collect(),
+                    atoms,
+                    shape: Shape::Chain,
+                    joins: vec![],
+                })
                 .collect()
         };
         if mode == Mode::Molecule
@@ -323,7 +395,7 @@ impl<'a> Namer<'a> {
 
         let evals: Vec<Eval> = numberings
             .into_iter()
-            .map(|(atoms, ring)| self.evaluate(atoms, ring, &pgs, region))
+            .map(|num| self.evaluate(num, &pgs, region))
             .collect();
         let best = evals
             .iter()
@@ -372,11 +444,142 @@ impl<'a> Namer<'a> {
         }
     }
 
-    fn evaluate(&self, atoms: Vec<usize>, ring: bool, pgs: &[Pg], region: &[bool]) -> Eval {
+    /// The senior of ring parents that tie on principal groups: the most ring atoms, then the
+    /// most multiple bonds (`Ring::rank`), then the most rings. Whether an assembly of junior
+    /// rings beats a senior single ring is not decided (that is refused).
+    fn senior_rings<'r>(
+        &self,
+        rings: Vec<&'r RingParent>,
+    ) -> Result<Vec<&'r RingParent>, Unsupported> {
+        let rank = |r: &RingParent| self.p.rings[r.rings[0]].rank;
+        let top = rings.iter().map(|r| rank(r)).max();
+        let most = rings
+            .iter()
+            .filter(|r| Some(rank(r)) == top)
+            .map(|r| r.rings.len())
+            .max();
+        if rings.iter().any(|r| Some(r.rings.len()) > most) {
+            return Err(
+                "seniority of a ring assembly against a larger or less saturated ring".into(),
+            );
+        }
+        Ok(rings
+            .into_iter()
+            .filter(|r| Some(rank(r)) == top && Some(r.rings.len()) == most)
+            .collect())
+    }
+
+    /// Every numbering of a ring parent. A ring is numbered from any atom in either
+    /// direction. An assembly (P-28.3) is numbered ring by ring from one end, the rings getting
+    /// unprimed, primed, double-primed … locants; each ring is numbered from its bond to the
+    /// previous ring (the first ring: to the next one), and an inner ring in the direction
+    /// that gives its bond to the next ring the lower locant.
+    fn ring_numberings(&self, rp: &RingParent) -> Vec<Numbering> {
+        let rings = &self.p.rings;
+        let walks = |ring: usize, start: usize| -> Vec<Vec<usize>> {
+            let r = &rings[ring].atoms;
+            let n = r.len();
+            let s = r
+                .iter()
+                .position(|&a| a == start)
+                .expect("atom of the ring");
+            [1, n - 1]
+                .map(|step| (0..n).map(|k| r[(s + k * step) % n]).collect())
+                .into()
+        };
+        let first = &rings[rp.rings[0]];
+        if rp.rings.len() == 1 {
+            let shape = Shape::Ring {
+                benzene: first.benzene,
+            };
+            return first
+                .atoms
+                .iter()
+                .flat_map(|&s| walks(rp.rings[0], s))
+                .map(|atoms| Numbering {
+                    locs: (1..=atoms.len()).map(loc).collect(),
+                    atoms,
+                    shape,
+                    joins: vec![],
+                })
+                .collect();
+        }
+        let shape = Shape::Assembly {
+            rings: rp.rings.len(),
+            benzene: first.benzene,
+        };
+        let mut out = Vec::new();
+        for reverse in [false, true] {
+            let (order, joins): (Vec<usize>, Vec<(usize, usize)>) = if reverse {
+                (
+                    rp.rings.iter().rev().copied().collect(),
+                    rp.joins.iter().rev().map(|&(a, b)| (b, a)).collect(),
+                )
+            } else {
+                (rp.rings.clone(), rp.joins.clone())
+            };
+            let k = order.len();
+            // The ways of numbering each ring, given where its numbering starts.
+            let options: Vec<Vec<Vec<usize>>> = (0..k)
+                .map(|i| {
+                    let start = if i == 0 { joins[0].0 } else { joins[i - 1].1 };
+                    let mut w = walks(order[i], start);
+                    if i > 0 && i + 1 < k {
+                        let exit = |walk: &Vec<usize>| walk.iter().position(|&a| a == joins[i].0);
+                        let lowest = w.iter().map(exit).min().flatten();
+                        w.retain(|walk| exit(walk) == lowest);
+                    }
+                    w
+                })
+                .collect();
+            let mut partial: Vec<Vec<&Vec<usize>>> = vec![vec![]];
+            for opts in &options {
+                partial = partial
+                    .into_iter()
+                    .flat_map(|p| {
+                        opts.iter().map(move |o| {
+                            let mut p = p.clone();
+                            p.push(o);
+                            p
+                        })
+                    })
+                    .collect();
+            }
+            for choice in partial {
+                let mut atoms = Vec::new();
+                let mut locs = Vec::new();
+                let mut pos = HashMap::new();
+                for (primes, walk) in choice.into_iter().enumerate() {
+                    for (i, &a) in walk.iter().enumerate() {
+                        let l = loc(i + 1) + primes as u32;
+                        atoms.push(a);
+                        locs.push(l);
+                        pos.insert(a, l);
+                    }
+                }
+                out.push(Numbering {
+                    joins: joins.iter().map(|(a, b)| (pos[a], pos[b])).collect(),
+                    atoms,
+                    locs,
+                    shape,
+                });
+            }
+        }
+        out
+    }
+
+    fn evaluate(&self, num: Numbering, pgs: &[Pg], region: &[bool]) -> Eval {
         let g = self.g;
+        let Numbering {
+            atoms,
+            locs,
+            shape,
+            joins,
+        } = num;
+        let ring = shape != Shape::Chain;
         let mut pos = vec![0u32; g.len()];
-        for (i, &a) in atoms.iter().enumerate() {
-            pos[a] = i as u32 + 1;
+        for (&a, &l) in atoms.iter().zip(&locs) {
+            pos[a] = l;
         }
         let mut skip: HashSet<(usize, usize)> = HashSet::new();
         let mut suffix = Vec::new();
@@ -416,15 +619,14 @@ impl<'a> Namer<'a> {
         suffix.sort_unstable();
 
         let mut mults = Vec::new();
-        let benzene = ring && self.p.benzene;
-        if !benzene {
+        // Benzene rings have no "ene" endings; an assembly's rings are benzene or saturated.
+        if matches!(shape, Shape::Chain | Shape::Ring { benzene: false }) {
             let n = atoms.len();
             let bonds = if ring { n } else { n.saturating_sub(1) };
             for i in 0..bonds {
                 let o = g.order(atoms[i], atoms[(i + 1) % n]);
                 if o > 1 {
-                    let loc = if i + 1 == n { n as u32 } else { i as u32 + 1 };
-                    mults.push((loc, o));
+                    mults.push((if i + 1 == n { loc(n) } else { locs[i] }, o));
                 }
             }
             mults.sort_unstable();
@@ -463,7 +665,8 @@ impl<'a> Namer<'a> {
         );
         Eval {
             atoms,
-            ring,
+            shape,
+            joins,
             suffix,
             mults,
             prefixes,
@@ -501,10 +704,26 @@ impl<'a> Namer<'a> {
             named.push((loc, self.sub(q, from)?));
         }
         let groups = group_prefixes(named);
+        if let Shape::Assembly { rings, benzene } = e.shape {
+            let (mut text, depth, order) = assembly_name(e, rings, benzene, suffix, &groups)?;
+            if mode == Mode::Molecule {
+                text = self.with_ester(e, region, text)?;
+            }
+            return Ok((
+                order,
+                Prefix {
+                    text,
+                    compound: !groups.is_empty(),
+                    depth,
+                    oxy: false,
+                },
+            ));
+        }
 
         let len = e.atoms.len();
-        let chain = !e.ring;
-        let benzene = e.ring && self.p.benzene;
+        let chain = e.shape == Shape::Chain;
+        let ring = !chain;
+        let benzene = e.shape == Shape::Ring { benzene: true };
         let nsuf = e.suffix.len();
         let n_c_prefix = e.prefixes.iter().filter(|(l, _, _)| *l != Loc::N).count();
         let n_feat = nsuf + n_c_prefix;
@@ -520,15 +739,16 @@ impl<'a> Namer<'a> {
         let omit_c = (chain && len == 1)
             || retained_two
             || (chain && len == 2 && n_feat <= 1)
-            || (e.ring && !benzene && n_feat + e.mults.len() <= 1)
+            || (ring && !benzene && n_feat + e.mults.len() <= 1)
             || (benzene && n_feat <= 1);
-        let contracted = matches!(suffix, Suffix::Yl(_)) && e.suffix == [1] && e.mults.is_empty();
+        let contracted =
+            matches!(suffix, Suffix::Yl(_)) && e.suffix == [loc(1)] && e.mults.is_empty();
         let cite_suffix = !omit_c && !(chain && terminal) && !contracted && !(benzene && nsuf == 1);
-        let cite_unsat = !(chain && len <= 2) && !(e.ring && n_feat + e.mults.len() <= 1);
+        let cite_unsat = !(chain && len <= 2) && !(ring && n_feat + e.mults.len() <= 1);
 
         let core = self.core(
             len,
-            e.ring,
+            ring,
             benzene,
             &e.mults,
             suffix,
@@ -552,13 +772,7 @@ impl<'a> Namer<'a> {
             {
                 text = t;
             }
-            if let Some((r, o)) = e.rprime
-                && self.p.principal == Some(Class::Ester)
-                && region[r]
-            {
-                let alkyl = self.sub(r, o)?;
-                text = format!("{} {text}", alkyl.text);
-            }
+            text = self.with_ester(e, region, text)?;
         } else if text == "2-methylpropan-2-yl" {
             text = "tert-butyl".into();
             compound = false;
@@ -578,6 +792,16 @@ impl<'a> Namer<'a> {
         ))
     }
 
+    /// An ester's name: the alkyl group of its O, then the "-oate" name `text`.
+    fn with_ester(&self, e: &Eval, region: &[bool], text: String) -> Result<String, Unsupported> {
+        Ok(match e.rprime {
+            Some((r, o)) if self.p.principal == Some(Class::Ester) && region[r] => {
+                format!("{} {text}", self.sub(r, o)?.text)
+            }
+            _ => text,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn core(
         &self,
@@ -592,12 +816,7 @@ impl<'a> Namer<'a> {
         contracted: bool,
     ) -> Result<String, Unsupported> {
         let count = locs.len();
-        let loc_list = || {
-            locs.iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
+        let loc_list = || loc_list(locs);
         if benzene {
             return Ok(match (suffix, count) {
                 (Suffix::None, _) => "benzene".into(),
@@ -880,6 +1099,63 @@ fn retained_benzene(groups: &[(Prefix, Vec<Loc>)]) -> Option<String> {
     }
 }
 
+/// The name of a ring assembly parent (P-28.2): "1,1'-biphenyl", "1,1':4',1''-terphenyl",
+/// "1,1'-bi(cyclohexane)", with its prefixes and its suffix or free valence:
+/// "4,4'-dichloro-1,1'-biphenyl", "[1,1'-biphenyl]-4-carboxylic acid", "[1,1'-biphenyl]-4-yl".
+/// The brackets around the assembly do not count as enclosing marks of the prefix
+/// ("([1,1'-biphenyl]-4-yl)", P-16.5.4).
+fn assembly_name(
+    e: &Eval,
+    rings: usize,
+    benzene: bool,
+    suffix: Suffix,
+    groups: &[(Prefix, Vec<Loc>)],
+) -> Result<(String, usize, Vec<Loc>), Unsupported> {
+    const MULT: [&str; 9] = [
+        "bi", "ter", "quater", "quinque", "sexi", "septi", "octi", "novi", "deci",
+    ];
+    let joins = e
+        .joins
+        .iter()
+        .map(|&(a, b)| format!("{},{}", loc_text(a), loc_text(b)))
+        .collect::<Vec<_>>()
+        .join(":");
+    let mult = MULT
+        .get(rings.wrapping_sub(2))
+        .ok_or("internal error: ring assembly size")?;
+    let ring = if benzene {
+        "phenyl".to_string()
+    } else {
+        let size = e.atoms.len() / rings;
+        format!(
+            "(cyclo{}ane)",
+            stem(size).ok_or("ring larger than 99 atoms")?
+        )
+    };
+    let hydride = format!("{joins}-{mult}{ring}");
+    let (prefixes, depth, order) = compose(groups, false);
+    let locs = loc_list(&e.suffix);
+    let text = match suffix {
+        Suffix::None if prefixes.is_empty() => hydride,
+        Suffix::None => format!("{prefixes}-{hydride}"),
+        // "[1,1'-bi(cyclohexan)]-4-ol"? The elision and enclosing marks are not settled here.
+        _ if !benzene => {
+            return Err(
+                "suffix or free valence on a ring assembly of rings other than benzene".into(),
+            );
+        }
+        Suffix::Class(Class::Ketone) | Suffix::Yl(2..) => {
+            return Err("internal error: ketone or ylidene on benzene".into());
+        }
+        Suffix::Class(_) | Suffix::Acyl => format!(
+            "{prefixes}[{hydride}]-{locs}-{}",
+            multiplied(e.suffix.len(), suffix_word(suffix, true))
+        ),
+        Suffix::Yl(_) => format!("{prefixes}[{hydride}]-{locs}-yl"),
+    };
+    Ok((text, depth, order))
+}
+
 /// The hydride name with its unsaturation: "butane", "but-2-ene", "buta-1,3-diene",
 /// "but-1-en-3-yne", "cyclohexene".
 fn unsaturation(base: &str, mults: &[(u32, u8)], cite: bool) -> String {
@@ -888,7 +1164,7 @@ fn unsaturation(base: &str, mults: &[(u32, u8)], cite: bool) -> String {
     if enes.is_empty() && ynes.is_empty() {
         return format!("{base}ane");
     }
-    let join = |l: &[u32]| l.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let join = loc_list;
     let mut s = base.to_string();
     if enes.len() > 1 || (enes.is_empty() && ynes.len() > 1) {
         s.push('a');

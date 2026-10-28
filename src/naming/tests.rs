@@ -458,8 +458,6 @@ fn table_of_names() {
 const UNSUPPORTED: &[(&str, &str)] = &[
     ("C1CCC2CCCCC2C1", "more than one ring"),
     ("C1=CC=C2C=CC=CC2=C1", "more than one ring"),
-    ("C1CC1C1CC1", "more than one ring"),
-    ("C1=CC=C(C=C1)C1=CC=CC=C1", "more than one ring"),
     ("C1CCOC1", "heterocycle"),
     ("C1=CC=NC=C1", "heterocycle"),
     ("CS", "element S"),
@@ -610,6 +608,169 @@ fn large_branched_structure() {
     let smiles = format!("C{}", "C(C)".repeat(40));
     let started = std::time::Instant::now();
     let name = name_of(&smiles);
-    assert!(name.name().is_some_and(|n| n.ends_with("dotetracontane")), "{name:?}");
-    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+    assert!(
+        name.name().is_some_and(|n| n.ends_with("dotetracontane")),
+        "{name:?}"
+    );
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Ring assemblies (P-28) and rings as substituents of rings (P-44.2, P-44.4.1.1).
+#[test]
+fn ring_assemblies_and_rings_on_rings() {
+    let cases = [
+        ("C1=CC=C(C=C1)C1=CC=CC=C1", "1,1'-biphenyl"),
+        ("CC1=CC=C(C=C1)C1=CC=CC=C1", "4-methyl-1,1'-biphenyl"),
+        ("CC1=CC(=CC=C1)C1=CC=CC=C1", "3-methyl-1,1'-biphenyl"),
+        (
+            "ClC1=CC=C(C=C1)C1=CC=C(Cl)C=C1",
+            "4,4'-dichloro-1,1'-biphenyl",
+        ),
+        (
+            "ClC1=CC=CC=C1C1=CC=C(Cl)C=C1",
+            "2,4'-dichloro-1,1'-biphenyl",
+        ),
+        ("CC1=CC=CC=C1C1=CC=CC=C1C", "2,2'-dimethyl-1,1'-biphenyl"),
+        (
+            "CC1=CC=C(C=C1)C1=CC=C(Cl)C=C1",
+            "4-chloro-4'-methyl-1,1'-biphenyl",
+        ),
+        (
+            "ClC1=C(Cl)C(Cl)=C(C(Cl)=C1Cl)C1=C(Cl)C(Cl)=C(Cl)C(Cl)=C1Cl",
+            "2,2',3,3',4,4',5,5',6,6'-decachloro-1,1'-biphenyl",
+        ),
+        (
+            "C1=CC=C(C=C1)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "1,1':4',1''-terphenyl",
+        ),
+        (
+            "C1=CC=C(C=C1)C1=CC(=CC=C1)C1=CC=CC=C1",
+            "1,1':3',1''-terphenyl",
+        ),
+        (
+            "C1=CC=C(C=C1)C1=CC=CC=C1C1=CC=CC=C1",
+            "1,1':2',1''-terphenyl",
+        ),
+        (
+            "C1=CC=C(C=C1)C1=CC=C(C=C1)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "1,1':4',1'':4'',1'''-quaterphenyl",
+        ),
+        (
+            "CC1=CC=C(C=C1)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "4-methyl-1,1':4',1''-terphenyl",
+        ),
+        ("C1CCC(CC1)C1CCCCC1", "1,1'-bi(cyclohexane)"),
+        ("C1CC1C1CC1", "1,1'-bi(cyclopropane)"),
+        ("CC1CCC(CC1)C1CCCCC1", "4-methyl-1,1'-bi(cyclohexane)"),
+        (
+            "OC(=O)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "[1,1'-biphenyl]-4-carboxylic acid",
+        ),
+        ("OC1=CC=C(C=C1)C1=CC=CC=C1", "[1,1'-biphenyl]-4-ol"),
+        ("OC1=CC=C(C=C1)C1=CC=C(O)C=C1", "[1,1'-biphenyl]-4,4'-diol"),
+        ("NC1=CC=C(C=C1)C1=CC=CC=C1", "[1,1'-biphenyl]-4-amine"),
+        (
+            "CNC1=CC=C(C=C1)C1=CC=CC=C1",
+            "N-methyl[1,1'-biphenyl]-4-amine",
+        ),
+        (
+            "COC(=O)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "methyl [1,1'-biphenyl]-4-carboxylate",
+        ),
+        (
+            "CC1=CC=C(C=C1)C1=CC=C(C=C1)C(O)=O",
+            "4'-methyl[1,1'-biphenyl]-4-carboxylic acid",
+        ),
+        (
+            "CC(C(O)=O)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "2-([1,1'-biphenyl]-4-yl)propanoic acid",
+        ),
+        (
+            "CC(=O)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "1-([1,1'-biphenyl]-4-yl)ethan-1-one",
+        ),
+        ("O=C(C1=CC=CC=C1)C1=CC=CC=C1", "diphenylmethanone"),
+        (
+            "OCC1=CC=C(C=C1)C1=CC=CC=C1",
+            "([1,1'-biphenyl]-4-yl)methanol",
+        ),
+        ("C1CCC(CC1)C1=CC=CC=C1", "cyclohexylbenzene"),
+        ("C1CCC(C1)C1=CC=CC=C1", "cyclopentylbenzene"),
+        ("C1CCCC(CC1)C1=CC=CC=C1", "phenylcycloheptane"),
+        ("C1CCC(CC1)C1CCCCCC1", "cyclohexylcycloheptane"),
+        ("C1CC1C1CCCCC1", "cyclopropylcyclohexane"),
+        ("C1CCC(CC1)=C1CCCCC1", "cyclohexylidenecyclohexane"),
+        // The larger ring is senior, whatever its unsaturation.
+        ("C1CCC(CC1)C1=CCCC1", "(cyclopent-1-en-1-yl)cyclohexane"),
+        ("OC(=O)C1=CC=C(C=C1)C1CCCCC1", "4-cyclohexylbenzoic acid"),
+        ("OC1CCC(CC1)C1=CC=CC=C1", "4-phenylcyclohexan-1-ol"),
+        ("C(C1=CC=CC=C1)C1=CC=CC=C1", "benzylbenzene"),
+        ("O(C1=CC=CC=C1)C1=CC=CC=C1", "phenoxybenzene"),
+        (
+            "C1=CC=C(C=C1)C1CCCCC1C1=CC=CC=C1",
+            "(2-phenylcyclohexyl)benzene",
+        ),
+        (
+            "OC(=O)CCC1=CC=C(C=C1)C1=CC=CC=C1",
+            "3-([1,1'-biphenyl]-4-yl)propanoic acid",
+        ),
+        (
+            "C1=CC=C(C=C1)C1=CC=C(C=C1)OC1=CC=CC=C1",
+            "4-phenoxy-1,1'-biphenyl",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (smiles, expected) in cases {
+        let got = name_of(smiles);
+        if got != NameResult::Ok(expected.into()) {
+            failures.push(format!("{smiles}: expected {expected:?}, got {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Ring combinations outside the supported classes are refused with a reason.
+#[test]
+fn unsupported_ring_combinations_say_why() {
+    let cases = [
+        // Suffixes on an assembly of rings other than benzene.
+        (
+            "OC1CCC(CC1)C1CCCCC1",
+            "ring assembly of rings other than benzene",
+        ),
+        // 1,3,5-triphenylbenzene.
+        (
+            "C1=CC=C(C=C1)C1=CC(=CC(=C1)C1=CC=CC=C1)C1=CC=CC=C1",
+            "branched ring assembly",
+        ),
+        // Cyclohexenylbenzene: a hydrogenated biphenyl, or substitutive?
+        ("C1CCC(=CC1)C1=CC=CC=C1", "partly unsaturated"),
+        ("C1CCC(CC1)C1=CCCCC1", "partly unsaturated"),
+        // Biphenyl against a larger ring.
+        (
+            "C1CCCC(CC1)C1=CC=C(C=C1)C1=CC=CC=C1",
+            "seniority of a ring assembly",
+        ),
+        // Bi(cyclohexane) against benzene.
+        (
+            "C1CCC(CC1)C1CCCCC1C1=CC=CC=C1",
+            "seniority of a ring assembly",
+        ),
+        ("C1=CC=NC(=C1)C1=CC=CC=N1", "heterocycle"),
+        ("C1=CC=C(N=C1)C1=CC=CC=C1", "heterocycle"),
+        ("C1CCC2(CC1)CCCC2", "more than one ring"),
+    ];
+    for (smiles, reason) in cases {
+        match name_of(smiles) {
+            NameResult::Unsupported(r) => assert!(
+                r.contains(reason),
+                "{smiles}: reason {r:?} lacks {reason:?}"
+            ),
+            other => panic!("{smiles}: expected unsupported ({reason}), got {other:?}"),
+        }
+    }
 }

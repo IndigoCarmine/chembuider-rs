@@ -120,14 +120,40 @@ pub(crate) struct Perceived {
     pub amine: Vec<bool>,
     /// Nitro nitrogens.
     pub nitro: Vec<bool>,
-    /// The ring's atoms in cyclic order, when there is a ring.
-    pub ring: Option<Vec<usize>>,
+    /// The rings, each a monocycle; no two share an atom.
+    pub rings: Vec<Ring>,
+    /// The ring parents the structure may be named from: every ring on its own, except that
+    /// identical rings joined by single bonds form one ring assembly (P-28).
+    pub parents: Vec<RingParent>,
     pub in_ring: Vec<bool>,
-    /// The ring is a benzene ring (six carbons, alternating double bonds).
-    pub benzene: bool,
     /// The most senior class present.
     pub principal: Option<Class>,
 }
+
+/// A monocycle of a structure.
+pub(crate) struct Ring {
+    /// Its atoms in cyclic order.
+    pub atoms: Vec<usize>,
+    /// A benzene ring (six carbons, alternating double bonds).
+    pub benzene: bool,
+    /// Its seniority as a parent (P-44.2.1, P-44.4.1.1): more ring atoms, then more multiple
+    /// bonds (benzene counts three), then more double bonds.
+    pub rank: (usize, usize, usize),
+}
+
+/// A ring parent: one ring, or an unbranched assembly of identical rings joined by single
+/// bonds (1,1'-biphenyl, 1,1'-bi(cyclohexane), 1,1':4',1''-terphenyl).
+pub(crate) struct RingParent {
+    /// Indices into [`Perceived::rings`], from one end of the assembly to the other.
+    pub rings: Vec<usize>,
+    /// The bond from each ring to the next: (atom in `rings[i]`, atom in `rings[i + 1]`).
+    pub joins: Vec<(usize, usize)>,
+    /// All its atoms.
+    pub atoms: Vec<usize>,
+}
+
+/// The most rings an assembly may have: its multiplying prefixes run from "bi" to "deci".
+pub(crate) const MAX_ASSEMBLY: usize = 10;
 
 /// A reason a structure cannot be named.
 pub(crate) type Unsupported = String;
@@ -337,34 +363,44 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
     Ok(Graph { el, charge, h, adj })
 }
 
-/// Find the ring and the characteristic groups, rejecting anything outside the supported
+/// Find the rings and the characteristic groups, rejecting anything outside the supported
 /// classes.
 pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     let n = g.len();
     if !g.el.contains(&El::C) {
         return Err("no carbon atom".into());
     }
-    let edges: usize = g.adj.iter().map(Vec::len).sum::<usize>() / 2;
-    // The structure is connected, so this is its number of independent rings.
-    let rings = edges + 1 - n;
-    if rings > 1 {
-        return Err("more than one ring (fused, bridged, spiro or separate rings)".into());
-    }
-    let (ring, in_ring) = if rings == 1 {
-        find_ring(g)
-    } else {
-        (None, vec![false; n])
-    };
-    if let Some(r) = &ring
-        && r.iter().any(|&a| g.el[a] != El::C)
-    {
+    let (cycles, in_ring) = find_rings(g)?;
+    if cycles.iter().flatten().any(|&a| g.el[a] != El::C) {
         return Err("heterocycle".into());
     }
-    let benzene = ring.as_ref().is_some_and(|r| {
-        r.len() == 6
-            && r.iter()
-                .all(|&a| r.iter().filter(|&&b| g.order(a, b) == 2).count() == 1)
-    });
+    let rings: Vec<Ring> = cycles
+        .into_iter()
+        .map(|atoms| {
+            let k = atoms.len();
+            let orders: Vec<u8> = (0..k)
+                .map(|i| g.order(atoms[i], atoms[(i + 1) % k]))
+                .collect();
+            let benzene = k == 6
+                && atoms
+                    .iter()
+                    .all(|&a| atoms.iter().filter(|&&b| g.order(a, b) == 2).count() == 1);
+            let (multiple, double) = if benzene {
+                (3, 3)
+            } else {
+                (
+                    orders.iter().filter(|&&o| o > 1).count(),
+                    orders.iter().filter(|&&o| o == 2).count(),
+                )
+            };
+            Ring {
+                atoms,
+                benzene,
+                rank: (k, multiple, double),
+            }
+        })
+        .collect();
+    let parents = ring_parents(g, &rings)?;
 
     // Nitro groups first: they are the only charged atoms allowed, and their nitrogen may be
     // drawn with five bonds.
@@ -568,48 +604,169 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
         hydroxyl,
         amine,
         nitro,
-        ring,
+        rings,
+        parents,
         in_ring,
-        benzene,
         principal,
     })
 }
 
-/// The single ring of a structure with one independent cycle: prune chain ends until only
-/// the cycle is left, then walk it.
-fn find_ring(g: &Graph) -> (Option<Vec<usize>>, Vec<bool>) {
+const SHARED_RINGS: &str = "more than one ring sharing atoms (fused, bridged or spiro ring system)";
+
+/// The rings of a structure, each in cyclic order, and which atoms are in one. Only separate
+/// monocycles are accepted: a ring system whose rings share atoms (fused, bridged, spiro) is
+/// refused.
+fn find_rings(g: &Graph) -> Result<(Vec<Vec<usize>>, Vec<bool>), Unsupported> {
     let n = g.len();
-    let mut deg: Vec<usize> = (0..n).map(|a| g.adj[a].len()).collect();
-    let mut alive = vec![true; n];
-    let mut stack: Vec<usize> = (0..n).filter(|&a| deg[a] <= 1).collect();
-    while let Some(a) = stack.pop() {
-        if !alive[a] {
+    // Bridges (bonds on no cycle), by an iterative depth-first search with low-links.
+    let mut disc = vec![usize::MAX; n];
+    let mut low = vec![0; n];
+    let mut bridges = std::collections::HashSet::new();
+    let mut time = 0;
+    for root in 0..n {
+        if disc[root] != usize::MAX {
             continue;
         }
-        alive[a] = false;
-        for m in g.nbrs(a) {
-            if alive[m] {
-                deg[m] -= 1;
-                if deg[m] == 1 {
-                    stack.push(m);
+        disc[root] = time;
+        low[root] = time;
+        time += 1;
+        // (atom, the atom it was reached from, index of its next neighbour to visit)
+        let mut stack = vec![(root, usize::MAX, 0)];
+        while let Some(&(v, parent, i)) = stack.last() {
+            if let Some(&(w, _)) = g.adj[v].get(i) {
+                if let Some(top) = stack.last_mut() {
+                    top.2 += 1;
+                }
+                if w == parent {
+                    continue;
+                }
+                if disc[w] == usize::MAX {
+                    disc[w] = time;
+                    low[w] = time;
+                    time += 1;
+                    stack.push((w, v, 0));
+                } else {
+                    low[v] = low[v].min(disc[w]);
+                }
+            } else {
+                stack.pop();
+                if let Some(&(u, _, _)) = stack.last() {
+                    low[u] = low[u].min(low[v]);
+                    if low[v] > disc[u] {
+                        bridges.insert((u.min(v), u.max(v)));
+                    }
                 }
             }
         }
     }
-    let Some(start) = (0..n).find(|&a| alive[a]) else {
-        return (None, vec![false; n]);
+    let ring_nbrs = |a: usize| -> Vec<usize> {
+        g.nbrs(a)
+            .filter(|&b| !bridges.contains(&(a.min(b), a.max(b))))
+            .collect()
     };
-    let mut ring = vec![start];
-    let mut prev = usize::MAX;
-    let mut cur = start;
-    loop {
-        let next = g.nbrs(cur).find(|&m| alive[m] && m != prev).unwrap();
-        if next == start {
-            break;
+    let in_ring: Vec<bool> = (0..n).map(|a| !ring_nbrs(a).is_empty()).collect();
+    let mut seen = vec![false; n];
+    let mut rings = Vec::new();
+    for start in 0..n {
+        if !in_ring[start] || seen[start] {
+            continue;
         }
-        ring.push(next);
-        prev = cur;
-        cur = next;
+        // Walk the ring system: it is a monocycle when every atom of it has two ring bonds.
+        let mut ring = vec![start];
+        seen[start] = true;
+        let (mut prev, mut cur) = (usize::MAX, start);
+        loop {
+            let nb = ring_nbrs(cur);
+            if nb.len() != 2 {
+                return Err(SHARED_RINGS.into());
+            }
+            let next = if nb[0] != prev { nb[0] } else { nb[1] };
+            if next == start {
+                break;
+            }
+            if seen[next] {
+                return Err(SHARED_RINGS.into());
+            }
+            seen[next] = true;
+            ring.push(next);
+            (prev, cur) = (cur, next);
+        }
+        rings.push(ring);
     }
-    (Some(ring), alive)
+    Ok((rings, in_ring))
+}
+
+/// Group the rings into ring parents: identical rings (benzene rings, or saturated rings of
+/// one size) joined by single bonds form a ring assembly (P-28.1), which must be unbranched.
+fn ring_parents(g: &Graph, rings: &[Ring]) -> Result<Vec<RingParent>, Unsupported> {
+    let mut ring_of = vec![usize::MAX; g.len()];
+    for (i, r) in rings.iter().enumerate() {
+        for &a in &r.atoms {
+            ring_of[a] = i;
+        }
+    }
+    let saturated = |r: &Ring| r.rank.1 == 0;
+    // links[i]: (the other ring, the atom in ring i, the atom in the other ring)
+    let mut links: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); rings.len()];
+    for a in 0..g.len() {
+        for &(b, o) in &g.adj[a] {
+            let (i, j) = (ring_of[a], ring_of[b]);
+            if i == usize::MAX || j == usize::MAX || i == j || o != 1 {
+                continue;
+            }
+            let (ri, rj) = (&rings[i], &rings[j]);
+            if ri.atoms.len() != rj.atoms.len() {
+                continue;
+            }
+            if (ri.benzene && rj.benzene) || (saturated(ri) && saturated(rj)) {
+                links[i].push((j, a, b));
+            } else if !(ri.benzene || saturated(ri)) || !(rj.benzene || saturated(rj)) {
+                // A cyclohexene ring on a benzene or cyclohexene ring: whether to name it as a
+                // hydrogenated ring assembly is not decided here.
+                return Err("directly bonded rings of one size, partly unsaturated \
+                     (hydrogenated ring assemblies)"
+                    .into());
+            }
+        }
+    }
+    if links.iter().any(|l| l.len() > 2) {
+        return Err(
+            "branched ring assembly (a ring bonded directly to three identical rings)".into(),
+        );
+    }
+    let mut done = vec![false; rings.len()];
+    let mut parents = Vec::new();
+    for start in 0..rings.len() {
+        // Each assembly is walked from one of its ends (a lone ring is its own end).
+        if done[start] || links[start].len() > 1 {
+            continue;
+        }
+        let mut order = vec![start];
+        let mut joins = Vec::new();
+        done[start] = true;
+        let mut cur = start;
+        while let Some(&(next, a, b)) = links[cur].iter().find(|l| !done[l.0]) {
+            done[next] = true;
+            order.push(next);
+            joins.push((a, b));
+            cur = next;
+        }
+        if order.len() > MAX_ASSEMBLY {
+            return Err(format!("ring assembly of more than {MAX_ASSEMBLY} rings"));
+        }
+        let atoms = order
+            .iter()
+            .flat_map(|&i| rings[i].atoms.iter().copied())
+            .collect();
+        parents.push(RingParent {
+            rings: order,
+            joins,
+            atoms,
+        });
+    }
+    // Directly bonded rings in a cycle close a further ring, which find_rings refuses.
+    if done.contains(&false) {
+        return Err("internal error: ring assembly without an end".into());
+    }
+    Ok(parents)
 }

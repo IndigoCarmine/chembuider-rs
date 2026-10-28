@@ -3,8 +3,15 @@
 //! [`iupac_name`] names every connected structure of a drawing. The namer covers a deliberately
 //! narrow set of classes and refuses everything else with a reason, rather than guess:
 //!
-//! - acyclic hydrocarbons and hydrocarbons with **one** carbocycle (cycloalkanes, cycloalkenes,
-//!   benzene drawn in Kekulé form), with branching, unsaturation and ylidene substituents;
+//! - acyclic hydrocarbons and hydrocarbons with carbocycles (cycloalkanes, cycloalkenes,
+//!   benzene drawn in Kekulé form) that share no atoms, with branching, unsaturation and
+//!   ylidene substituents. Of several rings the senior one is the parent (P-44.2, P-44.4.1.1:
+//!   the larger ring, then the one with more multiple bonds — cyclohexylbenzene,
+//!   phenylcycloheptane), the others are prefixes;
+//! - ring assemblies (P-28) of identical rings joined by single bonds, unbranched: benzene
+//!   rings (1,1'-biphenyl, 1,1':4',1''-terphenyl, [1,1'-biphenyl]-4-carboxylic acid,
+//!   [1,1'-biphenyl]-4-yl) and saturated rings (1,1'-bi(cyclohexane), with prefixes only);
+//!   primed locants are written with ASCII apostrophes;
 //! - the principal characteristic groups, in order of seniority: carboxylic acid > ester >
 //!   amide > nitrile > aldehyde > ketone > alcohol (phenol) > amine, as suffixes; the junior
 //!   ones and any that cannot sit on the parent as prefixes (carboxy, carbamoyl, cyano, formyl,
@@ -12,8 +19,11 @@
 //! - halogens, nitro groups and ethers (alkoxy prefixes) as prefixes; N-substituted amines
 //!   and amides with N locants; esters as "alkyl …oate".
 //!
-//! Not supported (an [`NameResult::Unsupported`] with the reason): more than one ring (fused,
-//! bridged, spiro, ring assemblies, separate rings), heterocycles, elements other than C, H,
+//! Not supported (an [`NameResult::Unsupported`] with the reason): rings sharing atoms (fused,
+//! bridged, spiro), branched ring assemblies, suffixes or free valences on assemblies of
+//! rings other than benzene, directly bonded rings of one size with partial unsaturation
+//! (cyclohexenylbenzene: a hydrogenated biphenyl?), an assembly competing with a larger or
+//! less saturated ring for parent, heterocycles, elements other than C, H,
 //! N, O and the halogens, charged species other than nitro groups, isotopes, and other
 //! functional groups (imines, azo, peroxides, acid halides, anhydrides, carbonates, ureas…).
 //! Stereodescriptors (E/Z, R/S) are not generated: the name describes the constitution only;
@@ -35,8 +45,9 @@
 //! - Enclosing marks follow P-16.5: "4-(propan-2-yl)benzoic acid", "di(propan-2-yl)",
 //!   "bis(2-chloroethyl)", "dichloro(fluoro)methane".
 //! - Multiplicative names (the preferred names of some symmetrical compounds, e.g.
-//!   2,2′-oxydi(ethan-1-ol)) and the retained names of α-amino acids are not produced; the
-//!   substitutive name given instead is a correct, if not preferred, IUPAC name.
+//!   2,2′-oxydi(ethan-1-ol), 1,1'-methylenedibenzene) and the retained names of α-amino acids
+//!   are not produced; the substitutive name given instead ("benzylbenzene",
+//!   "phenoxybenzene") is a correct, if not preferred, IUPAC name.
 
 mod engine;
 mod graph;
