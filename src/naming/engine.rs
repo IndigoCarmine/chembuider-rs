@@ -46,6 +46,9 @@ pub(crate) struct Prefix {
     pub compound: bool,
     /// How deeply the enclosing marks inside `text` nest.
     pub depth: usize,
+    /// The prefix contains the whole name of a parent hydride ("cyclohexanecarbonyl",
+    /// "cyclopropanecarboxamido"), which encloses it even when it is simple (P-16.5.1.4).
+    pub hydride: bool,
     /// Its "-yl" may contract to "-oxy" when an oxygen follows: methyl → methoxy,
     /// 2-chloroethyl → 2-chloroethoxy, phenyl → phenoxy, tert-butyl → tert-butoxy.
     pub oxy: bool,
@@ -57,12 +60,13 @@ impl Prefix {
             text: text.into(),
             compound: false,
             depth: 0,
+            hydride: false,
             oxy: false,
         }
     }
 
     fn needs_enclosure(&self) -> bool {
-        self.compound || self.text.contains(|c: char| c.is_ascii_digit())
+        self.compound || self.hydride || self.text.contains(|c: char| c.is_ascii_digit())
     }
 
     /// The prefix as it is written when cited once, and the depth of its marks.
@@ -998,6 +1002,10 @@ impl<'a> Namer<'a> {
             Mode::Acyl { .. } => Suffix::Acyl,
             Mode::Amido { .. } => Suffix::Class(Class::Amide),
         };
+        // The acyl and acylamino groups of a ring cite its whole name before "carbonyl" or
+        // "carboxamido" (P-16.5.1.4); those of chains ("propanoyl") and the retained "benzoyl"
+        // and "benzamido" do not.
+        let acyl_or_amido = matches!(mode, Mode::Acyl { .. } | Mode::Amido { .. });
         let has_n_prefix = e.prefixes.iter().any(|(l, _, _)| *l == Loc::N);
         if e.suffix.len() > 1
             && has_n_prefix
@@ -1033,6 +1041,7 @@ impl<'a> Namer<'a> {
                     text,
                     compound: !groups.is_empty(),
                     depth,
+                    hydride: acyl_or_amido,
                     oxy: false,
                 },
             ));
@@ -1054,6 +1063,7 @@ impl<'a> Namer<'a> {
                     text,
                     compound: !groups.is_empty(),
                     depth,
+                    hydride: acyl_or_amido,
                     oxy: false,
                 },
             ));
@@ -1144,6 +1154,7 @@ impl<'a> Namer<'a> {
                 text,
                 compound,
                 depth,
+                hydride: acyl_or_amido && ring && !benzene,
                 oxy,
             },
         ))
@@ -1424,6 +1435,7 @@ impl<'a> Namer<'a> {
                                 text: format!("{t}oxy"),
                                 compound: true,
                                 depth: d,
+                                hydride: false,
                                 oxy: false,
                             }
                         })
@@ -1512,6 +1524,7 @@ impl<'a> Namer<'a> {
             text: format!("{text}{word}"),
             compound: !subs.is_empty(),
             depth,
+            hydride: false,
             oxy: false,
         })
     }

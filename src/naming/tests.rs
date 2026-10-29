@@ -1696,7 +1696,7 @@ fn von_baeyer_bicycles() {
             "OC(=O)C1=CC=C(C=C1)C12CCC(CC1)CC2",
             "4-(bicyclo[2.2.2]octan-1-yl)benzoic acid",
         ),
-        // More rings before more ring atoms (P-44.2.1.2.3): the bicycle is the parent.
+        // More rings before more ring atoms (P-44.2.1.5): the bicycle is the parent.
         (
             "C(C1CCCCCCC1)C1CC2CCC1C2",
             "2-(cyclooctylmethyl)bicyclo[2.2.1]heptane",
@@ -1802,6 +1802,45 @@ fn acylamino_prefixes() {
     ]);
 }
 
+/// A prefix that contains the name of a parent hydride is enclosed even when it is simple
+/// (P-16.5.1.4): "4-(cyclohexanecarbonyl)benzene-1-carbothioic acid (PIN)", "3-(methane-
+/// sulfonamido)propanoic acid (PIN)". The acyl and acylamino prefixes of rings end in
+/// "carbonyl" and "carboxamido" after the ring's whole name; those of chains ("acetyl",
+/// "propanamido", "4,4'-butanediamidodibenzoic acid (PIN)") and the retained "benzoyl" and
+/// "benzamido" are not built on a parent hydride name and stay unenclosed.
+#[test]
+fn prefixes_with_a_parent_hydride_name_are_enclosed() {
+    check_names(&[
+        (
+            "OC(=O)C1=CC=C(NC(=O)C2CCCCC2)C=C1",
+            "4-(cyclohexanecarboxamido)benzoic acid",
+        ),
+        (
+            "OC(=O)C1=CC=C(NC(=O)C2CC2)C=C1",
+            "4-(cyclopropanecarboxamido)benzoic acid",
+        ),
+        (
+            "OC(=O)CCNC(=O)C1CCCCC1",
+            "3-(cyclohexanecarboxamido)propanoic acid",
+        ),
+        (
+            "OC(=O)C1=CC=C(C=C1)C(=O)C1CCCCC1",
+            "4-(cyclohexanecarbonyl)benzoic acid",
+        ),
+        // Built on a chain or retained: unenclosed.
+        ("OC(=O)C1=CC=C(C=C1)C(=O)CC", "4-propanoylbenzoic acid"),
+        ("CCC(=O)NCCC(O)=O", "3-propanamidopropanoic acid"),
+        (
+            "OC(=O)C1=CC=C(C=C1)C(=O)C1=CC=CC=C1",
+            "4-benzoylbenzoic acid",
+        ),
+        (
+            "OC(=O)C1=CC=C(NC(=O)C2=CC=CC=C2)C=C1",
+            "4-benzamidobenzoic acid",
+        ),
+    ]);
+}
+
 /// The ring examples of Wikipedia (ja) "IUPAC命名法" (oldid 111380645), structure → preferred
 /// IUPAC name, with the Penicillin G walk-through (constitution only: stereodescriptors are
 /// OPE-23). Where Wikipedia's name is not the 2013 PIN, the PIN is expected and the difference
@@ -1868,5 +1907,26 @@ fn unsupported_ring_systems_say_why() {
         ),
         // A spiro atom other than carbon would be charged (spiro ammonium): refused as such.
         ("C1CC[N+]2(C1)CCCC2", "charged"),
+        // A benzene ring bridged at its 1,4-positions by a chain ([n]paracyclophanes): the
+        // von Baeyer name "bicyclo[10.2.2]hexadeca-1(14),12,15-triene" (P-31.1.4.2) and the
+        // phane name "1(1,4)-benzenacyclotridecaphane" (P-52.2.5.1(1)) compete, and the 2013
+        // recommendations label the phane name the PIN for such analogues.
+        ("C1CCCCCCCC2=CC=C(CC1)C=C2", "paracyclophane"),
+        ("C1CCCCCCCCCC2=CC=C1C=C2", "paracyclophane"),
+        ("C1CCCCCCCCCC2=CC=C1C=C2C", "paracyclophane"),
+    ]);
+}
+
+/// A benzene ring bridged at its 1,3-positions keeps its von Baeyer name, the PIN by
+/// P-52.2.5.2.1: "bicyclo[16.3.1]docosa-1(22),18,20-triene".
+#[test]
+fn meta_bridged_benzene_keeps_its_von_baeyer_name() {
+    check_names(&[
+        (
+            "C1CCCCCCCCCCCCCCCC2=CC=CC1=C2",
+            "bicyclo[16.3.1]docosa-1(22),18,20-triene",
+        ),
+        // Two-atom bridges whose six-membered cycles are not mancude (barrelene): not refused.
+        ("C1=CC2C=CC1C=C2", "bicyclo[2.2.2]octa-2,5,7-triene"),
     ]);
 }

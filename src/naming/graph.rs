@@ -1246,6 +1246,9 @@ fn two_rings(g: &Graph, nb: &[Vec<usize>], system: &[usize]) -> Result<Poly, Uns
     let mut numberings = Vec::new();
     // The cycles of the system, each its atoms in cyclic order, for the Kekulé forms.
     let mut cycles: Vec<Vec<usize>> = Vec::new();
+    // The six-membered cycles of a bicycle made of two bridges of two atoms each: a ring
+    // bridged at its 1,4-positions by the third bridge.
+    let mut para: Vec<Vec<usize>> = Vec::new();
     let descriptor;
     if let Some(&s) = system.iter().find(|&&a| nb[a].len() == 4) {
         // Spiro: each ring, from a neighbour of the spiro atom round to the other.
@@ -1346,13 +1349,40 @@ fn two_rings(g: &Graph, nb: &[Vec<usize>], system: &[usize]) -> Result<Poly, Uns
             c.extend(&bridges[i]);
             c.push(h2);
             c.extend(reversed(&bridges[j]));
+            if bridges[i].len() == 2 && bridges[j].len() == 2 {
+                para.push(c.clone());
+            }
             cycles.push(c);
         }
+    }
+    let forms = kekule_forms(g, nb, system, &cycles);
+    // P-31.1.4.2 gives the von Baeyer name ("bicyclo[10.2.2]hexadeca-1(14),12,15-triene"), but
+    // a mancude six-membered ring bridged at its 1,4-positions is a phane-type structure
+    // (P-52.2.5.1(1)), whose phane name ("1(1,4)-benzenacyclotridecaphane") IUPAC 2013 labels
+    // the PIN; the 1,3-bridged ring keeps the von Baeyer name (P-52.2.5.2.1).
+    let mancude = |c: &[usize]| {
+        forms.iter().any(|f| {
+            (0..c.len())
+                .filter(|&i| {
+                    let (a, b) = (c[i], c[(i + 1) % c.len()]);
+                    f.get(&(a.min(b), a.max(b))) == Some(&2)
+                })
+                .count()
+                == 3
+        })
+    };
+    if para.iter().any(|c| mancude(c.as_slice())) {
+        return Err(
+            "benzene (or another mancude six-membered) ring bridged at its 1,4-positions \
+                    ([n]paracyclophane-type bicycle): its preferred name is a phane name \
+                    (1(1,4)-benzenacyclo…phane, P-52.2.5.1), which is not supported"
+                .into(),
+        );
     }
     Ok(Poly {
         descriptor,
         numberings,
-        forms: kekule_forms(g, nb, system, &cycles),
+        forms,
     })
 }
 

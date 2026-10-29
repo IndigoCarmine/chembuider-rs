@@ -33,7 +33,7 @@
 //!   consecutive, as few as possible, over every Kekulé form of the system ("bicyclo[4.2.0]oct-
 //!   1(6)-ene", "bicyclo[4.1.0]hepta-1,3,5-triene", P-31.1.4.2), and their suffixes, prefixes and
 //!   free valences ("1,7,7-trimethylbicyclo[2.2.1]heptan-2-one", "spiro[4.5]decan-8-yl"). A
-//!   ring system with more rings is senior to one with more ring atoms (P-44.2.1.2.3);
+//!   ring system with more rings is senior to one with more ring atoms (P-44.2.1.5);
 //! - lactones, lactams, cyclic anhydrides and imides as heterocyclic pseudoketones, with the
 //!   seniority of ketones (P-64.3.1, P-64.7.2): "oxepan-2-one", "azepan-2-one",
 //!   "oxolane-2,5-dione", "pyrrolidine-2,5-dione", "4-thia-1-azabicyclo[3.2.0]heptan-7-one";
@@ -65,8 +65,10 @@
 //!
 //! Not supported (an [`NameResult::Unsupported`] with the reason): ring systems of more than
 //! two rings (tricyclo…, dispiro…, adamantane), two ortho-fused rings of five or more members
-//! (they take fusion names: decahydronaphthalene, indole, P-52.2.4.1), assemblies of bicyclic
-//! or spiro systems, the choice of parent between different von Baeyer systems of equal rank,
+//! (they take fusion names: decahydronaphthalene, indole, P-52.2.4.1), a benzene (or other
+//! mancude six-membered) ring bridged at its 1,4-positions ([n]paracyclophanes, whose PIN is a
+//! phane name, P-52.2.5.1; the 1,3-bridged ring keeps its von Baeyer name), assemblies of
+//! bicyclic or spiro systems, the choice of parent between different von Baeyer systems of equal rank,
 //! branched ring assemblies, suffixes or free valences on assemblies of
 //! rings other than benzene, directly bonded rings of one size with partial unsaturation
 //! (cyclohexenylbenzene: a hydrogenated biphenyl?), an assembly competing with a larger or
@@ -111,7 +113,9 @@
 //!   two-carbon parents, monosubstituted rings, terminal chain suffixes, fully substituted
 //!   parents): "propan-2-one", "prop-1-ene", "3-methylcyclohex-1-ene", "2-methylcyclohexan-1-ol".
 //! - Enclosing marks follow P-16.5: "4-(propan-2-yl)benzoic acid", "di(propan-2-yl)",
-//!   "bis(2-chloroethyl)", "dichloro(fluoro)methane".
+//!   "bis(2-chloroethyl)", "dichloro(fluoro)methane"; a prefix containing a parent hydride's
+//!   name is enclosed even when simple (P-16.5.1.4): "4-(cyclohexanecarbonyl)benzoic acid",
+//!   "4-(cyclohexanecarboxamido)benzoic acid", but "4-propanoylbenzoic acid", "4-benzamido…".
 //! - Heterocycles take the 2013 preferred names: Hantzsch–Widman names where the older
 //!   retained names are no longer preferred (oxolane, not tetrahydrofuran; oxane, not
 //!   tetrahydropyran; 1,3-oxazole and 1,2-oxazole, not oxazole and isoxazole; 1,3-thiazole),
