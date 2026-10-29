@@ -458,14 +458,16 @@ catalog! {
         es: "Copiar el nombre", fr: "Copier le nom", de: "Namen kopieren", pt_br: "Copiar o nome",
         ko: "이름 복사", ru: "Копировать название", it: "Copia il nome",
     }
-    /// Under an IUPAC name of a drawing with stereo bonds.
+    /// Under an IUPAC name of a drawing with stereo bonds, when the name leaves some of the
+    /// stereogenic units without a descriptor (the reasons, in English, as its tooltip).
     StereoNotIncluded {
-        ja: "（立体表記は含まれません）", en: "(stereodescriptors not included)",
-        zh_hans: "（不含立体描述符）", zh_hant: "（不含立體描述符）",
-        es: "(sin descriptores estereoquímicos)", fr: "(descripteurs stéréochimiques non inclus)",
-        de: "(ohne Stereodeskriptoren)", pt_br: "(sem descritores estereoquímicos)",
-        ko: "(입체 표기는 포함되지 않음)", ru: "(без стереодескрипторов)",
-        it: "(descrittori stereochimici non inclusi)",
+        ja: "（一部の立体表記は含まれません）", en: "(some stereodescriptors not included)",
+        zh_hans: "（部分立体描述符未包含）", zh_hant: "（部分立體描述符未包含）",
+        es: "(faltan algunos descriptores estereoquímicos)",
+        fr: "(certains descripteurs stéréochimiques non inclus)",
+        de: "(einige Stereodeskriptoren fehlen)", pt_br: "(alguns descritores estereoquímicos não incluídos)",
+        ko: "(일부 입체 표기는 포함되지 않음)", ru: "(указаны не все стереодескрипторы)",
+        it: "(alcuni descrittori stereochimici non inclusi)",
     }
     /// Instead of an IUPAC name the engine cannot make. `{reason}`: why (in English).
     Unsupported {

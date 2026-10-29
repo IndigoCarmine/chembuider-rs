@@ -1,0 +1,404 @@
+//! Stereogenic units of a drawn structure and their CIP descriptors (P-93): R/S for tetrahedral
+//! carbon centres from the wedges and hashes drawn at them, E/Z for C=C double bonds from the
+//! drawn geometry.
+//!
+//! A unit gets a descriptor only when the drawing fixes it; otherwise the reason is kept, and
+//! the name leaves the unit undescribed rather than guess:
+//!
+//! - a centre is read only from wedges whose narrow end is at it (IUPAC 2006 graphical
+//!   representation, ST-1.2): solid (toward the viewer) or hashed (away). No wedge, a wavy bond
+//!   (configuration unspecified), a bold, hollow, dashed or plain hashed bond, or a drawing
+//!   whose wedges leave the sense of rotation undecided (all ligands nearly in a line) gives
+//!   no descriptor;
+//! - a double bond needs its two ends and a ligand on each end drawn off the line through
+//!   them; a wavy bond on either end atom, a straight (collinear) drawing or two ligands of an
+//!   end drawn on one side gives no descriptor;
+//! - double bonds in rings of fewer than eight members are not stereogenic units for naming
+//!   (P-93: their geometry is fixed);
+//! - out of scope, with no descriptor: centres on atoms other than carbon, ligands that tie under
+//!   CIP Rule 1a but may differ by Rules 1b–5 (pseudoasymmetric centres, r/s; reported when the
+//!   tied ligands carry stereo bonds of their own), allenes (axial chirality, reported),
+//!   longer cumulenes, atropisomeric axes and planar chirality (not detected), relative
+//!   configuration (rel-, rac-, R*/S*: a drawing's wedges are read as absolute).
+
+use super::cip::{self, Ligand, Unranked};
+use super::graph::{El, End, Graph, Wedge};
+
+/// A CIP stereodescriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Descriptor {
+    R,
+    S,
+    E,
+    Z,
+}
+
+impl std::fmt::Display for Descriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Descriptor::R => "R",
+            Descriptor::S => "S",
+            Descriptor::E => "E",
+            Descriptor::Z => "Z",
+        })
+    }
+}
+
+/// Where a stereogenic unit is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Site {
+    /// A tetrahedral centre.
+    Centre(usize),
+    /// A double bond between two atoms.
+    Double(usize, usize),
+    /// The axis of an allene, between its two terminal atoms.
+    Axis(usize, usize),
+}
+
+/// A stereogenic unit: its descriptor, or why it has none.
+#[derive(Clone, Debug)]
+pub(crate) struct Unit {
+    pub site: Site,
+    pub descriptor: Result<Descriptor, String>,
+}
+
+/// The atomic number of an element of the namer.
+fn atomic_number(e: El) -> u8 {
+    match e {
+        El::C => 6,
+        El::N => 7,
+        El::O => 8,
+        El::F => 9,
+        El::S => 16,
+        El::Cl => 17,
+        El::Br => 35,
+        El::I => 53,
+    }
+}
+
+/// The stereogenic units of `g`.
+pub(crate) fn units(g: &Graph) -> Vec<Unit> {
+    let z: Vec<u8> = g.el.iter().map(|&e| atomic_number(e)).collect();
+    let atoms = cip::Atoms {
+        z,
+        h: &g.h,
+        adj: &g.adj,
+    };
+    let mut out = Vec::new();
+    for c in 0..g.len() {
+        if let Some(u) = centre(g, &atoms, c) {
+            out.push(u);
+        }
+    }
+    for a in 0..g.len() {
+        for &(b, o) in &g.adj[a] {
+            if a < b
+                && o == 2
+                && let Some(u) = double_bond(g, &atoms, a, b)
+            {
+                out.push(u);
+            }
+        }
+        if let Some(u) = allene(g, &atoms, a) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+/// The ligands of `x` other than `except`: its neighbours, then its hydrogens.
+fn ligands(g: &Graph, x: usize, except: Option<usize>) -> Vec<Ligand> {
+    let mut l: Vec<Ligand> = g
+        .nbrs(x)
+        .filter(|&m| Some(m) != except)
+        .map(Ligand::Atom)
+        .collect();
+    l.extend((0..g.h[x]).map(|_| Ligand::H));
+    l
+}
+
+/// A tetrahedral carbon centre with four different ligands.
+fn centre(g: &Graph, atoms: &cip::Atoms, c: usize) -> Option<Unit> {
+    if g.el[c] != El::C
+        || g.charge[c] != 0
+        || g.free_on(c) > 0
+        || g.h[c] > 1
+        || g.adj[c].len() + g.h[c] as usize != 4
+        || g.adj[c].iter().any(|&(_, o)| o != 1)
+    {
+        return None;
+    }
+    let ligs = ligands(g, c, None);
+    let descriptor = match cip::rank(atoms, c, &ligs) {
+        Ok(order) => centre_descriptor(g, c, &ligs, &order),
+        Err(Unranked::Tie(i, j)) => {
+            // Alike constitutionally; they may still differ in their own configuration
+            // (Rules 3–5).
+            let marked = |l: Ligand| match l {
+                Ligand::Atom(a) => branch_marked(g, c, a),
+                Ligand::H => false,
+            };
+            if !(marked(ligs[i]) || marked(ligs[j])) {
+                return None;
+            }
+            Err(
+                "two ligands differ only in their own configuration (a pseudoasymmetric \
+                 centre, r/s, or CIP Rules 3–5), which is not supported"
+                    .into(),
+            )
+        }
+        Err(Unranked::TooLarge) => {
+            if !wedged_at(g, c) {
+                return None;
+            }
+            Err("the structure is too large to rank the ligands by the CIP rules".into())
+        }
+    };
+    Some(Unit {
+        site: Site::Centre(c),
+        descriptor,
+    })
+}
+
+/// Whether a wedge or hash starts at `c`.
+fn wedged_at(g: &Graph, c: usize) -> bool {
+    g.drawn
+        .marks
+        .iter()
+        .any(|m| m.narrow == End::Atom(c) && matches!(m.wedge, Wedge::Up | Wedge::Down))
+}
+
+/// Whether the branch from `c` through `a` has stereo bonds of its own or a double bond.
+fn branch_marked(g: &Graph, c: usize, a: usize) -> bool {
+    let mut seen = vec![false; g.len()];
+    seen[c] = true;
+    seen[a] = true;
+    let mut stack = vec![a];
+    while let Some(x) = stack.pop() {
+        if wedged_at(g, x) || g.adj[x].iter().any(|&(_, o)| o == 2) {
+            return true;
+        }
+        for y in g.nbrs(x) {
+            if !seen[y] {
+                seen[y] = true;
+                stack.push(y);
+            }
+        }
+    }
+    false
+}
+
+/// A drawn position as a vector in a right-handed frame (y upward), relative to `from`.
+fn rel(p: [f32; 2], from: [f32; 2]) -> [f32; 2] {
+    [p[0] - from[0], from[1] - p[1]]
+}
+
+fn unit2(v: [f32; 2]) -> Option<[f32; 2]> {
+    let n = v[0].hypot(v[1]);
+    (n > 1e-6).then(|| [v[0] / n, v[1] / n])
+}
+
+fn wavy_at(g: &Graph, x: usize) -> bool {
+    g.drawn
+        .marks
+        .iter()
+        .any(|m| m.wedge == Wedge::Wavy && (m.narrow == End::Atom(x) || m.wide == End::Atom(x)))
+}
+
+/// R or S for the centre `c` with `ligs` ranked `order` (highest first), from the wedges
+/// drawn at it.
+fn centre_descriptor(
+    g: &Graph,
+    c: usize,
+    ligs: &[Ligand],
+    order: &[usize],
+) -> Result<Descriptor, String> {
+    let d = &g.drawn;
+    if wavy_at(g, c) {
+        return Err("drawn with a wavy bond: the configuration is not specified".into());
+    }
+    let at_c: Vec<_> = d
+        .marks
+        .iter()
+        .filter(|m| m.narrow == End::Atom(c))
+        .collect();
+    if at_c.iter().any(|m| m.wedge == Wedge::Unclear) {
+        return Err(
+            "drawn with a bold, hollow, dashed or plain hashed bond, which does not fix \
+                    the configuration"
+                .into(),
+        );
+    }
+    if !at_c
+        .iter()
+        .any(|m| matches!(m.wedge, Wedge::Up | Wedge::Down))
+    {
+        return Err("stereocentre drawn without a wedge or hash bond starting at it".into());
+    }
+    let inside = || "inside an abbreviation, which is not drawn".to_string();
+    let p0 = d.pos[c].ok_or_else(inside)?;
+    // Each ligand as a 3D vector: its drawn direction, with the wedge's depth.
+    let mut v: Vec<Option<[f32; 3]>> = Vec::new();
+    for &k in order {
+        let (end, pos) = match ligs[k] {
+            Ligand::Atom(a) => (End::Atom(a), Some(d.pos[a].ok_or_else(inside)?)),
+            Ligand::H => match d.h.iter().position(|&(on, p)| on == c && p.is_some()) {
+                Some(i) => (End::H(i), d.h[i].1),
+                None => (End::Free, None),
+            },
+        };
+        let Some(pos) = pos else {
+            v.push(None);
+            continue;
+        };
+        let [x, y] = unit2(rel(pos, p0)).ok_or_else(inside)?;
+        let depth = at_c
+            .iter()
+            .find(|m| m.wide == end)
+            .map_or(0.0, |m| if m.wedge == Wedge::Up { 1.0 } else { -1.0 });
+        v.push(Some([x, y, depth]));
+    }
+    // An implicit hydrogen points away from the other three.
+    let sum = v
+        .iter()
+        .flatten()
+        .fold([0.0; 3], |s, a| [s[0] + a[0], s[1] + a[1], s[2] + a[2]]);
+    let v: Vec<[f32; 3]> = v
+        .into_iter()
+        .map(|a| a.unwrap_or([-sum[0], -sum[1], -sum[2]]))
+        .collect();
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let (a, b, e) = (sub(v[0], v[3]), sub(v[1], v[3]), sub(v[2], v[3]));
+    let det = a[0] * (b[1] * e[2] - b[2] * e[1]) - a[1] * (b[0] * e[2] - b[2] * e[0])
+        + a[2] * (b[0] * e[1] - b[1] * e[0]);
+    // Positive: 1 → 2 → 3 counterclockwise seen with 4 away from the viewer.
+    if det.abs() < 0.1 {
+        Err("the wedges drawn leave the configuration undecided".into())
+    } else if det > 0.0 {
+        Ok(Descriptor::S)
+    } else {
+        Ok(Descriptor::R)
+    }
+}
+
+/// The size of the smallest ring through the bond `a`–`b`, if it is in one.
+fn smallest_ring(g: &Graph, a: usize, b: usize) -> Option<usize> {
+    let mut dist = vec![usize::MAX; g.len()];
+    dist[a] = 0;
+    let mut queue = std::collections::VecDeque::from([a]);
+    while let Some(x) = queue.pop_front() {
+        for y in g.nbrs(x) {
+            if (x, y) == (a, b) || dist[y] != usize::MAX {
+                continue;
+            }
+            dist[y] = dist[x] + 1;
+            if y == b {
+                return Some(dist[y] + 1);
+            }
+            queue.push_back(y);
+        }
+    }
+    None
+}
+
+/// Whether `x` has a double bond to an atom other than `except`.
+fn other_double(g: &Graph, x: usize, except: usize) -> bool {
+    g.adj[x].iter().any(|&(m, o)| m != except && o >= 2)
+}
+
+/// A C=C double bond whose ends both bear two different ligands.
+fn double_bond(g: &Graph, atoms: &cip::Atoms, a: usize, b: usize) -> Option<Unit> {
+    if g.el[a] != El::C
+        || g.el[b] != El::C
+        || g.free_on(a) + g.free_on(b) > 0
+        || other_double(g, a, b)
+        || other_double(g, b, a)
+        || smallest_ring(g, a, b).is_some_and(|n| n < 8)
+    {
+        return None;
+    }
+    let mut ends = Vec::new();
+    for (x, y) in [(a, b), (b, a)] {
+        let ligs = ligands(g, x, Some(y));
+        if ligs.len() != 2 {
+            return None;
+        }
+        let order = cip::rank(atoms, x, &ligs).ok()?;
+        ends.push((x, [ligs[order[0]], ligs[order[1]]]));
+    }
+    Some(Unit {
+        site: Site::Double(a, b),
+        descriptor: double_descriptor(g, &ends),
+    })
+}
+
+/// E or Z for a double bond, its ends each with their two ligands, higher-ranked first.
+fn double_descriptor(g: &Graph, ends: &[(usize, [Ligand; 2])]) -> Result<Descriptor, String> {
+    let d = &g.drawn;
+    let (a, b) = (ends[0].0, ends[1].0);
+    if wavy_at(g, a) || wavy_at(g, b) {
+        return Err("drawn with a wavy bond: the geometry is not specified".into());
+    }
+    let inside = || "inside an abbreviation, which is not drawn".to_string();
+    let (pa, pb) = (d.pos[a].ok_or_else(inside)?, d.pos[b].ok_or_else(inside)?);
+    let axis = unit2(rel(pb, pa)).ok_or_else(inside)?;
+    let straight = || "drawn straight: a ligand in line with the double bond".to_string();
+    let mut sides = Vec::new();
+    for &(x, ligs) in ends {
+        let px = d.pos[x].ok_or_else(inside)?;
+        // Which side of the line through the double bond each drawn ligand is on.
+        let side = |l: Ligand| -> Result<Option<f32>, String> {
+            let p = match l {
+                Ligand::Atom(m) => d.pos[m],
+                Ligand::H => {
+                    d.h.iter()
+                        .find(|&&(on, p)| on == x && p.is_some())
+                        .and_then(|h| h.1)
+                }
+            };
+            let Some(p) = p else { return Ok(None) };
+            let v = unit2(rel(p, px)).ok_or_else(inside)?;
+            let s = axis[0] * v[1] - axis[1] * v[0];
+            if s.abs() < 0.1 {
+                return Err(straight());
+            }
+            Ok(Some(s.signum()))
+        };
+        let (hi, lo) = (side(ligs[0])?, side(ligs[1])?);
+        let s = match (hi, lo) {
+            (Some(h), Some(l)) if h == l => {
+                return Err("both ligands of an end drawn on one side of the double bond".into());
+            }
+            (Some(h), _) => h,
+            (None, Some(l)) => -l,
+            (None, None) => return Err(inside()),
+        };
+        sides.push(s);
+    }
+    Ok(if sides[0] == sides[1] {
+        Descriptor::Z
+    } else {
+        Descriptor::E
+    })
+}
+
+/// An allene C=C=C centred on `m` whose terminal carbons each bear two different ligands: axial
+/// chirality, not supported.
+fn allene(g: &Graph, atoms: &cip::Atoms, m: usize) -> Option<Unit> {
+    let [(a, 2), (b, 2)] = g.adj[m][..] else {
+        return None;
+    };
+    if g.el[m] != El::C || other_double(g, a, m) || other_double(g, b, m) {
+        return None;
+    }
+    for (x, y) in [(a, m), (b, m)] {
+        let ligs = ligands(g, x, Some(y));
+        if ligs.len() != 2 || cip::rank(atoms, x, &ligs).is_err() {
+            return None;
+        }
+    }
+    Some(Unit {
+        site: Site::Axis(a, b),
+        descriptor: Err("axial chirality of an allene (Ra/Sa) is not supported".into()),
+    })
+}
