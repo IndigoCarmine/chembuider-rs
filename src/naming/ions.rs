@@ -211,6 +211,22 @@ pub(crate) fn salt_name(ions: &[Ion]) -> Result<String, String> {
     salt(ions).map(|s| s.english())
 }
 
+/// The name of the salt made of `ions` without multiplying prefixes, "calcium chloride",
+/// which IR-5.2 allows "if there is no ambiguity about the stoichiometry": for one cation and
+/// one anion of the tables, whose fixed charges fix the proportion (with two cations they do
+/// not: AlK(SO₄)₂ and AlK₃(SO₄)₃). `None` for other salts, and where the name has no prefix.
+pub(crate) fn salt_name_unmultiplied(ions: &[Ion]) -> Option<String> {
+    let s = salt(ions).ok()?;
+    match (&s.cations[..], &s.anion) {
+        ([(cation @ IonName::Table { .. }, k)], (anion @ IonName::Table { .. }, n))
+            if *k > 1 || *n > 1 =>
+        {
+            Some(format!("{} {}", cation.english(), anion.english()))
+        }
+        _ => None,
+    }
+}
+
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }

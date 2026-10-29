@@ -66,7 +66,7 @@ impl Prefix {
         }
     }
 
-    fn needs_enclosure(&self) -> bool {
+    pub(crate) fn needs_enclosure(&self) -> bool {
         self.compound || self.hydride || self.text.contains(|c: char| c.is_ascii_digit())
     }
 
@@ -240,6 +240,27 @@ struct Eval {
     key: Key,
 }
 
+/// The vocabulary a name is written in: the preferred IUPAC name's, or that of one of the other
+/// names IUPAC 2013 accepts in general nomenclature (OPE-24). Each style changes only what it
+/// says; the rest of the name is the PIN's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Style {
+    #[default]
+    Preferred,
+    /// Systematic names for the retained preferred ones: methanal, ethanoic acid, ethanoyl
+    /// chloride, ethanedioic acid, benzenecarboxylic acid, benzenol, methylbenzene (P-65.1.1.1,
+    /// P-66.6.1.1.1, P-22.1.3); substituted, with the locants a systematic name cites
+    /// ("2-chloroethanoic acid", "4-methylbenzene-1-carboxylic acid").
+    Systematic,
+    /// The names retained for general nomenclature only, of the unsubstituted acids
+    /// (P-65.1.1.2, which allows them no substitution): propionic acid, propionate, propionyl,
+    /// succinic acid, succinate.
+    Retained,
+    /// "per" for a chain whose every hydrogen one halogen replaces: perbromoethane
+    /// (P-14.3.4.5: not in PINs).
+    Per,
+}
+
 pub(crate) struct Namer<'a> {
     g: &'a Graph,
     p: &'a Perceived,
@@ -248,6 +269,7 @@ pub(crate) struct Namer<'a> {
     stereo: &'a [Unit],
     /// The stereogenic units the name leaves without a descriptor, and why.
     notes: RefCell<Vec<String>>,
+    style: Style,
 }
 
 impl<'a> Namer<'a> {
@@ -258,7 +280,13 @@ impl<'a> Namer<'a> {
             cache: RefCell::new(HashMap::new()),
             stereo: &[],
             notes: RefCell::new(Vec::new()),
+            style: Style::Preferred,
         }
+    }
+
+    /// The namer writing names in `style`.
+    pub(crate) fn with_style(self, style: Style) -> Self {
+        Namer { style, ..self }
     }
 
     /// The namer citing the descriptors of `units` (P-93).
@@ -368,7 +396,7 @@ impl<'a> Namer<'a> {
         let mut acids = Vec::new();
         for half in [g.acid_half(c, o), g.acid_half(d, o)] {
             let hp = graph::perceive(&half)?;
-            let name = Namer::new(&half, &hp).name()?;
+            let name = Namer::new(&half, &hp).with_style(self.style).name()?;
             let acid = name
                 .strip_suffix(" acid")
                 .filter(|_| hp.principal == Some(Class::Acid))
@@ -1227,8 +1255,13 @@ impl<'a> Namer<'a> {
                         (carboxy- or cyanoformic acid, P-65.1.8)"
                 .into());
         }
-        let retained_two =
-            chain && len == 2 && nsuf == 1 && terminal && suffix != Suffix::Class(Class::Amide);
+        let systematic = self.style == Style::Systematic;
+        let retained_two = chain
+            && len == 2
+            && nsuf == 1
+            && terminal
+            && suffix != Suffix::Class(Class::Amide)
+            && !systematic;
         // Every hydrogen of the parent replaced by one and the same prefix: hexachloroethane.
         let fully = matches!(suffix, Suffix::None | Suffix::Yl(_))
             && groups.len() == 1
@@ -1243,23 +1276,43 @@ impl<'a> Namer<'a> {
             matches!(suffix, Suffix::Yl(_)) && e.suffix == [loc(1)] && e.mults.is_empty();
         // Benzene's retained names (phenol, benzoic acid…) cite no locant; "4-methylbenzene-1-
         // thiol" does.
-        let retained_benzene_suffix = benzene && nsuf == 1 && suffix != Suffix::Class(Class::Thiol);
+        let retained_benzene_suffix =
+            benzene && nsuf == 1 && suffix != Suffix::Class(Class::Thiol) && !systematic;
         let cite_suffix =
             !omit_c && !(chain && terminal) && !contracted && !retained_benzene_suffix;
         let cite_unsat = !(chain && len <= 2) && !(ring && n_feat + e.mults.len() <= 1);
 
-        let core = self.core(
-            len,
-            ring,
-            e.attached,
-            benzene,
-            &e.mults,
-            suffix,
-            &e.suffix,
-            cite_suffix,
-            cite_unsat,
-            contracted,
-        )?;
+        // The retained names for general nomenclature, of the unsubstituted acids only.
+        let unsubstituted_chain = self.style == Style::Retained
+            && mode == Mode::Molecule
+            && chain
+            && !e.attached
+            && groups.is_empty()
+            && e.mults.is_empty();
+        let general = match (len, nsuf, suffix) {
+            _ if !unsubstituted_chain => None,
+            (3, 1, Suffix::Class(Class::Acid)) => Some("propionic acid"),
+            (3, 1, Suffix::Class(Class::Ester | Class::Carboxylate)) => Some("propionate"),
+            (3, 1, Suffix::Class(Class::AcidHalide)) => Some("propionyl"),
+            (4, 2, Suffix::Class(Class::Acid)) => Some("succinic acid"),
+            (4, 2, Suffix::Class(Class::Carboxylate)) => Some("succinate"),
+            _ => None,
+        };
+        let core = match general {
+            Some(name) => name.to_string(),
+            None => self.core(
+                len,
+                ring,
+                e.attached,
+                benzene,
+                &e.mults,
+                suffix,
+                &e.suffix,
+                cite_suffix,
+                cite_unsat,
+                contracted,
+            )?,
+        };
         // With N-substituents present, carbon locants are cited to tell the two apart:
         // N,N-dimethyl-1-phenylmethanamine.
         let (prefix_text, depth, order) = compose(&groups, (omit_c || fully) && !has_n_prefix);
@@ -1270,12 +1323,23 @@ impl<'a> Namer<'a> {
             ""
         };
         let mut text = format!("{prefix_text}{hyphen}{core}");
+        if self.style == Style::Per
+            && mode == Mode::Molecule
+            && fully
+            && chain
+            && len >= 2
+            && let [(halo, _)] = &groups[..]
+            && ["fluoro", "chloro", "bromo", "iodo"].contains(&halo.text.as_str())
+        {
+            text = format!("per{}{core}", halo.text);
+        }
         let mut compound = !groups.is_empty();
         let mut oxy = (contracted && chain && len <= 4 && suffix == Suffix::Yl(1))
             || (benzene && suffix == Suffix::Yl(1));
         if mode == Mode::Molecule {
             if benzene
                 && suffix == Suffix::None
+                && !systematic
                 && let Some(t) = retained_benzene(&groups)
             {
                 text = t;
@@ -1295,7 +1359,7 @@ impl<'a> Namer<'a> {
                 text,
                 compound,
                 depth,
-                hydride: acyl_or_amido && ring && !benzene,
+                hydride: acyl_or_amido && ring && (!benzene || systematic),
                 oxy,
             },
             Uncited {
@@ -1431,10 +1495,11 @@ impl<'a> Namer<'a> {
     ) -> Result<String, Unsupported> {
         let count = locs.len();
         let loc_list = || loc_list(locs);
+        let systematic = self.style == Style::Systematic;
         if benzene {
             return Ok(match (suffix, count) {
                 (Suffix::None, _) => "benzene".into(),
-                (Suffix::Class(c), 1) if c != Class::Thiol => match c {
+                (Suffix::Class(c), 1) if c != Class::Thiol && !systematic => match c {
                     Class::Acid => "benzoic acid",
                     Class::Ester | Class::Carboxylate => "benzoate",
                     Class::AcidHalide => "benzoyl",
@@ -1450,16 +1515,23 @@ impl<'a> Namer<'a> {
                 .into(),
                 (Suffix::Class(c), _) => {
                     let word = multiplied(count, suffix_word(Suffix::Class(c), true));
-                    if cite_suffix {
-                        format!("benzene-{}-{word}", loc_list())
+                    // The final "e" elided before a vowel: "benzenol", "benzen-1-amine".
+                    let base = if starts_with_vowel(&word) {
+                        "benzen"
                     } else {
-                        format!("benzene{word}")
+                        "benzene"
+                    };
+                    if cite_suffix {
+                        format!("{base}-{}-{word}", loc_list())
+                    } else {
+                        format!("{base}{word}")
                     }
                 }
                 (Suffix::Yl(1), 1) => "phenyl".into(),
                 // P-29.6.1: the retained 1,2-, 1,3- and 1,4-phenylene.
                 (Suffix::Yl(1), 2) => format!("{}-phenylene", loc_list()),
                 (Suffix::Yl(1), _) => format!("benzene-{}-{}", loc_list(), multiplied(count, "yl")),
+                (Suffix::Acyl, _) if systematic => "benzenecarbonyl".into(),
                 (Suffix::Acyl, _) => "benzoyl".into(),
                 (Suffix::Yl(_), _) => return Err("internal error: ylidene on benzene".into()),
             });
@@ -1467,7 +1539,7 @@ impl<'a> Namer<'a> {
         let stem =
             stem(len).ok_or_else(|| format!("chain or ring longer than {MAX_NUMERAL} atoms"))?;
         let base = if ring { format!("cyclo{stem}") } else { stem };
-        if !ring && count == 1 && (len == 1 || len == 2) {
+        if !ring && count == 1 && (len == 1 || len == 2) && !systematic {
             let retained = match (len, suffix) {
                 (1, Suffix::Class(Class::Acid)) => Some("formic acid"),
                 (1, Suffix::Class(Class::Ester | Class::Carboxylate)) => Some("formate"),
@@ -1489,7 +1561,7 @@ impl<'a> Namer<'a> {
                 return Ok(r.into());
             }
         }
-        if !ring && !attached && len == 2 && count == 2 {
+        if !ring && !attached && len == 2 && count == 2 && !systematic {
             match suffix {
                 Suffix::Class(Class::Acid) => return Ok("oxalic acid".into()),
                 Suffix::Class(Class::Carboxylate) => return Ok("oxalate".into()),
@@ -1543,7 +1615,7 @@ impl<'a> Namer<'a> {
     }
 
     /// The prefix for the substituent that starts at `q` and is attached to `from`.
-    fn sub(&self, q: usize, from: usize) -> Result<Prefix, Unsupported> {
+    pub(crate) fn sub(&self, q: usize, from: usize) -> Result<Prefix, Unsupported> {
         if let Some(r) = self.cache.borrow().get(&(q, from)) {
             return r.clone();
         }

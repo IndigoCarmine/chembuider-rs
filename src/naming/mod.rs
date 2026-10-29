@@ -169,7 +169,7 @@
 //!   ethanoyl chloride; "oxalyl dichloride", P-65.5.1). Substituted acetic acid (and acetate, acetaldehyde, acetonitrile, acetyl) cite
 //!   no locant ("chloroacetic acid", P-65.1.1.1); acetamide does ("2-chloroacetamide").
 //! - Fully substituted parents are named with multiplying prefixes, not "per"
-//!   ("hexabromoethane", P-14.3.4.5).
+//!   ("hexabromoethane", P-14.3.4.5; "perbromoethane" is an alternative).
 //! - Locants are cited except where P-31.1.4.2.4 omits them (mononuclear and monosubstituted
 //!   two-carbon parents, monosubstituted rings, terminal chain suffixes, fully substituted
 //!   parents): "propan-2-one", "prop-1-ene", "3-methylcyclohex-1-ene", "2-methylcyclohexan-1-ol".
@@ -184,7 +184,8 @@
 //!   every locant is cited, a fully substituted one included ("2,3,4,5,6-pentachloropyridine").
 //! - Fully conjugated monocycles take their cycloalkapolyene names
 //!   ("cyclotetradeca-1,3,5,7,9,11,13-heptaene", P-22.1.2), not "\[14\]annulene"; lactones and
-//!   lactams their pseudoketone names ("oxepan-2-one"), not "6-hexanelactone" (P-65.6.3.5.1).
+//!   lactams their pseudoketone names ("oxepan-2-one"), not "6-hexanelactone" (P-65.6.3.5.1);
+//!   those names are alternatives.
 //! - Acylamino prefixes are the "amido" names ("acetamido", P-66.1.1.4.3 method (1)), not
 //!   "acetylamino".
 //! - Inorganic names follow the Red Book (2005) where Wikipedia differs: "hydrogencarbonate"
@@ -192,13 +193,50 @@
 //!   spelling), and every proportion stated by a multiplying prefix, "calcium dichloride" (the
 //!   form the Red Book gives first, IR-5.2, IR-5.4.2.1, and the one the namer gives organic
 //!   salts, "calcium diacetate"), not "calcium chloride", which IR-5.2 allows "if there is no
-//!   ambiguity about the stoichiometry" — an alternative name (OPE-24). Traditional names such
-//!   as ozone are alternatives too.
+//!   ambiguity about the stoichiometry" — an alternative name, for a salt of one cation and one
+//!   anion of the tables. "Ozone" is an alternative too.
 //! - Multiplicative names (the preferred names of some symmetrical compounds, e.g.
 //!   2,2′-oxydi(ethan-1-ol), 1,1'-methylenedibenzene) and the retained names of α-amino acids
 //!   are not produced; the substitutive name given instead ("benzylbenzene",
 //!   "phenoxybenzene") is a correct, if not preferred, IUPAC name.
+//!
+//! Alternative names ([`iupac_alternatives`], [`NameKind`]): beside the one PIN, the names
+//! IUPAC 2013 accepts in general nomenclature, made from the structure — by the engine in
+//! another vocabulary (`engine::Style`) or by recognisers of exact structures
+//! (`alternatives.rs`), never by rewriting the PIN's text — and only where they are certain:
+//!
+//! - retained names of the unsubstituted compounds (P-65.1.1.2 allows no substitution on them,
+//!   so "1-chloroisopropyl" is never made): glycerol, propionic acid (propionate, propionyl,
+//!   propionic anhydride), succinic acid (succinate), ε-caprolactone, ε-caprolactam, ozone, and
+//!   the groups ethylene (–CH2–CH2–) and propylene (–CH(CH3)–CH2–, P-29.6.2.3). "Propylene" is
+//!   only the name of that divalent group: the compound propene is not given it (IUPAC 2013 has
+//!   no such retained name), nor is propane-1,3-diyl (Wikipedia's "propylene" for –CH2CH2CH2–
+//!   is trimethylene, whose status the namer does not decide);
+//! - functional class names of a compound with one heteroatom on a hydrocarbyl group:
+//!   "methyl alcohol", "butyl chloride", "ethyl methyl ether", "diethyl ether", and amines
+//!   "methylamine" (where the group's name needs no enclosing marks);
+//! - additive: "tetrahydrofuran" (oxolane itself); conjunctive: an unsubstituted benzene or
+//!   cycloalkane ring with one chain carrying the group at its end, "cyclohexanemethanol",
+//!   "cyclohexaneethanol", "cyclohexaneacetic acid";
+//! - systematic names other than the PIN: the retained preferred names written
+//!   systematically ("methanal", "ethanoic acid", "ethanoyl chloride", "benzenecarboxylic
+//!   acid", "methylbenzene", "ethanoic propanoic anhydride"; formaldehyde stays the PIN,
+//!   P-66.6.1.1.1), "per" for a fully halogenated chain, lactones and lactams from their acids
+//!   ("6-hexanelactone"), primary amines by "amino" prefixes ("aminomethane"), "[n]annulene"
+//!   for the unsubstituted even rings of eight or more, salts without multiplying prefixes
+//!   ("calcium chloride"), and "cis-"/"trans-" for the one stereogenic double bond of a
+//!   structure whose two atoms each carry one hydrogen (there Z is cis): "trans-but-2-ene",
+//!   "cis-cyclooctene". A structure whose name cites any other descriptor gets no
+//!   alternative, since one written without it would leave the configuration out.
+//!
+//! Not produced: subtractive names (deoxy-, anhydro-, nor-: "2-deoxyribose"), since they
+//! modify the retained names of natural products and sugars (P-31.1.5, P-102), which the namer
+//! does not perceive — the deoxy sugar is named as the oxolane or oxane it is; cis/trans on
+//! rings (relative configuration of ring substituents: the namer gives absolute R/S only) and on
+//! double bonds of more than two substituents, where cis/trans is not defined by E/Z; Japanese
+//! names ([`NameKind::Japanese`], OPE-26).
 
+mod alternatives;
 mod cip;
 mod engine;
 mod graph;
@@ -209,6 +247,8 @@ mod stereo;
 mod words;
 
 #[cfg(test)]
+mod alternatives_tests;
+#[cfg(test)]
 mod inorganic_tests;
 #[cfg(test)]
 mod stereo_tests;
@@ -217,6 +257,7 @@ mod tests;
 
 use crate::config::Config;
 use crate::molecule::{BondStereo, Molecule};
+use engine::Style;
 
 /// The outcome of naming.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +276,61 @@ impl NameResult {
             NameResult::Unsupported(_) => None,
         }
     }
+}
+
+/// The kind of an alternative name ([`iupac_alternatives`]), in the order alternatives are
+/// listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NameKind {
+    /// A retained or traditional name accepted in general nomenclature: "glycerol", "succinic
+    /// acid", "potassium propionate", "ε-caprolactone", "ozone", "propylene" (the group).
+    Retained,
+    /// A functional class (radicofunctional) name: "methyl alcohol", "butyl chloride", "ethyl
+    /// methyl ether"; and "methylamine".
+    Radicofunctional,
+    /// An additive name: "tetrahydrofuran".
+    Additive,
+    /// A conjunctive name: "cyclohexanemethanol".
+    Conjunctive,
+    /// A systematic name other than the PIN: "methanal", "benzenecarboxylic acid", "ethanoyl
+    /// chloride", "perbromoethane", "6-hexanelactone", "aminomethane", "[14]annulene",
+    /// "trans-but-2-ene".
+    Systematic,
+    /// A Japanese name (reserved for OPE-26; not produced yet).
+    Japanese,
+}
+
+impl NameKind {
+    /// Every kind, in the order alternatives are listed.
+    pub const ALL: [NameKind; 6] = [
+        NameKind::Retained,
+        NameKind::Radicofunctional,
+        NameKind::Additive,
+        NameKind::Conjunctive,
+        NameKind::Systematic,
+        NameKind::Japanese,
+    ];
+
+    /// The kind in English words ("retained name"), for reports; the panel shows it localised.
+    pub fn label(self) -> &'static str {
+        match self {
+            NameKind::Retained => "retained name",
+            NameKind::Radicofunctional => "functional class name",
+            NameKind::Additive => "additive name",
+            NameKind::Conjunctive => "conjunctive name",
+            NameKind::Systematic => "systematic name",
+            NameKind::Japanese => "Japanese name",
+        }
+    }
+}
+
+/// Everything naming says about a drawing: the IUPAC name ([`iupac_name`]), the notes of
+/// [`iupac_name_with_notes`] and the alternative names of [`iupac_alternatives`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Naming {
+    pub name: NameResult,
+    pub notes: Vec<String>,
+    pub alternatives: Vec<(NameKind, String)>,
 }
 
 /// The IUPAC name of everything drawn in `mol` (every connected structure, joined by "; "),
@@ -265,6 +361,82 @@ fn name_and_notes(mol: &Molecule, config: &Config) -> (NameResult, Vec<String>) 
     }
     let (names, notes) = names_and_notes(mol, config);
     (joined(names), notes)
+}
+
+/// The other names of everything drawn in `mol` beside its IUPAC name (OPE-24): retained,
+/// functional class, additive, conjunctive and systematic names that IUPAC 2013 accepts in
+/// general nomenclature, each with its kind. None repeats the IUPAC name or another; they are
+/// listed by kind ([`NameKind::ALL`]), then in a fixed order. A drawing of several compounds
+/// has the alternatives of each, the others by their IUPAC names ("methyl alcohol;
+/// formaldehyde"); one the namer cannot name has none. Names are given only for structures
+/// recognised exactly — never a retained name with substituents (P-65.1.1.2) — so most
+/// structures have none.
+pub fn iupac_alternatives(mol: &Molecule) -> Vec<(NameKind, String)> {
+    iupac_naming(mol).alternatives
+}
+
+/// The IUPAC name, its notes and the alternatives of `mol` at once.
+pub fn iupac_naming(mol: &Molecule) -> Naming {
+    iupac_naming_with_config(mol, &Config::default())
+}
+
+/// [`iupac_naming`] with the abbreviations of `config`.
+pub fn iupac_naming_with_config(mol: &Molecule, config: &Config) -> Naming {
+    let (name, notes) = name_and_notes(mol, config);
+    let alternatives = match &name {
+        NameResult::Ok(_) => alternatives_of(mol, config),
+        NameResult::Unsupported(_) => vec![],
+    };
+    Naming {
+        name,
+        notes,
+        alternatives,
+    }
+}
+
+/// The styles of the engine that give alternatives, and their kind.
+const STYLES: [(Style, NameKind); 3] = [
+    (Style::Retained, NameKind::Retained),
+    (Style::Systematic, NameKind::Systematic),
+    (Style::Per, NameKind::Systematic),
+];
+
+/// [`iupac_alternatives`] of a drawing whose every compound is named.
+fn alternatives_of(mol: &Molecule, config: &Config) -> Vec<(NameKind, String)> {
+    let preferred = compounds(mol, config, Style::Preferred, true);
+    let Some(pins) = preferred
+        .names
+        .iter()
+        .map(|n| n.name().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return vec![];
+    };
+    let mut each = preferred.alternatives;
+    for (style, kind) in STYLES {
+        let styled = compounds(mol, config, style, false);
+        for (i, name) in styled.names.into_iter().enumerate() {
+            if let NameResult::Ok(n) = name
+                && n != pins[i]
+            {
+                each[i].push((kind, n));
+            }
+        }
+    }
+    let pin = pins.join("; ");
+    let mut out: Vec<(NameKind, String)> = Vec::new();
+    for (i, alternatives) in each.into_iter().enumerate() {
+        for (kind, alternative) in alternatives {
+            let mut names = pins.clone();
+            names[i] = alternative;
+            let whole = names.join("; ");
+            if whole != pin && !out.iter().any(|(_, n)| *n == whole) {
+                out.push((kind, whole));
+            }
+        }
+    }
+    out.sort_by_key(|&(kind, _)| kind);
+    out
 }
 
 /// The names of the compounds of a drawing as one result.
@@ -300,38 +472,67 @@ pub fn iupac_names_with_config(mol: &Molecule, config: &Config) -> Vec<NameResul
 
 /// [`iupac_names_with_config`], with the notes of [`iupac_name_with_notes`].
 fn names_and_notes(mol: &Molecule, config: &Config) -> (Vec<NameResult>, Vec<String>) {
+    let c = compounds(mol, config, Style::Preferred, false);
+    (c.names, c.notes)
+}
+
+/// The compounds of a drawing as named in one style: each one's name, with the alternatives
+/// that come from its structure when `alternatives` is set; and the notes on the stereogenic
+/// units.
+struct Compounds {
+    names: Vec<NameResult>,
+    notes: Vec<String>,
+    alternatives: Vec<Vec<(NameKind, String)>>,
+}
+
+/// [`iupac_names_with_config`] in `style`.
+fn compounds(mol: &Molecule, config: &Config, style: Style, alternatives: bool) -> Compounds {
     let mut names = Vec::new();
+    let mut each = Vec::new();
     let mut notes = Vec::new();
     let mut ions = Vec::new();
     let mut salt_at = None;
     // The reason a charged structure was refused: the reason the salt it belongs to is.
     let mut refused_ion = None;
     for atoms in graph::components(mol) {
-        match name_component(mol, &atoms, config, &mut notes) {
+        let mut alts = alternatives.then(Vec::new);
+        match name_component(mol, &atoms, config, style, &mut notes, alts.as_mut()) {
             Ok(Component::Ions(found)) => {
                 if salt_at.is_none() {
                     salt_at = Some(names.len());
                     names.push(NameResult::Unsupported(String::new()));
+                    each.push(Vec::new());
                 }
                 ions.extend(found);
             }
-            Ok(Component::Neutral(name)) => names.push(NameResult::Ok(name)),
+            Ok(Component::Neutral(name)) => {
+                names.push(NameResult::Ok(name));
+                each.push(alts.unwrap_or_default());
+            }
             Err(r) => {
                 let charge: i32 = atoms.iter().map(|&i| mol.atoms[i].charge as i32).sum();
                 if refused_ion.is_none() && charge != 0 {
                     refused_ion = Some(r.clone());
                 }
                 names.push(NameResult::Unsupported(r));
+                each.push(Vec::new());
             }
         }
     }
     if let Some(i) = salt_at {
+        if alternatives && let Some(n) = ions::salt_name_unmultiplied(&ions) {
+            each[i].push((NameKind::Systematic, n));
+        }
         names[i] = match (ions::salt_name(&ions), refused_ion) {
             (Ok(n), _) => NameResult::Ok(n),
             (Err(_), Some(r)) | (Err(r), None) => NameResult::Unsupported(r),
         };
     }
-    (names, notes)
+    Compounds {
+        names,
+        notes,
+        alternatives: each,
+    }
 }
 
 /// What one connected structure is.
@@ -343,14 +544,17 @@ enum Component {
     Ions(Vec<ions::Ion>),
 }
 
-/// The name of one connected structure: a cation of the table, an inorganic structure
-/// (`inorganic.rs`), or one named by the substitutive engine (a neutral compound, an anion, a
-/// substituent). The notes on its stereogenic units go to `notes`.
+/// The name of one connected structure in `style`: a cation of the table, an inorganic
+/// structure (`inorganic.rs`), or one named by the substitutive engine (a neutral compound, an
+/// anion, a substituent). The notes on its stereogenic units go to `notes`, the alternatives
+/// that come from its structure (`alternatives.rs`) to `alternatives`.
 fn name_component(
     mol: &Molecule,
     atoms: &[usize],
     config: &Config,
+    style: Style,
     notes: &mut Vec<String>,
+    alternatives: Option<&mut Vec<(NameKind, String)>>,
 ) -> Result<Component, String> {
     if let Some(c) = ions::recognise_cation(mol, atoms) {
         return Ok(Component::Ions(vec![ions::Ion {
@@ -364,10 +568,24 @@ fn name_component(
     let raw = graph::expand(mol, atoms, config)?;
     if let Some(found) = inorganic::name(&raw) {
         return Ok(match found? {
-            inorganic::Inorganic::Element(e) => Component::Neutral(e.english()?),
+            inorganic::Inorganic::Element(e) => {
+                // IR-3.4.3: "ozone", acceptable beside "trioxygen".
+                if let Some(alts) = alternatives
+                    && e.name == "oxygen"
+                    && e.atoms == 3
+                {
+                    alts.push((NameKind::Retained, "ozone".into()));
+                }
+                Component::Neutral(e.english()?)
+            }
             // A salt drawn with bonds is neutral and complete: one formula unit, named on its
             // own (IR-5.4), not pooled with the other structures' ions into a double salt.
             inorganic::Inorganic::Ions(ions) if ions.iter().map(|i| i.charge).sum::<i32>() == 0 => {
+                if let Some(alts) = alternatives
+                    && let Some(n) = ions::salt_name_unmultiplied(&ions)
+                {
+                    alts.push((NameKind::Systematic, n));
+                }
                 Component::Neutral(ions::salt_name(&ions)?)
             }
             inorganic::Inorganic::Ions(ions) => Component::Ions(ions),
@@ -376,10 +594,24 @@ fn name_component(
     let g = graph::to_graph(&raw)?;
     let p = graph::perceive(&g)?;
     let units = stereo::units(&g);
-    let namer = engine::Namer::new(&g, &p).with_stereo(&units);
+    let namer = engine::Namer::new(&g, &p)
+        .with_stereo(&units)
+        .with_style(style);
     let name = namer.name()?;
-    notes.extend(namer.notes());
+    let unit_notes = namer.notes();
     let charge = g.net_charge();
+    if let Some(alts) = alternatives
+        && charge == 0
+    {
+        alts.extend(alternatives::of_structure(
+            &g,
+            &p,
+            &units,
+            &namer,
+            unit_notes.is_empty(),
+        ));
+    }
+    notes.extend(unit_notes);
     Ok(if charge == 0 {
         Component::Neutral(name)
     } else {

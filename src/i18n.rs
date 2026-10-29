@@ -469,6 +469,50 @@ catalog! {
         ko: "(일부 입체 표기는 포함되지 않음)", ru: "(указаны не все стереодескрипторы)",
         it: "(alcuni descrittori stereochimici non inclusi)",
     }
+    /// The collapsible section of other names under the IUPAC name. `{count}`: how many.
+    OtherNames {
+        ja: "別名 ({count})", en: "Other names ({count})", zh_hans: "其他名称（{count}）",
+        zh_hant: "其他名稱（{count}）", es: "Otros nombres ({count})", fr: "Autres noms ({count})",
+        de: "Weitere Namen ({count})", pt_br: "Outros nomes ({count})", ko: "다른 이름 ({count})",
+        ru: "Другие названия ({count})", it: "Altri nomi ({count})",
+    }
+    /// The kind of an other name: a retained (traditional) name, "glycerol".
+    NameKindRetained {
+        ja: "慣用名", en: "retained name", zh_hans: "保留名", zh_hant: "保留名",
+        es: "nombre tradicional", fr: "nom traditionnel", de: "Trivialname", pt_br: "nome tradicional",
+        ko: "관용명", ru: "тривиальное название", it: "nome tradizionale",
+    }
+    /// The kind of an other name: a functional class (radicofunctional) name, "methyl alcohol".
+    NameKindRadicofunctional {
+        ja: "基官能命名法による名称", en: "functional class name", zh_hans: "官能团类别名",
+        zh_hant: "官能基類別名", es: "nombre de clase funcional", fr: "nom de classe fonctionnelle",
+        de: "radikofunktioneller Name", pt_br: "nome de classe funcional", ko: "작용기 부류명",
+        ru: "радикально-функциональное название", it: "nome di classe funzionale",
+    }
+    /// The kind of an other name: an additive name, "tetrahydrofuran".
+    NameKindAdditive {
+        ja: "付加名", en: "additive name", zh_hans: "加成名", zh_hant: "加成名",
+        es: "nombre aditivo", fr: "nom additif", de: "additiver Name", pt_br: "nome aditivo",
+        ko: "첨가명", ru: "аддитивное название", it: "nome additivo",
+    }
+    /// The kind of an other name: a conjunctive name, "cyclohexanemethanol".
+    NameKindConjunctive {
+        ja: "結合名", en: "conjunctive name", zh_hans: "结合名", zh_hant: "結合名",
+        es: "nombre conjuntivo", fr: "nom conjonctif", de: "konjunktiver Name", pt_br: "nome conjuntivo",
+        ko: "접합명", ru: "конъюнктивное название", it: "nome congiuntivo",
+    }
+    /// The kind of an other name: a systematic name other than the IUPAC name, "methanal".
+    NameKindSystematic {
+        ja: "系統名", en: "systematic name", zh_hans: "系统名", zh_hant: "系統名",
+        es: "nombre sistemático", fr: "nom systématique", de: "systematischer Name",
+        pt_br: "nome sistemático", ko: "계통명", ru: "систематическое название", it: "nome sistematico",
+    }
+    /// The kind of an other name: a Japanese name.
+    NameKindJapanese {
+        ja: "日本語名", en: "Japanese name", zh_hans: "日文名", zh_hant: "日文名",
+        es: "nombre japonés", fr: "nom japonais", de: "japanischer Name", pt_br: "nome japonês",
+        ko: "일본어 이름", ru: "японское название", it: "nome giapponese",
+    }
     /// Instead of an IUPAC name the engine cannot make. `{reason}`: why (in English).
     Unsupported {
         ja: "未対応: {reason}", en: "unsupported: {reason}", zh_hans: "不支持：{reason}",
