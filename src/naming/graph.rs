@@ -5,6 +5,7 @@
 //! itself only ever meets structures it knows how to name.
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 
 use super::hetero::{self, Hetero};
 use crate::config::Config;
@@ -373,27 +374,46 @@ pub(crate) struct Perceived {
     pub principal: Option<Class>,
 }
 
-/// A monocycle of a structure.
+/// A ring system of a structure: a monocycle, or two rings sharing atoms ([`Poly`]).
 pub(crate) struct Ring {
-    /// Its atoms in cyclic order.
+    /// Its atoms: a monocycle's in cyclic order, a bicycle's or spiro system's in the order of
+    /// one of its numberings.
     pub atoms: Vec<usize>,
     /// A benzene ring (six carbons, alternating double bonds).
     pub benzene: bool,
     /// For a heterocycle: which one, and how it may be numbered.
     pub hetero: Option<Hetero>,
+    /// For two rings sharing atoms: the von Baeyer system.
+    pub poly: Option<Poly>,
     /// Its seniority as a parent.
     pub rank: Rank,
 }
 
+/// A ring system of two rings sharing atoms, named by von Baeyer nomenclature: a bicycle
+/// ("bicyclo[3.2.0]heptane", P-23.2) or a monospiro system of two monocycles ("spiro[4.5]decane",
+/// P-24.2.1), its heteroatoms cited by replacement ('a') prefixes (P-23.3, P-24.2.4).
+pub(crate) struct Poly {
+    /// "bicyclo[3.2.0]" or "spiro[4.5]".
+    pub descriptor: String,
+    /// Every numbering the system's rules allow (P-23.2.3, P-24.2.1), each its atoms in the
+    /// order of their locants; the other criteria choose among them.
+    pub numberings: Vec<Vec<usize>>,
+    /// The bond orders of the system's bonds, keyed by (lower, higher atom index): as drawn,
+    /// then every other Kekulé form of the same compound (a benzene ring of
+    /// bicyclo[4.1.0]hepta-1,3,5-triene drawn either way).
+    pub forms: Vec<BTreeMap<(usize, usize), u8>>,
+}
+
 /// The seniority of a ring as a parent, greatest first (P-44.2.1.2, then P-44.4.1.1): a
-/// nitrogenous heterocycle; without nitrogen, a heteroatom early in the order O > S; more ring
-/// atoms; more heteroatoms; more kinds of heteroatom; more O, then S, then N atoms; lower
+/// nitrogenous heterocycle; without nitrogen, a heteroatom early in the order O > S; more
+/// rings; more ring atoms; more heteroatoms; more kinds of heteroatom; more O, then S, then N atoms; lower
 /// locants for the heteroatoms; then more multiple bonds (benzene counts three) and more
 /// double bonds. Carbocycles tie on every heteroatom criterion.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Rank {
     nitrogen: bool,
     first_hetero: u8,
+    rings: usize,
     size: usize,
     heteroatoms: usize,
     variety: usize,
@@ -678,7 +698,7 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     if !g.el.contains(&El::C) {
         return Err("no carbon atom".into());
     }
-    let (cycles, in_ring) = find_rings(g)?;
+    let (cycles, systems, in_ring) = find_rings(g)?;
     let mut rings: Vec<Ring> = Vec::new();
     for atoms in cycles {
         let k = atoms.len();
@@ -703,46 +723,38 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
                 orders.iter().filter(|&&o| o == 2).count(),
             )
         };
-        let els: Vec<El> = atoms
-            .iter()
-            .map(|&a| g.el[a])
-            .filter(|&e| e != El::C)
-            .collect();
-        let count = |e: El| els.iter().filter(|&&x| x == e).count();
-        let nitrogen = count(El::N) > 0;
-        // Criterion (b) applies only to rings without nitrogen.
-        let first_hetero = if nitrogen {
-            0
-        } else if count(El::O) > 0 {
-            2
-        } else if count(El::S) > 0 {
-            1
-        } else {
-            0
-        };
-        let variety = [El::O, El::S, El::N]
-            .iter()
-            .filter(|&&e| count(e) > 0)
-            .count();
+        let hetero_locants = hetero
+            .as_ref()
+            .map_or_else(Vec::new, |h| h.kind.hetero_locants());
         rings.push(Ring {
-            rank: Rank {
-                nitrogen,
-                first_hetero,
-                size: k,
-                heteroatoms: els.len(),
-                variety,
-                by_element: [count(El::O), count(El::S), count(El::N)],
-                hetero_locants: Reverse(
-                    hetero
-                        .as_ref()
-                        .map_or_else(Vec::new, |h| h.kind.hetero_locants()),
-                ),
-                multiple,
-                double,
-            },
+            rank: rank(g, &atoms, 1, hetero_locants, multiple, double),
             atoms,
             benzene,
             hetero,
+            poly: None,
+        });
+    }
+    for poly in systems {
+        let atoms = poly.numberings[0].clone();
+        let drawn = &poly.forms[0];
+        let multiple = drawn.values().filter(|&&o| o > 1).count();
+        let double = drawn.values().filter(|&&o| o == 2).count();
+        let hetero_locants = poly
+            .numberings
+            .iter()
+            .map(|num| {
+                (1..=num.len())
+                    .filter(|&l| g.el[num[l - 1]] != El::C)
+                    .collect::<Vec<_>>()
+            })
+            .min()
+            .unwrap_or_default();
+        rings.push(Ring {
+            rank: rank(g, &atoms, 2, hetero_locants, multiple, double),
+            atoms,
+            benzene: false,
+            hetero: None,
+            poly: Some(poly),
         });
     }
     let parents = ring_parents(g, &rings)?;
@@ -936,6 +948,13 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
             .filter(|&&(m, o)| o == 1 && g.el[m] != El::C)
             .map(|&(m, _)| m)
             .collect();
+        // A ring C=O carbon's other bonds are its two ring bonds. Next to a ring heteroatom it
+        // is a pseudoketone (a lactone, lactam, cyclic anhydride or imide: oxolan-2-one,
+        // pyrrolidine-2,5-dione), with the same seniority as a ketone (P-64.3.1, P-64.7.2).
+        if in_ring[c] {
+            ketone[c] = true;
+            continue;
+        }
         if hetero.iter().any(|&m| g.el[m] == El::S) {
             return Err(
                 "thioacid or thioester (sulfur on a C=O carbon; sulfur outside a ring is \
@@ -943,14 +962,9 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
                     .into(),
             );
         }
-        if !hetero.is_empty() && in_ring[c] {
-            return Err("lactone or lactam (a ring C=O next to a ring heteroatom)".into());
-        }
         match hetero.as_slice() {
             [] => {
-                if in_ring[c] {
-                    ketone[c] = true;
-                } else if g.h[c] >= 1 {
+                if g.h[c] >= 1 {
                     ctype[c] = Some(Class::Aldehyde);
                 } else {
                     ketone[c] = true;
@@ -1057,12 +1071,62 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     })
 }
 
-const SHARED_RINGS: &str = "more than one ring sharing atoms (fused, bridged or spiro ring system)";
+/// The seniority of a ring system of `rings` rings with `atoms` as a parent.
+fn rank(
+    g: &Graph,
+    atoms: &[usize],
+    rings: usize,
+    hetero_locants: Vec<usize>,
+    multiple: usize,
+    double: usize,
+) -> Rank {
+    let els: Vec<El> = atoms
+        .iter()
+        .map(|&a| g.el[a])
+        .filter(|&e| e != El::C)
+        .collect();
+    let count = |e: El| els.iter().filter(|&&x| x == e).count();
+    let nitrogen = count(El::N) > 0;
+    // Criterion (b) applies only to rings without nitrogen.
+    let first_hetero = if nitrogen {
+        0
+    } else if count(El::O) > 0 {
+        2
+    } else if count(El::S) > 0 {
+        1
+    } else {
+        0
+    };
+    let variety = [El::O, El::S, El::N]
+        .iter()
+        .filter(|&&e| count(e) > 0)
+        .count();
+    Rank {
+        nitrogen,
+        first_hetero,
+        rings,
+        size: atoms.len(),
+        heteroatoms: els.len(),
+        variety,
+        by_element: [count(El::O), count(El::S), count(El::N)],
+        hetero_locants: Reverse(hetero_locants),
+        multiple,
+        double,
+    }
+}
 
-/// The rings of a structure, each in cyclic order, and which atoms are in one. Only separate
-/// monocycles are accepted: a ring system whose rings share atoms (fused, bridged, spiro) is
-/// refused.
-fn find_rings(g: &Graph) -> Result<(Vec<Vec<usize>>, Vec<bool>), Unsupported> {
+const MORE_RINGS: &str = "more than one ring sharing atoms: a ring system of more than two rings \
+                          (tricyclo…, dispiro…, fused polycycles)";
+
+const FUSED: &str = "more than one ring sharing atoms: two ortho-fused rings of five or more \
+                     members, named by fusion nomenclature (decahydronaphthalene, indole, \
+                     P-52.2.4.1), which is not supported";
+
+/// The ring systems of a structure: the monocycles, each in cyclic order; the systems of two
+/// rings sharing atoms (bicycles, monospiro systems); and which atoms are in a ring. Systems of
+/// more rings, and ortho-fused bicycles that take fusion names, are refused.
+#[allow(clippy::type_complexity)]
+fn find_rings(g: &Graph) -> Result<(Vec<Vec<usize>>, Vec<Poly>, Vec<bool>), Unsupported> {
     let n = g.len();
     // Bridges (bonds on no cycle), by an iterative depth-first search with low-links.
     let mut disc = vec![usize::MAX; n];
@@ -1105,41 +1169,266 @@ fn find_rings(g: &Graph) -> Result<(Vec<Vec<usize>>, Vec<bool>), Unsupported> {
             }
         }
     }
-    let ring_nbrs = |a: usize| -> Vec<usize> {
-        g.nbrs(a)
-            .filter(|&b| !bridges.contains(&(a.min(b), a.max(b))))
-            .collect()
-    };
-    let in_ring: Vec<bool> = (0..n).map(|a| !ring_nbrs(a).is_empty()).collect();
+    let ring_nbrs: Vec<Vec<usize>> = (0..n)
+        .map(|a| {
+            g.nbrs(a)
+                .filter(|&b| !bridges.contains(&(a.min(b), a.max(b))))
+                .collect()
+        })
+        .collect();
+    let in_ring: Vec<bool> = (0..n).map(|a| !ring_nbrs[a].is_empty()).collect();
     let mut seen = vec![false; n];
     let mut rings = Vec::new();
+    let mut systems = Vec::new();
     for start in 0..n {
         if !in_ring[start] || seen[start] {
             continue;
         }
-        // Walk the ring system: it is a monocycle when every atom of it has two ring bonds.
-        let mut ring = vec![start];
+        // The ring system: the atoms reachable by ring bonds. It has as many rings as it has
+        // bonds less atoms plus one.
+        let mut system = vec![start];
         seen[start] = true;
-        let (mut prev, mut cur) = (usize::MAX, start);
-        loop {
-            let nb = ring_nbrs(cur);
-            if nb.len() != 2 {
-                return Err(SHARED_RINGS.into());
+        let mut k = 0;
+        while k < system.len() {
+            for &b in &ring_nbrs[system[k]] {
+                if !seen[b] {
+                    seen[b] = true;
+                    system.push(b);
+                }
             }
-            let next = if nb[0] != prev { nb[0] } else { nb[1] };
-            if next == start {
-                break;
+            k += 1;
+        }
+        let bonds = system.iter().map(|&a| ring_nbrs[a].len()).sum::<usize>() / 2;
+        match bonds + 1 - system.len() {
+            1 => {
+                // A monocycle: walk it in cyclic order.
+                let mut ring = vec![start];
+                let (mut prev, mut cur) = (usize::MAX, start);
+                loop {
+                    let nb = &ring_nbrs[cur];
+                    let next = if nb[0] != prev { nb[0] } else { nb[1] };
+                    if next == start {
+                        break;
+                    }
+                    ring.push(next);
+                    (prev, cur) = (cur, next);
+                }
+                rings.push(ring);
             }
-            if seen[next] {
-                return Err(SHARED_RINGS.into());
-            }
-            seen[next] = true;
-            ring.push(next);
+            2 => systems.push(two_rings(g, &ring_nbrs, &system)?),
+            _ => return Err(MORE_RINGS.into()),
+        }
+    }
+    Ok((rings, systems, in_ring))
+}
+
+/// A ring system of two rings (`system`, its atoms; `nb`, the ring bonds of every atom): a
+/// monospiro system or a bicycle, with every numbering its rules allow.
+fn two_rings(g: &Graph, nb: &[Vec<usize>], system: &[usize]) -> Result<Poly, Unsupported> {
+    let internal = || "internal error: ring system of two rings".to_string();
+    // The atoms from `first` on, leaving `from`, up to the next atom with more than two ring
+    // bonds (not included), and that atom.
+    let walk = |from: usize, first: usize| -> (Vec<usize>, usize) {
+        let (mut prev, mut cur) = (from, first);
+        let mut path = Vec::new();
+        while nb[cur].len() == 2 {
+            path.push(cur);
+            let next = if nb[cur][0] != prev {
+                nb[cur][0]
+            } else {
+                nb[cur][1]
+            };
             (prev, cur) = (cur, next);
         }
-        rings.push(ring);
+        (path, cur)
+    };
+    let reversed = |v: &[usize]| v.iter().rev().copied().collect::<Vec<_>>();
+    let mut numberings = Vec::new();
+    // The cycles of the system, each its atoms in cyclic order, for the Kekulé forms.
+    let mut cycles: Vec<Vec<usize>> = Vec::new();
+    // The six-membered cycles of a bicycle made of two bridges of two atoms each: a ring
+    // bridged at its 1,4-positions by the third bridge.
+    let mut para: Vec<Vec<usize>> = Vec::new();
+    let descriptor;
+    if let Some(&s) = system.iter().find(|&&a| nb[a].len() == 4) {
+        // Spiro: each ring, from a neighbour of the spiro atom round to the other.
+        let mut ring_paths: Vec<Vec<usize>> = Vec::new();
+        for &f in &nb[s] {
+            let (path, end) = walk(s, f);
+            if end != s {
+                return Err(internal());
+            }
+            if !ring_paths.iter().any(|r| r.last() == Some(&f)) {
+                ring_paths.push(path);
+            }
+        }
+        let [a, b] = &ring_paths[..] else {
+            return Err(internal());
+        };
+        let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        descriptor = format!("spiro[{}.{}]", small.len(), large.len());
+        // P-24.2.1: from the smaller ring (either, if they are alike) next to the spiro atom,
+        // around it, through the spiro atom and around the other ring.
+        let mut orders = vec![(small, large)];
+        if small.len() == large.len() {
+            orders.push((large, small));
+        }
+        for (first, second) in orders {
+            for p in [first.clone(), reversed(first)] {
+                for q in [second.clone(), reversed(second)] {
+                    let mut num = p.clone();
+                    num.push(s);
+                    num.extend(q);
+                    numberings.push(num);
+                }
+            }
+        }
+        for r in [a, b] {
+            let mut c = vec![s];
+            c.extend(r);
+            cycles.push(c);
+        }
+    } else {
+        let heads: Vec<usize> = system
+            .iter()
+            .copied()
+            .filter(|&a| nb[a].len() == 3)
+            .collect();
+        let [h1, h2] = heads[..] else {
+            return Err(internal());
+        };
+        // The three bridges, each from h1's side, the largest first.
+        let mut bridges: Vec<Vec<usize>> = Vec::new();
+        for &f in &nb[h1] {
+            let (path, end) = if f == h2 { (vec![], h2) } else { walk(h1, f) };
+            if end != h2 {
+                return Err(internal());
+            }
+            bridges.push(path);
+        }
+        bridges.sort_by_key(|b| Reverse(b.len()));
+        let [x, y, z] = [0, 1, 2].map(|i| bridges[i].len());
+        // P-52.2.4.1: two ortho-fused rings of five or more members take a fusion name.
+        if z == 0 && y >= 3 {
+            return Err(FUSED.into());
+        }
+        descriptor = format!("bicyclo[{x}.{y}.{z}]");
+        // P-23.2.3: from a main bridgehead along the largest bridge to the other bridgehead,
+        // back along the second largest, then the main bridge from the atom next to the first
+        // bridgehead. Bridges of one length may take each other's place.
+        const PERMS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for (b1, b2, flip) in [(h1, h2, false), (h2, h1, true)] {
+            let from_b1 = |i: usize| {
+                if flip {
+                    reversed(&bridges[i])
+                } else {
+                    bridges[i].clone()
+                }
+            };
+            for [i, j, k] in PERMS {
+                if bridges[i].len() != x || bridges[j].len() != y {
+                    continue;
+                }
+                let mut num = vec![b1];
+                num.extend(from_b1(i));
+                num.push(b2);
+                num.extend(reversed(&from_b1(j)));
+                num.extend(from_b1(k));
+                numberings.push(num);
+            }
+        }
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            let mut c = vec![h1];
+            c.extend(&bridges[i]);
+            c.push(h2);
+            c.extend(reversed(&bridges[j]));
+            if bridges[i].len() == 2 && bridges[j].len() == 2 {
+                para.push(c.clone());
+            }
+            cycles.push(c);
+        }
     }
-    Ok((rings, in_ring))
+    let forms = kekule_forms(g, nb, system, &cycles);
+    // P-31.1.4.2 gives the von Baeyer name ("bicyclo[10.2.2]hexadeca-1(14),12,15-triene"), but
+    // a mancude six-membered ring bridged at its 1,4-positions is a phane-type structure
+    // (P-52.2.5.1(1)), whose phane name ("1(1,4)-benzenacyclotridecaphane") IUPAC 2013 labels
+    // the PIN; the 1,3-bridged ring keeps the von Baeyer name (P-52.2.5.2.1).
+    let mancude = |c: &[usize]| {
+        forms.iter().any(|f| {
+            (0..c.len())
+                .filter(|&i| {
+                    let (a, b) = (c[i], c[(i + 1) % c.len()]);
+                    f.get(&(a.min(b), a.max(b))) == Some(&2)
+                })
+                .count()
+                == 3
+        })
+    };
+    if para.iter().any(|c| mancude(c.as_slice())) {
+        return Err(
+            "benzene (or another mancude six-membered) ring bridged at its 1,4-positions \
+                    ([n]paracyclophane-type bicycle): its preferred name is a phane name \
+                    (1(1,4)-benzenacyclo…phane, P-52.2.5.1), which is not supported"
+                .into(),
+        );
+    }
+    Ok(Poly {
+        descriptor,
+        numberings,
+        forms,
+    })
+}
+
+/// The most Kekulé forms of one ring system considered.
+const MAX_FORMS: usize = 16;
+
+/// The bond orders of a ring system as drawn, then those of every other Kekulé form reached by
+/// swapping the single and double bonds around a cycle in which they alternate.
+fn kekule_forms(
+    g: &Graph,
+    nb: &[Vec<usize>],
+    system: &[usize],
+    cycles: &[Vec<usize>],
+) -> Vec<BTreeMap<(usize, usize), u8>> {
+    let drawn: BTreeMap<(usize, usize), u8> = system
+        .iter()
+        .flat_map(|&a| nb[a].iter().map(move |&b| (a, b)))
+        .filter(|&(a, b)| a < b)
+        .map(|(a, b)| ((a, b), g.order(a, b)))
+        .collect();
+    let key = |a: usize, b: usize| (a.min(b), a.max(b));
+    let mut forms = vec![drawn];
+    let mut i = 0;
+    while i < forms.len() && forms.len() < MAX_FORMS {
+        for c in cycles {
+            let k = c.len();
+            let orders: Vec<u8> = (0..k)
+                .map(|j| forms[i][&key(c[j], c[(j + 1) % k])])
+                .collect();
+            let alternating = k % 2 == 0
+                && orders.iter().all(|&o| o == 1 || o == 2)
+                && (0..k).all(|j| orders[j] != orders[(j + 1) % k]);
+            if !alternating {
+                continue;
+            }
+            let mut form = forms[i].clone();
+            for j in 0..k {
+                form.insert(key(c[j], c[(j + 1) % k]), 3 - orders[j]);
+            }
+            if !forms.contains(&form) {
+                forms.push(form);
+            }
+        }
+        i += 1;
+    }
+    forms
 }
 
 /// Group the rings into ring parents: identical rings (benzene rings, or saturated rings of
@@ -1168,6 +1457,16 @@ fn ring_parents(g: &Graph, rings: &[Ring]) -> Result<Vec<RingParent>, Unsupporte
             let (ri, rj) = (&rings[i], &rings[j]);
             if ri.atoms.len() != rj.atoms.len() {
                 continue;
+            }
+            match (&ri.poly, &rj.poly) {
+                (None, None) => {}
+                (Some(p), Some(q)) if p.descriptor == q.descriptor => {
+                    return Err("ring assembly of bicyclic or spiro ring systems \
+                                (2,2'-bi(bicyclo[2.2.1]heptane))"
+                        .into());
+                }
+                // Different ring systems: one is a substituent of the other.
+                _ => continue,
             }
             if (benzene(ri) && benzene(rj))
                 || (saturated(ri) && saturated(rj))

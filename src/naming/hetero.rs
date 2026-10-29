@@ -94,6 +94,9 @@ pub(crate) const RINGS: &[HeteroRing] = &[
     ring("oxepane", &[O, C, C, C, C, C, C], false),
     ring("azepane", &[N, C, C, C, C, C, C], false),
     ring("thiepane", &[S, C, C, C, C, C, C], false),
+    ring("oxocane", &[O, C, C, C, C, C, C, C], false),
+    ring("azocane", &[N, C, C, C, C, C, C, C], false),
+    ring("thiocane", &[S, C, C, C, C, C, C, C], false),
 ];
 
 /// A recognised heterocycle of a structure.
