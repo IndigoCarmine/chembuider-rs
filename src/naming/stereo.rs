@@ -18,7 +18,8 @@
 //!   more than one (P-91.2.2: "cycloocta-1,3,5,7-tetraene");
 //! - out of scope, with no descriptor: centres on atoms other than carbon, ligands that tie under
 //!   CIP Rule 1a but may differ by Rules 1b–5 (pseudoasymmetric centres, r/s; reported when the
-//!   tied ligands carry stereo bonds of their own), allenes (axial chirality, reported),
+//!   tied ligands carry stereo bonds or stereogenic double bonds of their own, unless the
+//!   descriptors found show them alike), allenes (axial chirality, reported),
 //!   longer cumulenes, atropisomeric axes and planar chirality (not detected), relative
 //!   configuration (rel-, rac-, R*/S*: a drawing's wedges are read as absolute).
 
@@ -83,7 +84,7 @@ pub(crate) fn units(g: &Graph) -> Vec<Unit> {
     let atoms = cip::Atoms::new(z, &g.h, &g.adj);
     let mut out = Vec::new();
     for c in 0..g.len() {
-        if let Some(u) = centre(g, &atoms, c) {
+        if let Some(u) = centre(g, &atoms, c, None) {
             out.push(u);
         }
     }
@@ -100,8 +101,22 @@ pub(crate) fn units(g: &Graph) -> Vec<Unit> {
             out.push(u);
         }
     }
+    // A centre whose tied ligands bear stereogenic units of their own is one only where their
+    // configurations differ: decided with the descriptors just found.
+    let first = out.clone();
+    out.retain(|u| match (u.site, &u.descriptor) {
+        (Site::Centre(c), Err(why)) if why == PSEUDOASYMMETRIC => {
+            centre(g, &atoms, c, Some(&first)).is_some()
+        }
+        _ => true,
+    });
     out
 }
+
+/// Why a centre whose tied ligands differ only in their own configuration has no descriptor.
+const PSEUDOASYMMETRIC: &str = "two ligands differ only in their own configuration (a \
+                                pseudoasymmetric centre, r/s, or CIP Rules 3–5), which is not \
+                                supported";
 
 /// The ligands of `x` other than `except`: its neighbours, then its hydrogens.
 fn ligands(g: &Graph, x: usize, except: Option<usize>) -> Vec<Ligand> {
@@ -114,8 +129,10 @@ fn ligands(g: &Graph, x: usize, except: Option<usize>) -> Vec<Ligand> {
     l
 }
 
-/// A tetrahedral carbon centre with four different ligands.
-fn centre(g: &Graph, atoms: &cip::Atoms, c: usize) -> Option<Unit> {
+/// A tetrahedral carbon centre with four different ligands. Two ligands that tie under Rule 1a
+/// but bear stereogenic units of their own may still differ in configuration: with the units
+/// `known` from a first pass, the centre is left out where they do not.
+fn centre(g: &Graph, atoms: &cip::Atoms, c: usize, known: Option<&[Unit]>) -> Option<Unit> {
     if g.el[c] != El::C
         || g.charge[c] != 0
         || g.free_on(c) > 0
@@ -131,18 +148,16 @@ fn centre(g: &Graph, atoms: &cip::Atoms, c: usize) -> Option<Unit> {
         Err(Unranked::Tie(i, j)) => {
             // Alike constitutionally; they may still differ in their own configuration
             // (Rules 3–5).
-            let marked = |l: Ligand| match l {
-                Ligand::Atom(a) => branch_marked(g, &[c], a),
-                Ligand::H => false,
+            let (Ligand::Atom(a), Ligand::Atom(b)) = (ligs[i], ligs[j]) else {
+                return None;
             };
-            if !(marked(ligs[i]) || marked(ligs[j])) {
+            if !(branch_marked(g, atoms, &[c], a) || branch_marked(g, atoms, &[c], b)) {
                 return None;
             }
-            Err(
-                "two ligands differ only in their own configuration (a pseudoasymmetric \
-                 centre, r/s, or CIP Rules 3–5), which is not supported"
-                    .into(),
-            )
+            if known.is_some_and(|k| alike_configurations(g, k, c, a, b)) {
+                return None;
+            }
+            Err(PSEUDOASYMMETRIC.into())
         }
         Err(Unranked::TooLarge) => {
             if !wedged_at(g, c) {
@@ -165,9 +180,9 @@ fn wedged_at(g: &Graph, c: usize) -> bool {
         .any(|m| m.narrow == End::Atom(c) && matches!(m.wedge, Wedge::Up | Wedge::Down))
 }
 
-/// Whether the branch through `a` away from the atoms `from` has stereo bonds of its own or a
-/// double bond.
-fn branch_marked(g: &Graph, from: &[usize], a: usize) -> bool {
+/// Whether the branch through `a` away from the atoms `from` has stereo bonds of its own, a
+/// double bond that can be stereogenic or an allene.
+fn branch_marked(g: &Graph, atoms: &cip::Atoms, from: &[usize], a: usize) -> bool {
     let mut seen = vec![false; g.len()];
     for &c in from {
         seen[c] = true;
@@ -175,7 +190,12 @@ fn branch_marked(g: &Graph, from: &[usize], a: usize) -> bool {
     seen[a] = true;
     let mut stack = vec![a];
     while let Some(x) = stack.pop() {
-        if wedged_at(g, x) || g.adj[x].iter().any(|&(_, o)| o == 2) {
+        if wedged_at(g, x)
+            || g.adj[x]
+                .iter()
+                .any(|&(y, o)| o == 2 && stereogenic_double(g, atoms, x, y))
+            || allene(g, atoms, x).is_some()
+        {
             return true;
         }
         for y in g.nbrs(x) {
@@ -186,6 +206,61 @@ fn branch_marked(g: &Graph, from: &[usize], a: usize) -> bool {
         }
     }
     false
+}
+
+/// Whether the branches through `a` and `b` away from the centre `c`, alike under Rule 1a, have
+/// the same configuration: they share no atom (no ring), and their stereogenic units in `known`,
+/// by distance from `c`, have the same descriptors. Only one unit at each distance, all of them
+/// described, is decided; anything else is taken to differ.
+fn alike_configurations(g: &Graph, known: &[Unit], c: usize, a: usize, b: usize) -> bool {
+    // The distance from `c` of each atom of the branch through `top`.
+    let distances = |top: usize| {
+        let mut dist = vec![usize::MAX; g.len()];
+        dist[c] = 0;
+        dist[top] = 1;
+        let mut queue = std::collections::VecDeque::from([top]);
+        while let Some(x) = queue.pop_front() {
+            for y in g.nbrs(x) {
+                if dist[y] == usize::MAX {
+                    dist[y] = dist[x] + 1;
+                    queue.push_back(y);
+                }
+            }
+        }
+        dist
+    };
+    let (da, db) = (distances(a), distances(b));
+    if (0..g.len()).any(|x| x != c && da[x] != usize::MAX && db[x] != usize::MAX) {
+        return false;
+    }
+    let units_of = |dist: &[usize]| -> Option<Vec<(usize, Descriptor)>> {
+        let mut found = Vec::new();
+        for u in known {
+            let at = match u.site {
+                Site::Centre(x) => vec![x],
+                Site::Double(x, y) | Site::Axis(x, y) => vec![x, y],
+            };
+            let inside = at
+                .iter()
+                .filter(|&&x| x != c && dist[x] != usize::MAX)
+                .count();
+            if inside == 0 {
+                continue;
+            }
+            if inside < at.len() {
+                return None;
+            }
+            let d = at
+                .iter()
+                .map(|&x| dist[x])
+                .min()
+                .expect("a unit has an atom");
+            found.push((d, *u.descriptor.as_ref().ok()?));
+        }
+        found.sort_by_key(|u| u.0);
+        found.windows(2).all(|w| w[0].0 != w[1].0).then_some(found)
+    };
+    units_of(&da).is_some_and(|ua| units_of(&db) == Some(ua))
 }
 
 /// A drawn position as a vector in a right-handed frame (y upward), relative to `from`.
@@ -322,16 +397,32 @@ fn other_double(g: &Graph, x: usize, except: usize) -> bool {
     g.adj[x].iter().any(|&(m, o)| m != except && o >= 2)
 }
 
+/// Whether the double bond `a`–`b` (in the smallest ring `ring`, if any) can be a stereogenic
+/// unit by its constitution: between two carbons, not cumulated, not in a ring of fewer than
+/// eight members (P-93).
+fn double_bond_possible(g: &Graph, a: usize, b: usize, ring: Option<&[usize]>) -> bool {
+    g.el[a] == El::C
+        && g.el[b] == El::C
+        && g.free_on(a) + g.free_on(b) == 0
+        && !other_double(g, a, b)
+        && !other_double(g, b, a)
+        && !ring.is_some_and(|r| r.len() < 8)
+}
+
+/// Whether the double bond `a`–`b` can be stereogenic: possible by its constitution, with two
+/// ligands on each end that Rule 1a does not tie.
+fn stereogenic_double(g: &Graph, atoms: &cip::Atoms, a: usize, b: usize) -> bool {
+    double_bond_possible(g, a, b, smallest_ring(g, a, b).as_deref())
+        && [(a, b), (b, a)].into_iter().all(|(x, y)| {
+            let ligs = ligands(g, x, Some(y));
+            ligs.len() == 2 && !matches!(cip::rank(atoms, x, &ligs), Err(Unranked::Tie(..)))
+        })
+}
+
 /// A C=C double bond whose ends both bear two different ligands.
 fn double_bond(g: &Graph, atoms: &cip::Atoms, a: usize, b: usize) -> Option<Unit> {
     let ring = smallest_ring(g, a, b);
-    if g.el[a] != El::C
-        || g.el[b] != El::C
-        || g.free_on(a) + g.free_on(b) > 0
-        || other_double(g, a, b)
-        || other_double(g, b, a)
-        || ring.as_ref().is_some_and(|r| r.len() < 8)
-    {
+    if !double_bond_possible(g, a, b, ring.as_deref()) {
         return None;
     }
     let mut ends = Vec::new();
@@ -347,7 +438,7 @@ fn double_bond(g: &Graph, atoms: &cip::Atoms, a: usize, b: usize) -> Option<Unit
                 // Alike constitutionally (no stereogenic unit), or only in their own
                 // configuration (Rules 3–5).
                 let marked = ligs.iter().any(|&l| match l {
-                    Ligand::Atom(m) => branch_marked(g, &[a, b], m),
+                    Ligand::Atom(m) => branch_marked(g, atoms, &[a, b], m),
                     Ligand::H => false,
                 });
                 if !marked {

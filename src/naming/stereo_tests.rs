@@ -778,6 +778,122 @@ fn mancude_heterocycle_in_either_kekule_structure() {
     }
 }
 
+/// Ring double bonds that are no Kekulé structure keep their drawn duplicates (P-92.1.4.2):
+/// cumulated in cyclonona-1,2-diene, they cannot be rearranged, so the cyclononadienyl C1' is
+/// (C, C, C) with the duplicate of C2', like that of cyclonon-1-en-1-yl, and outranks the
+/// isopropyl group (C, C, H). C1 at the right of the ring, the hydroxy group on a solid wedge
+/// (up), the isopropyl group lower right: O → ring → isopropyl counterclockwise with H behind: S.
+#[test]
+fn cumulated_ring_double_bonds_keep_their_duplicates() {
+    let mol = |doubles: &[usize]| {
+        let (mut a, mut b) = polygon(9, 1.5, doubles);
+        a.extend([
+            ("C", 2.5, 0.0),    // 9: C1
+            ("O", 2.5, 1.0),    // 10
+            ("C", 3.0, -0.866), // 11: C2
+            ("C", 4.0, -0.866), // 12
+            ("C", 2.5, -1.732), // 13
+        ]);
+        b.extend([
+            (9, 0, '-'),
+            (9, 10, 'w'),
+            (9, 11, '-'),
+            (11, 12, '-'),
+            (11, 13, '-'),
+        ]);
+        draw(&a, &b)
+    };
+    for (doubles, ring) in [
+        (&[0][..], "cyclonon-1-en-1-yl"),
+        (&[0, 1][..], "cyclonona-1,2-dien-1-yl"),
+    ] {
+        let expected = format!("(1S)-1-({ring})-2-methylpropan-1-ol");
+        assert_eq!(name(&mol(doubles)), expected);
+        assert_eq!(
+            name(&mirrored(mol(doubles))),
+            expected.replace("(1S)", "(1R)")
+        );
+    }
+}
+
+/// A centre whose alike ligands hold no stereogenic unit of their own is no stereogenic unit,
+/// and gets no note about Rules 3–5: a double bond that cannot be one (aromatic, C=O) does not
+/// count, nor do ligands whose own centres have the same configuration. C2 of
+/// 1,3-diphenylpropan-2-ol, C4 of 4-hydroxycyclohexan-1-one (hydroxy groups on a solid wedge,
+/// their names unchanged), C3 of (2R,4R)-pentane-2,3,4-triol. In the meso triol, (2R,4S), C3 is
+/// pseudoasymmetric (r/s, not supported), and the note stays.
+#[test]
+fn no_pseudoasymmetric_note_without_a_stereogenic_unit_in_the_ligands() {
+    let hexagon = |cx: f32, cy: f32| -> Atoms {
+        (0..6)
+            .map(|k| {
+                let t = std::f32::consts::PI / 3.0 * k as f32 + std::f32::consts::PI / 6.0;
+                ("C", cx + t.cos(), cy + t.sin())
+            })
+            .collect()
+    };
+    // 1,3-Diphenylpropan-2-ol: rings 0–5 and 6–11, the chain 12–14, O 15.
+    let mut atoms = hexagon(-1.0, 1.0);
+    atoms.extend(hexagon(4.5, 1.0));
+    atoms.extend([
+        ("C", zz(1).0, zz(1).1),
+        ("C", zz(2).0, zz(2).1),
+        ("C", zz(3).0, zz(3).1),
+        ("O", zz(2).0, -1.0),
+    ]);
+    let mut bonds: Bonds = Vec::new();
+    for base in [0, 6] {
+        for k in 0..6 {
+            bonds.push((
+                base + k,
+                base + (k + 1) % 6,
+                if k % 2 == 0 { '=' } else { '-' },
+            ));
+        }
+    }
+    bonds.extend([
+        (12, 4, '-'),
+        (12, 13, '-'),
+        (13, 14, '-'),
+        (14, 9, '-'),
+        (13, 15, 'w'),
+    ]);
+    let diphenyl = draw(&atoms, &bonds);
+    // 4-Hydroxycyclohexan-1-one: the ring 0–5, =O on atom 0, OH on atom 3.
+    let mut atoms = hexagon(0.0, 0.0);
+    atoms.extend([("O", 1.732, 1.0), ("O", -1.732, -1.0)]);
+    let mut bonds: Bonds = (0..6).map(|k| (k, (k + 1) % 6, '-')).collect();
+    bonds.extend([(0, 6, '='), (3, 7, 'w')]);
+    let cyclohexanone = draw(&atoms, &bonds);
+    // Pentane-2,3,4-triol, C2 and C4 up, their hydroxy groups above them, C3's below.
+    let triol = |c4: char| {
+        chain_with(
+            5,
+            &[],
+            &[
+                ("O", zz(1).0, 1.5, 1, 'w'),
+                ("O", zz(2).0, -1.0, 2, '-'),
+                ("O", zz(3).0, 1.5, 3, c4),
+            ],
+        )
+    };
+    for (mol, expected) in [
+        (diphenyl, "1,3-diphenylpropan-2-ol"),
+        (cyclohexanone, "4-hydroxycyclohexan-1-one"),
+        (triol('h'), "(2R,4R)-pentane-2,3,4-triol"),
+    ] {
+        assert_eq!(noted(&mol), (expected.to_string(), vec![]));
+    }
+    let (n, notes) = noted(&triol('w'));
+    assert_eq!(n, "(2R,4S)-pentane-2,3,4-triol");
+    assert!(
+        notes
+            .iter()
+            .any(|t| t.contains("C3") && t.contains("own configuration")),
+        "{notes:?}"
+    );
+}
+
 /// Descriptors are given for the parent chain or ring only; a stereocentre in a substituent
 /// prefix ("[(2R)-butan-2-yl]") is left out, with a note.
 #[test]

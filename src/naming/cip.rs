@@ -33,14 +33,16 @@ pub(crate) struct Atoms<'a> {
     /// The duplicate atom of each atom of a mancude ring.
     dup: Vec<Dup>,
     /// The neighbours of each atom across the bonds of its mancude ring system, whose double
-    /// bonds the drawing places in one Kekulé structure of several.
+    /// bonds the drawing places in one Kekulé structure of several (empty where the duplicates
+    /// are as drawn, [`Dup::Drawn`]).
     kekule: Vec<Vec<usize>>,
 }
 
 /// The duplicate atom an atom bears for the double bond of its mancude ring.
 #[derive(Clone, Copy, Debug)]
 enum Dup {
-    /// Not in a mancude ring: its multiple bonds give duplicates as drawn.
+    /// Not in a mancude ring, or in one whose double bonds are drawn as no Kekulé structure
+    /// (cumulated): its multiple bonds give duplicates as drawn.
     Drawn,
     /// One duplicate, the mean atomic number of its partners in every Kekulé structure.
     Mean(Z),
@@ -116,7 +118,7 @@ impl<'a> Atoms<'a> {
         let mancude: Vec<bool> = (0..n)
             .map(|a| adj[a].iter().any(|&(b, o)| o == 2 && in_ring(a, b)))
             .collect();
-        let kekule: Vec<Vec<usize>> = (0..n)
+        let mut kekule: Vec<Vec<usize>> = (0..n)
             .map(|a| {
                 if !mancude[a] {
                     return Vec::new();
@@ -147,6 +149,22 @@ impl<'a> Atoms<'a> {
                 }
                 i += 1;
             }
+            // Only double bonds drawn as one Kekulé structure (each atom of the system doubly
+            // bonded to exactly one other) can be placed otherwise; cumulated ones cannot, and
+            // keep their duplicates as drawn (P-92.1.4.2).
+            let drawn_kekule = system.iter().all(|&a| {
+                adj[a]
+                    .iter()
+                    .filter(|&&(b, o)| o == 2 && kekule[a].contains(&b))
+                    .count()
+                    == 1
+            });
+            if !drawn_kekule {
+                for &a in &system {
+                    kekule[a].clear();
+                }
+                continue;
+            }
             let mut found = Kekule {
                 partner: vec![None; n],
                 sum: vec![0; n],
@@ -154,14 +172,15 @@ impl<'a> Atoms<'a> {
                 steps: 0,
             };
             let complete = found.go(&system, &kekule, &z);
+            // The structure drawn is one of them, so there is at least one.
             for &a in &system {
-                dup[a] = match (complete, found.structures) {
-                    (false, _) => Dup::Unknown,
-                    (true, 0) => Dup::Drawn,
-                    (true, k) => Dup::Mean(Z {
+                dup[a] = if complete {
+                    Dup::Mean(Z {
                         num: found.sum[a],
-                        den: k,
-                    }),
+                        den: found.structures,
+                    })
+                } else {
+                    Dup::Unknown
                 };
             }
         }
@@ -533,6 +552,27 @@ mod tests {
                 "C2'=N1' drawn: {c2_n}"
             );
         }
+    }
+
+    /// Cumulated ring double bonds are no Kekulé structure: they give their duplicates as drawn
+    /// (P-92.1.4.2). Cyclonona-1,2-dien-1-yl (C, C, C) > isopropyl (C, C, H).
+    #[test]
+    fn cumulated_ring_double_bonds() {
+        // 0 the root CH(OH), 1 O; 2–10 the ring, C1'=C2'=C3'; 11 the isopropyl CH, 12–13.
+        let mut atoms = vec![(6, 1), (8, 1), (6, 0), (6, 0), (6, 1)];
+        atoms.extend([(6, 2); 6]);
+        atoms.extend([(6, 1), (6, 3), (6, 3)]);
+        let mut bonds: Vec<(usize, usize, u8)> = (0..9)
+            .map(|k| (2 + k, 2 + (k + 1) % 9, if k < 2 { 2 } else { 1 }))
+            .collect();
+        bonds.extend([(0, 1, 1), (0, 2, 1), (0, 11, 1), (11, 12, 1), (11, 13, 1)]);
+        let ligands = [
+            Ligand::Atom(11),
+            Ligand::Atom(2),
+            Ligand::Atom(1),
+            Ligand::H,
+        ];
+        assert_eq!(rank_of(&atoms, &bonds, 0, &ligands), Ok(vec![2, 1, 0, 3]));
     }
 
     /// Two ethyl groups tie.
