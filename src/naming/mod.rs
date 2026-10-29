@@ -95,11 +95,16 @@
 //! of the name, with their locants, in ascending order of the locants whatever their kind
 //! (P-93): "(2R)-butan-2-ol", "(2E)-pent-2-ene", "(3S,4E)-hex-4-en-3-ol", "(2S,5R,6R)-3,3-
 //! dimethyl-7-oxo-6-(2-phenylacetamido)-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid";
-//! of an ester before its acid part ("ethyl (2R)-…oate"). R/S comes from the wedges and hashes
+//! of an ester before its acid part ("ethyl (2R)-…oate"). Where the name cites no locant for
+//! the unit, its descriptor has none (P-93.4.1.1): "(R)-bromo(chloro)(fluoro)methane",
+//! "(E)-1,2-dichloroethene", "(Z)-cyclooctene". R/S comes from the wedges and hashes
 //! drawn at a tetrahedral carbon centre, E/Z from the drawn geometry of a C=C double bond (not
-//! in a ring of fewer than eight members, P-93). Of numberings that tie on everything
-//! else, the lower locants go to Z, then to R (P-31.1.4.3.4: meso "(2R,3S)"). The CIP ranking
-//! is Rule 1a over the hierarchical digraph with duplicate atoms (P-92.1). A unit gets no
+//! in a ring of fewer than eight members, P-93; nor the Z double bonds of an eight-membered
+//! ring with more than one, P-91.2.2: "cycloocta-1,3,5,7-tetraene"). Of numberings that tie on
+//! everything else, the lower locants go to Z, then to R (P-14.4 (j): meso "(2R,3S)"). The CIP
+//! ranking is Rule 1a over the hierarchical digraph with duplicate atoms (P-92.1), the
+//! duplicates of a mancude ring averaged over its Kekulé structures (P-92.1.4.4), so that the
+//! Kekulé structure drawn does not matter. A unit gets no
 //! descriptor, and [`iupac_name_with_notes`] says why, where the drawing does not fix it (no
 //! wedge at a centre, a wavy, bold or plain hashed bond, a double bond drawn straight), where it
 //! is not on the parent (a stereocentre in a substituent prefix: "[(2R)-butan-2-yl]" is not

@@ -382,8 +382,7 @@ fn show_values(
                 });
                 if !stereo_notes.is_empty() {
                     ui.weak(tr_in(lang, Msg::StereoNotIncluded))
-                        .on_hover_text(stereo_notes.join("
-"));
+                        .on_hover_text(stereo_notes.join("\n"));
                 }
             }
             NameResult::Unsupported(reason) => {

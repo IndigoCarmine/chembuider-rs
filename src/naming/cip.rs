@@ -4,7 +4,11 @@
 //! The digraph is grown from the root atom along every path that does not revisit an atom. A
 //! ring closure ends in a duplicate of the atom it closes on, and a multiple bond adds a
 //! duplicate of each of its atoms to the other (P-92.1: C=O counts as C(O)(O) and O(C)).
-//! Duplicates carry only phantom atoms (atomic number 0) further out. Two branches are compared
+//! Duplicates carry only phantom atoms (atomic number 0) further out. In a mancude ring the
+//! double bonds drawn are one Kekulé structure of several; each atom of such a ring bears a
+//! single duplicate whose atomic number is the mean over every Kekulé structure of the atom it
+//! is then doubly bonded to (P-92.1.4.4: 6½ for C2 of pyridine, doubly bonded to N1 or C3), so
+//! the ranking does not depend on the structure drawn. Two branches are compared
 //! sphere by sphere; in each sphere the sets of atoms are compared in the order of the branches
 //! they come from, the higher-ranked branch first (P-92.1), each set from its highest atom
 //! down.
@@ -21,11 +25,196 @@ use std::cmp::Ordering;
 /// A structure as the CIP rules see it.
 pub(crate) struct Atoms<'a> {
     /// Atomic number of each atom.
-    pub z: Vec<u8>,
+    z: Vec<u8>,
     /// The hydrogens on each atom (not drawn as atoms of `adj`).
-    pub h: &'a [u8],
+    h: &'a [u8],
     /// Neighbours with the bond order to each.
-    pub adj: &'a [Vec<(usize, u8)>],
+    adj: &'a [Vec<(usize, u8)>],
+    /// The duplicate atom of each atom of a mancude ring.
+    dup: Vec<Dup>,
+    /// The neighbours of each atom across the bonds of its mancude ring system, whose double
+    /// bonds the drawing places in one Kekulé structure of several.
+    kekule: Vec<Vec<usize>>,
+}
+
+/// The duplicate atom an atom bears for the double bond of its mancude ring.
+#[derive(Clone, Copy, Debug)]
+enum Dup {
+    /// Not in a mancude ring: its multiple bonds give duplicates as drawn.
+    Drawn,
+    /// One duplicate, the mean atomic number of its partners in every Kekulé structure.
+    Mean(Z),
+    /// Its ring system has too many Kekulé structures to go through.
+    Unknown,
+}
+
+/// The Kekulé structures of a ring system are not looked for past this many steps.
+const MAX_KEKULE_STEPS: usize = 100_000;
+
+/// An atomic number, or the mean of several: `num / den`.
+#[derive(Clone, Copy, Debug)]
+struct Z {
+    num: u32,
+    den: u32,
+}
+
+impl Z {
+    fn of(z: u8) -> Z {
+        Z {
+            num: z.into(),
+            den: 1,
+        }
+    }
+}
+
+impl Ord for Z {
+    fn cmp(&self, other: &Z) -> Ordering {
+        (u64::from(self.num) * u64::from(other.den))
+            .cmp(&(u64::from(other.num) * u64::from(self.den)))
+    }
+}
+
+impl PartialOrd for Z {
+    fn partial_cmp(&self, other: &Z) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Z {
+    fn eq(&self, other: &Z) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Z {}
+
+impl<'a> Atoms<'a> {
+    /// The structure of atoms with atomic numbers `z`, hydrogens `h` and bonds `adj`.
+    pub(crate) fn new(z: Vec<u8>, h: &'a [u8], adj: &'a [Vec<(usize, u8)>]) -> Self {
+        let n = z.len();
+        // Whether the bond a–b is in a ring: b is reached from a without it.
+        let in_ring = |a: usize, b: usize| {
+            let mut seen = vec![false; n];
+            seen[a] = true;
+            let mut stack = vec![a];
+            while let Some(x) = stack.pop() {
+                for &(y, _) in &adj[x] {
+                    if (x, y) == (a, b) || seen[y] {
+                        continue;
+                    }
+                    if y == b {
+                        return true;
+                    }
+                    seen[y] = true;
+                    stack.push(y);
+                }
+            }
+            false
+        };
+        // The atoms of mancude rings: those with a double bond in a ring. Their Kekulé
+        // structures are the ways of pairing them all up across ring bonds.
+        let mancude: Vec<bool> = (0..n)
+            .map(|a| adj[a].iter().any(|&(b, o)| o == 2 && in_ring(a, b)))
+            .collect();
+        let kekule: Vec<Vec<usize>> = (0..n)
+            .map(|a| {
+                if !mancude[a] {
+                    return Vec::new();
+                }
+                adj[a]
+                    .iter()
+                    .filter(|&&(b, o)| mancude[b] && o <= 2 && in_ring(a, b))
+                    .map(|e| e.0)
+                    .collect()
+            })
+            .collect();
+        let mut dup = vec![Dup::Drawn; n];
+        let mut done = vec![false; n];
+        for start in 0..n {
+            if !mancude[start] || done[start] {
+                continue;
+            }
+            // The ring system of `start`.
+            let mut system = vec![start];
+            done[start] = true;
+            let mut i = 0;
+            while i < system.len() {
+                for &y in &kekule[system[i]] {
+                    if !done[y] {
+                        done[y] = true;
+                        system.push(y);
+                    }
+                }
+                i += 1;
+            }
+            let mut found = Kekule {
+                partner: vec![None; n],
+                sum: vec![0; n],
+                structures: 0,
+                steps: 0,
+            };
+            let complete = found.go(&system, &kekule, &z);
+            for &a in &system {
+                dup[a] = match (complete, found.structures) {
+                    (false, _) => Dup::Unknown,
+                    (true, 0) => Dup::Drawn,
+                    (true, k) => Dup::Mean(Z {
+                        num: found.sum[a],
+                        den: k,
+                    }),
+                };
+            }
+        }
+        Atoms {
+            z,
+            h,
+            adj,
+            dup,
+            kekule,
+        }
+    }
+}
+
+/// The Kekulé structures of a ring system, found by pairing its atoms in turn.
+struct Kekule {
+    partner: Vec<Option<usize>>,
+    /// The atomic numbers of each atom's partners, summed over the structures found.
+    sum: Vec<u32>,
+    structures: u32,
+    steps: usize,
+}
+
+impl Kekule {
+    /// Go through every pairing of the unpaired atoms of `system`; `false` if there are too
+    /// many to go through.
+    fn go(&mut self, system: &[usize], kekule: &[Vec<usize>], z: &[u8]) -> bool {
+        self.steps += 1;
+        if self.steps > MAX_KEKULE_STEPS {
+            return false;
+        }
+        let Some(&a) = system.iter().find(|&&a| self.partner[a].is_none()) else {
+            self.structures += 1;
+            for &a in system {
+                let b = self.partner[a].expect("every atom paired");
+                self.sum[a] += u32::from(z[b]);
+            }
+            return true;
+        };
+        for &b in &kekule[a] {
+            if self.partner[b].is_some() {
+                continue;
+            }
+            self.partner[a] = Some(b);
+            self.partner[b] = Some(a);
+            let complete = self.go(system, kekule, z);
+            self.partner[a] = None;
+            self.partner[b] = None;
+            if !complete {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// A ligand of the root atom.
@@ -54,7 +243,7 @@ pub(crate) fn rank(atoms: &Atoms, root: usize, ligands: &[Ligand]) -> Result<Vec
     let mut tops = Vec::new();
     for &l in ligands {
         tops.push(match l {
-            Ligand::H => d.push(1, None, NO_NODE)?,
+            Ligand::H => d.push(Z::of(1), None, NO_NODE)?,
             Ligand::Atom(a) => {
                 let order = atoms.adj[root].iter().find(|e| e.0 == a).map_or(1, |e| e.1);
                 d.grow(atoms, root, a, order)?
@@ -78,7 +267,7 @@ const NO_NODE: usize = usize::MAX;
 /// A hierarchical digraph: each node an atom (or a duplicate) with its atomic number.
 #[derive(Default)]
 struct Digraph {
-    z: Vec<u8>,
+    z: Vec<Z>,
     /// Each node's branches, highest-ranked first once sorted.
     kids: Vec<Vec<usize>>,
     /// The atom a node stands for, `None` for a duplicate or a hydrogen (which end there).
@@ -88,7 +277,7 @@ struct Digraph {
 }
 
 impl Digraph {
-    fn push(&mut self, z: u8, atom: Option<usize>, up: usize) -> Result<usize, Unranked> {
+    fn push(&mut self, z: Z, atom: Option<usize>, up: usize) -> Result<usize, Unranked> {
         if self.z.len() >= MAX_NODES {
             return Err(Unranked::TooLarge);
         }
@@ -117,15 +306,27 @@ impl Digraph {
     /// The branch of `root` through its neighbour `a` (bonded by `order`), breadth first, so
     /// that every node is created after its parent.
     fn grow(&mut self, atoms: &Atoms, root: usize, a: usize, order: u8) -> Result<usize, Unranked> {
-        let top = self.push(atoms.z[a], Some(a), NO_NODE)?;
+        let z = |x: usize| Z::of(atoms.z[x]);
+        let top = self.push(z(a), Some(a), NO_NODE)?;
         let mut queue = std::collections::VecDeque::from([(top, root, order)]);
         while let Some((node, from, order)) = queue.pop_front() {
             let x = self.atom[node].expect("only atoms are grown");
-            for _ in 1..order {
-                self.push(atoms.z[from], None, node)?;
+            // In a mancude ring, the mean duplicate stands for those of the double bond drawn.
+            let kekule = |y: usize| atoms.kekule[x].contains(&y);
+            match atoms.dup[x] {
+                Dup::Drawn => {}
+                Dup::Mean(mean) => {
+                    self.push(mean, None, node)?;
+                }
+                Dup::Unknown => return Err(Unranked::TooLarge),
+            }
+            if !kekule(from) {
+                for _ in 1..order {
+                    self.push(z(from), None, node)?;
+                }
             }
             for _ in 0..atoms.h[x] {
-                self.push(1, None, node)?;
+                self.push(Z::of(1), None, node)?;
             }
             for &(y, o) in &atoms.adj[x] {
                 if y == from {
@@ -133,13 +334,15 @@ impl Digraph {
                 }
                 if y == root || self.on_path(node, y) {
                     // A ring closure: a duplicate of the atom it closes on.
-                    self.push(atoms.z[y], None, node)?;
+                    self.push(z(y), None, node)?;
                 } else {
-                    let k = self.push(atoms.z[y], Some(y), node)?;
+                    let k = self.push(z(y), Some(y), node)?;
                     queue.push_back((k, x, o));
                 }
-                for _ in 1..o {
-                    self.push(atoms.z[y], None, node)?;
+                if !kekule(y) {
+                    for _ in 1..o {
+                        self.push(z(y), None, node)?;
+                    }
                 }
             }
         }
@@ -172,8 +375,8 @@ impl Digraph {
             for (&x, &y) in sa.iter().zip(&sb) {
                 let (kx, ky) = (&self.kids[x], &self.kids[y]);
                 for i in 0..kx.len().max(ky.len()) {
-                    let zx = kx.get(i).map_or(0, |&k| self.z[k]);
-                    let zy = ky.get(i).map_or(0, |&k| self.z[k]);
+                    let zx = kx.get(i).map_or(Z::of(0), |&k| self.z[k]);
+                    let zy = ky.get(i).map_or(Z::of(0), |&k| self.z[k]);
                     if zx != zy {
                         return zx.cmp(&zy);
                     }
@@ -206,11 +409,7 @@ mod tests {
             adj[b].push((a, o));
         }
         let h: Vec<u8> = atoms.iter().map(|a| a.1).collect();
-        let cip = Atoms {
-            z: atoms.iter().map(|a| a.0).collect(),
-            h: &h,
-            adj: &adj,
-        };
+        let cip = Atoms::new(atoms.iter().map(|a| a.0).collect(), &h, &adj);
         rank(&cip, root, ligands)
     }
 
@@ -297,6 +496,43 @@ mod tests {
             Ligand::H,
         ];
         assert_eq!(rank_of(&atoms, &bonds, 0, &ligands), Ok(vec![1, 0, 2, 3]));
+    }
+
+    /// Pyridin-2-yl against –C(CH3)(NMe2)CH2OH: drawn C2'=N1', the pyridyl group is (N, N, C)
+    /// at the first sphere; drawn C2'=C3', (N, C, C) as the other group, which then wins further
+    /// out (N1' (C, C) ties with NMe2 (C, C), and CH2OH (O, H, H) beats C3' (C, C, H)). With the
+    /// mean duplicate (P-92.1.4.4) it is (N, 6½, C) either way, and the pyridyl group ranks
+    /// higher.
+    #[test]
+    fn mancude_heterocycle() {
+        for c2_n in [true, false] {
+            // 0 the root CH(OH), 1 O; 2–7 pyridine: C2', N1', C6', C5', C4', C3'; 8 the
+            // quaternary C, 9 its N with the methyls 12–13, 10–11 CH2OH, 14 its methyl.
+            let mut atoms = vec![(6, 1), (8, 1)];
+            atoms.extend([(6, 0), (7, 0), (6, 1), (6, 1), (6, 1), (6, 1)]);
+            atoms.extend([(6, 0), (7, 0), (6, 2), (8, 1), (6, 3), (6, 3), (6, 3)]);
+            let first = if c2_n { 0 } else { 1 };
+            let mut bonds: Vec<(usize, usize, u8)> = (0..6)
+                .map(|k| (2 + k, 2 + (k + 1) % 6, if k % 2 == first { 2 } else { 1 }))
+                .collect();
+            bonds.extend([
+                (0, 1, 1),
+                (0, 2, 1),
+                (0, 8, 1),
+                (8, 9, 1),
+                (8, 10, 1),
+                (10, 11, 1),
+                (8, 14, 1),
+                (9, 12, 1),
+                (9, 13, 1),
+            ]);
+            let ligands = [Ligand::Atom(8), Ligand::Atom(2), Ligand::Atom(1), Ligand::H];
+            assert_eq!(
+                rank_of(&atoms, &bonds, 0, &ligands),
+                Ok(vec![2, 1, 0, 3]),
+                "C2'=N1' drawn: {c2_n}"
+            );
+        }
     }
 
     /// Two ethyl groups tie.

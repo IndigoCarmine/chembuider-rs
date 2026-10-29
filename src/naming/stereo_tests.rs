@@ -7,10 +7,12 @@
 //! out by hand from the figure: the ligands' CIP ranks, then the sense of rotation 1 → 2 → 3 seen
 //! with the lowest-ranked ligand away from the viewer.
 //!
-//! IUPAC 2013 cites the locant with every descriptor in a preferred IUPAC name — "(2Z)-but-2-
-//! enedioic acid (PIN)", "(2E)-…" (P-93) — where Wikipedia and many textbooks
-//! write the shorter "(E)-pent-2-ene", "(R)-butan-2-ol" for a compound with one stereogenic
-//! unit. The names here follow 2013.
+//! IUPAC 2013 cites a descriptor with the locant of its unit whenever the name cites that locant
+//! — "(2R)-butan-2-ol (PIN)", "(2Z)-but-2-ene (PIN)" (P-93.4.1.1) — where Wikipedia and many
+//! textbooks write the shorter "(E)-pent-2-ene", "(R)-butan-2-ol" for a compound with one
+//! stereogenic unit. Where the name cites no locant for the unit, the descriptor has none either:
+//! "(R)-bromo(chloro)(fluoro)methane (PIN)" (P-91.3), "(E)-cyclooctene (PIN)" (P-93.5.1.4.1).
+//! The names here follow 2013.
 
 use super::{NameResult, iupac_name, iupac_name_with_notes};
 use crate::molecule::{BondOrder, BondStereo, Molecule};
@@ -304,7 +306,7 @@ fn deep_comparison() {
 
 /// Tartaric acid: C2 has O > C1 (O, O, O) > C3 (O, C, H) > H. Both hydroxy groups hashed:
 /// (2R,3R), the natural L-(+)-tartaric acid. The meso acid is (2R,3S), not (2S,3R): the two
-/// numberings tie on everything else and the lower locant goes to R (P-31.1.4.3.4).
+/// numberings tie on everything else and the lower locant goes to R (P-14.4 (j)).
 #[test]
 fn tartaric_acid() {
     let tartaric = |k2: char, k3: char| {
@@ -498,6 +500,44 @@ fn undetermined_configurations_get_no_descriptor() {
     }
 }
 
+/// An end of a double bond whose two ligands are alike but for their own configuration: the
+/// two 1-hydroxyethyl groups on C3 of 3-ethylidenepentane-2,4-diol, one hydroxy group on a
+/// solid wedge, the other hashed. Rule 1a ties them; Rules 3–5 are not implemented, so the
+/// double bond gets no descriptor, with a note rather than silently.
+#[test]
+fn double_bond_end_with_ligands_alike_but_for_configuration() {
+    let mol = draw(
+        &[
+            ("C", zz(0).0, zz(0).1),
+            ("C", zz(1).0, zz(1).1),
+            ("C", zz(2).0, zz(2).1),
+            ("C", zz(3).0, zz(3).1),
+            ("C", zz(4).0, zz(4).1),
+            ("O", zz(1).0, 1.5),
+            ("O", zz(3).0, 1.5),
+            ("C", zz(2).0, -1.0),
+            ("C", zz(3).0, -1.5),
+        ],
+        &[
+            (0, 1, '-'),
+            (1, 2, '-'),
+            (2, 3, '-'),
+            (3, 4, '-'),
+            (1, 5, 'w'),
+            (3, 6, 'h'),
+            (2, 7, '='),
+            (7, 8, '-'),
+        ],
+    );
+    let (_, notes) = noted(&mol);
+    assert!(
+        notes
+            .iter()
+            .any(|t| t.contains("double bond") && t.contains("own configuration")),
+        "{notes:?}"
+    );
+}
+
 /// Where there is no stereogenic unit there is nothing to describe, and nothing to note: two
 /// alike ligands on the centre or on an end of the double bond, a double bond in a ring of fewer
 /// than eight members (P-93), a terminal double bond.
@@ -531,23 +571,211 @@ fn no_stereogenic_unit() {
     }
 }
 
-/// In a ring of eight or more members a double bond is stereogenic. A regular octagon draws
-/// it cis. CAS and the locant rule of 2013 give "(1Z)-"; Wikipedia: "(Z)-cyclooctene".
-#[test]
-fn double_bond_in_a_large_ring() {
-    let octagon: Vec<(&str, f32, f32)> = (0..8)
+/// A regular `n`-gon of carbons (atoms 0..n), radius `r`, single bonds except the `doubles`
+/// (index of the first atom of each).
+fn polygon(n: usize, r: f32, doubles: &[usize]) -> (Atoms, Bonds) {
+    let atoms = (0..n)
         .map(|k| {
-            let t = std::f32::consts::PI / 4.0 * k as f32;
-            ("C", 1.3 * t.cos(), 1.3 * t.sin())
+            let t = std::f32::consts::TAU / n as f32 * k as f32;
+            ("C", r * t.cos(), r * t.sin())
         })
         .collect();
-    let mol = draw(
-        &octagon,
-        &(0..8)
-            .map(|k| (k, (k + 1) % 8, if k == 0 { '=' } else { '-' }))
-            .collect::<Vec<_>>(),
-    );
-    assert_eq!(name(&mol), "(1Z)-cyclooctene");
+    let bonds = (0..n)
+        .map(|k| (k, (k + 1) % n, if doubles.contains(&k) { '=' } else { '-' }))
+        .collect();
+    (atoms, bonds)
+}
+
+/// In a ring of eight or more members a double bond is stereogenic (P-93.5.1.4.1). A regular
+/// polygon draws it cis. The name "cyclooctene" cites no locant (P-31.1.3.1: a lone locant 1
+/// is omitted), so neither does its descriptor (P-93.4.1.1): "(E)-cyclooctene (PIN)",
+/// "(Z)-cyclooctene" (P-91.2.2). Wikipedia: "(Z)-cyclooctene".
+#[test]
+fn double_bond_in_a_large_ring() {
+    let (a, b) = polygon(8, 1.3, &[0]);
+    assert_eq!(name(&draw(&a, &b)), "(Z)-cyclooctene");
+    let (a, b) = polygon(10, 1.6, &[0]);
+    assert_eq!(name(&draw(&a, &b)), "(Z)-cyclodecene");
+}
+
+/// An eight-membered ring needs its descriptor for one double bond, but not for "the
+/// corresponding di-, tri-, or tetraene, i.e. 'cycloocta-1,3,5,7-tetraene'" (P-91.2.2): their
+/// Z double bonds get none, and no note.
+#[test]
+fn cis_double_bonds_of_an_eight_membered_polyene() {
+    for (doubles, expected) in [
+        (&[0, 2, 4, 6][..], "cycloocta-1,3,5,7-tetraene"),
+        (&[1, 3, 5, 7][..], "cycloocta-1,3,5,7-tetraene"),
+        (&[0, 2][..], "cycloocta-1,3-diene"),
+        (&[0, 4][..], "cycloocta-1,5-diene"),
+    ] {
+        let (a, b) = polygon(8, 1.3, doubles);
+        assert_eq!(noted(&draw(&a, &b)), (expected.to_string(), vec![]));
+    }
+}
+
+/// The trans isomer: cyclododecene with C12 (atom 11) moved across the line through the double
+/// bond C1=C2, so that C12 and C3 are on opposite sides of it: E.
+#[test]
+fn trans_double_bond_in_a_large_ring() {
+    let (mut a, b) = polygon(12, 1.9, &[0]);
+    let (p, q) = ((a[0].1, a[0].2), (a[1].1, a[1].2));
+    let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+    let (x, y) = (a[11].1 - p.0, a[11].2 - p.1);
+    let t = (x * dx + y * dy) / (dx * dx + dy * dy);
+    let (fx, fy) = (p.0 + t * dx, p.1 + t * dy);
+    a[11] = ("C", 2.0 * fx - a[11].1, 2.0 * fy - a[11].2);
+    assert_eq!(name(&draw(&a, &b)), "(E)-cyclododecene");
+}
+
+/// Where the name cites the locants of the ring, the descriptors carry them: the regular decagon
+/// draws both double bonds of cyclodeca-1,3-diene cis.
+#[test]
+fn ring_descriptors_with_locants() {
+    let (a, b) = polygon(10, 1.6, &[0, 2]);
+    assert_eq!(name(&draw(&a, &b)), "(1Z,3Z)-cyclodeca-1,3-diene");
+}
+
+/// Cyclonon-4-en-1-ol, C1 (atom 0) on the right of a regular nonagon, the hydroxy group on a
+/// solid wedge pointing outward (right). C1 has O > C2 (toward the double bond: the third
+/// sphere holds C4 with its duplicate, (C, C, H), against C7's (C, H, H)) > C9 > H; O (right) →
+/// C2 (upper left) → C9 (lower left) counterclockwise with H behind: S. The double bond is cis.
+#[test]
+fn ring_centre_and_double_bond() {
+    let (mut a, mut b) = polygon(9, 1.5, &[3]);
+    a.push(("O", 2.5, 0.0));
+    b.push((0, 9, 'w'));
+    let mol = draw(&a, &b);
+    assert_eq!(name(&mol), "(1S,4Z)-cyclonon-4-en-1-ol");
+    assert_eq!(name(&mirrored(mol)), "(1R,4Z)-cyclonon-4-en-1-ol");
+}
+
+/// A one-carbon parent cites no locant, so neither does its descriptor: "(R)-bromo(chloro)
+/// (fluoro)methane (PIN)" (P-91.3, P-93.4.1.1). Br (on a solid wedge, up) > Cl (lower left) > F
+/// (lower right) > H (implicit, behind): counterclockwise, S.
+#[test]
+fn one_carbon_parent() {
+    let methane = |x: &'static str, y: &'static str, z: &'static str| {
+        draw(
+            &[
+                ("C", 0.0, 0.0),
+                (x, 0.0, 1.0),
+                (y, -0.866, -0.5),
+                (z, 0.866, -0.5),
+            ],
+            &[(0, 1, 'w'), (0, 2, '-'), (0, 3, '-')],
+        )
+    };
+    let mol = methane("Br", "Cl", "F");
+    assert_eq!(name(&mol), "(S)-bromo(chloro)(fluoro)methane");
+    assert_eq!(name(&mirrored(mol)), "(R)-bromo(chloro)(fluoro)methane");
+    // Cl > F > O > H, in the same places: S.
+    let mol = methane("Cl", "F", "O");
+    assert_eq!(name(&mol), "(S)-chloro(fluoro)methanol");
+    assert_eq!(name(&mirrored(mol)), "(R)-chloro(fluoro)methanol");
+}
+
+/// 1,2-Dichloroethene. The name of ethene cites no locant for its double bond ("ethene", not
+/// "eth-1-ene": the locants of a two-carbon parent are left out); the "1,2" locate the chlorine
+/// atoms. The descriptor belongs to the stereogenic unit, the double bond, which the name
+/// locates by no locant, so it is cited alone (P-93.4.1.1: "When no locant is required in the
+/// name …, no locant is necessary before the stereodescriptor"; the examples
+/// "(E)-2-…ethen-1-yl" of P-93.6 likewise cite none, the locant 1 of the double bond being
+/// implied): "(E)-1,2-dichloroethene". A zigzag Cl–CH=CH–Cl is trans; with the second chlorine
+/// below C2, cis.
+#[test]
+fn ethene_double_bond() {
+    let ethene = |cl2: (f32, f32)| {
+        draw(
+            &[
+                ("Cl", zz(0).0, zz(0).1),
+                ("C", zz(1).0, zz(1).1),
+                ("C", zz(2).0, zz(2).1),
+                ("Cl", cl2.0, cl2.1),
+            ],
+            &[(0, 1, '-'), (1, 2, '='), (2, 3, '-')],
+        )
+    };
+    assert_eq!(name(&ethene(zz(3))), "(E)-1,2-dichloroethene");
+    assert_eq!(name(&ethene((zz(2).0, -1.0))), "(Z)-1,2-dichloroethene");
+}
+
+/// 1-Phenylethan-1-ol cites its locant: O (upper left, on a solid wedge) > phenyl (right) >
+/// methyl (lower left) > H (behind): clockwise, R. The benzene ring gives the same ranking in
+/// either Kekulé structure (P-92.1.4.4: for mancude hydrocarbons it is immaterial).
+#[test]
+fn phenylethanol_in_either_kekule_structure() {
+    for first in [0, 1] {
+        let (mut a, mut b) = polygon(6, 1.0, &[first, first + 2, first + 4]);
+        // The ring to the right of the centre, its atom 3 (at the left) bonded to it.
+        for atom in &mut a {
+            atom.1 += 2.0;
+        }
+        a.extend([("C", 0.0, 0.0), ("O", -0.5, 0.866), ("C", -0.5, -0.866)]);
+        b.extend([(6, 3, '-'), (6, 7, 'w'), (6, 8, '-')]);
+        let mol = draw(&a, &b);
+        assert_eq!(name(&mol), "(1R)-1-phenylethan-1-ol", "Kekulé {first}");
+        assert_eq!(name(&mirrored(mol)), "(1S)-1-phenylethan-1-ol");
+    }
+}
+
+/// Pyridin-2-yl–C*H(OH)–C(CH3)(NMe2)–CH2OH, the hydroxy group on C* on a solid wedge (up), the
+/// pyridyl group lower left, C2 lower right. In a mancude heterocycle each duplicate atom has
+/// the mean of the atomic numbers it would have for every position of the double bonds
+/// (P-92.1.4.4): C2' of pyridine is doubly bonded either to N1' or to C3', so its duplicate
+/// counts 6½, and the pyridyl group (N, 6½, C) outranks C2 (N, C, C) whichever Kekulé structure
+/// is drawn (drawn C2'=C3', the duplicate alone would make it (N, C, C), and C2 would win at
+/// the next sphere). O → pyridyl → C2 counterclockwise with H behind: S. (C2 is a stereocentre
+/// too, drawn without a wedge.)
+#[test]
+fn mancude_heterocycle_in_either_kekule_structure() {
+    let mol = |c2_n: bool| {
+        // The ring: C2' (atom 0) at the centre's lower left, then N1', C6', C5', C4', C3'
+        // around a centre further out.
+        let (cx, cy) = (-1.732, -1.0);
+        let mut atoms: Atoms = (0..6)
+            .map(|k| {
+                let t = (30.0 + 60.0 * k as f32).to_radians();
+                (if k == 1 { "N" } else { "C" }, cx + t.cos(), cy + t.sin())
+            })
+            .collect();
+        let doubles: [usize; 3] = if c2_n { [0, 2, 4] } else { [1, 3, 5] };
+        let mut bonds: Bonds = (0..6)
+            .map(|k| (k, (k + 1) % 6, if doubles.contains(&k) { '=' } else { '-' }))
+            .collect();
+        atoms.extend([
+            ("C", 0.0, 0.0),     // 6: C1
+            ("O", 0.0, 1.0),     // 7
+            ("C", 0.866, -0.5),  // 8: C2
+            ("C", 1.366, 0.366), // 9: C3
+            ("O", 2.366, 0.366), // 10
+            ("C", 1.866, -0.5),  // 11: the methyl group
+            ("N", 0.866, -1.5),  // 12
+            ("C", 0.0, -2.0),    // 13
+            ("C", 1.732, -2.0),  // 14
+        ]);
+        bonds.extend([
+            (6, 0, '-'),
+            (6, 7, 'w'),
+            (6, 8, '-'),
+            (8, 9, '-'),
+            (9, 10, '-'),
+            (8, 11, '-'),
+            (8, 12, '-'),
+            (12, 13, '-'),
+            (12, 14, '-'),
+        ]);
+        draw(&atoms, &bonds)
+    };
+    let expected = "(1S)-2-(dimethylamino)-2-methyl-1-(pyridin-2-yl)propane-1,3-diol";
+    for c2_n in [true, false] {
+        assert_eq!(name(&mol(c2_n)), expected, "C2'=N1' drawn: {c2_n}");
+        assert_eq!(
+            name(&mirrored(mol(c2_n))),
+            expected.replace("(1S)", "(1R)"),
+            "C2'=N1' drawn: {c2_n}"
+        );
+    }
 }
 
 /// Descriptors are given for the parent chain or ring only; a stereocentre in a substituent

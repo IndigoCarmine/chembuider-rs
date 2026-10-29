@@ -209,6 +209,18 @@ type Key = (
     Vec<u32>,
 );
 
+/// Which locants of its parent a name leaves out, and so the stereodescriptors there
+/// (P-93.4.1.1: "When no locant is required in the name …, no locant is necessary before the
+/// stereodescriptor"): "(R)-bromo(chloro)(fluoro)methane", "(E)-1,2-dichloroethene",
+/// "(Z)-cyclooctene".
+#[derive(Clone, Copy, Default)]
+struct Uncited {
+    /// The locants of the parent's atoms: methane, a monosubstituted ring.
+    atoms: bool,
+    /// The locants of its multiple bonds: ethene, cyclooctene (P-31.1.3.1).
+    bonds: bool,
+}
+
 /// One numbered candidate parent, evaluated.
 struct Eval {
     atoms: Vec<usize>,
@@ -638,23 +650,23 @@ impl<'a> Namer<'a> {
             .ok_or("internal error: no numbering")?
             .clone();
         // The candidates that tie on everything but their stereodescriptors.
-        let mut chosen: Vec<(&Eval, Vec<Loc>, Prefix)> = Vec::new();
+        let mut chosen: Vec<(&Eval, Vec<Loc>, Prefix, Uncited)> = Vec::new();
         for e in evals.iter().filter(|e| e.key == best) {
-            let (order, named) = self.render(e, mode, region, "")?;
+            let (order, named, uncited) = self.render(e, mode, region, "")?;
             let rank = chosen
                 .first()
-                .map(|(_, o, n)| (&order, &named.text).cmp(&(o, &n.text)));
+                .map(|(_, o, n, _)| (&order, &named.text).cmp(&(o, &n.text)));
             match rank {
                 Some(std::cmp::Ordering::Greater) => {}
-                Some(std::cmp::Ordering::Equal) => chosen.push((e, order, named)),
-                _ => chosen = vec![(e, order, named)],
+                Some(std::cmp::Ordering::Equal) => chosen.push((e, order, named, uncited)),
+                _ => chosen = vec![(e, order, named, uncited)],
             }
         }
         if !stereo {
             return Ok(chosen.swap_remove(0).2);
         }
-        // Among those, the lower locants go to Z, then to R (P-31.1.4.3.4).
-        let cited: Vec<_> = chosen.iter().map(|(e, _, _)| self.cite(e)).collect();
+        // Among those, the lower locants go to Z, then to R (P-14.4 (j)).
+        let cited: Vec<_> = chosen.iter().map(|(e, ..)| self.cite(e)).collect();
         let locants_of = |c: &[(u32, Descriptor)], d: Descriptor| -> Vec<u32> {
             c.iter().filter(|x| x.1 == d).map(|x| x.0).collect()
         };
@@ -670,13 +682,23 @@ impl<'a> Namer<'a> {
             .expect("at least one candidate");
         let (descriptors, notes) = &cited[pick];
         self.notes.borrow_mut().extend(notes.iter().cloned());
-        let (e, _, named) = chosen.swap_remove(pick);
+        let (e, _, named, uncited) = chosen.swap_remove(pick);
         if descriptors.is_empty() {
             return Ok(named);
         }
         let list: Vec<String> = descriptors
             .iter()
-            .map(|&(l, d)| format!("{}{d}", loc_text(l)))
+            .map(|&(l, d)| {
+                let bare = match d {
+                    Descriptor::R | Descriptor::S => uncited.atoms,
+                    Descriptor::E | Descriptor::Z => uncited.bonds,
+                };
+                if bare {
+                    d.to_string()
+                } else {
+                    format!("{}{d}", loc_text(l))
+                }
+            })
             .collect();
         Ok(self
             .render(e, mode, region, &format!("({})-", list.join(",")))?
@@ -1095,7 +1117,7 @@ impl<'a> Namer<'a> {
     }
 
     /// The name of an evaluated candidate, with the locants in the order its prefixes are
-    /// cited (the last tie-breaker).
+    /// cited (the last tie-breaker), and the locants of the parent it leaves out.
     ///
     /// `stereo` (the stereodescriptors, "(2R)-") goes before the name of a molecule, after an
     /// ester's alkyl group: "ethyl (2R)-2-hydroxypropanoate".
@@ -1105,7 +1127,7 @@ impl<'a> Namer<'a> {
         mode: Mode,
         region: &[bool],
         stereo: &str,
-    ) -> Result<(Vec<Loc>, Prefix), Unsupported> {
+    ) -> Result<(Vec<Loc>, Prefix, Uncited), Unsupported> {
         let g = self.g;
         let suffix = match mode {
             Mode::Molecule => match self.p.principal {
@@ -1161,6 +1183,7 @@ impl<'a> Namer<'a> {
                     hydride: acyl_or_amido,
                     oxy: false,
                 },
+                Uncited::default(),
             ));
         }
         if let Shape::Assembly {
@@ -1183,6 +1206,7 @@ impl<'a> Namer<'a> {
                     hydride: acyl_or_amido,
                     oxy: false,
                 },
+                Uncited::default(),
             ));
         }
 
@@ -1273,6 +1297,10 @@ impl<'a> Namer<'a> {
                 depth,
                 hydride: acyl_or_amido && ring && !benzene,
                 oxy,
+            },
+            Uncited {
+                atoms: (omit_c || fully) && !has_n_prefix,
+                bonds: !cite_unsat,
             },
         ))
     }

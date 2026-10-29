@@ -14,7 +14,8 @@
 //!   them; a wavy bond on either end atom, a straight (collinear) drawing or two ligands of an
 //!   end drawn on one side gives no descriptor;
 //! - double bonds in rings of fewer than eight members are not stereogenic units for naming
-//!   (P-93: their geometry is fixed);
+//!   (P-93: their geometry is fixed), nor are the Z double bonds of an eight-membered ring with
+//!   more than one (P-91.2.2: "cycloocta-1,3,5,7-tetraene");
 //! - out of scope, with no descriptor: centres on atoms other than carbon, ligands that tie under
 //!   CIP Rule 1a but may differ by Rules 1b–5 (pseudoasymmetric centres, r/s; reported when the
 //!   tied ligands carry stereo bonds of their own), allenes (axial chirality, reported),
@@ -79,11 +80,7 @@ fn atomic_number(e: El) -> u8 {
 /// The stereogenic units of `g`.
 pub(crate) fn units(g: &Graph) -> Vec<Unit> {
     let z: Vec<u8> = g.el.iter().map(|&e| atomic_number(e)).collect();
-    let atoms = cip::Atoms {
-        z,
-        h: &g.h,
-        adj: &g.adj,
-    };
+    let atoms = cip::Atoms::new(z, &g.h, &g.adj);
     let mut out = Vec::new();
     for c in 0..g.len() {
         if let Some(u) = centre(g, &atoms, c) {
@@ -135,7 +132,7 @@ fn centre(g: &Graph, atoms: &cip::Atoms, c: usize) -> Option<Unit> {
             // Alike constitutionally; they may still differ in their own configuration
             // (Rules 3–5).
             let marked = |l: Ligand| match l {
-                Ligand::Atom(a) => branch_marked(g, c, a),
+                Ligand::Atom(a) => branch_marked(g, &[c], a),
                 Ligand::H => false,
             };
             if !(marked(ligs[i]) || marked(ligs[j])) {
@@ -168,10 +165,13 @@ fn wedged_at(g: &Graph, c: usize) -> bool {
         .any(|m| m.narrow == End::Atom(c) && matches!(m.wedge, Wedge::Up | Wedge::Down))
 }
 
-/// Whether the branch from `c` through `a` has stereo bonds of its own or a double bond.
-fn branch_marked(g: &Graph, c: usize, a: usize) -> bool {
+/// Whether the branch through `a` away from the atoms `from` has stereo bonds of its own or a
+/// double bond.
+fn branch_marked(g: &Graph, from: &[usize], a: usize) -> bool {
     let mut seen = vec![false; g.len()];
-    seen[c] = true;
+    for &c in from {
+        seen[c] = true;
+    }
     seen[a] = true;
     let mut stack = vec![a];
     while let Some(x) = stack.pop() {
@@ -281,24 +281,40 @@ fn centre_descriptor(
     }
 }
 
-/// The size of the smallest ring through the bond `a`–`b`, if it is in one.
-fn smallest_ring(g: &Graph, a: usize, b: usize) -> Option<usize> {
-    let mut dist = vec![usize::MAX; g.len()];
-    dist[a] = 0;
+/// The atoms of the smallest ring through the bond `a`–`b`, if it is in one, from `a` around to
+/// `b`.
+fn smallest_ring(g: &Graph, a: usize, b: usize) -> Option<Vec<usize>> {
+    let mut up = vec![usize::MAX; g.len()];
+    up[a] = a;
     let mut queue = std::collections::VecDeque::from([a]);
     while let Some(x) = queue.pop_front() {
         for y in g.nbrs(x) {
-            if (x, y) == (a, b) || dist[y] != usize::MAX {
+            if (x, y) == (a, b) || up[y] != usize::MAX {
                 continue;
             }
-            dist[y] = dist[x] + 1;
+            up[y] = x;
             if y == b {
-                return Some(dist[y] + 1);
+                let mut ring = vec![b];
+                while *ring.last().expect("not empty") != a {
+                    ring.push(up[*ring.last().expect("not empty")]);
+                }
+                ring.reverse();
+                return Some(ring);
             }
             queue.push_back(y);
         }
     }
     None
+}
+
+/// The double bonds of `ring` (its atoms in order around it).
+fn ring_doubles(g: &Graph, ring: &[usize]) -> usize {
+    (0..ring.len())
+        .filter(|&i| {
+            let (x, y) = (ring[i], ring[(i + 1) % ring.len()]);
+            g.adj[x].iter().any(|&(m, o)| m == y && o == 2)
+        })
+        .count()
 }
 
 /// Whether `x` has a double bond to an atom other than `except`.
@@ -308,27 +324,59 @@ fn other_double(g: &Graph, x: usize, except: usize) -> bool {
 
 /// A C=C double bond whose ends both bear two different ligands.
 fn double_bond(g: &Graph, atoms: &cip::Atoms, a: usize, b: usize) -> Option<Unit> {
+    let ring = smallest_ring(g, a, b);
     if g.el[a] != El::C
         || g.el[b] != El::C
         || g.free_on(a) + g.free_on(b) > 0
         || other_double(g, a, b)
         || other_double(g, b, a)
-        || smallest_ring(g, a, b).is_some_and(|n| n < 8)
+        || ring.as_ref().is_some_and(|r| r.len() < 8)
     {
         return None;
     }
     let mut ends = Vec::new();
+    let mut unranked = None;
     for (x, y) in [(a, b), (b, a)] {
         let ligs = ligands(g, x, Some(y));
         if ligs.len() != 2 {
             return None;
         }
-        let order = cip::rank(atoms, x, &ligs).ok()?;
-        ends.push((x, [ligs[order[0]], ligs[order[1]]]));
+        match cip::rank(atoms, x, &ligs) {
+            Ok(order) => ends.push((x, [ligs[order[0]], ligs[order[1]]])),
+            Err(Unranked::Tie(..)) => {
+                // Alike constitutionally (no stereogenic unit), or only in their own
+                // configuration (Rules 3–5).
+                let marked = ligs.iter().any(|&l| match l {
+                    Ligand::Atom(m) => branch_marked(g, &[a, b], m),
+                    Ligand::H => false,
+                });
+                if !marked {
+                    return None;
+                }
+                unranked = Some(
+                    "the two ligands of an end differ only in their own configuration (CIP \
+                     Rules 3–5), which is not supported",
+                );
+            }
+            Err(Unranked::TooLarge) => {
+                unranked = Some("the structure is too large to rank the ligands by the CIP rules");
+            }
+        }
+    }
+    let descriptor = match unranked {
+        Some(why) => Err(why.to_string()),
+        None => double_descriptor(g, &ends),
+    };
+    // The Z double bonds of an eight-membered ring need no descriptor when the ring has more
+    // than one (P-91.2.2).
+    if descriptor == Ok(Descriptor::Z)
+        && ring.is_some_and(|r| r.len() == 8 && ring_doubles(g, &r) > 1)
+    {
+        return None;
     }
     Some(Unit {
         site: Site::Double(a, b),
-        descriptor: double_descriptor(g, &ends),
+        descriptor,
     })
 }
 
