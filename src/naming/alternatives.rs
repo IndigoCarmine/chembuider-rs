@@ -21,26 +21,27 @@ pub(crate) fn of_structure(
 ) -> Vec<(NameKind, String)> {
     let mut out = Vec::new();
     // A name written without the descriptors would name the compound without its
-    // configuration: only cis/trans, which states it, is given for a structure with any.
+    // configuration: only cis/trans, which states it, is given for a structure with any — and
+    // [n]annulene, a name that states no configuration by definition, for a ring whose only
+    // stereogenic units are its double bonds (a polygon draws them Z).
     if units.iter().any(|u| u.descriptor.is_ok()) {
         if cited && let Some(n) = cis_trans(g, p, units) {
             out.push((NameKind::Systematic, n));
         }
+        out.extend(annulene(g, p).map(|n| (NameKind::Systematic, n)));
         return out;
     }
     if g.charge.iter().any(|&q| q != 0) {
         return out;
     }
     if !g.free.is_empty() {
-        if let Some(n) = substituent_group(g) {
-            out.push((NameKind::Retained, n));
-        }
+        out.extend(substituent_group(g));
         return out;
     }
     let found = [
         radicofunctional(g, p, namer).map(|n| (NameKind::Radicofunctional, n)),
-        glycerol(g).map(|n| (NameKind::Retained, n)),
-        lactone(g, p, true).map(|n| (NameKind::Retained, n)),
+        glycerol(g, p).map(|n| (NameKind::Retained, n)),
+        lactone(g, p, true).map(|n| (NameKind::Traditional, n)),
         oxolane(g, p).map(|n| (NameKind::Additive, n)),
         conjunctive(g, p).map(|n| (NameKind::Conjunctive, n)),
         lactone(g, p, false).map(|n| (NameKind::Systematic, n)),
@@ -108,9 +109,10 @@ fn radicofunctional(g: &Graph, p: &Perceived, namer: &Namer) -> Option<String> {
     }
 }
 
-/// Glycerol (P-63.1.1.2: general nomenclature), propane-1,2,3-triol itself: three carbons in a
-/// chain, each with one hydroxy group, and nothing else.
-fn glycerol(g: &Graph) -> Option<String> {
+/// Glycerol (P-63.1.1.2: general nomenclature), propane-1,2,3-triol itself: three carbons in an
+/// open chain, each with one hydroxy group, and nothing else (cyclopropane-1,2,3-triol is not
+/// glycerol).
+fn glycerol(g: &Graph, p: &Perceived) -> Option<String> {
     let carbons: Vec<usize> = (0..g.len()).filter(|&a| g.el[a] == El::C).collect();
     let oxygens: Vec<usize> = (0..g.len()).filter(|&a| g.el[a] == El::O).collect();
     let hydroxy = |o: usize| g.h[o] == 1 && matches!(g.adj[o][..], [(c, 1)] if g.el[c] == El::C);
@@ -118,6 +120,7 @@ fn glycerol(g: &Graph) -> Option<String> {
     (carbons.len() == 3
         && oxygens.len() == 3
         && g.len() == 6
+        && p.rings.is_empty()
         && oxygens.iter().all(|&o| hydroxy(o))
         && carbons.iter().all(|&c| one_oh(c) && saturated(g, c)))
     .then(|| "glycerol".to_string())
@@ -133,10 +136,12 @@ fn only_ring<'p>(g: &Graph, p: &'p Perceived, outside: usize) -> Option<&'p [usi
 }
 
 /// An unsubstituted saturated lactone or lactam of four to eight ring members (oxetan-2-one …
-/// oxocan-2-one): retained, only ε-caprolactone and ε-caprolactam (the seven-membered ones);
-/// systematic, the name from the hydroxy or amino acid (P-65.6.3.5.1, P-66.1.5.1):
-/// "6-hexanelactone", "6-hexanelactam", "4-butanelactone".
-fn lactone(g: &Graph, p: &Perceived, retained: bool) -> Option<String> {
+/// oxocan-2-one). `traditional`: only ε-caprolactone and ε-caprolactam (the seven-membered
+/// ones), traditional names IUPAC 2013 no longer recommends (P-65.6.3.5: "not
+/// γ-butyrolactone"). Otherwise the systematic name from the hydroxy or amino acid, the
+/// 2013 form of P-65.6.3.5.1 method (2) and P-66.1.5.1 method (2): "butano-4-lactone",
+/// "hexano-6-lactone", "hexano-6-lactam" (not the older "6-hexanelactone" of Wikipedia).
+fn lactone(g: &Graph, p: &Perceived, traditional: bool) -> Option<String> {
     let ring = only_ring(g, p, 1)?;
     let m = ring.len();
     if !(4..=8).contains(&m) {
@@ -172,11 +177,11 @@ fn lactone(g: &Graph, p: &Perceived, retained: bool) -> Option<String> {
         return None;
     }
     let word = if lactam { "lactam" } else { "lactone" };
-    if retained {
+    if traditional {
         return (m == 7).then(|| format!("ε-capro{word}"));
     }
     let k = m - 1;
-    Some(format!("{k}-{}ane{word}", stem(k)?))
+    Some(format!("{}ano-{k}-{word}", stem(k)?))
 }
 
 /// Tetrahydrofuran (P-31.1.4.2.4, an additive name: furan with four added hydrogens), oxolane
@@ -285,10 +290,11 @@ fn annulene(g: &Graph, p: &Perceived) -> Option<String> {
     (n >= 8 && n % 2 == 0 && conjugated).then(|| format!("[{n}]annulene"))
 }
 
-/// The substituent groups –CH2–CH2– "ethylene" and –CH(CH3)–CH2– "propylene" (P-29.6.2.3:
-/// general nomenclature; their PINs ethane-1,2-diyl and propane-1,2-diyl), unsubstituted. Only
-/// the groups: propene is not "propylene" here.
-fn substituent_group(g: &Graph) -> Option<String> {
+/// The substituent groups –CH2–CH2– "ethylene" (retained, P-29.6.2.3: general nomenclature)
+/// and –CH(CH3)–CH2– "propylene" (traditional, of the 1979 and 1993 rules; P-29.6.2.3 does not
+/// list it), unsubstituted; their PINs are ethane-1,2-diyl and propane-1,2-diyl. Only the
+/// groups: propene is not "propylene" here.
+fn substituent_group(g: &Graph) -> Option<(NameKind, String)> {
     let all_carbon_saturated = (0..g.len()).all(|a| g.el[a] == El::C && saturated(g, a));
     let free: Vec<usize> = g.free.iter().map(|&(a, _)| a).collect();
     if !all_carbon_saturated || g.free.iter().any(|&(_, o)| o != 1) {
@@ -301,9 +307,10 @@ fn substituent_group(g: &Graph) -> Option<String> {
         return None;
     }
     match g.len() {
-        2 => Some("ethylene".into()),
+        2 => Some((NameKind::Retained, "ethylene".into())),
         // The third carbon on one of the two: –CH(CH3)–CH2–.
-        3 => (g.adj[x].len() + g.adj[y].len() == 3).then(|| "propylene".into()),
+        3 => (g.adj[x].len() + g.adj[y].len() == 3)
+            .then(|| (NameKind::Traditional, "propylene".into())),
         _ => None,
     }
 }

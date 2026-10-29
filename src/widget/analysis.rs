@@ -430,6 +430,7 @@ fn kind_msg(kind: NameKind) -> Msg {
         NameKind::Additive => Msg::NameKindAdditive,
         NameKind::Conjunctive => Msg::NameKindConjunctive,
         NameKind::Systematic => Msg::NameKindSystematic,
+        NameKind::Traditional => Msg::NameKindTraditional,
         NameKind::Japanese => Msg::NameKindJapanese,
     }
 }

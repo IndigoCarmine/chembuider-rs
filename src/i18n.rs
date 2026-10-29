@@ -476,11 +476,11 @@ catalog! {
         de: "Weitere Namen ({count})", pt_br: "Outros nomes ({count})", ko: "다른 이름 ({count})",
         ru: "Другие названия ({count})", it: "Altri nomi ({count})",
     }
-    /// The kind of an other name: a retained (traditional) name, "glycerol".
+    /// The kind of an other name: a retained name IUPAC accepts, "glycerol".
     NameKindRetained {
         ja: "慣用名", en: "retained name", zh_hans: "保留名", zh_hant: "保留名",
-        es: "nombre tradicional", fr: "nom traditionnel", de: "Trivialname", pt_br: "nome tradicional",
-        ko: "관용명", ru: "тривиальное название", it: "nome tradizionale",
+        es: "nombre retenido", fr: "nom retenu", de: "Trivialname", pt_br: "nome retido",
+        ko: "관용명", ru: "тривиальное название", it: "nome conservato",
     }
     /// The kind of an other name: a functional class (radicofunctional) name, "methyl alcohol".
     NameKindRadicofunctional {
@@ -506,6 +506,13 @@ catalog! {
         ja: "系統名", en: "systematic name", zh_hans: "系统名", zh_hant: "系統名",
         es: "nombre sistemático", fr: "nom systématique", de: "systematischer Name",
         pt_br: "nome sistemático", ko: "계통명", ru: "систематическое название", it: "nome sistematico",
+    }
+    /// The kind of an other name: a traditional name IUPAC 2013 no longer recommends,
+    /// "ε-caprolactone".
+    NameKindTraditional {
+        ja: "旧慣用名", en: "traditional name", zh_hans: "传统名", zh_hant: "傳統名",
+        es: "nombre tradicional", fr: "nom traditionnel", de: "traditioneller Name",
+        pt_br: "nome tradicional", ko: "전통명", ru: "традиционное название", it: "nome tradizionale",
     }
     /// The kind of an other name: a Japanese name.
     NameKindJapanese {

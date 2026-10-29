@@ -261,6 +261,26 @@ fn double_bond_geometry() {
     assert_eq!(name(&cis(5)), "(2Z)-pent-2-ene"); // Wikipedia: "(Z)-pent-2-ene"
 }
 
+/// [n]annulene (OPE-24) for an annulene drawn as a polygon, whose drawing fixes its ring double
+/// bonds as Z and whose name cites their descriptors: the annulene name states no
+/// configuration, so it is given all the same.
+#[test]
+fn drawn_annulenes() {
+    use super::{NameKind, iupac_alternatives};
+    for (n, r) in [(10, 1.6), (14, 2.3)] {
+        let doubles: Vec<usize> = (0..n).step_by(2).collect();
+        let (a, b) = polygon(n, r, &doubles);
+        let mol = draw(&a, &b);
+        assert!(name(&mol).starts_with('('), "{n}: {}", name(&mol));
+        assert_eq!(
+            iupac_alternatives(&mol),
+            [(NameKind::Systematic, format!("[{n}]annulene"))],
+            "{n}: {}",
+            name(&mol)
+        );
+    }
+}
+
 /// cis/trans for a double bond whose two atoms each carry one hydrogen (OPE-24): there the
 /// higher-ranked ligand of each end is its only other one, so Z is cis and E trans. Elsewhere —
 /// a trisubstituted double bond, several stereogenic units, an ester whose descriptor stands

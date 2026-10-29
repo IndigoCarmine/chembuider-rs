@@ -83,7 +83,7 @@ fn radicofunctional_names() {
 }
 
 /// Retained names for general nomenclature (P-63.1.1.2 glycerol, P-65.1.1.2 propionic and
-/// succinic acid, P-65.6.3.5.1 ε-caprolactone, IR-3.4.3 ozone), of the unsubstituted compounds.
+/// succinic acid, P-29.6.2.3 ethylene, IR-3.4.3 ozone), of the unsubstituted compounds.
 #[test]
 fn retained_names() {
     check(&[
@@ -95,17 +95,58 @@ fn retained_names() {
         ("CCC(=O)OC(=O)CC", "propanoic anhydride", Retained, "propionic anhydride"),
         ("CCC(Cl)=O", "propanoyl chloride", Retained, "propionyl chloride"),
         // Wikipedia: "ozone"; the Red Book gives "trioxygen" first (IR-3.4.3) and "ozone" as
-        // the acceptable alternative.
-        ("O1OO1", "trioxygen", Retained, "ozone"),
+        // the acceptable alternative — of the open, bent O–O–O molecule only.
         ("O=[O+][O-]", "trioxygen", Retained, "ozone"),
-        ("O=C1CCCCCO1", "oxepan-2-one", Retained, "ε-caprolactone"),
-        ("O=C1CCCCCN1", "azepan-2-one", Retained, "ε-caprolactam"),
-        // The substituent group –CH(CH3)–CH2– (P-29.6.2.3); only the group, never propene.
-        ("*C(C)C*", "propane-1,2-diyl", Retained, "propylene"),
+        ("O=O=O", "trioxygen", Retained, "ozone"),
         ("*CC*", "ethane-1,2-diyl", Retained, "ethylene"),
     ]);
     // Not dioxygen: one of the retained names of elements is ozone alone.
     assert!(alternatives("O=O").is_empty(), "{:?}", alternatives("O=O"));
+}
+
+/// Traditional names IUPAC 2013 no longer recommends, given because the issue (and Wikipedia)
+/// lists them: ε-caprolactone and ε-caprolactam (P-65.6.3.5 rejects such names: "not
+/// γ-butyrolactone"), the group propylene (1979/1993 rules; P-29.6.2.3 lists ethylene but not
+/// propylene) and "per" (P-14.3.4.5: no longer recommended).
+#[test]
+fn traditional_names() {
+    check(&[
+        ("O=C1CCCCCO1", "oxepan-2-one", Traditional, "ε-caprolactone"),
+        ("O=C1CCCCCN1", "azepan-2-one", Traditional, "ε-caprolactam"),
+        // The substituent group –CH(CH3)–CH2–; only the group, never propene.
+        ("*C(C)C*", "propane-1,2-diyl", Traditional, "propylene"),
+        // Wikipedia: "perbromoethane".
+        ("BrC(Br)(Br)C(Br)(Br)Br", "hexabromoethane", Traditional, "perbromoethane"),
+    ]);
+}
+
+/// The recognisers of exact structures tell a ring from a chain: an isomer drawn as a ring is
+/// another compound and has none of the open-chain compound's names, and the other way round.
+#[test]
+fn rings_are_not_chains() {
+    check_absent(&[
+        // cyclopropane-1,2,3-triol, not propane-1,2,3-triol.
+        ("OC1C(O)C1O", "glycerol"),
+        // Cyclic O3 is a different species (cyclo-, IR-3.4.3), not ozone.
+        ("O1OO1", "ozone"),
+        ("[O]1[O][O]1", "ozone"),
+        // Rings with the atoms of succinic and propionic acid.
+        ("OC(=O)C1CC1C(O)=O", "succinic"),
+        ("OC(=O)C1CC1", "propion"),
+        ("OC(=O)C1CC(C(O)=O)C1", "succinic"),
+        // An open chain is not tetrahydrofuran, nor a chain a conjunctive ring name.
+        ("CCCCO", "tetrahydrofuran"),
+        ("OCCCCCCC", "cyclohexane"),
+        // A cyclic ether is not a functional class ether, nor a ring of three carbons with two
+        // free valences propylene.
+        ("C1CCOC1", "ether"),
+        ("*C1CC1*", "propylene"),
+    ]);
+    check(&[
+        // The radicofunctional and amino names of a ring compound are those of the ring.
+        ("OC1CCCCC1", "cyclohexanol", Radicofunctional, "cyclohexyl alcohol"),
+        ("NC1CCCCC1", "cyclohexanamine", Systematic, "aminocyclohexane"),
+    ]);
 }
 
 /// Retained names are not derivatised (P-65.1.1.2: no substitution on these names; Wikipedia's
@@ -158,12 +199,15 @@ fn systematic_names() {
         ("NC1=CC=CC=C1", "aniline", Systematic, "benzenamine"),
         ("OC(=O)C1=CC=C(C)C=C1", "4-methylbenzoic acid", Systematic, "4-methylbenzene-1-carboxylic acid"),
         ("OC(=O)CCl", "chloroacetic acid", Systematic, "2-chloroethanoic acid"),
-        // Wikipedia: "perbromoethane" (P-14.3.4.5: not for PINs).
-        ("BrC(Br)(Br)C(Br)(Br)Br", "hexabromoethane", Systematic, "perbromoethane"),
-        // Wikipedia: "6-hexanelactone", "6-hexanelactam" (P-65.6.3.5.1, P-66.1.5.1).
-        ("O=C1CCCCCO1", "oxepan-2-one", Systematic, "6-hexanelactone"),
-        ("O=C1CCCCCN1", "azepan-2-one", Systematic, "6-hexanelactam"),
-        ("O=C1CCCO1", "oxolan-2-one", Systematic, "4-butanelactone"),
+        // Wikipedia and the issue write "6-hexanelactone" and "6-hexanelactam"; IUPAC 2013
+        // (P-65.6.3.5.1 method (2), P-66.1.5.1 method (2): "butano-4-lactone",
+        // "butano-4-lactam") writes "hexano-6-lactone", and the 2013 form is the one given.
+        ("O=C1CCCCCO1", "oxepan-2-one", Systematic, "hexano-6-lactone"),
+        ("O=C1CCCCCN1", "azepan-2-one", Systematic, "hexano-6-lactam"),
+        ("O=C1CCCO1", "oxolan-2-one", Systematic, "butano-4-lactone"),
+        ("O=C1CCN1", "azetidin-2-one", Systematic, "propano-3-lactam"),
+        ("O=C1CCO1", "oxetan-2-one", Systematic, "propano-3-lactone"),
+        ("O=C1CCCCO1", "oxan-2-one", Systematic, "pentano-5-lactone"),
         ("CN", "methanamine", Systematic, "aminomethane"),
         ("NCCN", "ethane-1,2-diamine", Systematic, "1,2-diaminoethane"),
         // Wikipedia: "[14]annulene" (P-22.1.2: general nomenclature).
@@ -182,6 +226,10 @@ fn systematic_names() {
         ("NCCO", "amino"),
         // Substituted lactones keep their PIN alone.
         ("CC1CCCCC(=O)O1", "lactone"),
+        // Not the forms of the older rules.
+        ("O=C1CCCCCO1", "hexanelactone"),
+        ("O=C1CCCCCN1", "hexanelactam"),
+        ("O=C1CCCO1", "butanelactone"),
     ]);
 }
 
@@ -300,7 +348,8 @@ fn no_alternatives() {
 fn kind_labels() {
     assert_eq!(Retained.label(), "retained name");
     assert_eq!(Radicofunctional.label(), "functional class name");
+    assert_eq!(Traditional.label(), "traditional name");
     assert_eq!(Japanese.label(), "Japanese name");
-    assert_eq!(NameKind::ALL.len(), 6);
+    assert_eq!(NameKind::ALL.len(), 7);
 }
 
