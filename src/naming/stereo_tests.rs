@@ -261,6 +261,85 @@ fn double_bond_geometry() {
     assert_eq!(name(&cis(5)), "(2Z)-pent-2-ene"); // Wikipedia: "(Z)-pent-2-ene"
 }
 
+/// [n]annulene (OPE-24) for an annulene drawn as a polygon, whose drawing fixes its ring double
+/// bonds as Z and whose name cites their descriptors: the annulene name states no
+/// configuration, so it is given all the same.
+#[test]
+fn drawn_annulenes() {
+    use super::{NameKind, iupac_alternatives};
+    for (n, r) in [(10, 1.6), (14, 2.3)] {
+        let doubles: Vec<usize> = (0..n).step_by(2).collect();
+        let (a, b) = polygon(n, r, &doubles);
+        let mol = draw(&a, &b);
+        assert!(name(&mol).starts_with('('), "{n}: {}", name(&mol));
+        assert_eq!(
+            iupac_alternatives(&mol),
+            [(NameKind::Systematic, format!("[{n}]annulene"))],
+            "{n}: {}",
+            name(&mol)
+        );
+    }
+}
+
+/// cis/trans for a double bond whose two atoms each carry one hydrogen (OPE-24): there the
+/// higher-ranked ligand of each end is its only other one, so Z is cis and E trans. Elsewhere —
+/// a trisubstituted double bond, several stereogenic units, an ester whose descriptor stands
+/// inside the name — no cis/trans name is given.
+#[test]
+fn cis_trans_alternatives() {
+    use super::{NameKind, iupac_alternatives};
+    let alt = |mol: &Molecule| -> Vec<String> {
+        iupac_alternatives(mol)
+            .into_iter()
+            .filter(|(k, _)| *k == NameKind::Systematic)
+            .map(|(_, n)| n)
+            .collect()
+    };
+    let trans = |n| {
+        let (a, b) = chain(n, &[1]);
+        draw(&a, &b)
+    };
+    let cis = |n: usize| {
+        let mut atoms = vec![
+            ("C", zz(0).0, zz(0).1),
+            ("C", zz(1).0, zz(1).1),
+            ("C", zz(2).0, zz(2).1),
+        ];
+        atoms.push(("C", zz(2).0, zz(2).1 - 1.0));
+        let mut bonds = vec![(0, 1, '-'), (1, 2, '='), (2, 3, '-')];
+        if n == 5 {
+            atoms.push(("C", zz(3).0, zz(2).1 - 1.5));
+            bonds.push((3, 4, '-'));
+        }
+        draw(&atoms, &bonds)
+    };
+    assert_eq!(name(&trans(4)), "(2E)-but-2-ene");
+    assert_eq!(alt(&trans(4)), ["trans-but-2-ene"]);
+    assert_eq!(name(&cis(4)), "(2Z)-but-2-ene");
+    assert_eq!(alt(&cis(4)), ["cis-but-2-ene"]);
+    assert_eq!(alt(&trans(5)), ["trans-pent-2-ene"]);
+    assert_eq!(alt(&cis(5)), ["cis-pent-2-ene"]);
+    // (E)-1,2-dichloroethene: the descriptor without a locant, and so cis/trans.
+    let dichloro = chain_with(2, &[0], &[("Cl", 0.0, -1.0, 0, '-'), ("Cl", 0.866, 1.5, 1, '-')]);
+    assert_eq!(name(&dichloro), "(E)-1,2-dichloroethene");
+    assert_eq!(alt(&dichloro), ["trans-1,2-dichloroethene"]);
+    // 3-Methylpent-2-ene: C3 carries two carbons, so E/Z only.
+    let trisubstituted = chain_with(5, &[1], &[("C", 1.732, -1.0, 2, '-')]);
+    assert!(name(&trisubstituted).contains("3-methylpent-2-ene"), "{}", name(&trisubstituted));
+    assert!(alt(&trisubstituted).is_empty(), "{:?}", alt(&trisubstituted));
+    // Hexa-2,4-diene: two units.
+    let (a, b) = chain(6, &[1, 3]);
+    let diene = draw(&a, &b);
+    assert_eq!(name(&diene), "(2E,4E)-hexa-2,4-diene");
+    assert!(alt(&diene).is_empty(), "{:?}", alt(&diene));
+    // But-2-ene drawn straight: no descriptor, no cis/trans.
+    let straight = draw(
+        &[("C", 0.0, 0.0), ("C", 1.0, 0.0), ("C", 2.0, 0.0), ("C", 3.0, 0.0)],
+        &[(0, 1, '-'), (1, 2, '='), (2, 3, '-')],
+    );
+    assert!(iupac_alternatives(&straight).is_empty());
+}
+
 /// E/Z and R/S together, in ascending order of their locants (P-93): C3 has O >
 /// C4 (a vinylic carbon: C, C, H with its duplicate) > C2 > H; the hydroxy group on a solid
 /// wedge, below the chain, gives O → C4 → C2 counterclockwise, S.

@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use crate::i18n::{self, Language, Msg, tr_in, trf};
 use crate::molecule::Molecule;
 use crate::molecule::bracket::expand;
-use crate::naming::{has_stereo_marks, iupac_name_with_notes, NameResult};
+use crate::naming::{has_stereo_marks, iupac_naming, NameKind, NameResult, Naming};
 use crate::reaction::ion::{Adduct, Ion, IonError};
 use crate::reaction::{FormulaAnalysis, MolecularFormula, PolymerFormula};
 use crate::widget::rich_text::RichLabel;
@@ -58,9 +58,9 @@ pub struct AnalysisPanel {
     /// in every language.
     pub ja: bool,
     cache: Option<(MolecularFormula, Option<Ion>, FormulaAnalysis)>,
-    /// The structures last named, their name and the notes on the stereogenic units it leaves
-    /// without a descriptor (naming is too slow to redo every frame).
-    name_cache: Option<(Molecule, NameResult, Vec<String>)>,
+    /// The structures last named, their name, the notes on the stereogenic units it leaves
+    /// without a descriptor and their other names (naming is too slow to redo every frame).
+    name_cache: Option<(Molecule, Naming)>,
 }
 
 impl Default for AnalysisPanel {
@@ -115,20 +115,26 @@ impl AnalysisPanel {
     /// The IUPAC name of `mol` (or of the selected structures). Recomputed only when they
     /// changed.
     pub fn iupac_name(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &NameResult {
-        self.named(mol, selection).0
+        &self.named(mol, selection).name
     }
 
-    /// The IUPAC name of `mol` (or of the selected structures) and the notes on the stereogenic
-    /// units it leaves without a descriptor. Recomputed only when they changed.
-    fn named(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> (&NameResult, &[String]) {
+    /// The other names of `mol` (or of the selected structures) beside the IUPAC name, each with
+    /// its kind ([`crate::naming::iupac_alternatives`]).
+    pub fn alternative_names(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &[(NameKind, String)] {
+        &self.named(mol, selection).alternatives
+    }
+
+    /// The IUPAC name of `mol` (or of the selected structures), the notes on the stereogenic
+    /// units it leaves without a descriptor and the other names. Recomputed only when they
+    /// changed.
+    fn named(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &Naming {
         let target = expand(&analysis_target(mol, selection));
-        let fresh = matches!(&self.name_cache, Some((m, _, _)) if *m == target);
+        let fresh = matches!(&self.name_cache, Some((m, _)) if *m == target);
         if !fresh {
-            let (name, notes) = iupac_name_with_notes(&target);
-            self.name_cache = Some((target, name, notes));
+            let naming = iupac_naming(&target);
+            self.name_cache = Some((target, naming));
         }
-        let (_, name, notes) = self.name_cache.as_ref().unwrap();
-        (name, notes)
+        &self.name_cache.as_ref().unwrap().1
     }
 
     /// Draw the panel. Returns `true` when the user copied the report to the clipboard.
@@ -160,13 +166,12 @@ impl AnalysisPanel {
                 ui.weak(tr_in(lang, Msg::NothingDrawn));
             }
             Ok(a) => {
-                let (name, notes) = self.named(mol, selection);
-                let (name, mut notes) = (name.clone(), notes.to_vec());
+                let Naming { name, mut notes, alternatives } = self.named(mol, selection).clone();
                 // Stereo bonds whose meaning the name leaves out (in part).
                 if !has_stereo_marks(&analysis_target(mol, selection)) {
                     notes.clear();
                 }
-                if show_values(ui, &a, polymer.as_ref(), &name, &notes, lang) {
+                if show_values(ui, &a, polymer.as_ref(), &name, &notes, &alternatives, lang) {
                     copied = true;
                 }
                 ui.add_space(4.0);
@@ -277,15 +282,17 @@ fn per_unit(p: &PolymerFormula, mass: fn(&MolecularFormula) -> Option<f64>) -> O
     Some(parts.join(" + "))
 }
 
-/// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid. A polymer's
-/// formula is shown with its repeat units (`polymer`), its values marked as those of n = 1 and
-/// its masses also given per n. Returns `true` when the user copied the name.
+/// Formula, masses, m/z, elemental analysis and IUPAC name as a two-column grid, the other
+/// names of the structure under the IUPAC name in a collapsed section. A polymer's formula is
+/// shown with its repeat units (`polymer`), its values marked as those of n = 1 and its masses
+/// also given per n. Returns `true` when the user copied a name.
 fn show_values(
     ui: &mut egui::Ui,
     a: &FormulaAnalysis,
     polymer: Option<&PolymerFormula>,
     name: &NameResult,
     stereo_notes: &[String],
+    alternatives: &[(NameKind, String)],
     lang: Language,
 ) -> bool {
     let mut copied = false;
@@ -384,6 +391,27 @@ fn show_values(
                     ui.weak(tr_in(lang, Msg::StereoNotIncluded))
                         .on_hover_text(stereo_notes.join("\n"));
                 }
+                if !alternatives.is_empty() {
+                    let count = alternatives.len().to_string();
+                    egui::CollapsingHeader::new(trf(lang, Msg::OtherNames, &[("count", &count)]))
+                        .id_salt("iupac_alternatives")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for (kind, alternative) in alternatives {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.weak(format!("{}:", tr_in(lang, kind_msg(*kind))));
+                                    ui.label(alternative);
+                                    let copy = ui
+                                        .small_button("📋")
+                                        .on_hover_text(tr_in(lang, Msg::CopyName));
+                                    if copy.clicked() {
+                                        ui.ctx().copy_text(alternative.clone());
+                                        copied = true;
+                                    }
+                                });
+                            }
+                        });
+                }
             }
             NameResult::Unsupported(reason) => {
                 ui.weak(format!("— ({})", trf(lang, Msg::Unsupported, &[("reason", reason)])));
@@ -392,6 +420,19 @@ fn show_values(
         ui.end_row();
     });
     copied
+}
+
+/// The label of an other name's kind.
+fn kind_msg(kind: NameKind) -> Msg {
+    match kind {
+        NameKind::Retained => Msg::NameKindRetained,
+        NameKind::Radicofunctional => Msg::NameKindRadicofunctional,
+        NameKind::Additive => Msg::NameKindAdditive,
+        NameKind::Conjunctive => Msg::NameKindConjunctive,
+        NameKind::Systematic => Msg::NameKindSystematic,
+        NameKind::Traditional => Msg::NameKindTraditional,
+        NameKind::Japanese => Msg::NameKindJapanese,
+    }
 }
 
 /// `H⁺`, `Cl⁻`, `e⁻` — the species with its charge sign, for the adduct list.
@@ -536,6 +577,24 @@ mod tests {
         assert_eq!(p.iupac_name(&m, &HashSet::new()), &NameResult::Ok("ethene; methanol".into()));
         assert_eq!(p.iupac_name(&m, &[c1].into()), &NameResult::Ok("ethene".into()));
         assert_eq!(p.iupac_name(&m, &[o].into()), &NameResult::Ok("methanol".into()));
+        // The other names follow it too; the IUPAC name stays the PIN.
+        assert_eq!(p.alternative_names(&m, &[o].into()), [(NameKind::Radicofunctional, "methyl alcohol".to_string())]);
+        assert!(p.alternative_names(&m, &[c1].into()).is_empty());
+        assert_eq!(
+            p.alternative_names(&m, &HashSet::new()),
+            [(NameKind::Radicofunctional, "ethene; methyl alcohol".to_string())]
+        );
+    }
+
+    /// Every kind of other name has its label, distinct from the others, in every language.
+    #[test]
+    fn kind_labels_are_localised() {
+        for language in Language::ALL {
+            let labels: HashSet<&str> = NameKind::ALL.iter().map(|&k| tr_in(language, kind_msg(k))).collect();
+            assert_eq!(labels.len(), NameKind::ALL.len(), "{language}");
+        }
+        assert_eq!(tr_in(Language::En, kind_msg(NameKind::Retained)), NameKind::Retained.label());
+        assert_eq!(trf(Language::Ja, Msg::OtherNames, &[("count", &"2")]), "別名 (2)");
     }
 
     /// Me–[CH2–CH2–O]3–Me: every value is that of CH3(CH2CH2O)3CH3, the end groups included.
@@ -575,9 +634,19 @@ mod tests {
         let (m, _, _) = two_structures();
         let mut labelled = Molecule::default();
         labelled.add_atom("OMe".into(), [0.0, 0.0], 0);
+        let mut glycerol = Molecule::default();
+        let c: Vec<u32> = (0..3).map(|i| glycerol.add_atom("C".into(), [i as f32, 0.0], 0)).collect();
+        for (i, &ci) in c.iter().enumerate() {
+            let o = glycerol.add_atom("O".into(), [i as f32, 1.0], 0);
+            glycerol.add_bond(ci, o, BondOrder::Single);
+        }
+        glycerol.add_bond(c[0], c[1], BondOrder::Single);
+        glycerol.add_bond(c[1], c[2], BondOrder::Single);
         let mut p = AnalysisPanel::default();
+        assert_eq!(p.alternative_names(&glycerol, &HashSet::new()), [(NameKind::Retained, "glycerol".to_string())]);
         for (mol, adduct, charge) in [
             (Molecule::default(), AdductChoice::Neutral, 1),
+            (glycerol, AdductChoice::Neutral, 1),
             (m.clone(), AdductChoice::Neutral, 1),
             (m.clone(), AdductChoice::Preset(0), 2),
             (labelled, AdductChoice::Preset(0), 1),

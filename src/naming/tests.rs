@@ -1015,7 +1015,7 @@ fn check_refused(cases: &[(&str, &str)]) {
 /// "IUPAC命名法" (oldid 111380645), structure → preferred IUPAC name. Where Wikipedia gives a
 /// name that is not the 2013 preferred name, the PIN is expected and Wikipedia's name noted;
 /// functional class names and retained names it lists beside the PIN (butyl chloride, methyl
-/// alcohol, glycerol, propylene…) are other names, not produced here.
+/// alcohol, glycerol, propylene…) are alternatives (`alternatives_tests.rs`).
 const WIKIPEDIA_ACYCLIC: &[(&str, &str)] = &[
     // CH3–CH2–CH2–CH(C2H5)–CH3: the longest chain (not 2-ethylpentane).
     ("CCCC(CC)C", "3-methylhexane"),
@@ -1062,7 +1062,9 @@ const WIKIPEDIA_ACYCLIC: &[(&str, &str)] = &[
     // Substituent groups, drawn with attachment points.
     ("*CCCCC", "pentyl"),
     // Wikipedia: "propylene"; propane-1,3-diyl is the preferred prefix (P-29.3.2.2; not
-    // trimethylene).
+    // trimethylene). Propylene is –CH(CH3)–CH2–, propane-1,2-diyl (a traditional name of the
+    // 1979 and 1993 rules; P-29.6.2.3 lists ethylene only): Wikipedia's name is not an
+    // alternative of this group (`alternatives_tests.rs`).
     ("*CCC*", "propane-1,3-diyl"),
     ("*C(=O)CCCCC", "hexanoyl"),
     ("*OCCCCC", "pentyloxy"),
@@ -1748,9 +1750,10 @@ fn annulenes() {
 
 /// Lactones, lactams, cyclic anhydrides and imides are heterocyclic pseudoketones (P-64.3.1,
 /// P-65.6.3.5.1, P-66.1.5.1): "oxolan-2-one", not butano-4-lactone. Pseudoketones and ketones
-/// have the same seniority (P-64.7.2). Names such as "6-hexanelactone" are other names
-/// (OPE-24). Only saturated monocycles are supported: on a fully unsaturated ring the C=O
-/// needs indicated hydrogen (pyridin-2(1H)-one, refused). IUPAC 2013 examples are marked.
+/// have the same seniority (P-64.7.2). Names such as "hexano-6-lactone" (method (2) of
+/// P-65.6.3.5.1; Wikipedia's "6-hexanelactone") are other names (OPE-24). Only saturated
+/// monocycles are supported: on a fully unsaturated ring the C=O needs indicated hydrogen
+/// (pyridin-2(1H)-one, refused). IUPAC 2013 examples are marked.
 #[test]
 fn lactones_and_lactams() {
     check_names(&[
