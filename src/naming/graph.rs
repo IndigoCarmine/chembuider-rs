@@ -539,10 +539,11 @@ pub(crate) fn components(mol: &Molecule) -> Vec<Vec<usize>> {
 }
 
 /// Atoms and bonds by label, hydrogens still explicit, while abbreviations are expanded.
-struct Raw {
-    label: Vec<String>,
-    charge: Vec<i8>,
-    bonds: Vec<(usize, usize, u8)>,
+pub(crate) struct Raw {
+    pub label: Vec<String>,
+    pub charge: Vec<i8>,
+    /// Both ends (indices into `label`) and the order.
+    pub bonds: Vec<(usize, usize, u8)>,
     /// Where each atom is drawn (`None`: an atom an abbreviation stands for).
     pos: Vec<Option<[f32; 2]>>,
     /// The stereo bonds: begin (a wedge's narrow end), end, and what they say.
@@ -575,12 +576,9 @@ fn plain_text(label: &str) -> String {
         .collect()
 }
 
-/// Build the graph of one connected structure (`atoms` index `mol.atoms`).
-pub(crate) fn build(
-    mol: &Molecule,
-    atoms: &[usize],
-    config: &Config,
-) -> Result<Graph, Unsupported> {
+/// The atoms and bonds of one connected structure (`atoms` index `mol.atoms`), every
+/// abbreviation expanded into the atoms it stands for; [`to_graph`] makes its graph.
+pub(crate) fn expand(mol: &Molecule, atoms: &[usize], config: &Config) -> Result<Raw, Unsupported> {
     let local: std::collections::HashMap<u32, usize> = atoms
         .iter()
         .enumerate()
@@ -612,7 +610,7 @@ pub(crate) fn build(
         }
     }
     expand_labels(&mut raw, config)?;
-    to_graph(&raw)
+    Ok(raw)
 }
 
 /// Replace every abbreviation ("Ph", "OMe", "CO2Et", …) by the atoms it stands for.
@@ -655,7 +653,7 @@ fn expand_labels(raw: &mut Raw, config: &Config) -> Result<(), Unsupported> {
 }
 
 /// An attachment point of a substituent group drawn on its own.
-const ATTACHMENT: &str = "*";
+pub(crate) const ATTACHMENT: &str = "*";
 
 /// A label that stands for one atom: an element or an attachment point.
 fn is_atom_label(label: &str) -> bool {
@@ -663,7 +661,7 @@ fn is_atom_label(label: &str) -> bool {
 }
 
 /// Fold the hydrogens into their heavy atoms and check every element is one the namer knows.
-fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
+pub(crate) fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
     let n = raw.label.len();
     let mut explicit_h = vec![0u8; n];
     let mut sum = vec![0i16; n];
@@ -674,16 +672,9 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
         if label == "H" || label == ATTACHMENT {
             continue;
         }
-        let e = El::from_symbol(label).ok_or_else(|| {
-            if super::ions::is_cation_element(label) {
-                format!(
-                    "element {label} other than as a lone cation {label}\u{207a} (draw a salt as \
-                     separate ions)"
-                )
-            } else {
-                format!("element {label} is not supported")
-            }
-        })?;
+        // A structure with a metal is the inorganic namer's (`inorganic.rs`).
+        let e =
+            El::from_symbol(label).ok_or_else(|| format!("element {label} is not supported"))?;
         heavy_index[i] = el.len();
         el.push(e);
         charge.push(raw.charge[i]);

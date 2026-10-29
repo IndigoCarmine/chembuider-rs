@@ -1,14 +1,17 @@
 //! Ions and salts: the cations the namer knows by name, and the name of a salt from its ions.
 //!
 //! A salt is drawn as separate structures, each carrying its charges: "[K+].CCC(=O)[O-]". Each
-//! ion is named on its own — a cation from [`CATIONS`], an anion by the substitutive engine
-//! ("propanoate") — and [`salt_name`] puts them together (P-65.6.2.1, P-72): the cations in
+//! ion is named on its own — a cation from [`CATIONS`], an inorganic anion from the tables of
+//! `inorganic.rs` ("chloride", "sulfate"), an organic one by the substitutive engine
+//! ("propanoate") — and [`salt`] puts them together (IR-5.4, P-65.6.2.1, P-72): the cations in
 //! alphabetical order with their multiplying prefixes, then the anion: "potassium propanoate",
-//! "disodium butanedioate", "ammonium potassium hexanedioate".
+//! "disodium butanedioate", "ammonium potassium hexanedioate", "calcium dichloride",
+//! "tricalcium bis(phosphate)". The names are kept in parts ([`IonName`], [`Salt`]) so that a
+//! translation can render them.
 
 use crate::molecule::{Molecule, charged_valence};
 
-use super::words::{enclose, multiplier, multiplier_complex};
+use super::words::{MAX_NUMERAL, enclose, multiplier, multiplier_complex};
 
 /// A cation named from a table: one atom of `symbol` with `hydrogens` hydrogens and `charge`.
 #[derive(Debug, PartialEq, Eq)]
@@ -28,22 +31,44 @@ const fn cation(symbol: &'static str, hydrogens: u8, charge: i8, name: &'static 
     }
 }
 
-/// The cations the namer knows: the alkali metals and ammonium (P-73.1, IUPAC 2005 IR-5.2).
+/// The cations the namer knows (IR-5.3.2, P-73.1): ammonium and the metals of one common
+/// charge — the alkali and alkaline-earth metals, aluminium, zinc and cadmium — whose salts
+/// need no oxidation number (IR-5.4.2.2). Their names are the element names
+/// (`inorganic::element_name`).
 pub(crate) const CATIONS: &[Cation] = &[
     cation("Li", 0, 1, "lithium"),
     cation("Na", 0, 1, "sodium"),
     cation("K", 0, 1, "potassium"),
     cation("Rb", 0, 1, "rubidium"),
     cation("Cs", 0, 1, "caesium"),
+    cation("Fr", 0, 1, "francium"),
+    cation("Be", 0, 2, "beryllium"),
+    cation("Mg", 0, 2, "magnesium"),
+    cation("Ca", 0, 2, "calcium"),
+    cation("Sr", 0, 2, "strontium"),
+    cation("Ba", 0, 2, "barium"),
+    cation("Ra", 0, 2, "radium"),
+    cation("Al", 0, 3, "aluminium"),
+    cation("Zn", 0, 2, "zinc"),
+    cation("Cd", 0, 2, "cadmium"),
     cation("N", 4, 1, "ammonium"),
 ];
 
-/// Whether `symbol` is the element of a monatomic cation of [`CATIONS`] (a metal the namer
-/// accepts only as a lone ion).
-pub(crate) fn is_cation_element(symbol: &str) -> bool {
+/// The one charge of the metal `symbol` of [`CATIONS`], if it is one.
+pub(crate) fn fixed_charge(symbol: &str) -> Option<i8> {
     CATIONS
         .iter()
-        .any(|c| c.hydrogens == 0 && c.symbol == symbol)
+        .find(|c| c.hydrogens == 0 && c.symbol == symbol)
+        .map(|c| c.charge)
+}
+
+/// The name of the cation of the metal `symbol` of [`CATIONS`] with `charge`.
+pub(crate) fn cation_name(symbol: &str, charge: i8) -> &'static str {
+    CATIONS
+        .iter()
+        .find(|c| c.hydrogens == 0 && c.symbol == symbol && c.charge == charge)
+        .expect("a cation of the table")
+        .name
 }
 
 /// The cation of [`CATIONS`] that the connected structure `atoms` (indices into `mol.atoms`)
@@ -73,24 +98,83 @@ pub(crate) fn recognise_cation(mol: &Molecule, atoms: &[usize]) -> Option<&'stat
         .find(|c| c.symbol == atom.element && c.charge == atom.charge && c.hydrogens as i16 == h)
 }
 
+/// The name of an ion, in parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IonName {
+    /// An ion of the tables ([`CATIONS`], the anions of `inorganic.rs`), by its English name;
+    /// a `compound` one is multiplied as "bis(sulfate)", not "disulfate" (IR-5.4.2.1).
+    Table { name: &'static str, compound: bool },
+    /// An ion named by the substitutive engine ("propanoate").
+    Organic(String),
+}
+
+impl IonName {
+    /// The English name.
+    pub(crate) fn english(&self) -> &str {
+        match self {
+            IonName::Table { name, .. } => name,
+            IonName::Organic(name) => name,
+        }
+    }
+
+    /// `n` times the ion: "acetate", "diacetate", "bis(2-chloropropanoate)", "bis(sulfate)".
+    fn multiplied(&self, n: usize) -> String {
+        let name = self.english();
+        let compound = match self {
+            IonName::Table { compound, .. } => *compound,
+            IonName::Organic(name) => {
+                name.contains(|c: char| c.is_ascii_digit() || c == ' ' || c == '(')
+            }
+        };
+        if n == 1 {
+            name.to_string()
+        } else if compound {
+            format!("{}{}", multiplier_complex(n), enclose(name, 0))
+        } else {
+            format!("{}{name}", multiplier(n))
+        }
+    }
+}
+
 /// A named ion of a salt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Ion {
-    pub name: String,
+    pub name: IonName,
     pub charge: i32,
 }
 
-/// The name of the salt made of `ions` (each drawn ion once): the cations in alphabetical
-/// order, then the anion, each with the multiplying prefix of its count in the smallest
-/// formula unit ("disodium butanedioate", "calcium diacetate"). Only one kind of anion is
-/// supported, and the charges must balance.
-pub(crate) fn salt_name(ions: &[Ion]) -> Result<String, String> {
+/// A salt in parts: its cations in the order of citation, each with its count in the formula
+/// unit, and its one kind of anion with its count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Salt {
+    pub cations: Vec<(IonName, usize)>,
+    pub anion: (IonName, usize),
+}
+
+impl Salt {
+    /// The English name: "potassium sodium sulfate", "calcium dichloride".
+    pub(crate) fn english(&self) -> String {
+        let mut words: Vec<String> = self
+            .cations
+            .iter()
+            .map(|(c, k)| format!("{}{}", multiplier(*k), c.english()))
+            .collect();
+        words.push(self.anion.0.multiplied(self.anion.1));
+        words.join(" ")
+    }
+}
+
+/// The salt made of `ions` (each drawn ion once): the cations in alphabetical order (IR-5.4.1,
+/// P-65.6.2.1), then the anion, each with its count in the smallest formula unit ("disodium
+/// butanedioate", "calcium diacetate"). Only one kind of anion is supported, the charges must
+/// balance, and no count may exceed the multiplying prefixes ([`MAX_NUMERAL`]).
+pub(crate) fn salt(ions: &[Ion]) -> Result<Salt, String> {
     let anions: Vec<&Ion> = ions.iter().filter(|i| i.charge < 0).collect();
-    let mut cations: Vec<(&str, usize)> = Vec::new();
+    let mut cations: Vec<(IonName, usize)> = Vec::new();
     for i in ions.iter().filter(|i| i.charge > 0) {
         match cations.iter_mut().find(|(n, _)| *n == i.name) {
             Some((_, k)) => *k += 1,
-            None => cations.push((&i.name, 1)),
+            None => cations.push((i.name.clone(), 1)),
         }
     }
     let total: i32 = ions.iter().map(|i| i.charge).sum();
@@ -106,24 +190,25 @@ pub(crate) fn salt_name(ions: &[Ion]) -> Result<String, String> {
         return Err("salt of more than one kind of anion".into());
     }
     let unit = cations.iter().fold(anions.len(), |g, &(_, k)| gcd(g, k));
-    cations.sort_unstable();
-    let mut words: Vec<String> = cations
-        .iter()
-        .map(|&(n, k)| format!("{}{n}", multiplier(k / unit)))
-        .collect();
-    words.push(multiplied_name(anion, anions.len() / unit));
-    Ok(words.join(" "))
+    for (_, k) in &mut cations {
+        *k /= unit;
+    }
+    let anion_count = anions.len() / unit;
+    if anion_count > MAX_NUMERAL || cations.iter().any(|&(_, k)| k > MAX_NUMERAL) {
+        return Err(format!(
+            "salt with more than {MAX_NUMERAL} of one ion in its formula unit"
+        ));
+    }
+    cations.sort_by(|a, b| a.0.english().cmp(b.0.english()));
+    Ok(Salt {
+        cations,
+        anion: (anion.clone(), anion_count),
+    })
 }
 
-/// `n` times the ion `name`: "acetate", "diacetate", "bis(2-chloropropanoate)".
-fn multiplied_name(name: &str, n: usize) -> String {
-    if n == 1 {
-        name.to_string()
-    } else if name.contains(|c: char| c.is_ascii_digit() || c == ' ' || c == '(') {
-        format!("{}{}", multiplier_complex(n), enclose(name, 0))
-    } else {
-        format!("{}{name}", multiplier(n))
-    }
+/// The English name of the salt made of `ions` ([`salt`]).
+pub(crate) fn salt_name(ions: &[Ion]) -> Result<String, String> {
+    salt(ions).map(|s| s.english())
 }
 
 fn gcd(a: usize, b: usize) -> usize {
@@ -136,8 +221,19 @@ mod tests {
 
     fn ion(name: &str, charge: i32) -> Ion {
         Ion {
-            name: name.into(),
+            name: IonName::Organic(name.into()),
             charge,
+        }
+    }
+
+    /// The cations of the metals are named as their elements.
+    #[test]
+    fn cation_names_are_the_element_names() {
+        for c in CATIONS.iter().filter(|c| c.hydrogens == 0) {
+            assert_eq!(
+                super::super::inorganic::element_name(c.symbol),
+                Some(c.name)
+            );
         }
     }
 
@@ -169,7 +265,7 @@ mod tests {
             ]),
             Ok("sodium acetate".into())
         );
-        // A divalent cation (not yet in the table) multiplies the anion (P-65.6.2.1).
+        // A divalent cation multiplies the anion (P-65.6.2.1).
         assert_eq!(
             salt_name(&[ion("calcium", 2), ion("acetate", -1), ion("acetate", -1)]),
             Ok("calcium diacetate".into())
@@ -182,6 +278,11 @@ mod tests {
             ]),
             Ok("calcium bis(2-chloropropanoate)".into())
         );
+        // A count beyond the numerals (9999) is refused, not written in digits.
+        let mut many = vec![ion("potassium", 1); 10_000];
+        many.push(ion("sodium", 1));
+        many.extend(vec![ion("chloride", -1); 10_001]);
+        assert!(salt_name(&many).unwrap_err().contains("9999"));
         assert!(salt_name(&[ion("acetate", -1)]).is_err());
         assert!(salt_name(&[ion("sodium", 1)]).is_err());
         assert!(salt_name(&[ion("sodium", 1), ion("butanedioate", -2)]).is_err());

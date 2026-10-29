@@ -1255,9 +1255,9 @@ fn anhydrides() {
 }
 
 /// Salts of carboxylic acids (P-65.6.2): the cations in alphabetical order, then the anion.
-/// The cations are the alkali metals and ammonium, drawn as separate ions; a partly
-/// neutralised acid names its free acid groups as "carboxy" (P-65.6.2.3.1, method 1).
-/// IUPAC 2013 examples are marked.
+/// The cations are those of `ions.rs` (metals of one charge, ammonium), drawn as separate
+/// ions; a partly neutralised acid names its free acid groups as "carboxy" (P-65.6.2.3.1,
+/// method 1). IUPAC 2013 examples are marked.
 #[test]
 fn carboxylate_salts() {
     check_names(&[
@@ -1290,6 +1290,9 @@ fn carboxylate_salts() {
         ("[Na+].CC([O-])=O.[Na+].CC([O-])=O", "sodium acetate"),
         // A neutral compound beside the salt keeps its own name.
         ("CCO.[Na+].CC([O-])=O", "ethanol; sodium acetate"),
+        // A divalent cation multiplies the anion (P-65.6.2.1; Ca²⁺ is in the table since
+        // OPE-25).
+        ("[Ca+2].CC([O-])=O.CC([O-])=O", "calcium diacetate"),
     ]);
     check_refused(&[
         ("CC([O-])=O", "charges do not balance"),
@@ -1301,7 +1304,6 @@ fn carboxylate_salts() {
         ),
         ("CC(=O)O[Na]", "draw a salt as separate ions"),
         ("C[NH3+].CC([O-])=O", "charged"),
-        ("[Ca+2].CC([O-])=O.CC([O-])=O", "element Ca"),
         ("CC(=O)OCC(=O)[O-].[Na+]", "ester group as a substituent"),
     ]);
 }
