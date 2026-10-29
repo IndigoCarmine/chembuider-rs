@@ -1842,9 +1842,9 @@ fn prefixes_with_a_parent_hydride_name_are_enclosed() {
 }
 
 /// The ring examples of Wikipedia (ja) "IUPAC命名法" (oldid 111380645), structure → preferred
-/// IUPAC name, with the Penicillin G walk-through (constitution only: stereodescriptors are
-/// OPE-23). Where Wikipedia's name is not the 2013 PIN, the PIN is expected and the difference
-/// noted.
+/// IUPAC name, with the Penicillin G walk-through (constitution only: SMILES read by the test
+/// parser carry no stereo; the full name, "(2S,5R,6R)-…", is `stereo_tests::penicillin_g_full_name`).
+/// Where Wikipedia's name is not the 2013 PIN, the PIN is expected and the difference noted.
 #[test]
 fn wikipedia_ring_examples() {
     check_names(&[

@@ -11,7 +11,7 @@ use super::hetero::{self, Hetero};
 use crate::config::Config;
 use crate::label_chain::resolve_label;
 use crate::molecule::elements::element_of_label;
-use crate::molecule::{BondOrder, Molecule, charged_valence};
+use crate::molecule::{BondOrder, BondStereo, Molecule, charged_valence};
 use crate::widget::rich_text::RichText;
 
 /// The elements the namer handles.
@@ -91,6 +91,54 @@ pub(crate) struct Graph {
     /// Free valences drawn as attachment points ("*"): the atom and the order of the bond to
     /// the point. A structure with any is named as a substituent group (P-29).
     pub free: Vec<(usize, u8)>,
+    /// How the structure is drawn, for its stereodescriptors.
+    pub drawn: Drawn,
+}
+
+/// The 2D drawing of a structure: where its atoms are and its stereo bonds. Atoms that an
+/// abbreviation stands for ("Ph", "CO2Et") are not drawn; the abbreviation's own atom is drawn
+/// where its label is.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Drawn {
+    /// Where each heavy atom is drawn, in molecule units (y downward).
+    pub pos: Vec<Option<[f32; 2]>>,
+    /// The hydrogens drawn as atoms: the heavy atom each is on, and where it is drawn.
+    pub h: Vec<(usize, Option<[f32; 2]>)>,
+    /// The bonds drawn as wedges, hashes or wavy lines.
+    pub marks: Vec<Mark>,
+}
+
+/// One end of a drawn bond.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum End {
+    /// A heavy atom.
+    Atom(usize),
+    /// A hydrogen drawn as an atom: an index into [`Drawn::h`].
+    H(usize),
+    /// An attachment point.
+    Free,
+}
+
+/// What a stereo bond says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wedge {
+    /// A solid wedge: its wide end toward the viewer.
+    Up,
+    /// A hashed wedge: its wide end away from the viewer.
+    Down,
+    /// A wavy bond: the configuration is not specified.
+    Wavy,
+    /// A bold, hollow-wedged, plain hashed or dashed bond, which says nothing definite about a
+    /// configuration (IUPAC 2006 graphical representation, ST-1.1).
+    Unclear,
+}
+
+/// A stereo bond, from its narrow end (where a wedge starts) to its wide end.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mark {
+    pub narrow: End,
+    pub wide: End,
+    pub wedge: Wedge,
 }
 
 impl Graph {
@@ -304,6 +352,7 @@ impl Graph {
             h,
             adj,
             free: Vec::new(),
+            drawn: Drawn::default(),
         }
     }
 }
@@ -494,6 +543,23 @@ struct Raw {
     label: Vec<String>,
     charge: Vec<i8>,
     bonds: Vec<(usize, usize, u8)>,
+    /// Where each atom is drawn (`None`: an atom an abbreviation stands for).
+    pos: Vec<Option<[f32; 2]>>,
+    /// The stereo bonds: begin (a wedge's narrow end), end, and what they say.
+    marks: Vec<(usize, usize, Wedge)>,
+}
+
+/// What a bond's stereo style says about a configuration, if anything.
+fn wedge_of(stereo: &BondStereo) -> Option<Wedge> {
+    match stereo {
+        BondStereo::None | BondStereo::Dative => None,
+        BondStereo::WedgeUp => Some(Wedge::Up),
+        BondStereo::WedgeDown => Some(Wedge::Down),
+        BondStereo::Wavy => Some(Wedge::Wavy),
+        BondStereo::Bold | BondStereo::Dashed | BondStereo::Hashed | BondStereo::HollowWedge => {
+            Some(Wedge::Unclear)
+        }
+    }
 }
 
 fn order_value(o: &BondOrder) -> u8 {
@@ -527,12 +593,22 @@ pub(crate) fn build(
             .collect(),
         charge: atoms.iter().map(|&i| mol.atoms[i].charge).collect(),
         bonds: Vec::new(),
+        // A hydrogen that came with a group label is drawn folded into the label, not where
+        // its atom is.
+        pos: atoms
+            .iter()
+            .map(|&i| (!mol.atoms[i].group_h).then_some(mol.atoms[i].pos))
+            .collect(),
+        marks: Vec::new(),
     };
     for b in &mol.bonds {
         if let (Some(&a), Some(&c)) = (local.get(&b.begin), local.get(&b.end))
             && a != c
         {
             raw.bonds.push((a, c, order_value(&b.order)));
+            if let Some(w) = wedge_of(&b.stereo) {
+                raw.marks.push((a, c, w));
+            }
         }
     }
     expand_labels(&mut raw, config)?;
@@ -564,6 +640,7 @@ fn expand_labels(raw: &mut Raw, config: &Config) -> Result<(), Unsupported> {
                 map[k] = raw.label.len();
                 raw.label.push(fa.element.clone());
                 raw.charge.push(fa.charge);
+                raw.pos.push(None);
             }
         }
         for fb in &frag.bonds {
@@ -668,6 +745,40 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
             }
         }
     }
+    let mut drawn = Drawn {
+        pos: (0..n)
+            .filter(|&i| heavy_index[i] != usize::MAX)
+            .map(|i| raw.pos[i])
+            .collect(),
+        ..Drawn::default()
+    };
+    let mut h_index = vec![usize::MAX; n];
+    for &(a, b, _) in &raw.bonds {
+        for (x, y) in [(a, b), (b, a)] {
+            if raw.label[x] == "H" && heavy_index[y] != usize::MAX {
+                h_index[x] = drawn.h.len();
+                drawn.h.push((heavy_index[y], raw.pos[x]));
+            }
+        }
+    }
+    let end = |i: usize| {
+        if heavy_index[i] != usize::MAX {
+            End::Atom(heavy_index[i])
+        } else if h_index[i] != usize::MAX {
+            End::H(h_index[i])
+        } else {
+            End::Free
+        }
+    };
+    drawn.marks = raw
+        .marks
+        .iter()
+        .map(|&(a, b, wedge)| Mark {
+            narrow: end(a),
+            wide: end(b),
+            wedge,
+        })
+        .collect();
     let mut h = vec![0u8; el.len()];
     for i in 0..n {
         let k = heavy_index[i];
@@ -688,6 +799,7 @@ fn to_graph(raw: &Raw) -> Result<Graph, Unsupported> {
         h,
         adj,
         free,
+        drawn,
     })
 }
 

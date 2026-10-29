@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use crate::i18n::{self, Language, Msg, tr_in, trf};
 use crate::molecule::Molecule;
 use crate::molecule::bracket::expand;
-use crate::naming::{has_stereo_marks, iupac_name, NameResult};
+use crate::naming::{has_stereo_marks, iupac_name_with_notes, NameResult};
 use crate::reaction::ion::{Adduct, Ion, IonError};
 use crate::reaction::{FormulaAnalysis, MolecularFormula, PolymerFormula};
 use crate::widget::rich_text::RichLabel;
@@ -58,8 +58,9 @@ pub struct AnalysisPanel {
     /// in every language.
     pub ja: bool,
     cache: Option<(MolecularFormula, Option<Ion>, FormulaAnalysis)>,
-    /// The structures last named, and their name (naming is too slow to redo every frame).
-    name_cache: Option<(Molecule, NameResult)>,
+    /// The structures last named, their name and the notes on the stereogenic units it leaves
+    /// without a descriptor (naming is too slow to redo every frame).
+    name_cache: Option<(Molecule, NameResult, Vec<String>)>,
 }
 
 impl Default for AnalysisPanel {
@@ -114,13 +115,20 @@ impl AnalysisPanel {
     /// The IUPAC name of `mol` (or of the selected structures). Recomputed only when they
     /// changed.
     pub fn iupac_name(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> &NameResult {
+        self.named(mol, selection).0
+    }
+
+    /// The IUPAC name of `mol` (or of the selected structures) and the notes on the stereogenic
+    /// units it leaves without a descriptor. Recomputed only when they changed.
+    fn named(&mut self, mol: &Molecule, selection: &HashSet<u32>) -> (&NameResult, &[String]) {
         let target = expand(&analysis_target(mol, selection));
-        let fresh = matches!(&self.name_cache, Some((m, _)) if *m == target);
+        let fresh = matches!(&self.name_cache, Some((m, _, _)) if *m == target);
         if !fresh {
-            let name = iupac_name(&target);
-            self.name_cache = Some((target, name));
+            let (name, notes) = iupac_name_with_notes(&target);
+            self.name_cache = Some((target, name, notes));
         }
-        &self.name_cache.as_ref().unwrap().1
+        let (_, name, notes) = self.name_cache.as_ref().unwrap();
+        (name, notes)
     }
 
     /// Draw the panel. Returns `true` when the user copied the report to the clipboard.
@@ -152,9 +160,13 @@ impl AnalysisPanel {
                 ui.weak(tr_in(lang, Msg::NothingDrawn));
             }
             Ok(a) => {
-                let name = self.iupac_name(mol, selection).clone();
-                let stereo = has_stereo_marks(&analysis_target(mol, selection));
-                if show_values(ui, &a, polymer.as_ref(), &name, stereo, lang) {
+                let (name, notes) = self.named(mol, selection);
+                let (name, mut notes) = (name.clone(), notes.to_vec());
+                // Stereo bonds whose meaning the name leaves out (in part).
+                if !has_stereo_marks(&analysis_target(mol, selection)) {
+                    notes.clear();
+                }
+                if show_values(ui, &a, polymer.as_ref(), &name, &notes, lang) {
                     copied = true;
                 }
                 ui.add_space(4.0);
@@ -273,7 +285,7 @@ fn show_values(
     a: &FormulaAnalysis,
     polymer: Option<&PolymerFormula>,
     name: &NameResult,
-    stereo: bool,
+    stereo_notes: &[String],
     lang: Language,
 ) -> bool {
     let mut copied = false;
@@ -368,8 +380,9 @@ fn show_values(
                         copied = true;
                     }
                 });
-                if stereo {
-                    ui.weak(tr_in(lang, Msg::StereoNotIncluded));
+                if !stereo_notes.is_empty() {
+                    ui.weak(tr_in(lang, Msg::StereoNotIncluded))
+                        .on_hover_text(stereo_notes.join("\n"));
                 }
             }
             NameResult::Unsupported(reason) => {

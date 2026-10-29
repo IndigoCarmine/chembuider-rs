@@ -90,8 +90,30 @@
 //! acid's oxygen (acyloxy), several free valences other than single bonds on carbon or not
 //! all on one parent ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and
 //! others, and other functional groups (imines, azo, peroxides, carbonates, ureas…).
-//! Stereodescriptors (E/Z, R/S) are not generated: the name describes the constitution only;
-//! see [`has_stereo_marks`].
+//!
+//! Stereodescriptors (P-9, `stereo.rs`, ranked by the CIP rules in `cip.rs`) are cited in front
+//! of the name, with their locants, in ascending order of the locants whatever their kind
+//! (P-93): "(2R)-butan-2-ol", "(2E)-pent-2-ene", "(3S,4E)-hex-4-en-3-ol", "(2S,5R,6R)-3,3-
+//! dimethyl-7-oxo-6-(2-phenylacetamido)-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid";
+//! of an ester before its acid part ("ethyl (2R)-…oate"). Where the name cites no locant for
+//! the unit, its descriptor has none (P-93.4.1.1): "(R)-bromo(chloro)(fluoro)methane",
+//! "(E)-1,2-dichloroethene", "(Z)-cyclooctene". R/S comes from the wedges and hashes
+//! drawn at a tetrahedral carbon centre, E/Z from the drawn geometry of a C=C double bond (not
+//! in a ring of fewer than eight members, P-93; nor the Z double bonds of an eight-membered
+//! ring with more than one, P-91.2.2: "cycloocta-1,3,5,7-tetraene"). Of numberings that tie on
+//! everything else, the lower locants go to Z, then to R (P-14.4 (j): meso "(2R,3S)"). The CIP
+//! ranking is Rule 1a over the hierarchical digraph with duplicate atoms (P-92.1), the
+//! duplicates of a mancude ring averaged over its Kekulé structures (P-92.1.4.4), so that the
+//! Kekulé structure drawn does not matter. A unit gets no
+//! descriptor, and [`iupac_name_with_notes`] says why, where the drawing does not fix it (no
+//! wedge at a centre, a wavy, bold or plain hashed bond, a double bond drawn straight), where it
+//! is not on the parent (a stereocentre in a substituent prefix: "[(2R)-butan-2-yl]" is not
+//! produced, nor are the descriptors of substituent groups drawn on their own and anhydrides),
+//! and for what is not supported: pseudoasymmetric centres (r/s) and other ligands told apart
+//! only by CIP Rules 1b–5, allenes (axial chirality); centres on atoms other than carbon,
+//! cumulenes, atropisomers and planar chirality are not perceived at all. Wedges are read as
+//! absolute configuration: relative descriptors (rel-, R*, rac-) are not produced. See also
+//! [`has_stereo_marks`].
 //!
 //! Choices made where IUPAC 2013 offers more than one name, or where PubChem's names (OpenEye
 //! Lexichem) differ:
@@ -131,12 +153,16 @@
 //!   are not produced; the substitutive name given instead ("benzylbenzene",
 //!   "phenoxybenzene") is a correct, if not preferred, IUPAC name.
 
+mod cip;
 mod engine;
 mod graph;
 mod hetero;
 mod ions;
+mod stereo;
 mod words;
 
+#[cfg(test)]
+mod stereo_tests;
 #[cfg(test)]
 mod tests;
 
@@ -170,12 +196,30 @@ pub fn iupac_name(mol: &Molecule) -> NameResult {
 
 /// [`iupac_name`] with the abbreviations of `config`.
 pub fn iupac_name_with_config(mol: &Molecule, config: &Config) -> NameResult {
+    name_and_notes(mol, config).0
+}
+
+/// [`iupac_name`], with a note on every stereogenic unit the name leaves without a descriptor
+/// and why (in English): "C2: stereocentre drawn without a wedge or hash bond starting at it".
+pub fn iupac_name_with_notes(mol: &Molecule) -> (NameResult, Vec<String>) {
+    name_and_notes(mol, &Config::default())
+}
+
+fn name_and_notes(mol: &Molecule, config: &Config) -> (NameResult, Vec<String>) {
     // Brackets (a polymer's repeat unit, a multiple group) change what the atoms stand for;
     // naming the atoms as drawn would name the wrong compound.
     if mol.brackets().next().is_some() {
-        return NameResult::Unsupported("brackets (polymers, multiple groups)".into());
+        return (
+            NameResult::Unsupported("brackets (polymers, multiple groups)".into()),
+            vec![],
+        );
     }
-    let names = iupac_names_with_config(mol, config);
+    let (names, notes) = names_and_notes(mol, config);
+    (joined(names), notes)
+}
+
+/// The names of the compounds of a drawing as one result.
+fn joined(names: Vec<NameResult>) -> NameResult {
     if names.is_empty() {
         return NameResult::Unsupported("nothing drawn".into());
     }
@@ -201,11 +245,17 @@ pub fn iupac_names(mol: &Molecule) -> Vec<NameResult> {
 
 /// [`iupac_names`] with the abbreviations of `config`.
 pub fn iupac_names_with_config(mol: &Molecule, config: &Config) -> Vec<NameResult> {
+    names_and_notes(mol, config).0
+}
+
+/// [`iupac_names_with_config`], with the notes of [`iupac_name_with_notes`].
+fn names_and_notes(mol: &Molecule, config: &Config) -> (Vec<NameResult>, Vec<String>) {
     let mut names = Vec::new();
+    let mut notes = Vec::new();
     let mut ions = Vec::new();
     let mut salt_at = None;
     for atoms in graph::components(mol) {
-        match name_component(mol, &atoms, config) {
+        match name_component(mol, &atoms, config, &mut notes) {
             Ok(ion) if ion.charge != 0 => {
                 if salt_at.is_none() {
                     salt_at = Some(names.len());
@@ -223,12 +273,18 @@ pub fn iupac_names_with_config(mol: &Molecule, config: &Config) -> Vec<NameResul
             Err(r) => NameResult::Unsupported(r),
         };
     }
-    names
+    (names, notes)
 }
 
 /// The name of one connected structure and its net charge: a cation of the table, or a
 /// structure named by the substitutive engine (a neutral compound, an anion, a substituent).
-fn name_component(mol: &Molecule, atoms: &[usize], config: &Config) -> Result<ions::Ion, String> {
+/// The notes on its stereogenic units go to `notes`.
+fn name_component(
+    mol: &Molecule,
+    atoms: &[usize],
+    config: &Config,
+    notes: &mut Vec<String>,
+) -> Result<ions::Ion, String> {
     if let Some(c) = ions::recognise_cation(mol, atoms) {
         return Ok(ions::Ion {
             name: c.name.into(),
@@ -237,14 +293,18 @@ fn name_component(mol: &Molecule, atoms: &[usize], config: &Config) -> Result<io
     }
     let g = graph::build(mol, atoms, config)?;
     let p = graph::perceive(&g)?;
+    let units = stereo::units(&g);
+    let namer = engine::Namer::new(&g, &p).with_stereo(&units);
+    let name = namer.name()?;
+    notes.extend(namer.notes());
     Ok(ions::Ion {
-        name: engine::Namer::new(&g, &p).name()?,
+        name,
         charge: g.net_charge(),
     })
 }
 
-/// Whether the drawing has stereo bonds (wedges, hashes, wavy bonds), whose meaning the
-/// generated name leaves out.
+/// Whether the drawing has stereo bonds (wedges, hashes, wavy bonds). The name cites the
+/// configurations they fix where it can; [`iupac_name_with_notes`] lists those it leaves out.
 pub fn has_stereo_marks(mol: &Molecule) -> bool {
     mol.bonds.iter().any(|b| {
         matches!(

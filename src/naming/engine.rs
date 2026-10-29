@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::graph::{self, Class, El, Graph, Perceived, RingParent, Unsupported};
 use super::hetero::HeteroRing;
+use super::stereo::{Descriptor, Site, Unit};
 use super::words::{
     MAX_NUMERAL, alpha_key, enclose, multiplier, multiplier_complex, starts_with_vowel, stem,
 };
@@ -208,9 +209,23 @@ type Key = (
     Vec<u32>,
 );
 
+/// Which locants of its parent a name leaves out, and so the stereodescriptors there
+/// (P-93.4.1.1: "When no locant is required in the name …, no locant is necessary before the
+/// stereodescriptor"): "(R)-bromo(chloro)(fluoro)methane", "(E)-1,2-dichloroethene",
+/// "(Z)-cyclooctene".
+#[derive(Clone, Copy, Default)]
+struct Uncited {
+    /// The locants of the parent's atoms: methane, a monosubstituted ring.
+    atoms: bool,
+    /// The locants of its multiple bonds: ethene, cyclooctene (P-31.1.3.1).
+    bonds: bool,
+}
+
 /// One numbered candidate parent, evaluated.
 struct Eval {
     atoms: Vec<usize>,
+    /// The locant of each atom.
+    locs: Vec<u32>,
     shape: Shape,
     joins: Vec<(u32, u32)>,
     attached: bool,
@@ -229,6 +244,10 @@ pub(crate) struct Namer<'a> {
     g: &'a Graph,
     p: &'a Perceived,
     cache: RefCell<HashMap<(usize, usize), Result<Prefix, Unsupported>>>,
+    /// The stereogenic units whose descriptors the name cites.
+    stereo: &'a [Unit],
+    /// The stereogenic units the name leaves without a descriptor, and why.
+    notes: RefCell<Vec<String>>,
 }
 
 impl<'a> Namer<'a> {
@@ -237,12 +256,45 @@ impl<'a> Namer<'a> {
             g,
             p,
             cache: RefCell::new(HashMap::new()),
+            stereo: &[],
+            notes: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The namer citing the descriptors of `units` (P-93).
+    pub(crate) fn with_stereo(self, units: &'a [Unit]) -> Self {
+        Namer {
+            stereo: units,
+            ..self
+        }
+    }
+
+    /// The stereogenic units the name left without a descriptor, and why (after [`name`]).
+    ///
+    /// [`name`]: Self::name
+    pub(crate) fn notes(&self) -> Vec<String> {
+        self.notes.borrow().clone()
+    }
+
+    /// Notes for every stereogenic unit, none of whose descriptors is cited because the
+    /// structure is named `how`.
+    fn note_all(&self, how: &str) {
+        for u in self.stereo {
+            let why = match &u.descriptor {
+                Ok(_) => format!("stereodescriptors are not generated for {how}"),
+                Err(r) => r.clone(),
+            };
+            self.notes
+                .borrow_mut()
+                .push(format!("{}: {why}", site_text(u.site, None)));
         }
     }
 
     pub(crate) fn name(&self) -> Result<String, Unsupported> {
         if !self.g.free.is_empty() {
-            return self.substituent();
+            let n = self.substituent()?;
+            self.note_all("substituent groups");
+            return Ok(n);
         }
         let count = |k: Class| self.p.ctype.iter().filter(|t| **t == Some(k)).count();
         if self.p.principal == Some(Class::Carboxylate)
@@ -254,10 +306,12 @@ impl<'a> Namer<'a> {
                 .into());
         }
         if self.p.principal == Some(Class::Anhydride) {
-            return self.anhydride();
+            let n = self.anhydride()?;
+            self.note_all("anhydrides");
+            return Ok(n);
         }
         let region = vec![true; self.g.len()];
-        Ok(self.unit(Mode::Molecule, &region)?.text)
+        Ok(self.unit_cited(Mode::Molecule, &region, true)?.text)
     }
 
     /// The name of a substituent group drawn with attachment points (P-29): "pentyl",
@@ -494,6 +548,12 @@ impl<'a> Namer<'a> {
     }
 
     fn unit(&self, mode: Mode, region: &[bool]) -> Result<Prefix, Unsupported> {
+        self.unit_cited(mode, region, false)
+    }
+
+    /// The unit named in `mode`; with `stereo`, citing the descriptors of the stereogenic units
+    /// on its parent.
+    fn unit_cited(&self, mode: Mode, region: &[bool], stereo: bool) -> Result<Prefix, Unsupported> {
         let p = self.p;
         let pgs = self.principal_groups(mode, region);
         // A substituent whose free valence is on a ring is named from that ring (or assembly).
@@ -589,18 +649,92 @@ impl<'a> Namer<'a> {
             .min()
             .ok_or("internal error: no numbering")?
             .clone();
-        let mut chosen: Option<(Vec<Loc>, Prefix)> = None;
+        // The candidates that tie on everything but their stereodescriptors.
+        let mut chosen: Vec<(&Eval, Vec<Loc>, Prefix, Uncited)> = Vec::new();
         for e in evals.iter().filter(|e| e.key == best) {
-            let (order, named) = self.render(e, mode, region)?;
-            let better = match &chosen {
-                None => true,
-                Some((o, n)) => (&order, &named.text) < (o, &n.text),
-            };
-            if better {
-                chosen = Some((order, named));
+            let (order, named, uncited) = self.render(e, mode, region, "")?;
+            let rank = chosen
+                .first()
+                .map(|(_, o, n, _)| (&order, &named.text).cmp(&(o, &n.text)));
+            match rank {
+                Some(std::cmp::Ordering::Greater) => {}
+                Some(std::cmp::Ordering::Equal) => chosen.push((e, order, named, uncited)),
+                _ => chosen = vec![(e, order, named, uncited)],
             }
         }
-        Ok(chosen.expect("at least one candidate").1)
+        if !stereo {
+            return Ok(chosen.swap_remove(0).2);
+        }
+        // Among those, the lower locants go to Z, then to R (P-14.4 (j)).
+        let cited: Vec<_> = chosen.iter().map(|(e, ..)| self.cite(e)).collect();
+        let locants_of = |c: &[(u32, Descriptor)], d: Descriptor| -> Vec<u32> {
+            c.iter().filter(|x| x.1 == d).map(|x| x.0).collect()
+        };
+        let pick = (0..cited.len())
+            .min_by_key(|&i| {
+                let c = &cited[i].0;
+                (
+                    Reverse(c.len()),
+                    locants_of(c, Descriptor::Z),
+                    locants_of(c, Descriptor::R),
+                )
+            })
+            .expect("at least one candidate");
+        let (descriptors, notes) = &cited[pick];
+        self.notes.borrow_mut().extend(notes.iter().cloned());
+        let (e, _, named, uncited) = chosen.swap_remove(pick);
+        if descriptors.is_empty() {
+            return Ok(named);
+        }
+        let list: Vec<String> = descriptors
+            .iter()
+            .map(|&(l, d)| {
+                let bare = match d {
+                    Descriptor::R | Descriptor::S => uncited.atoms,
+                    Descriptor::E | Descriptor::Z => uncited.bonds,
+                };
+                if bare {
+                    d.to_string()
+                } else {
+                    format!("{}{d}", loc_text(l))
+                }
+            })
+            .collect();
+        Ok(self
+            .render(e, mode, region, &format!("({})-", list.join(",")))?
+            .1)
+    }
+
+    /// The descriptors of the stereogenic units on the parent of `e`, with their locants, in
+    /// ascending order of the locants (P-93); and notes on the units left without one.
+    fn cite(&self, e: &Eval) -> (Vec<(u32, Descriptor)>, Vec<String>) {
+        let mut pos = vec![None; self.g.len()];
+        for (&a, &l) in e.atoms.iter().zip(&e.locs) {
+            pos[a] = Some(l);
+        }
+        let mut cited = Vec::new();
+        let mut notes = Vec::new();
+        for u in self.stereo {
+            let locant = match u.site {
+                Site::Centre(c) => pos[c].ok_or("in a substituent group"),
+                Site::Double(a, b) => match (pos[a], pos[b]) {
+                    (Some(x), Some(y)) if x.abs_diff(y) == loc(1) => Ok(x.min(y)),
+                    (Some(_), Some(_)) => Err("a double bond with a compound locant"),
+                    _ => Err("in a substituent group"),
+                },
+                Site::Axis(..) => Err("an allene"),
+            };
+            let at = site_text(u.site, Some(&pos));
+            match (&u.descriptor, locant) {
+                (Ok(d), Ok(l)) => cited.push((l, *d)),
+                (Ok(_), Err(why)) => notes.push(format!(
+                    "{at}: {why}: descriptors are only given for the parent chain or ring"
+                )),
+                (Err(why), _) => notes.push(format!("{at}: {why}")),
+            }
+        }
+        cited.sort_unstable_by_key(|c| c.0);
+        (cited, notes)
     }
 
     /// The heteroatoms of a group carbon belong to the group; an amide's N-substituents and
@@ -969,6 +1103,7 @@ impl<'a> Namer<'a> {
         );
         Eval {
             atoms,
+            locs,
             shape,
             joins,
             attached,
@@ -982,13 +1117,17 @@ impl<'a> Namer<'a> {
     }
 
     /// The name of an evaluated candidate, with the locants in the order its prefixes are
-    /// cited (the last tie-breaker).
+    /// cited (the last tie-breaker), and the locants of the parent it leaves out.
+    ///
+    /// `stereo` (the stereodescriptors, "(2R)-") goes before the name of a molecule, after an
+    /// ester's alkyl group: "ethyl (2R)-2-hydroxypropanoate".
     fn render(
         &self,
         e: &Eval,
         mode: Mode,
         region: &[bool],
-    ) -> Result<(Vec<Loc>, Prefix), Unsupported> {
+        stereo: &str,
+    ) -> Result<(Vec<Loc>, Prefix, Uncited), Unsupported> {
         let g = self.g;
         let suffix = match mode {
             Mode::Molecule => match self.p.principal {
@@ -1033,7 +1172,7 @@ impl<'a> Namer<'a> {
         };
         if let Some((mut text, depth, order)) = special {
             if mode == Mode::Molecule {
-                text = self.with_ester(e, region, text)?;
+                text = self.with_ester(e, region, format!("{stereo}{text}"))?;
             }
             return Ok((
                 order,
@@ -1044,6 +1183,7 @@ impl<'a> Namer<'a> {
                     hydride: acyl_or_amido,
                     oxy: false,
                 },
+                Uncited::default(),
             ));
         }
         if let Shape::Assembly {
@@ -1055,7 +1195,7 @@ impl<'a> Namer<'a> {
             let (mut text, depth, order) =
                 assembly_name(e, rings, benzene, hetero, suffix, &groups)?;
             if mode == Mode::Molecule {
-                text = self.with_ester(e, region, text)?;
+                text = self.with_ester(e, region, format!("{stereo}{text}"))?;
             }
             return Ok((
                 order,
@@ -1066,6 +1206,7 @@ impl<'a> Namer<'a> {
                     hydride: acyl_or_amido,
                     oxy: false,
                 },
+                Uncited::default(),
             ));
         }
 
@@ -1139,7 +1280,7 @@ impl<'a> Namer<'a> {
             {
                 text = t;
             }
-            text = self.with_ester(e, region, text)?;
+            text = self.with_ester(e, region, format!("{stereo}{text}"))?;
         } else if text == "2-methylpropan-2-yl" {
             text = "tert-butyl".into();
             compound = false;
@@ -1156,6 +1297,10 @@ impl<'a> Namer<'a> {
                 depth,
                 hydride: acyl_or_amido && ring && !benzene,
                 oxy,
+            },
+            Uncited {
+                atoms: (omit_c || fully) && !has_n_prefix,
+                bonds: !cite_unsat,
             },
         ))
     }
@@ -1861,5 +2006,22 @@ fn suffix_word(suffix: Suffix, ring: bool) -> &'static str {
         (Suffix::Yl(3), _) => "ylidyne",
         (Suffix::Yl(_), _) => "yl",
         (Suffix::None, _) => "",
+    }
+}
+
+/// Where a stereogenic unit is, for a note: by its locants on the parent ("C2", "the double
+/// bond C2=C3"), or in words when it is not on the parent (or no parent is numbered).
+fn site_text(site: Site, pos: Option<&[Option<u32>]>) -> String {
+    let at = |a: usize| pos.and_then(|p| p[a]).map(|l| format!("C{}", loc_text(l)));
+    match site {
+        Site::Centre(c) => at(c).unwrap_or_else(|| "a stereocentre".into()),
+        Site::Double(a, b) => match (at(a), at(b)) {
+            (Some(x), Some(y)) => format!("the double bond {x}={y}"),
+            _ => "a double bond".into(),
+        },
+        Site::Axis(a, b) => match (at(a), at(b)) {
+            (Some(x), Some(y)) => format!("the allene {x}=C={y}"),
+            _ => "an allene".into(),
+        },
     }
 }
