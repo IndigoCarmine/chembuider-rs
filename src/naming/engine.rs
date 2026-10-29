@@ -9,14 +9,18 @@
 //!
 //! 1. most principal characteristic groups (or the free valence) on the parent;
 //! 2. a ring rather than a chain (P-44.1.2.2, 2013 rule: rings are always senior);
-//! 3. for rings: the most ring atoms, then the most multiple bonds (P-44.2.1, P-44.4.1.1) —
-//!    benzene before cyclohexene before cyclohexane — a ring assembly of identical rings
-//!    (biphenyl) being one parent; for chains: the most skeletal atoms, then the most
-//!    multiple bonds, then double bonds;
-//! 4. lowest locants for the principal groups / free valence;
-//! 5. lowest locants for all multiple bonds together, then for double bonds;
-//! 6. most substituent prefixes, then lowest locants for them all together;
-//! 7. lowest locants for the prefix cited first in alphanumerical order, then the
+//! 3. for rings: the most rings (a bicycle or spiro system before a monocycle), the most ring
+//!    atoms, then the most multiple bonds (P-44.2.1, P-44.4.1.1) — benzene before cyclohexene
+//!    before cyclohexane — a ring assembly of identical rings (biphenyl) being one parent; for
+//!    chains: the most skeletal atoms, then the most multiple bonds, then double bonds;
+//! 4. in a von Baeyer system, within its fixed numbering, lowest locants for its heteroatoms
+//!    together, then for O, S and N in turn (P-23.3.2, P-24.2.4.1);
+//! 5. lowest locants for the principal groups / free valence;
+//! 6. lowest locants for all multiple bonds together, then for double bonds (in a von Baeyer
+//!    system: first the fewest compound locants, then the locants without those in
+//!    parentheses, then all of them, P-31.1.4.2);
+//! 7. most substituent prefixes, then lowest locants for them all together;
+//! 8. lowest locants for the prefix cited first in alphanumerical order, then the
 //!    alphanumerically first name.
 
 use std::cell::RefCell;
@@ -123,6 +127,11 @@ enum Shape {
         benzene: bool,
         hetero: Option<&'static HeteroRing>,
     },
+    /// A von Baeyer system of two rings (bicycle or spiro): `ring` indexes
+    /// [`Perceived::rings`].
+    Poly {
+        ring: usize,
+    },
 }
 
 /// One numbering of a candidate parent.
@@ -137,6 +146,8 @@ struct Numbering {
     /// A chain whose principal groups are attached to it rather than end it, expressed like
     /// those on a ring: "propane-1,2,3-tricarboxylic acid" (P-65.1.2.2.1).
     attached: bool,
+    /// For a von Baeyer system: which of its Kekulé forms ([`graph::Poly::forms`]).
+    form: usize,
 }
 
 /// What the unit being named is.
@@ -148,6 +159,9 @@ enum Mode {
     FreeValence { atom: usize, order: u8 },
     /// An acyl substituent whose C=O carbon `atom` carries the free valence (acetyl, benzoyl).
     Acyl { atom: usize },
+    /// The amide whose C=O carbon is `atom`, named as a substituent through its nitrogen: an
+    /// acylamino prefix, the amide's name ending in "amido" ("acetamido", P-66.1.1.4.3).
+    Amido { atom: usize },
     /// A substituent group drawn on its own with several free valences, all single bonds on
     /// carbon ([`Graph::free`]): propane-1,3-diyl, methylene, 1,4-phenylene.
     Valences,
@@ -185,6 +199,7 @@ type Key = (
     Vec<u32>,
     Vec<u32>,
     Vec<u32>,
+    Vec<u32>,
     Reverse<usize>,
     Vec<u32>,
 );
@@ -196,7 +211,11 @@ struct Eval {
     joins: Vec<(u32, u32)>,
     attached: bool,
     suffix: Vec<u32>,
+    /// The multiple bonds: the lower locant of each and its order.
     mults: Vec<(u32, u8)>,
+    /// For a von Baeyer system, the higher locant of each multiple bond, cited in parentheses
+    /// when the two are not consecutive: "oct-1(6)-ene" (P-31.1.1).
+    mult_ends: Vec<u32>,
     prefixes: Vec<(Loc, usize, usize)>,
     rprime: Option<(usize, usize)>,
     key: Key,
@@ -315,7 +334,10 @@ impl<'a> Namer<'a> {
         self.g.el[a] == El::C
             && match self.p.ctype[a] {
                 None | Some(Class::Aldehyde) => true,
-                Some(c) => mode == Mode::Molecule && Some(c) == self.p.principal,
+                Some(c) => {
+                    (mode == Mode::Molecule && Some(c) == self.p.principal)
+                        || mode == Mode::Amido { atom: a }
+                }
             }
     }
 
@@ -336,7 +358,7 @@ impl<'a> Namer<'a> {
                 })
                 .collect(),
             Mode::Acyls => g.free.iter().map(|&(a, _)| Pg::InChain(a)).collect(),
-            Mode::Acyl { atom } => vec![Pg::InChain(atom)],
+            Mode::Acyl { atom } | Mode::Amido { atom } => vec![Pg::InChain(atom)],
             Mode::Molecule => match p.principal {
                 None => vec![],
                 Some(c) if c.has_carbon() => atoms
@@ -393,7 +415,9 @@ impl<'a> Namer<'a> {
             .collect();
         let nb = |a: usize| g.nbrs(a).filter(|&m| ok[m]).collect::<Vec<_>>();
         let must: Vec<usize> = match mode {
-            Mode::FreeValence { atom, .. } | Mode::Acyl { atom } => vec![atom],
+            Mode::FreeValence { atom, .. } | Mode::Acyl { atom } | Mode::Amido { atom } => {
+                vec![atom]
+            }
             Mode::Valences => g.free.iter().map(|&(a, _)| a).collect(),
             Mode::Molecule | Mode::Acyls => vec![],
         };
@@ -546,6 +570,7 @@ impl<'a> Namer<'a> {
                     shape: Shape::Chain,
                     joins: vec![],
                     attached,
+                    form: 0,
                 })
                 .collect()
         };
@@ -620,10 +645,25 @@ impl<'a> Namer<'a> {
                 "seniority of a ring assembly against a larger or less saturated ring".into(),
             );
         }
-        Ok(rings
+        let senior: Vec<&RingParent> = rings
             .into_iter()
             .filter(|r| Some(rank(r)) == top && Some(r.rings.len()) == most)
-            .collect())
+            .collect();
+        // Different von Baeyer systems of one rank (spiro[4.5]decane, bicyclo[4.2.2]decane):
+        // the further criteria of P-44.2 are not implemented.
+        let descriptor = |r: &RingParent| {
+            self.p.rings[r.rings[0]]
+                .poly
+                .as_ref()
+                .map(|p| p.descriptor.as_str())
+        };
+        if senior
+            .iter()
+            .any(|r| descriptor(r) != descriptor(senior[0]))
+        {
+            return Err("seniority between different bicyclic or spiro ring systems".into());
+        }
+        Ok(senior)
     }
 
     /// Every numbering of a ring parent. A carbocycle is numbered from any atom in either
@@ -647,6 +687,24 @@ impl<'a> Namer<'a> {
                 .into()
         };
         let first = &rings[rp.rings[0]];
+        // A von Baeyer system: each of its numberings, with each of its Kekulé forms.
+        if let Some(poly) = &first.poly {
+            let shape = Shape::Poly { ring: rp.rings[0] };
+            return poly
+                .numberings
+                .iter()
+                .flat_map(|atoms| {
+                    (0..poly.forms.len()).map(move |form| Numbering {
+                        locs: (1..=atoms.len()).map(loc).collect(),
+                        atoms: atoms.clone(),
+                        shape,
+                        joins: vec![],
+                        attached: true,
+                        form,
+                    })
+                })
+                .collect();
+        }
         let hetero = first.hetero.as_ref().map(|h| h.kind);
         if rp.rings.len() == 1 {
             let shape = Shape::Ring {
@@ -669,6 +727,7 @@ impl<'a> Namer<'a> {
                     shape,
                     joins: vec![],
                     attached: true,
+                    form: 0,
                 })
                 .collect();
         }
@@ -735,6 +794,7 @@ impl<'a> Namer<'a> {
                     locs,
                     shape,
                     attached: true,
+                    form: 0,
                 });
             }
         }
@@ -759,6 +819,7 @@ impl<'a> Namer<'a> {
             shape,
             joins,
             attached,
+            form,
         } = num;
         let ring = shape != Shape::Chain;
         let mut pos = vec![0u32; g.len()];
@@ -803,6 +864,48 @@ impl<'a> Namer<'a> {
         suffix.sort_unstable();
 
         let mut mults = Vec::new();
+        let mut mult_ends = Vec::new();
+        // The heteroatoms of a von Baeyer system: low locants for all of them, then for O, S
+        // and N in turn (P-23.3.2, P-24.2.4.1.2), before the suffixes.
+        let mut hetero = Vec::new();
+        // The multiple bonds of a von Baeyer system: as few compound locants as possible, then
+        // the lower locants (those in parentheses ignored), then all locants (P-31.1.4.2).
+        let poly_mult_key = |bonds: &[&(u32, u32, u8)]| -> Vec<u32> {
+            let compound = bonds.iter().filter(|b| b.1 != b.0 + loc(1)).count();
+            let mut all: Vec<u32> = bonds.iter().flat_map(|b| [b.0, b.1]).collect();
+            all.sort_unstable();
+            let mut key = vec![compound as u32];
+            key.extend(bonds.iter().map(|b| b.0));
+            key.extend(all);
+            key
+        };
+        let mut poly_keys = None;
+        if let Shape::Poly { ring } = shape {
+            let poly = self.p.rings[ring]
+                .poly
+                .as_ref()
+                .expect("a von Baeyer system");
+            for el in [None, Some(El::O), Some(El::S), Some(El::N)] {
+                hetero.extend(
+                    atoms
+                        .iter()
+                        .zip(&locs)
+                        .filter(|&(&a, _)| g.el[a] != El::C && el.is_none_or(|e| g.el[a] == e))
+                        .map(|(_, &l)| l),
+                );
+            }
+            let mut bonds: Vec<(u32, u32, u8)> = poly.forms[form]
+                .iter()
+                .filter(|&(_, &o)| o > 1)
+                .map(|(&(a, b), &o)| (pos[a].min(pos[b]), pos[a].max(pos[b]), o))
+                .collect();
+            bonds.sort_unstable();
+            mults = bonds.iter().map(|&(l, _, o)| (l, o)).collect();
+            mult_ends = bonds.iter().map(|&(_, e, _)| e).collect();
+            let all: Vec<&(u32, u32, u8)> = bonds.iter().collect();
+            let doubles: Vec<&(u32, u32, u8)> = bonds.iter().filter(|b| b.2 == 2).collect();
+            poly_keys = Some((poly_mult_key(&all), poly_mult_key(&doubles)));
+        }
         // Benzene rings have no "ene" endings; an assembly's rings are benzene or saturated.
         if matches!(
             shape,
@@ -842,12 +945,18 @@ impl<'a> Namer<'a> {
         let nprefixes = prefixes.len() + nprefix.len();
         prefixes.extend(nprefix);
 
-        let mult_locs: Vec<u32> = mults.iter().map(|m| m.0).collect();
-        let double_locs: Vec<u32> = mults.iter().filter(|m| m.1 == 2).map(|m| m.0).collect();
+        let doubles = mults.iter().filter(|m| m.1 == 2).count();
+        let (mult_locs, double_locs) = poly_keys.unwrap_or_else(|| {
+            (
+                mults.iter().map(|m| m.0).collect(),
+                mults.iter().filter(|m| m.1 == 2).map(|m| m.0).collect(),
+            )
+        });
         let key = (
             Reverse(atoms.len()),
             Reverse(mults.len()),
-            Reverse(double_locs.len()),
+            Reverse(doubles),
+            hetero,
             suffix.clone(),
             mult_locs,
             double_locs,
@@ -861,6 +970,7 @@ impl<'a> Namer<'a> {
             attached,
             suffix,
             mults,
+            mult_ends,
             prefixes,
             rprime,
             key,
@@ -886,6 +996,7 @@ impl<'a> Namer<'a> {
             // The stems of the acyl halides: oxalyl, butanedioyl, benzene-1,4-dicarbonyl.
             Mode::Acyls => Suffix::Class(Class::AcidHalide),
             Mode::Acyl { .. } => Suffix::Acyl,
+            Mode::Amido { .. } => Suffix::Class(Class::Amide),
         };
         let has_n_prefix = e.prefixes.iter().any(|(l, _, _)| *l == Loc::N);
         if e.suffix.len() > 1
@@ -899,11 +1010,20 @@ impl<'a> Namer<'a> {
             named.push((loc, self.sub(q, from)?));
         }
         let groups = group_prefixes(named);
-        if let Shape::Ring {
-            hetero: Some(h), ..
-        } = e.shape
-        {
-            let (mut text, depth, order) = hetero_name(e, h, suffix, &groups);
+        let special = match e.shape {
+            Shape::Ring {
+                hetero: Some(h), ..
+            } => Some(hetero_name(e, h, suffix, &groups)),
+            Shape::Poly { ring } => {
+                let poly = self.p.rings[ring]
+                    .poly
+                    .as_ref()
+                    .expect("a von Baeyer system");
+                Some(poly_name(g, e, poly, suffix, &groups)?)
+            }
+            _ => None,
+        };
+        if let Some((mut text, depth, order)) = special {
             if mode == Mode::Molecule {
                 text = self.with_ester(e, region, text)?;
             }
@@ -1320,10 +1440,18 @@ impl<'a> Namer<'a> {
                 if p.nitro[q] {
                     return Ok(Prefix::simple("nitro"));
                 }
-                if others.iter().any(|&r| p.ctype[r] == Some(Class::Amide)) {
-                    return Err(
-                        "amide bonded through its nitrogen (acylamino) as a substituent".into(),
-                    );
+                // An acylamino group: the amide's name ending in "amido" (perception refuses
+                // imides, so there is one acyl group).
+                if let Some(&c) = others.iter().find(|&&r| p.ctype[r] == Some(Class::Amide)) {
+                    let amide = self.unit(Mode::Amido { atom: c }, &self.region_from(q, from))?;
+                    let stem = amide
+                        .text
+                        .strip_suffix("amide")
+                        .ok_or("internal error: amide name")?;
+                    return Ok(Prefix {
+                        text: format!("{stem}amido"),
+                        ..amide
+                    });
                 }
                 self.amino_like(q, &others, "amino")
             }
@@ -1573,22 +1701,99 @@ fn hetero_name(
     (text, depth, order)
 }
 
+/// The name of a von Baeyer parent (P-23.2, P-24.2.1, P-31.1.4): the heteroatoms by
+/// replacement prefixes in the order O, S, N ("4-thia-1-aza", P-23.3.2), the descriptor and
+/// the hydride's stem — "bicyclo[3.2.0]heptane", "1,4-dioxaspiro[4.5]decane",
+/// "bicyclo[4.2.0]oct-1(6)-ene" — with its prefixes and suffix: "bicyclo[2.2.1]heptan-2-one",
+/// "spiro[4.5]decan-8-yl". Every locant is cited.
+fn poly_name(
+    g: &Graph,
+    e: &Eval,
+    poly: &graph::Poly,
+    suffix: Suffix,
+    groups: &[(Prefix, Vec<Loc>)],
+) -> Result<(String, usize, Vec<Loc>), Unsupported> {
+    let mut replacement = Vec::new();
+    for (el, word) in [(El::O, "oxa"), (El::S, "thia"), (El::N, "aza")] {
+        let locs: Vec<u32> = (0..e.atoms.len())
+            .filter(|&i| g.el[e.atoms[i]] == el)
+            .map(|i| loc(i + 1))
+            .collect();
+        if !locs.is_empty() {
+            replacement.push(format!(
+                "{}-{}{word}",
+                loc_list(&locs),
+                multiplier(locs.len())
+            ));
+        }
+    }
+    let stem = stem(e.atoms.len())
+        .ok_or_else(|| format!("ring system larger than {MAX_NUMERAL} atoms"))?;
+    let base = format!("{}{}{stem}", replacement.join("-"), poly.descriptor);
+    let cited = |order: u8| -> Vec<String> {
+        e.mults
+            .iter()
+            .zip(&e.mult_ends)
+            .filter(|((_, o), _)| *o == order)
+            .map(|(&(l, _), &end)| {
+                if end == l + loc(1) {
+                    loc_text(l)
+                } else {
+                    format!("{}({})", loc_text(l), loc_text(end))
+                }
+            })
+            .collect()
+    };
+    let mut hydride = unsaturation_cited(&base, &cited(2), &cited(3), true);
+    let core = match suffix {
+        Suffix::None => hydride,
+        Suffix::Acyl => return Err("internal error: acyl group on a ring".into()),
+        _ => {
+            let word = multiplied(e.suffix.len(), suffix_word(suffix, true));
+            if starts_with_vowel(&word) {
+                hydride.pop();
+            }
+            format!("{hydride}-{}-{word}", loc_list(&e.suffix))
+        }
+    };
+    let (prefixes, depth, order) = compose(groups, false);
+    let text = if prefixes.is_empty() {
+        core
+    } else if core.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("{prefixes}-{core}")
+    } else {
+        format!("{prefixes}{core}")
+    };
+    Ok((text, depth, order))
+}
+
 /// The hydride name with its unsaturation: "butane", "but-2-ene", "buta-1,3-diene",
 /// "but-1-en-3-yne", "cyclohexene".
 fn unsaturation(base: &str, mults: &[(u32, u8)], cite: bool) -> String {
-    let enes: Vec<u32> = mults.iter().filter(|m| m.1 == 2).map(|m| m.0).collect();
-    let ynes: Vec<u32> = mults.iter().filter(|m| m.1 == 3).map(|m| m.0).collect();
+    let locs = |order: u8| -> Vec<String> {
+        mults
+            .iter()
+            .filter(|m| m.1 == order)
+            .map(|m| loc_text(m.0))
+            .collect()
+    };
+    unsaturation_cited(base, &locs(2), &locs(3), cite)
+}
+
+/// The hydride name with double bonds at `enes` and triple bonds at `ynes` (their locants as
+/// cited).
+fn unsaturation_cited(base: &str, enes: &[String], ynes: &[String], cite: bool) -> String {
     if enes.is_empty() && ynes.is_empty() {
         return format!("{base}ane");
     }
-    let join = loc_list;
+    let join = |l: &[String]| l.join(",");
     let mut s = base.to_string();
     if enes.len() > 1 || (enes.is_empty() && ynes.len() > 1) {
         s.push('a');
     }
     if !enes.is_empty() {
         if cite {
-            s += &format!("-{}-", join(&enes));
+            s += &format!("-{}-", join(enes));
         }
         s += &format!("{}ene", multiplier(enes.len()));
     }
@@ -1597,7 +1802,7 @@ fn unsaturation(base: &str, mults: &[(u32, u8)], cite: bool) -> String {
             s.pop();
         }
         if cite {
-            s += &format!("-{}-", join(&ynes));
+            s += &format!("-{}-", join(ynes));
         }
         s += &format!("{}yne", multiplier(ynes.len()));
     }

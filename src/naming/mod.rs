@@ -23,6 +23,20 @@
 //!   then the heteroatoms, then hydrogenation): 2-phenylpyridine, 1-phenylpiperidine.
 //!   Assemblies of identical fully unsaturated heterocycles take the lowest locants for their
 //!   bonds (2,2'-bipyridine, 2,3'-bipyridine, 2,2'-bithiophene), with prefixes only;
+//! - ring systems of two rings sharing atoms, by von Baeyer nomenclature: bicycles
+//!   ("bicyclo[2.2.1]heptane", "bicyclo[3.2.0]heptane", P-23.2) and monospiro systems of two
+//!   monocycles ("spiro[4.5]decane", P-24.2.1), with their fixed numbering (P-23.2.3: the main
+//!   bridge from the atom next to bridgehead 1; P-24.2.1: from the smaller ring next to the
+//!   spiro atom), heteroatoms by replacement prefixes in the order O, S, N with the lowest
+//!   locants (P-23.3.2, P-24.2.4.1: "4-thia-1-azabicyclo[3.2.0]heptane",
+//!   "1,4-dioxaspiro[4.5]decane"), double bonds with compound locants where the two ends are not
+//!   consecutive, as few as possible, over every Kekulé form of the system ("bicyclo[4.2.0]oct-
+//!   1(6)-ene", "bicyclo[4.1.0]hepta-1,3,5-triene", P-31.1.4.2), and their suffixes, prefixes and
+//!   free valences ("1,7,7-trimethylbicyclo[2.2.1]heptan-2-one", "spiro[4.5]decan-8-yl"). A
+//!   ring system with more rings is senior to one with more ring atoms (P-44.2.1.2.3);
+//! - lactones, lactams, cyclic anhydrides and imides as heterocyclic pseudoketones, with the
+//!   seniority of ketones (P-64.3.1, P-64.7.2): "oxepan-2-one", "azepan-2-one",
+//!   "oxolane-2,5-dione", "pyrrolidine-2,5-dione", "4-thia-1-azabicyclo[3.2.0]heptan-7-one";
 //! - the principal characteristic groups, in order of seniority (P-41): carboxylate anion >
 //!   carboxylic acid > anhydride > ester > acid halide > amide > nitrile > aldehyde > ketone >
 //!   alcohol (phenol) > thiol > amine, as suffixes; the junior ones and any that cannot sit on
@@ -32,7 +46,10 @@
 //!   (P-65.1.2.2.1: propane-1,2,3-tricarboxylic acid); otherwise two end the chain and the
 //!   others are prefixes (3-(carboxymethyl)heptanedioic acid);
 //! - halogens, nitro groups and ethers (alkoxy prefixes) as prefixes; N-substituted amines
-//!   and amides with N locants; thiols ("pentane-2-thiol", "2-sulfanylpentan-1-ol");
+//!   and amides with N locants; thiols ("pentane-2-thiol", "2-sulfanylpentan-1-ol"); amides
+//!   bonded through their nitrogen as acylamino prefixes, the amide's name ending in "amido"
+//!   ("acetamido", "4-(N-methylacetamido)benzoic acid", "6-(2-phenylacetamido)…",
+//!   P-66.1.1.4.3);
 //! - functional class names: esters ("ethyl propanoate"), acyl halides with F, Cl, Br, I
 //!   ("acetyl chloride", "butanedioyl bromide chloride", P-65.5.1; different halides only
 //!   where the acyl halide groups are interchangeable by symmetry), acyclic anhydrides
@@ -46,14 +63,19 @@
 //!   parent, "propane-1,3-diyl", "methylene", "1,4-phenylene"; or all on C=O carbons,
 //!   "carbonyl", "oxalyl", "butanedioyl", "benzene-1,4-dicarbonyl" (P-65.1.7).
 //!
-//! Not supported (an [`NameResult::Unsupported`] with the reason): rings sharing atoms (fused,
-//! bridged, spiro), branched ring assemblies, suffixes or free valences on assemblies of
+//! Not supported (an [`NameResult::Unsupported`] with the reason): ring systems of more than
+//! two rings (tricyclo…, dispiro…, adamantane), two ortho-fused rings of five or more members
+//! (they take fusion names: decahydronaphthalene, indole, P-52.2.4.1), assemblies of bicyclic
+//! or spiro systems, the choice of parent between different von Baeyer systems of equal rank,
+//! branched ring assemblies, suffixes or free valences on assemblies of
 //! rings other than benzene, directly bonded rings of one size with partial unsaturation
 //! (cyclohexenylbenzene: a hydrogenated biphenyl?), an assembly competing with a larger or
 //! less saturated ring for parent, heterocycles outside the table, partly hydrogenated ones
 //! (2,3-dihydrofuran) and those with indicated hydrogen on carbon (2H-pyran) or an exocyclic
-//! double bond on a fully unsaturated ring (pyridin-2(1H)-one), lactones and lactams, amides
-//! on a ring nitrogen (1-acetylpiperidine), assemblies of saturated heterocycles or of those
+//! double bond on a fully unsaturated ring (pyridin-2(1H)-one, so lactones and lactams only on
+//! saturated monocycles of the table or in von Baeyer systems), monocycles of more than eight
+//! members with heteroatoms (1-oxacyclododecan-2-one), amides on a ring nitrogen
+//! (1-acetylpiperidine), assemblies of saturated heterocycles or of those
 //! with indicated hydrogen (bipiperidine, bipyrrole), sulfur outside a ring other than in a
 //! thiol (sulfides, disulfides, thiones, thioacids, sulfoxides…), elements other than C, H, N,
 //! O, S and the halogens (except the cations above), charged species other than nitro groups,
@@ -95,6 +117,11 @@
 //!   tetrahydropyran; 1,3-oxazole and 1,2-oxazole, not oxazole and isoxazole; 1,3-thiazole),
 //!   and the retained pyrrolidine, piperidine, piperazine and morpholine. On a heterocycle
 //!   every locant is cited, a fully substituted one included ("2,3,4,5,6-pentachloropyridine").
+//! - Fully conjugated monocycles take their cycloalkapolyene names
+//!   ("cyclotetradeca-1,3,5,7,9,11,13-heptaene", P-22.1.2), not "\[14\]annulene"; lactones and
+//!   lactams their pseudoketone names ("oxepan-2-one"), not "6-hexanelactone" (P-65.6.3.5.1).
+//! - Acylamino prefixes are the "amido" names ("acetamido", P-66.1.1.4.3 method (1)), not
+//!   "acetylamino".
 //! - Multiplicative names (the preferred names of some symmetrical compounds, e.g.
 //!   2,2′-oxydi(ethan-1-ol), 1,1'-methylenedibenzene) and the retained names of α-amino acids
 //!   are not produced; the substitutive name given instead ("benzylbenzene",

@@ -470,7 +470,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("CC(=O)OCC(=O)O", "ester together with a carboxylic acid"),
     ("CCOOCC", "O–O"),
     ("CC(=O)OCCOC(C)=O", "more than one ester"),
-    ("CC(=O)NCC(=O)O", "acylamino"),
     ("OC(=O)CCC(N)=O", "carbamoyl on a chain"),
     ("NCCNC", "N,N′"),
     ("O", "no carbon"),
@@ -756,7 +755,6 @@ fn unsupported_ring_combinations_say_why() {
             "C1CCC(CC1)C1CCCCC1C1=CC=CC=C1",
             "seniority of a ring assembly",
         ),
-        ("C1CCC2(CC1)CCCC2", "more than one ring"),
     ];
     for (smiles, reason) in cases {
         match name_of(smiles) {
@@ -947,9 +945,7 @@ fn unsupported_heterocycles_say_why() {
         ("C1CSCS1", "not among the supported monocycles"),
         ("C1=CN=NN1", "not among the supported monocycles"),
         ("C1COOC1", "not among the supported monocycles"),
-        // Lactones, lactams, amides on a ring nitrogen.
-        ("O=C1CCCO1", "lactone or lactam"),
-        ("O=C1CCCCN1", "lactone or lactam"),
+        // Amides on a ring nitrogen (lactones and lactams are in `lactones_and_lactams`).
         ("CC(=O)N1CCCCC1", "amide whose nitrogen is a ring atom"),
         // Ring nitrogen bonded to O or N, charged rings, oxidised sulfur.
         ("ON1CCCC1", "O–N"),
@@ -1233,7 +1229,8 @@ fn acyl_halides() {
 
 /// Acyclic anhydrides (P-65.7.1, P-65.7.2): symmetric ones replace "acid" by "anhydride",
 /// substituted or not; mixed ones cite both acids in alphanumerical order. IUPAC 2013
-/// examples are marked. Cyclic anhydrides (oxolane-2,5-dione) are refused with the lactones.
+/// examples are marked. Cyclic anhydrides are named as pseudoketones (oxolane-2,5-dione, in
+/// `lactones_and_lactams`).
 #[test]
 fn anhydrides() {
     check_names(&[
@@ -1252,7 +1249,6 @@ fn anhydrides() {
         ),
     ]);
     check_refused(&[
-        ("O=C1CCC(=O)O1", "lactone"),
         ("CC(=O)OC(=O)CC(O)=O", "anhydride group as a substituent"),
         ("CC(=O)OC(=O)CCC(=O)OC(C)=O", "more than one anhydride"),
     ]);
@@ -1613,4 +1609,264 @@ fn mixed_acyl_halides_on_long_chains_refine_few_rounds() {
         NameResult::Ok(format!("{stem}dioyl bromide chloride"))
     );
     assert!(n <= MAX_REFINEMENT_ROUNDS, "{n} rounds");
+}
+
+/// Monospiro compounds of two monocycles (P-24.2.1): numbered from a ring atom next to the
+/// spiro atom in the smaller ring, around it, through the spiro atom and around the larger
+/// ring; then low locants for heteroatoms (P-24.2.4.1), principal groups, multiple bonds and
+/// prefixes. Heteroatoms are cited by 'a' prefixes in the order O, S, N. IUPAC 2013 examples
+/// are marked.
+#[test]
+fn spiro_compounds() {
+    check_names(&[
+        ("C1CCC2(C1)CCCCC2", "spiro[4.5]decane"), // P-24.2.1
+        ("C1CCC2(C1)CCCC2", "spiro[4.4]nonane"),  // P-24.2.1
+        ("C1CC12CC2", "spiro[2.2]pentane"),
+        ("C1CCC2(CC1)CCCCC2", "spiro[5.5]undecane"),
+        ("CC1CCC2(C1)CCCCC2", "2-methylspiro[4.5]decane"),
+        ("O=C1CCCC12CCCCC2", "spiro[4.5]decan-1-one"),
+        ("O=C1CCC2(CC1)CCCC2", "spiro[4.5]decan-8-one"),
+        ("O=C1CCCCC11CCCC1", "spiro[4.5]decan-6-one"),
+        (
+            "OC(=O)C1CCC2(CCCC2)CC1",
+            "spiro[4.5]decane-8-carboxylic acid",
+        ),
+        ("C1CC2(C=C1)CCCCC2", "spiro[4.5]dec-1-ene"),
+        ("C1CCC2(C1)C=CCCC2", "spiro[4.5]dec-6-ene"),
+        ("O=C1CCC2(CCCC2)C=C1", "spiro[4.5]dec-6-en-8-one"),
+        ("O=C1CCCC12CCCC2", "spiro[4.4]nonan-1-one"),
+        ("CC1CCCC2(C1)CCC2", "6-methylspiro[3.5]nonane"),
+        ("OCC1CCC2(CC1)CCCC2", "(spiro[4.5]decan-8-yl)methanol"),
+        // Heteroatoms (replacement names, P-24.2.4.1).
+        ("C1CCC2(C1)CCCCO2", "6-oxaspiro[4.5]decane"), // P-24.2.4.1.1
+        ("C1CCC2(C1)NCCOC2", "9-oxa-6-azaspiro[4.5]decane"), // P-24.2.4.1.2
+        ("C1CCC2(C1)CSCNC2", "7-thia-9-azaspiro[4.5]decane"), // P-24.2.4.1.2
+        ("C1COC2(O1)CCCCC2", "1,4-dioxaspiro[4.5]decane"),
+        ("O=C1CCC2(CC1)OCCO2", "1,4-dioxaspiro[4.5]decan-8-one"),
+    ]);
+}
+
+/// Bicyclic von Baeyer hydrocarbons (P-23.2): bicyclo[x.y.z] with the bridges in decreasing
+/// size; numbered from a main bridgehead along the largest bridge to the other bridgehead,
+/// back along the second, then the main bridge from the atom next to bridgehead 1 (P-23.2.3).
+/// Double bonds between non-consecutive locants take compound locants, as few as possible
+/// (P-31.1.4.2). Ortho-fused bicycles with a ring of fewer than five members are named this
+/// way (P-52.2.4.1). IUPAC 2013 examples are marked.
+#[test]
+fn von_baeyer_bicycles() {
+    check_names(&[
+        ("C12CCCC1CC2", "bicyclo[3.2.0]heptane"),
+        ("C1CC2CCC1C2", "bicyclo[2.2.1]heptane"),
+        ("C1CC2CCC1CC2", "bicyclo[2.2.2]octane"),
+        ("C1CC2CCC(C1)C2", "bicyclo[3.2.1]octane"), // P-23.2.3
+        ("C1C2CC12", "bicyclo[1.1.0]butane"),
+        ("C1CCC2CC2C1", "bicyclo[4.1.0]heptane"),
+        ("C1CCC2CCC2C1", "bicyclo[4.2.0]octane"),
+        // Camphor (constitution only).
+        (
+            "CC1(C)C2CCC1(C)C(=O)C2",
+            "1,7,7-trimethylbicyclo[2.2.1]heptan-2-one",
+        ),
+        ("OC1CC2CCC1C2", "bicyclo[2.2.1]heptan-2-ol"),
+        (
+            "OC(=O)C1CC2CCC1CC2",
+            "bicyclo[2.2.2]octane-2-carboxylic acid",
+        ),
+        ("CC12CCC(CC1)CC2", "1-methylbicyclo[2.2.2]octane"),
+        ("NC12CCC(CC1)CC2", "bicyclo[2.2.2]octan-1-amine"),
+        ("C1CC2CC1C=C2", "bicyclo[2.2.1]hept-2-ene"),
+        ("C1=CC2C=CC1C2", "bicyclo[2.2.1]hepta-2,5-diene"),
+        ("C1CC2CCC1C=C2", "bicyclo[2.2.2]oct-2-ene"),
+        // The suffix before the double bond (P-31.1.4.3.4).
+        ("OC1CC2CCC1C=C2", "bicyclo[2.2.2]oct-5-en-2-ol"),
+        ("OC1C=CC2CC1CC2", "bicyclo[3.2.1]oct-3-en-2-ol"),
+        // The main bridge is numbered from the atom next to bridgehead 1: methyls next to the
+        // same bridgehead on the two two-atom bridges are 6 and 9 (not 6,8 or 7,8).
+        ("C12CCCC(C(C)C1)C(C)C2", "6,9-dimethylbicyclo[3.2.2]nonane"),
+        // Compound locants: as few as possible (P-31.1.4.2).
+        ("C1CCC2=CCC2C1", "bicyclo[4.2.0]oct-6-ene"), // P-31.1.4.2, not oct-1(8)-ene
+        // Both Kekulé forms of the benzene ring name the same compound (P-31.1.4.2, not
+        // hepta-1(6),2,4-triene).
+        ("C1=CC=C2CC2=C1", "bicyclo[4.1.0]hepta-1,3,5-triene"), // P-31.1.4.2
+        ("C1=CC2=C(C2)C=C1", "bicyclo[4.1.0]hepta-1,3,5-triene"),
+        ("C1=CC=C2CCC2=C1", "bicyclo[4.2.0]octa-1,3,5-triene"),
+        // As substituents.
+        ("OCC1CC2CCC1C2", "(bicyclo[2.2.1]heptan-2-yl)methanol"),
+        (
+            "OC(=O)C1=CC=C(C=C1)C12CCC(CC1)CC2",
+            "4-(bicyclo[2.2.2]octan-1-yl)benzoic acid",
+        ),
+        // More rings before more ring atoms (P-44.2.1.2.3): the bicycle is the parent.
+        (
+            "C(C1CCCCCCC1)C1CC2CCC1C2",
+            "2-(cyclooctylmethyl)bicyclo[2.2.1]heptane",
+        ),
+    ]);
+}
+
+/// Heteroatoms in von Baeyer systems by skeletal replacement (P-23.3): low locants for the
+/// heteroatoms together, then in the order O > S > N (P-23.3.2); the prefixes are cited in
+/// that order. IUPAC 2013 examples are marked.
+#[test]
+fn replacement_names() {
+    check_names(&[
+        ("N12CCSC1CC2", "4-thia-1-azabicyclo[3.2.0]heptane"),
+        ("C1CCC2OC2C1", "7-oxabicyclo[4.1.0]heptane"),
+        ("C1CC2CCC1O2", "7-oxabicyclo[2.2.1]heptane"),
+        ("C1CN2CCC1CC2", "1-azabicyclo[2.2.2]octane"),
+        ("OC1CN2CCC1CC2", "1-azabicyclo[2.2.2]octan-3-ol"),
+        ("CN1C2CCC1CC(O)C2", "8-methyl-8-azabicyclo[3.2.1]octan-3-ol"),
+        ("C12COCC(OC1)CO2", "3,6,8-trioxabicyclo[3.2.2]nonane"), // P-23.3.2.1
+        ("C12OCSC(CC1)C2", "2-oxa-4-thiabicyclo[3.2.1]octane"),  // P-23.3.2.2
+        // The cephalosporin skeleton.
+        (
+            "C1C=CN2C(S1)CC2=O",
+            "5-thia-1-azabicyclo[4.2.0]oct-2-en-8-one",
+        ),
+    ]);
+}
+
+/// Fully conjugated monocyclic hydrocarbons: the PIN is the cycloalkapolyene name (P-22.1.2);
+/// "[n]annulene" is a name for general nomenclature only (OPE-24).
+#[test]
+fn annulenes() {
+    check_names(&[
+        ("C1=CC=CC=CC=CC=C1", "cyclodeca-1,3,5,7,9-pentaene"),
+        ("C1=CC=CC=CC=CC=CC=C1", "cyclododeca-1,3,5,7,9,11-hexaene"), // P-22.1.2
+        (
+            "C1=CC=CC=CC=CC=CC=CC=C1",
+            "cyclotetradeca-1,3,5,7,9,11,13-heptaene",
+        ),
+        (
+            "C1=CC=CC=CC=CC=CC=CC=CC=CC=C1",
+            "cyclooctadeca-1,3,5,7,9,11,13,15,17-nonaene",
+        ),
+    ]);
+}
+
+/// Lactones, lactams, cyclic anhydrides and imides are heterocyclic pseudoketones (P-64.3.1,
+/// P-65.6.3.5.1, P-66.1.5.1): "oxolan-2-one", not butano-4-lactone. Pseudoketones and ketones
+/// have the same seniority (P-64.7.2). Names such as "6-hexanelactone" are other names
+/// (OPE-24). Only saturated monocycles are supported: on a fully unsaturated ring the C=O
+/// needs indicated hydrogen (pyridin-2(1H)-one, refused). IUPAC 2013 examples are marked.
+#[test]
+fn lactones_and_lactams() {
+    check_names(&[
+        ("O=C1CCO1", "oxetan-2-one"),
+        ("O=C1CCN1", "azetidin-2-one"),
+        ("O=C1CCCO1", "oxolan-2-one"),     // P-65.6.3.5.1
+        ("O=C1CCCN1", "pyrrolidin-2-one"), // P-64.3.1
+        ("O=C1CCCCO1", "oxan-2-one"),
+        ("O=C1CCCCN1", "piperidin-2-one"),
+        ("O=C1CCCCCO1", "oxepan-2-one"),
+        ("O=C1CCCCCN1", "azepan-2-one"), // P-64.3.1
+        ("O=C1CCCCCCN1", "azocan-2-one"),
+        ("O=C1CCCS1", "thiolan-2-one"),
+        ("CC1CCC(=O)O1", "5-methyloxolan-2-one"),
+        ("CN1CCCC1=O", "1-methylpyrrolidin-2-one"),
+        ("O=C1COCCN1", "morpholin-3-one"),
+        ("O=C1CNC(=O)CN1", "piperazine-2,5-dione"),
+        ("O=C1OCCO1", "1,3-dioxolan-2-one"),
+        // A cyclic anhydride and a cyclic imide.
+        ("O=C1CCC(=O)O1", "oxolane-2,5-dione"),
+        ("O=C1CCC(=O)N1", "pyrrolidine-2,5-dione"),
+        // Below a carboxylic acid, the C=O is an oxo prefix.
+        ("OC(=O)C1CCCNC1=O", "2-oxopiperidine-3-carboxylic acid"),
+        // A heterocycle is senior to a carbocycle (P-64.7.2).
+        ("O=C1CCC(CC1)C1CC(=O)OC1", "4-(4-oxocyclohexyl)oxolan-2-one"),
+    ]);
+}
+
+/// Acylamino substituents (P-66.1.1.4.3): the amide name with its final "e" changed to "o"
+/// gives the preferred prefix ("acetamido", not "acetylamino"). IUPAC 2013 examples are
+/// marked.
+#[test]
+fn acylamino_prefixes() {
+    check_names(&[
+        ("OC(=O)C1=CC=C(NC=O)C=C1", "4-formamidobenzoic acid"), // P-66.1.1.4.3
+        ("OC(=O)C1=CC=C(NC(C)=O)C=C1", "4-acetamidobenzoic acid"),
+        ("CC(=O)NCC(O)=O", "acetamidoacetic acid"),
+        ("CCC(=O)NCCC(O)=O", "3-propanamidopropanoic acid"),
+        (
+            "OC(=O)C1=CC=C(N(C)C(C)=O)C=C1",
+            "4-(N-methylacetamido)benzoic acid",
+        ),
+        (
+            "OC(=O)C1=CC=C(NC(=O)C2=CC=CC=C2)C=C1",
+            "4-benzamidobenzoic acid",
+        ),
+        (
+            "OC(=O)C1=CC=C(NC(=O)CC2=CC=CC=C2)C=C1",
+            "4-(2-phenylacetamido)benzoic acid",
+        ),
+    ]);
+}
+
+/// The ring examples of Wikipedia (ja) "IUPAC命名法" (oldid 111380645), structure → preferred
+/// IUPAC name, with the Penicillin G walk-through (constitution only: stereodescriptors are
+/// OPE-23). Where Wikipedia's name is not the 2013 PIN, the PIN is expected and the difference
+/// noted.
+#[test]
+fn wikipedia_ring_examples() {
+    check_names(&[
+        ("C1CCC2(C1)CCCCC2", "spiro[4.5]decane"),
+        // Wikipedia: "[14]annulene"; the PIN is the cycloalkapolyene name (P-22.1.2).
+        (
+            "C1=CC=CC=CC=CC=CC=CC=C1",
+            "cyclotetradeca-1,3,5,7,9,11,13-heptaene",
+        ),
+        // Wikipedia: "6-hexanelactone" (ε-caprolactone) and "oxepane-2-one"; the PIN is the
+        // pseudoketone name, the "e" elided before "one" (P-65.6.3.5.1).
+        ("O=C1CCCCCO1", "oxepan-2-one"),
+        // Wikipedia: "6-hexanelactam" (ε-caprolactam) and "azocan-2-one". The formula given,
+        // –NH–CO–(CH2)5– in a ring, is a seven-membered ring: azepan-2-one (P-64.3.1); azocane
+        // is the eight-membered ring.
+        ("O=C1CCCCCN1", "azepan-2-one"),
+        // Penicillin G, step 1: the parent hydrocarbon.
+        ("C12CCCC1CC2", "bicyclo[3.2.0]heptane"),
+        // Step 2: thia and aza by replacement, N lowest (P-23.3.2).
+        ("N12CCSC1CC2", "4-thia-1-azabicyclo[3.2.0]heptane"),
+        // Step 3: 6-aminopenicillanic acid.
+        (
+            "CC1(C)SC2C(N)C(=O)N2C1C(O)=O",
+            "6-amino-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",
+        ),
+        // Step 5, without stereodescriptors. Wikipedia: "6-phenylacetylamino-2,2-dimethyl-
+        // 7-oxo-…". Its step 3 puts the two methyl groups on C-3 (C-2 carries the carboxy
+        // group): 3,3-dimethyl. The acylamino prefix is the amide name ending in "amido"
+        // (P-66.1.1.4.3: "Method (1) generates preferred IUPAC names", "4-formamidobenzoic
+        // acid (PIN)"), with the locant of 2-phenylacetamide; the prefixes are in
+        // alphanumerical order.
+        (
+            "CC1(C)SC2C(NC(=O)CC3=CC=CC=C3)C(=O)N2C1C(O)=O",
+            "3,3-dimethyl-7-oxo-6-(2-phenylacetamido)-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",
+        ),
+    ]);
+    check_refused(&[
+        // DBU (1,8-diazabicyclo[5.4.0]undec-7-ene): two fused rings of five or more members
+        // take a fusion name (P-52.2.4.1), which is not supported.
+        ("C1CCC2=NCCCN2CC1", "fusion nomenclature"),
+    ]);
+}
+
+/// Ring systems outside the supported ones are refused with a reason, never misnamed.
+#[test]
+fn unsupported_ring_systems_say_why() {
+    check_refused(&[
+        // Ortho-fused rings of five or more members: fusion names (decahydronaphthalene,
+        // octahydropentalene, indole).
+        ("C1CCC2CCCCC2C1", "fusion nomenclature"),
+        ("C1CC2CCCC2C1", "fusion nomenclature"),
+        ("C1=CC=C2NC=CC2=C1", "fusion nomenclature"),
+        // More than two rings: adamantane, a dispiro compound.
+        ("C1C2CC3CC1CC(C2)C3", "more than two rings"),
+        ("C1CC11CCC2(CC1)CC2", "more than two rings"),
+        // An assembly of identical bicycles.
+        (
+            "C1CC2CC1CC2C1CC2CCC1C2",
+            "ring assembly of bicyclic or spiro",
+        ),
+        // A spiro atom other than carbon would be charged (spiro ammonium): refused as such.
+        ("C1CC[N+]2(C1)CCCC2", "charged"),
+    ]);
 }
