@@ -1057,6 +1057,8 @@ const WIKIPEDIA_ACYCLIC: &[(&str, &str)] = &[
     ("CN", "methanamine"),
     ("CCC(CC)C#N", "2-ethylbutanenitrile"),
     ("CC(S)CCC", "pentane-2-thiol"),
+    // Wikipedia: "2-sulfanyl pentan-1-ol"; a substitutive name is one word, the prefixes
+    // joined to the parent name without a space.
     ("OCC(S)CCC", "2-sulfanylpentan-1-ol"),
     ("C1CCC1", "cyclobutane"),
     // Substituent groups, drawn with attachment points.
@@ -1116,15 +1118,14 @@ fn wikipedia_seniority_of_groups() {
             "OC(=O)C1=CC=C(C(=O)OC)C=C1",
             "ester together with a carboxylic acid",
         ),
-        (
-            "CC(=O)OC(=O)CC(=O)OC",
-            "ester together with a carboxylic acid",
-        ),
+        ("CC(=O)OC(=O)CC(=O)OC", "anhydride together with an ester"),
         (
             "COC(=O)C1=CC=C(C(Cl)=O)C=C1",
             "acid halide group as a prefix",
         ),
         ("CC(=N)C", "nitrogen group other than amine"),
+        // Amine and imine together: 4-iminopentan-1-amine.
+        ("NCCCC(=N)C", "nitrogen group other than amine"),
     ]);
 }
 
@@ -1910,7 +1911,7 @@ fn wikipedia_ring_examples() {
             "cyclotetradeca-1,3,5,7,9,11,13-heptaene",
         ),
         // Wikipedia: "6-hexanelactone" (ε-caprolactone) and "oxepane-2-one"; the PIN is the
-        // pseudoketone name, the "e" elided before "one" (P-65.6.3.5.1).
+        // pseudoketone name (P-65.6.3.5.1), the "e" elided before "one" (P-16.7.1).
         ("O=C1CCCCCO1", "oxepan-2-one"),
         // Wikipedia: "6-hexanelactam" (ε-caprolactam) and "azocan-2-one". The formula given,
         // –NH–CO–(CH2)5– in a ring, is a seven-membered ring: azepan-2-one (P-64.3.1); azocane
@@ -1931,8 +1932,8 @@ fn wikipedia_ring_examples() {
             "CC1(C)SC2C(N)C(=O)N2C1C(O)=O",
             "6-amino-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",
         ),
-        // Step 5, without stereodescriptors. Wikipedia: "6-phenylacetylamino-2,2-dimethyl-
-        // 7-oxo-…". Its step 3 puts the two methyl groups on C-3 (C-2 carries the carboxy
+        // Step 4's figure (step 5 adds the stereodescriptors). Wikipedia: "6-phenylacetylamino-
+        // 2,2-dimethyl-7-oxo-…". Its step 3 puts the two methyl groups on C-3 (C-2 carries the carboxy
         // group): 3,3-dimethyl. The acylamino prefix is the amide name ending in "amido"
         // (P-66.1.1.4.3: "Method (1) generates preferred IUPAC names", "4-formamidobenzoic
         // acid (PIN)"), with the locant of 2-phenylacetamide; the prefixes are in

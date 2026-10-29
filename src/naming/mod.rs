@@ -103,14 +103,15 @@
 //! an organic structure — CH₃–Li, CH₃–Mg–Br may be organometallic, an organic salt is to be
 //! drawn as ions —, salts whose charges do not balance or with two kinds of anion), isotopes,
 //! ester, acid halide, anhydride and carboxylate groups as prefixes (so an ester or anhydride
-//! together with a carboxylic acid), amide groups as prefixes on a chain (carbamoyl or
-//! amino…oxo, not decided), cyclic anhydrides named as anhydrides (they are named as
-//! pseudoketones, above), partial salts of acids with more than two acid groups ("hydrogen
-//! …tricarboxylate"), prefixes on a one-carbon acid parent (carboxyformic acid, P-65.1.8),
-//! different halides on acyl halide groups that are not interchangeable (no locants for
-//! them), free valences on sulfur or an acid's oxygen (acyloxy), several free valences other
-//! than single bonds on carbon or not all on one parent ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and
-//! others, and other functional groups (imines, azo, peroxides, carbonates, ureas…).
+//! together with a carboxylic acid, or an anhydride together with an ester), amide groups as
+//! prefixes on a chain (carbamoyl or amino…oxo, not decided), cyclic anhydrides named as
+//! anhydrides (they are named as pseudoketones, above), partial salts of acids with more than
+//! two acid groups ("hydrogen …tricarboxylate"), prefixes on a one-carbon acid parent
+//! (carboxyformic acid, P-65.1.8), different halides on acyl halide groups that are not
+//! interchangeable (no locants for them), free valences on sulfur or an acid's oxygen
+//! (acyloxy), several free valences other than single bonds on carbon or not all on one parent
+//! ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and others, and other
+//! functional groups (imines, azo, peroxides, carbonates, ureas…).
 //!
 //! Not supported among inorganic compounds, each for its reason:
 //!

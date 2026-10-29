@@ -4,7 +4,7 @@ Every example of the Japanese Wikipedia article [IUPAC命名法](https://ja.wiki
 
 Policy: one preferred IUPAC name (PIN) per structure, the other names separately (`iupac_alternatives`, OPE-24). Where Wikipedia and the IUPAC 2013 recommendations (the Red Book 2005 for inorganic names) differ, the IUPAC name is expected and the reason is in a comment beside the test case.
 
-Status: **pass**: the test asserts Wikipedia’s name. **IUPAC-2013 override**: the test asserts the IUPAC name, which differs from Wikipedia’s (reason in the note). **out of scope**: deliberately not produced. **gap**: not named; the namer refuses the structure with a reason (never a wrong name). **rule, no structure**: a general rule without a concrete compound.
+Status: **pass**: the test asserts Wikipedia’s name. **IUPAC-2013 override**: the test asserts the IUPAC name, which differs from Wikipedia’s (reason in the note). **out of scope**: deliberately not produced. **gap**: not named; the namer refuses the structure with a reason (never a wrong name). **rule, no structure**: a general rule without a concrete compound. **extension**: not a Wikipedia example; a case added beside one (the groups Wikipedia’s seniority list leaves out), with the namer’s result in the note.
 
 Tests are `src/naming/<file>.rs::<fn>`; `words::tests` is the test module of `src/naming/words.rs`.
 
@@ -13,11 +13,13 @@ Tests are `src/naming/<file>.rs::<fn>`; `words::tests` is the test module of `sr
 | status | count |
 |---|---|
 | pass | 162 |
-| IUPAC-2013 override | 24 |
+| IUPAC-2013 override | 22 |
 | out of scope | 2 |
-| gap | 8 |
+| gap | 7 |
 | rule, no structure | 3 |
-| **total (English names)** | **199** |
+| **total (Wikipedia’s English names)** | **196** |
+| extension (not in Wikipedia) | 3 |
+| **total rows** | **199** |
 | Japanese names: out of scope (OPE-26 canceled) | 151 |
 
 Gaps:
@@ -26,9 +28,8 @@ Gaps:
 - Replacement nomenclature (figure, DBU), diazabicycloundecene (figure): fusion name, as above. The figure puts the C=N in the seven-membered ring: an isomer of DBU, whose amidine is in the six-membered ring.
 - Replacement nomenclature (figure, DBU), DBU (text): fusion names are not implemented; real DBU (C1CCC2=NCCCN2CC1) is refused with the reason. Wikipedia’s fusion name fits the drawn isomer, not DBU.
 - General rules: seniority of groups (P-41), acid + anhydride: refused: an anhydride as a substituent (acyloxycarbonyl) is not built.
-- General rules: seniority of groups (P-41), anhydride + ester: refused: ester prefixes (alkoxycarbonyl) are not built.
-- General rules: seniority of groups (P-41), amine + imine: imines are not supported (refused: “nitrogen group other than amine…”).
-- General rules: seniority of groups (P-41), ester + acid halide: refused: the acid-halide prefix (carbonochloridoyl or chloro…oxo) is not decided.
+- General rules: seniority of groups (P-41), anhydride + ester: refused: “anhydride together with an ester” (the ester would be an alkoxycarbonyl prefix of one acid, which is not built).
+- General rules: seniority of groups (P-41), amine + imine: imines are not supported (refused: “nitrogen group other than amine…”, also with an amine present: 4-iminopentan-1-amine).
 - Penicillin G walk-through, Step 1: azete and thiazole fused: fusion nomenclature is not implemented. With a four-membered ring the von Baeyer name is the PIN (P-52.2.4.1; Wikipedia also takes it), so only this alternative is missing.
 
 ## Examples
@@ -57,7 +58,7 @@ Gaps:
 | General rules: seniority of groups (P-41) | Wikipedia’s list as a whole | carboxy > anhydride > ester > amide > nitrile > aldehyde > ketone > alcohol > amine > imine > (ether, nitro, halo) | rule | `tests::wikipedia_seniority_of_groups` | rule, no structure | checked pair by pair below |
 | General rules: seniority of groups (P-41) | acid + anhydride | — | rule pair | `tests::wikipedia_seniority_of_groups` | gap | refused: an anhydride as a substituent (acyloxycarbonyl) is not built |
 | General rules: seniority of groups (P-41) | acid + nitrile: HOOC–CH2CH2–CN | 3-cyanopropanoic acid | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
-| General rules: seniority of groups (P-41) | anhydride + ester | — | rule pair | `tests::wikipedia_seniority_of_groups` | gap | refused: ester prefixes (alkoxycarbonyl) are not built |
+| General rules: seniority of groups (P-41) | anhydride + ester | — | rule pair | `tests::wikipedia_seniority_of_groups` | gap | refused: “anhydride together with an ester” (alkoxycarbonyl prefix not built) |
 | General rules: seniority of groups (P-41) | anhydride + nitrile | acetic 3-cyanopropanoic anhydride | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
 | General rules: seniority of groups (P-41) | ester + amide | methyl 4-carbamoylbenzoate | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
 | General rules: seniority of groups (P-41) | amide + nitrile | 2-cyanoacetamide; 4-cyanobenzamide | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
@@ -65,16 +66,16 @@ Gaps:
 | General rules: seniority of groups (P-41) | aldehyde + ketone | 3-oxobutanal | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
 | General rules: seniority of groups (P-41) | ketone + alcohol | 1-hydroxypropan-2-one | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
 | General rules: seniority of groups (P-41) | alcohol + amine | 2-aminoethan-1-ol | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
-| General rules: seniority of groups (P-41) | amine + imine | — | rule pair | `tests::wikipedia_seniority_of_groups` | gap | imines are not supported (refused: “nitrogen group other than amine…”) |
+| General rules: seniority of groups (P-41) | amine + imine | — | rule pair | `tests::wikipedia_seniority_of_groups` | gap | imines are not supported (refused: “nitrogen group other than amine…”; tested with CC(=N)C and with H2N–(CH2)3–C(=NH)–CH3) |
 | General rules: seniority of groups (P-41) | ether, nitro, halo: prefixes only | 1-methoxy-2-nitroethane; 1-chloro-2-nitroethane; 1-chloro-2-methoxyethane | PIN | `tests::wikipedia_seniority_of_groups` | pass |  |
-| General rules: seniority of groups (P-41) | acid halides (missing from Wikipedia’s list) | acid halide > amide: 4-carbamoylbenzoyl chloride | PIN | `tests::wikipedia_seniority_of_groups` | IUPAC-2013 override | P-41 ranks acid halides between esters and amides |
-| General rules: seniority of groups (P-41) | ester + acid halide | — | rule pair | `tests::wikipedia_seniority_of_groups` | gap | refused: the acid-halide prefix (carbonochloridoyl or chloro…oxo) is not decided |
-| General rules: seniority of groups (P-41) | thiols (missing from Wikipedia’s list) | alcohol > thiol > amine: 2-sulfanylpentan-1-ol; 2-aminoethane-1-thiol | PIN | `tests::wikipedia_seniority_of_groups` | IUPAC-2013 override | P-41 class 17: OH > SH, both above amines |
+| General rules: seniority of groups (P-41) | acid halides (missing from Wikipedia’s list) | acid halide > amide: 4-carbamoylbenzoyl chloride | PIN | `tests::wikipedia_seniority_of_groups` | extension | named (pass); P-41 ranks acid halides between esters and amides |
+| General rules: seniority of groups (P-41) | ester + acid halide (not in Wikipedia’s list) | — | rule pair | `tests::wikipedia_seniority_of_groups` | extension | not named (refused): the acid-halide prefix (carbonochloridoyl or chloro…oxo) is not decided |
+| General rules: seniority of groups (P-41) | thiols (missing from Wikipedia’s list) | alcohol > thiol > amine: 2-sulfanylpentan-1-ol; 2-aminoethane-1-thiol | PIN | `tests::wikipedia_seniority_of_groups` | extension | named (pass); P-41 class 17: OH > SH, both above amines |
 | General rules: principal chain | CH3–CH2–CH2–CH(C2H5)–CH3 | 3-methylhexane (not 2-ethylpentane) | PIN | `tests::wikipedia_acyclic_examples` | pass |  |
 | General rules: principal chain | R1(R2)C=C(R3)R4: R3–C–R4 must not be the chain | CH2=C(C2H5)(C3H7): 3-methylidenehexane | rule | `tests::substituent_edge_cases` | IUPAC-2013 override | Wikipedia gives the 1979/1993 rule (unsaturation first); IUPAC 2013 takes the longest chain first (P-44.3), so the chain may pass through the sp2 carbon |
 | General rules: locants | lowest locants from the nearer end, then the principal group | — | rule | (throughout, e.g. tests::wikipedia_acyclic_examples) | rule, no structure |  |
 | Substituent groups | C5H11– (unbranched) | pentyl | PIN (prefix) | `tests::wikipedia_acyclic_examples` | pass |  |
-| Substituent groups | –CH2–CH2–CH2– | propane-1,3-diyl | PIN (prefix) | `tests::wikipedia_acyclic_examples` | IUPAC-2013 override | Wikipedia: “propylene”; P-29.6 gives propane-1,3-diyl. “propylene” is given only as a traditional name of –CH(CH3)–CH2– (`alternatives_tests::traditional_names`) |
+| Substituent groups | –CH2–CH2–CH2– | propane-1,3-diyl | PIN (prefix) | `tests::wikipedia_acyclic_examples` | IUPAC-2013 override | Wikipedia: “propylene”; P-29.3.2.2 gives propane-1,3-diyl. “propylene” is given only as a traditional name of –CH(CH3)–CH2– (`alternatives_tests::traditional_names`) |
 | Substituent groups | CH3(CH2)4CO– | hexanoyl | PIN (prefix) | `tests::wikipedia_acyclic_examples` | pass |  |
 | Substituent groups | C5H11O– (unbranched) | pentyloxy | PIN (prefix) | `tests::wikipedia_acyclic_examples` | pass |  |
 | Substituent groups | CH3O– | methoxy | PIN (prefix) | `tests::substituent_groups` | pass |  |
@@ -210,7 +211,7 @@ Gaps:
 | Acyl halides, anhydrides | CH3–CO–O–CO–C2H5 | acetic propanoic anhydride | PIN | `tests::wikipedia_acyclic_examples` | IUPAC-2013 override | Wikipedia: “ethanoic propanoic anhydride”; acetic acid is the retained PIN (P-65.7.2) |
 | Acyl halides, anhydrides | CH3–CO–O–CO–C2H5 | ethanoic propanoic anhydride | alternative (systematic) | `alternatives_tests::systematic_names` | pass |  |
 | Amines, nitriles, thiols | CH3NH2 | methanamine | PIN | `tests::wikipedia_acyclic_examples` | pass |  |
-| Amines, nitriles, thiols | CH3NH2 | methylamine | alternative (functional class) | `alternatives_tests::radicofunctional_names` | IUPAC-2013 override | Wikipedia: “methyl amine”; one word (P-62.2.1.2) |
+| Amines, nitriles, thiols | CH3NH2 | methylamine | alternative (functional class) | `alternatives_tests::radicofunctional_names` | IUPAC-2013 override | Wikipedia: “methyl amine”; one word (P-62.2.1.1.2) |
 | Amines, nitriles, thiols | CH3NH2 | aminomethane | alternative (systematic) | `alternatives_tests::systematic_names` | pass |  |
 | Amines, nitriles, thiols | C2H5CH(CN)–C2H5 | 2-ethylbutanenitrile | PIN | `tests::wikipedia_acyclic_examples` | pass |  |
 | Amines, nitriles, thiols | CH3–CH(SH)–(CH2)2–CH3 | pentane-2-thiol | PIN | `tests::wikipedia_acyclic_examples` | pass |  |
@@ -219,7 +220,7 @@ Gaps:
 | Rings | cyclopentane and cyclohexane sharing one carbon | spiro[4.5]decane | PIN | `tests::wikipedia_ring_examples` | pass |  |
 | Rings | (–CH=CH–)7 (ring) | cyclotetradeca-1,3,5,7,9,11,13-heptaene | PIN | `tests::wikipedia_ring_examples` | IUPAC-2013 override | Wikipedia: “[14]annulene”; the PIN is the cycloalkapolyene name (P-22.1.2) |
 | Rings | (–CH=CH–)7 (ring) | [14]annulene | alternative (systematic) | `alternatives_tests::systematic_names` | pass |  |
-| Rings | –O–CO–(CH2)5– (ring) | oxepan-2-one | PIN | `tests::wikipedia_ring_examples` | IUPAC-2013 override | Wikipedia: “oxepane-2-one”; the “e” is elided before “one” |
+| Rings | –O–CO–(CH2)5– (ring) | oxepan-2-one | PIN | `tests::wikipedia_ring_examples` | IUPAC-2013 override | Wikipedia: “oxepane-2-one”; the pseudoketone name (P-65.6.3.5.1), the “e” elided before “one” (P-16.7.1) |
 | Rings | –O–CO–(CH2)5– (ring) | hexano-6-lactone | alternative (systematic) | `alternatives_tests::systematic_names` | IUPAC-2013 override | Wikipedia: “6-hexanelactone” (older rules); P-65.6.3.5.1 method (2) |
 | Rings | –O–CO–(CH2)5– (ring) | ε-caprolactone | alternative (traditional) | `alternatives_tests::traditional_names` | pass |  |
 | Rings | –NH–CO–(CH2)5– (ring) | azepan-2-one | PIN | `tests::wikipedia_ring_examples` | IUPAC-2013 override | Wikipedia: “azocan-2-one”, an eight-membered ring; the formula is a seven-membered ring (P-64.3.1) |

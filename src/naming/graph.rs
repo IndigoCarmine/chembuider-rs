@@ -1136,6 +1136,11 @@ pub(crate) fn perceive(g: &Graph) -> Result<Perceived, Unsupported> {
     if count(Class::Anhydride) > 2 {
         return Err("more than one anhydride group".into());
     }
+    // The ester would be a prefix of one of the anhydride's acids (alkoxy…oxo or
+    // alkoxycarbonyl), which is not built.
+    if count(Class::Anhydride) > 0 && count(Class::Ester) > 0 {
+        return Err("anhydride together with an ester (alkoxycarbonyl prefix)".into());
+    }
     if count(Class::Ester) > 1 {
         return Err("more than one ester group".into());
     }
