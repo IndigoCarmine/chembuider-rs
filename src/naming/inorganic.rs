@@ -19,11 +19,13 @@
 //!   organic structure may be an organometallic compound (CH₃–Li, CH₃–Mg–Br), and a salt of
 //!   an organic anion is to be drawn as ions.
 //!
-//! Refused, with the reason: metals with more than one common oxidation state (the transition
-//! metals other than zinc and cadmium, tin, lead, thallium, the lanthanoids and actinoids…),
-//! whose salts need an oxidation or charge number ("iron(II) chloride", IR-5.4.2.2), and their
-//! coordination compounds (IR-9); a cation-table metal with another charge or number of bonds;
-//! ions outside the tables; and molecular compounds other than elements — hydrides (water,
+//! Refused, with the reason: metals outside the fixed-charge set of the cation table (the
+//! transition metals other than zinc and cadmium, gallium, indium, tin, lead, thallium, the
+//! lanthanoids and actinoids…), whose salts may need an oxidation or charge number ("iron(II)
+//! chloride", IR-5.4.2.2) — a judgement the namer does not make, even for those of one common
+//! charge such as silver and gallium —, and their coordination compounds (IR-9); an element
+//! molecule of more atoms than the multiplying prefixes count (9999); a cation-table metal
+//! with another charge or number of bonds; ions outside the tables; and molecular compounds other than elements — hydrides (water,
 //! ammonia, hydrogen chloride), oxoacids and binary compounds of nonmetals, whose names need the
 //! parent hydrides of IR-6 or the element sequence of Table VI.
 
@@ -32,6 +34,7 @@ use crate::molecule::elements::atomic_number;
 
 use super::graph::Raw;
 use super::ions::{self, Ion, IonName};
+use super::words::MAX_NUMERAL;
 
 /// The English names of the elements (IR-3, Table I), by atomic number.
 #[rustfmt::skip]
@@ -194,9 +197,17 @@ pub(crate) struct Element {
 }
 
 impl Element {
-    /// The English name: "trioxygen", "argon".
-    pub(crate) fn english(&self) -> String {
-        format!("{}{}", super::words::multiplier(self.atoms), self.name)
+    /// The English name: "trioxygen", "argon". More atoms than the multiplying prefixes count
+    /// ([`MAX_NUMERAL`]) are refused.
+    pub(crate) fn english(&self) -> Result<String, String> {
+        if self.atoms > MAX_NUMERAL {
+            return Err(format!("element molecule of more than {MAX_NUMERAL} atoms"));
+        }
+        Ok(format!(
+            "{}{}",
+            super::words::multiplier(self.atoms),
+            self.name
+        ))
     }
 }
 
@@ -328,7 +339,7 @@ fn with_metals(atoms: &Atoms) -> Result<Inorganic, String> {
                 "{el} with the charge {q:+}: its ion is {el}{}",
                 charge_text(c)
             ),
-            None => several_oxidation_states(el),
+            None => outside_fixed_charge_set(el),
         });
     }
     let metals: Vec<usize> = (0..n).filter(|&i| is_metal(atoms.el(i))).collect();
@@ -347,7 +358,7 @@ fn with_metals(atoms: &Atoms) -> Result<Inorganic, String> {
                     element_name(el).unwrap()
                 )
             } else {
-                several_oxidation_states(el)
+                outside_fixed_charge_set(el)
             });
         };
         let bonds = &atoms.nbrs[m];
@@ -420,10 +431,11 @@ fn with_metals(atoms: &Atoms) -> Result<Inorganic, String> {
     Ok(Inorganic::Ions(ions))
 }
 
-/// The refusal for a metal of more than one common oxidation state.
-fn several_oxidation_states(el: &str) -> String {
+/// The refusal for a metal outside the fixed-charge set of the cation table ([`ions::CATIONS`]).
+fn outside_fixed_charge_set(el: &str) -> String {
     format!(
-        "compound of {}, a metal of more than one oxidation state: its salts need an oxidation \
+        "compound of {}, a metal not in the supported fixed-charge set (the alkali and \
+         alkaline-earth metals, aluminium, zinc, cadmium): its salts may need an oxidation \
          number or a charge number (iron(II) chloride, iron(2+) chloride; IR-5.4.2.2), not \
          supported",
         element_name(el).unwrap_or(el)

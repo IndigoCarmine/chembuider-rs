@@ -18,9 +18,11 @@
 //!   cation the prefixes cannot go ("magnesium potassium trichloride", Example 4) — and it is
 //!   what the namer gives the salts of carboxylic acids ("calcium diacetate", "disodium
 //!   butanedioate", P-65.6.2.1). The short names are other names (OPE-24).
-//! - Oxoanion names are multiplied with "bis", "tris" and parentheses (IR-5.4.2.1:
-//!   "tricalcium bis(phosphate)", "aluminium potassium bis(sulfate)"): "diphosphate",
-//!   "disulfate" and "dinitrate" name other anions.
+//! - Oxoanion names are multiplied with "bis", "tris" and parentheses ("tricalcium
+//!   bis(phosphate)", IR-5.4.2.1, Example 9; "aluminium potassium bis(sulfate)", IR-5.5,
+//!   Example 11): "diphosphate", "disulfate" and "dinitrate" name other anions. IR-5.4.2.1 asks
+//!   for "bis" "when ambiguity could otherwise arise", and Table IX has dinitrate(N–N)(2−), so
+//!   "calcium bis(nitrate)" — though IR-2.6, Example 2, writes "sodium thallium(I) dinitrate".
 
 use super::{NameResult, iupac_name};
 use crate::molecule::smiles::parser::parse;
@@ -151,7 +153,7 @@ fn several_cations() {
         ), // IR-5.4.2.1, Ex. 4
         (
             "[K+].[Al+3].[O-]S([O-])(=O)=O.[O-]S([O-])(=O)=O",
-            "aluminium potassium bis(sulfate)", // IR-5.4.2.1 (KAl(SO4)2)
+            "aluminium potassium bis(sulfate)", // IR-5.5, Ex. 11 (KAl(SO4)2 of the hydrate)
         ),
         (
             "[NH4+].[Na+].OP([O-])([O-])=O",
@@ -174,6 +176,8 @@ fn oxoanions() {
         ), // IR-5.4.2.1, Ex. 11
         ("[Na+].[O-][N+]([O-])=O", "sodium nitrate"),
         ("[Na+].[O-]N(=O)=O", "sodium nitrate"),
+        // "bis": Table IX has dinitrate(N–N)(2−), so "dinitrate" is ambiguous (IR-5.4.2.1),
+        // though IR-2.6, Example 2, writes "sodium thallium(I) dinitrate".
         (
             "[Ca+2].[O-][N+]([O-])=O.[O-][N+]([O-])=O",
             "calcium bis(nitrate)",
@@ -232,6 +236,48 @@ fn salts_drawn_with_bonds() {
     ]);
 }
 
+/// A salt drawn with bonds is neutral and complete: one formula unit, named on its own (IR-5.4),
+/// in drawing order like any neutral structure ("ethanol; sodium chloride"). Only the charged
+/// structures of a drawing are put together as one salt; pooling neutral ones would name a
+/// double salt that was not drawn ("magnesium potassium trichloride" is KMgCl₃, IR-5.4.2.1,
+/// Example 4).
+#[test]
+fn bonded_salts_are_named_one_by_one() {
+    check_names(&[
+        ("Cl[Ca]Cl.[Na]Cl", "calcium dichloride; sodium chloride"),
+        ("Cl[Mg]Cl.[K]Cl", "magnesium dichloride; potassium chloride"),
+        ("[Na]Br.[K]Br", "sodium bromide; potassium bromide"),
+        ("[Na]Cl.[K]Cl", "sodium chloride; potassium chloride"),
+        (
+            "[Na]OS(=O)(=O)O[Na].[K]OS(=O)(=O)O[K]",
+            "disodium sulfate; dipotassium sulfate",
+        ),
+        // A bonded salt beside a salt drawn as ions: each its own name, in drawing order.
+        (
+            "Cl[Ca]Cl.[Na+].[Cl-]",
+            "calcium dichloride; sodium chloride",
+        ),
+        (
+            "[Na+].[Cl-].Cl[Ca]Cl",
+            "sodium chloride; calcium dichloride",
+        ),
+        ("[Na]Cl.[K+].[Br-]", "sodium chloride; potassium bromide"),
+        ("[Na]O[Na].[Na]Cl", "disodium oxide; sodium chloride"),
+        ("[Na]Cl.[Na+].CC([O-])=O", "sodium chloride; sodium acetate"),
+        // A charged structure with a bonded metal is one ion of the salt drawn as ions.
+        ("[Na]OS(=O)(=O)[O-].[Na+]", "disodium sulfate"),
+    ]);
+    // The ions drawn on their own are still one salt.
+    check_names(&[
+        (
+            "[K+].[Mg+2].[Cl-].[Cl-].[Cl-]",
+            "magnesium potassium trichloride",
+        ),
+        ("[Na+].[K+].[O-]S(=O)(=O)[O-]", "potassium sodium sulfate"),
+        ("CCO.[Na+].[Cl-]", "ethanol; sodium chloride"),
+    ]);
+}
+
 /// A drawing whose hydrogen was drawn as an atom on the ion, or whose ion is an abbreviation.
 #[test]
 fn drawn_hydrogens_and_labels() {
@@ -262,6 +308,16 @@ fn refusals() {
         ("[Cu+].[Cl-]", "oxidation number"),
         ("Cl[Fe](Cl)Cl", "oxidation number"),
         ("[Sn+2].[Cl-].[Cl-]", "oxidation number"),
+        // Silver and gallium have one common charge, but are outside the supported set.
+        ("[Ag+].[Cl-]", "not in the supported fixed-charge set"),
+        (
+            "[Ga+3].[Cl-].[Cl-].[Cl-]",
+            "not in the supported fixed-charge set",
+        ),
+        (
+            "[Fe+2].[Cl-].[Cl-]",
+            "not in the supported fixed-charge set",
+        ),
         // Coordination compounds: K4[Fe(CN)6], [Cu(NH3)4]2+.
         (
             "[K+].[K+].[K+].[K+].N#C[Fe-4](C#N)(C#N)(C#N)(C#N)C#N",
@@ -290,4 +346,19 @@ fn refusals() {
         // A lone neutral hydrogen atom is H2 by its valence; H–H is drawn for dihydrogen.
         ("[H]", "hydrogen"),
     ]);
+}
+
+/// A multiplying prefix is spelt up to 9999 ("nonanonacontanonactanonalia"); a larger count
+/// is refused rather than written in digits ("12000sulfur").
+#[test]
+fn counts_beyond_the_numerals_are_refused() {
+    let ring = |n: usize| format!("S1{}S1", "S".repeat(n - 2));
+    assert_eq!(
+        name_of(&ring(9999)),
+        NameResult::Ok("nonanonacontanonactanonaliasulfur".into())
+    );
+    match name_of(&ring(12000)) {
+        NameResult::Unsupported(r) => assert!(r.contains("9999"), "{r}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }

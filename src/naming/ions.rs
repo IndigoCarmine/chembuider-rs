@@ -11,7 +11,7 @@
 
 use crate::molecule::{Molecule, charged_valence};
 
-use super::words::{enclose, multiplier, multiplier_complex};
+use super::words::{MAX_NUMERAL, enclose, multiplier, multiplier_complex};
 
 /// A cation named from a table: one atom of `symbol` with `hydrogens` hydrogens and `charge`.
 #[derive(Debug, PartialEq, Eq)]
@@ -166,8 +166,8 @@ impl Salt {
 
 /// The salt made of `ions` (each drawn ion once): the cations in alphabetical order (IR-5.4.1,
 /// P-65.6.2.1), then the anion, each with its count in the smallest formula unit ("disodium
-/// butanedioate", "calcium diacetate"). Only one kind of anion is supported, and the charges
-/// must balance.
+/// butanedioate", "calcium diacetate"). Only one kind of anion is supported, the charges must
+/// balance, and no count may exceed the multiplying prefixes ([`MAX_NUMERAL`]).
 pub(crate) fn salt(ions: &[Ion]) -> Result<Salt, String> {
     let anions: Vec<&Ion> = ions.iter().filter(|i| i.charge < 0).collect();
     let mut cations: Vec<(IonName, usize)> = Vec::new();
@@ -193,10 +193,16 @@ pub(crate) fn salt(ions: &[Ion]) -> Result<Salt, String> {
     for (_, k) in &mut cations {
         *k /= unit;
     }
+    let anion_count = anions.len() / unit;
+    if anion_count > MAX_NUMERAL || cations.iter().any(|&(_, k)| k > MAX_NUMERAL) {
+        return Err(format!(
+            "salt with more than {MAX_NUMERAL} of one ion in its formula unit"
+        ));
+    }
     cations.sort_by(|a, b| a.0.english().cmp(b.0.english()));
     Ok(Salt {
         cations,
-        anion: (anion.clone(), anions.len() / unit),
+        anion: (anion.clone(), anion_count),
     })
 }
 
@@ -272,6 +278,11 @@ mod tests {
             ]),
             Ok("calcium bis(2-chloropropanoate)".into())
         );
+        // A count beyond the numerals (9999) is refused, not written in digits.
+        let mut many = vec![ion("potassium", 1); 10_000];
+        many.push(ion("sodium", 1));
+        many.extend(vec![ion("chloride", -1); 10_001]);
+        assert!(salt_name(&many).unwrap_err().contains("9999"));
         assert!(salt_name(&[ion("acetate", -1)]).is_err());
         assert!(salt_name(&[ion("sodium", 1)]).is_err());
         assert!(salt_name(&[ion("sodium", 1), ion("butanedioate", -2)]).is_err());
