@@ -1057,6 +1057,8 @@ const WIKIPEDIA_ACYCLIC: &[(&str, &str)] = &[
     ("CN", "methanamine"),
     ("CCC(CC)C#N", "2-ethylbutanenitrile"),
     ("CC(S)CCC", "pentane-2-thiol"),
+    // Wikipedia: "2-sulfanyl pentan-1-ol"; a substitutive name is one word, the prefixes
+    // joined to the parent name without a space.
     ("OCC(S)CCC", "2-sulfanylpentan-1-ol"),
     ("C1CCC1", "cyclobutane"),
     // Substituent groups, drawn with attachment points.
@@ -1076,6 +1078,55 @@ const WIKIPEDIA_ACYCLIC: &[(&str, &str)] = &[
 #[test]
 fn wikipedia_acyclic_examples() {
     check_names(WIKIPEDIA_ACYCLIC);
+}
+
+/// Wikipedia's order of the characteristic groups (carboxy > anhydride > ester > amide >
+/// nitrile > aldehyde > ketone > alcohol > amine > imine; ether, nitro and halogeno as
+/// prefixes only), on structures with two of them: the senior one is the suffix. Its list
+/// lacks acid halides and thiols; P-41 ranks acid halides between esters and amides and
+/// thiols after alcohols (class 17: OH > SH), before amines.
+#[test]
+fn wikipedia_seniority_of_groups() {
+    check_names(&[
+        ("OC(=O)CCC#N", "3-cyanopropanoic acid"),
+        ("CC(=O)OC(=O)CCC#N", "acetic 3-cyanopropanoic anhydride"),
+        ("COC(=O)C1=CC=C(C(N)=O)C=C1", "methyl 4-carbamoylbenzoate"),
+        // P-41: acid halide above amide.
+        ("NC(=O)C1=CC=C(C(Cl)=O)C=C1", "4-carbamoylbenzoyl chloride"),
+        ("NC(=O)CC#N", "2-cyanoacetamide"),
+        ("NC(=O)C1=CC=C(C#N)C=C1", "4-cyanobenzamide"),
+        ("O=CCC#N", "3-oxopropanenitrile"),
+        ("CC(=O)CC=O", "3-oxobutanal"),
+        ("CC(=O)CO", "1-hydroxypropan-2-one"),
+        ("NCCO", "2-aminoethan-1-ol"),
+        // P-41: thiol below alcohol, above amine.
+        ("OCC(S)CCC", "2-sulfanylpentan-1-ol"),
+        ("NCCS", "2-aminoethane-1-thiol"),
+        // Prefixes only, in alphanumerical order.
+        ("COCC[N+](=O)[O-]", "1-methoxy-2-nitroethane"),
+        ("ClCC[N+](=O)[O-]", "1-chloro-2-nitroethane"),
+        ("COCCCl", "1-chloro-2-methoxyethane"),
+    ]);
+    // Pairs whose junior group would need a prefix the namer does not build, and imines:
+    // refused, never misnamed.
+    check_refused(&[
+        (
+            "OC(=O)C1=CC=C(C(=O)OC(C)=O)C=C1",
+            "anhydride group as a substituent",
+        ),
+        (
+            "OC(=O)C1=CC=C(C(=O)OC)C=C1",
+            "ester together with a carboxylic acid",
+        ),
+        ("CC(=O)OC(=O)CC(=O)OC", "anhydride together with an ester"),
+        (
+            "COC(=O)C1=CC=C(C(Cl)=O)C=C1",
+            "acid halide group as a prefix",
+        ),
+        ("CC(=N)C", "nitrogen group other than amine"),
+        // Amine and imine together: 4-iminopentan-1-amine.
+        ("NCCCC(=N)C", "nitrogen group other than amine"),
+    ]);
 }
 
 /// Wikipedia's table of alkanes, each drawn as an unbranched chain, and its example of how
@@ -1860,7 +1911,7 @@ fn wikipedia_ring_examples() {
             "cyclotetradeca-1,3,5,7,9,11,13-heptaene",
         ),
         // Wikipedia: "6-hexanelactone" (ε-caprolactone) and "oxepane-2-one"; the PIN is the
-        // pseudoketone name, the "e" elided before "one" (P-65.6.3.5.1).
+        // pseudoketone name (P-65.6.3.5.1), the "e" elided before "one" (P-16.7.1).
         ("O=C1CCCCCO1", "oxepan-2-one"),
         // Wikipedia: "6-hexanelactam" (ε-caprolactam) and "azocan-2-one". The formula given,
         // –NH–CO–(CH2)5– in a ring, is a seven-membered ring: azepan-2-one (P-64.3.1); azocane
@@ -1870,13 +1921,19 @@ fn wikipedia_ring_examples() {
         ("C12CCCC1CC2", "bicyclo[3.2.0]heptane"),
         // Step 2: thia and aza by replacement, N lowest (P-23.3.2).
         ("N12CCSC1CC2", "4-thia-1-azabicyclo[3.2.0]heptane"),
-        // Step 3: 6-aminopenicillanic acid.
+        // Step 2's figure, the lactam. Wikipedia: "…heptane-7-one"; the final "e" of the
+        // parent is elided before the vowel of the suffix (P-16.7.1).
+        ("O=C1CC2SCCN12", "4-thia-1-azabicyclo[3.2.0]heptan-7-one"),
+        // Step 3: 6-aminopenicillanic acid. The figure's name, "6-amino-2-carboxy-2,2-
+        // dimethyl-…heptane-7-one", keeps the lactam as the suffix; the carboxylic acid is
+        // senior (P-41), as the walk-through itself concludes, and the methyl groups are on
+        // C-3.
         (
             "CC1(C)SC2C(N)C(=O)N2C1C(O)=O",
             "6-amino-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",
         ),
-        // Step 5, without stereodescriptors. Wikipedia: "6-phenylacetylamino-2,2-dimethyl-
-        // 7-oxo-…". Its step 3 puts the two methyl groups on C-3 (C-2 carries the carboxy
+        // Step 4's figure (step 5 adds the stereodescriptors). Wikipedia: "6-phenylacetylamino-
+        // 2,2-dimethyl-7-oxo-…". Its step 3 puts the two methyl groups on C-3 (C-2 carries the carboxy
         // group): 3,3-dimethyl. The acylamino prefix is the amide name ending in "amido"
         // (P-66.1.1.4.3: "Method (1) generates preferred IUPAC names", "4-formamidobenzoic
         // acid (PIN)"), with the locant of 2-phenylacetamide; the prefixes are in
@@ -1890,6 +1947,11 @@ fn wikipedia_ring_examples() {
         // DBU (1,8-diazabicyclo[5.4.0]undec-7-ene): two fused rings of five or more members
         // take a fusion name (P-52.2.4.1), which is not supported.
         ("C1CCC2=NCCCN2CC1", "fusion nomenclature"),
+        // The replacement example's figure: "bicycloundecene" and "diazabicycloundecene",
+        // the C=N in the seven-membered ring (an isomer of DBU, whose amidine is in the
+        // six-membered ring; Wikipedia's octahydropyrido[2,1-b][1,3]diazepine is this one).
+        ("C1CCC2CCCCC=C2C1", "fusion nomenclature"),
+        ("C1CCN2CCCCN=C2C1", "fusion nomenclature"),
     ]);
 }
 

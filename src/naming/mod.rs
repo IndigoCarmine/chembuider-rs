@@ -41,9 +41,9 @@
 //! - the principal characteristic groups, in order of seniority (P-41): carboxylate anion >
 //!   carboxylic acid > anhydride > ester > acid halide > amide > nitrile > aldehyde > ketone >
 //!   alcohol (phenol) > thiol > amine, as suffixes; the junior ones and any that cannot sit on
-//!   the parent as prefixes (carboxy, carbamoyl, cyano, formyl, oxo, hydroxy, sulfanyl, amino,
-//!   acyl groups such as acetyl and benzoyl). More than two acid (nitrile, aldehyde…) groups
-//!   on one unbranched chain are all suffixes, the chain without their carbons
+//!   the parent as prefixes (carboxy, carbamoyl on a ring, cyano, formyl, oxo, hydroxy,
+//!   sulfanyl, amino, acyl groups such as acetyl and benzoyl). More than two acid (nitrile,
+//!   aldehyde…) groups on one unbranched chain are all suffixes, the chain without their carbons
 //!   (P-65.1.2.2.1: propane-1,2,3-tricarboxylic acid); otherwise two end the chain and the
 //!   others are prefixes (3-(carboxymethyl)heptanedioic acid);
 //! - halogens, nitro groups and ethers (alkoxy prefixes) as prefixes; N-substituted amines
@@ -102,13 +102,16 @@
 //! carboxylate anions and the ions above (substituted ammonium, zwitterions, metals bonded to
 //! an organic structure — CH₃–Li, CH₃–Mg–Br may be organometallic, an organic salt is to be
 //! drawn as ions —, salts whose charges do not balance or with two kinds of anion), isotopes,
-//! acid halide, anhydride and carboxylate groups as prefixes, cyclic anhydrides, partial salts
-//! of acids with more than two acid groups ("hydrogen …tricarboxylate"), prefixes on a
-//! one-carbon acid parent (carboxyformic acid, P-65.1.8), different halides on acyl halide
-//! groups that are not interchangeable (no locants for them), free valences on sulfur or an
-//! acid's oxygen (acyloxy), several free valences other than single bonds on carbon or not
-//! all on one parent ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and
-//! others, and other functional groups (imines, azo, peroxides, carbonates, ureas…).
+//! ester, acid halide, anhydride and carboxylate groups as prefixes (so an ester or anhydride
+//! together with a carboxylic acid, or an anhydride together with an ester), amide groups as
+//! prefixes on a chain (carbamoyl or amino…oxo, not decided), cyclic anhydrides named as
+//! anhydrides (they are named as pseudoketones, above), partial salts of acids with more than
+//! two acid groups ("hydrogen …tricarboxylate"), prefixes on a one-carbon acid parent
+//! (carboxyformic acid, P-65.1.8), different halides on acyl halide groups that are not
+//! interchangeable (no locants for them), free valences on sulfur or an acid's oxygen
+//! (acyloxy), several free valences other than single bonds on carbon or not all on one parent
+//! ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and others, and other
+//! functional groups (imines, azo, peroxides, carbonates, ureas…).
 //!
 //! Not supported among inorganic compounds, each for its reason:
 //!
@@ -245,7 +248,11 @@
 //! does not perceive — the deoxy sugar is named as the oxolane or oxane it is; cis/trans on
 //! rings (relative configuration of ring substituents: the namer gives absolute R/S only) and on
 //! double bonds of more than two substituents, where cis/trans is not defined by E/Z; Japanese
-//! names ([`NameKind::Japanese`], OPE-26).
+//! names (OPE-26 was canceled: [`NameKind::Japanese`] is reserved and never produced).
+//!
+//! Every example of Wikipedia (ja) "IUPAC命名法" is mapped to its test, with the IUPAC 2013
+//! name where Wikipedia's differs and the reason for each one not named, in
+//! `docs/naming_wikipedia_coverage.md`.
 
 mod alternatives;
 mod cip;
@@ -316,7 +323,7 @@ pub enum NameKind {
     /// rules; P-29.6.2.3 keeps ethylene only), "perbromoethane" ("per", P-14.3.4.5: no longer
     /// recommended). Listed after the names IUPAC 2013 accepts.
     Traditional,
-    /// A Japanese name (reserved for OPE-26; not produced yet).
+    /// A Japanese name (reserved; OPE-26 was canceled, so none is produced).
     Japanese,
 }
 

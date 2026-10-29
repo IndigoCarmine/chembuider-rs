@@ -56,6 +56,8 @@ fn radicofunctional_names() {
         ("CO", "methanol", Radicofunctional, "methyl alcohol"),
         ("CCCO", "propan-1-ol", Radicofunctional, "propyl alcohol"),
         ("CCCCCl", "1-chlorobutane", Radicofunctional, "butyl chloride"),
+        // Wikipedia: "methyl amine"; the substituent group and "amine" form one word
+        // (P-62.2.1.1.2: "methylamine").
         ("CN", "methanamine", Radicofunctional, "methylamine"),
         ("COCC", "methoxyethane", Radicofunctional, "ethyl methyl ether"),
         // Alphanumerical order, "tert" not counted; two identical groups multiplied.
