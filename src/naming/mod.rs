@@ -1,4 +1,5 @@
-//! Structure → IUPAC name (substitutive nomenclature, IUPAC 2013 recommendations).
+//! Structure → IUPAC name (substitutive nomenclature, IUPAC 2013 recommendations; for inorganic
+//! compounds compositional nomenclature, IUPAC 2005).
 //!
 //! [`iupac_name`] names every connected structure of a drawing. The namer covers a deliberately
 //! narrow set of classes and refuses everything else with a reason, rather than guess:
@@ -54,10 +55,24 @@
 //!   ("acetyl chloride", "butanedioyl bromide chloride", P-65.5.1; different halides only
 //!   where the acyl halide groups are interchangeable by symmetry), acyclic anhydrides
 //!   ("propanoic anhydride", "acetic propanoic anhydride", P-65.7);
-//! - salts of carboxylic acids drawn as separate ions (P-65.6.2): the cations Li⁺, Na⁺, K⁺,
-//!   Rb⁺, Cs⁺ and NH₄⁺ (`ions.rs`) in alphabetical order, then the carboxylate anion
-//!   ("potassium propanoate", "disodium butanedioate", "ammonium 3-carboxypropanoate"). The
-//!   ions of a drawing are named together as one salt;
+//! - salts of carboxylic acids drawn as separate ions (P-65.6.2): the cations of `ions.rs` in
+//!   alphabetical order, then the carboxylate anion ("potassium propanoate", "disodium
+//!   butanedioate", "calcium diacetate", "ammonium 3-carboxypropanoate"). The ions of a drawing
+//!   are named together as one salt;
+//! - inorganic compounds by compositional nomenclature (IUPAC 2005, the Red Book;
+//!   `inorganic.rs`): elements, with the multiplying prefix of the atoms of the molecule
+//!   ("trioxygen", "dinitrogen", "octasulfur"; one atom the bare name, "argon", "iron";
+//!   IR-3.4.3, IR-5.2), the English name of every element; and salts (IR-5.4) of the cations of one common charge —
+//!   the alkali and alkaline-earth metals, aluminium, zinc, cadmium, ammonium — with one kind of
+//!   anion of the tables: monoatomic ("chloride", "hydride", "oxide", "nitride"), hydroxide,
+//!   cyanide, peroxide, azide, and the oxoanions of Table IR-8.1 with the hydrogen names of
+//!   IR-8.5 ("sulfate", "hydrogencarbonate", "dihydrogenphosphate", "perchlorate"…). The
+//!   cations are cited in alphabetical order, every proportion with a multiplying prefix,
+//!   oxoanions with "bis", "tris" (IR-5.4.2.1): "sodium chloride", "calcium dichloride",
+//!   "potassium sodium sulfate", "sodium hydrogencarbonate", "tricalcium bis(phosphate)". A salt
+//!   may be drawn as ions or with the metal bonded to its anions ("Na–Cl", "Cl–Ca–Cl", "Na–H"):
+//!   each metal has one charge, the number of its single bonds, so the structure is that salt
+//!   (a compositional name says nothing of the bonding, IR-5.2);
 //! - substituent groups drawn with attachment points ("*", P-29): "pentyl", "pentyloxy",
 //!   "hexanoyl", "1-chloropropan-2-yl", and with several free valences on carbon, all on the
 //!   parent, "propane-1,3-diyl", "methylene", "1,4-phenylene"; or all on C=O carbons,
@@ -80,9 +95,10 @@
 //! (1-acetylpiperidine), assemblies of saturated heterocycles or of those
 //! with indicated hydrogen (bipiperidine, bipyrrole), sulfur outside a ring other than in a
 //! thiol (sulfides, disulfides, thiones, thioacids, sulfoxides…), elements other than C, H, N,
-//! O, S and the halogens (except the cations above), charged species other than nitro groups,
-//! carboxylate anions and those cations (substituted ammonium, zwitterions, metals bonded to
-//! the structure, salts whose charges do not balance or with two kinds of anion), isotopes,
+//! O, S and the halogens in organic structures, charged species other than nitro groups,
+//! carboxylate anions and the ions above (substituted ammonium, zwitterions, metals bonded to
+//! an organic structure — CH₃–Li, CH₃–Mg–Br may be organometallic, an organic salt is to be
+//! drawn as ions —, salts whose charges do not balance or with two kinds of anion), isotopes,
 //! acid halide, anhydride and carboxylate groups as prefixes, cyclic anhydrides, partial salts
 //! of acids with more than two acid groups ("hydrogen …tricarboxylate"), prefixes on a
 //! one-carbon acid parent (carboxyformic acid, P-65.1.8), different halides on acyl halide
@@ -90,6 +106,23 @@
 //! acid's oxygen (acyloxy), several free valences other than single bonds on carbon or not
 //! all on one parent ("1,4-phenylenebis(methylene)", P-29.4.2) or both on C=O carbons and
 //! others, and other functional groups (imines, azo, peroxides, carbonates, ureas…).
+//!
+//! Not supported among inorganic compounds, each for its reason:
+//!
+//! - salts of the transition metals (other than zinc and cadmium) and of the other metals of
+//!   more than one common oxidation state (tin, lead, thallium, mercury, the lanthanoids and
+//!   actinoids…), even where the drawn charge fixes it: their names need an oxidation number or
+//!   charge number ("iron(II) chloride", "iron(2+) chloride", IR-5.4.2.2), which the Red Book
+//!   omits only "when there is no ambiguity" — a judgement the namer does not make;
+//! - coordination compounds and complexes (IR-9: ligand names, additive nomenclature);
+//! - hydrates and other addition compounds (IR-5.5: "·5H₂O");
+//! - ions outside the tables (amide NH₂⁻, diphosphate, the hydrogen names that IR-8.5 does not
+//!   accept in short form, hydron H⁺, oxonium), and molecular compounds other than elements:
+//!   hydrides (water, ammonia, hydrogen chloride: the parent hydrides of IR-6), oxoacids
+//!   (sulfuric acid) and binary compounds of nonmetals (SF₆, SO₂), whose names need the element
+//!   sequence of Table VI; carbon dioxide and carbon monoxide among them;
+//! - a cation-table metal with another charge or other bonds than its ion has ("Na²⁺",
+//!   "Cl–Na–Cl", "Na=O", "Na–Na"), and a lone neutral hydrogen atom (by its valence H₂).
 //!
 //! Stereodescriptors (P-9, `stereo.rs`, ranked by the CIP rules in `cip.rs`) are cited in front
 //! of the name, with their locants, in ascending order of the locants whatever their kind
@@ -148,6 +181,13 @@
 //!   lactams their pseudoketone names ("oxepan-2-one"), not "6-hexanelactone" (P-65.6.3.5.1).
 //! - Acylamino prefixes are the "amido" names ("acetamido", P-66.1.1.4.3 method (1)), not
 //!   "acetylamino".
+//! - Inorganic names follow the Red Book (2005) where Wikipedia differs: "hydrogencarbonate"
+//!   in one word (IR-8.4, IR-8.5; Wikipedia's "sodium hydrogen carbonate" is the older
+//!   spelling), and every proportion stated by a multiplying prefix, "calcium dichloride" (the
+//!   form the Red Book gives first, IR-5.2, IR-5.4.2.1, and the one the namer gives organic
+//!   salts, "calcium diacetate"), not "calcium chloride", which IR-5.2 allows "if there is no
+//!   ambiguity about the stoichiometry" — an alternative name (OPE-24). Traditional names such
+//!   as ozone are alternatives too.
 //! - Multiplicative names (the preferred names of some symmetrical compounds, e.g.
 //!   2,2′-oxydi(ethan-1-ol), 1,1'-methylenedibenzene) and the retained names of α-amino acids
 //!   are not produced; the substitutive name given instead ("benzylbenzene",
@@ -157,10 +197,13 @@ mod cip;
 mod engine;
 mod graph;
 mod hetero;
+mod inorganic;
 mod ions;
 mod stereo;
 mod words;
 
+#[cfg(test)]
+mod inorganic_tests;
 #[cfg(test)]
 mod stereo_tests;
 #[cfg(test)]
@@ -254,52 +297,83 @@ fn names_and_notes(mol: &Molecule, config: &Config) -> (Vec<NameResult>, Vec<Str
     let mut notes = Vec::new();
     let mut ions = Vec::new();
     let mut salt_at = None;
+    // The reason a charged structure was refused: the reason the salt it belongs to is.
+    let mut refused_ion = None;
     for atoms in graph::components(mol) {
         match name_component(mol, &atoms, config, &mut notes) {
-            Ok(ion) if ion.charge != 0 => {
+            Ok(Component::Ions(found)) => {
                 if salt_at.is_none() {
                     salt_at = Some(names.len());
                     names.push(NameResult::Unsupported(String::new()));
                 }
-                ions.push(ion);
+                ions.extend(found);
             }
-            Ok(neutral) => names.push(NameResult::Ok(neutral.name)),
-            Err(r) => names.push(NameResult::Unsupported(r)),
+            Ok(Component::Neutral(name)) => names.push(NameResult::Ok(name)),
+            Err(r) => {
+                let charge: i32 = atoms.iter().map(|&i| mol.atoms[i].charge as i32).sum();
+                if refused_ion.is_none() && charge != 0 {
+                    refused_ion = Some(r.clone());
+                }
+                names.push(NameResult::Unsupported(r));
+            }
         }
     }
     if let Some(i) = salt_at {
-        names[i] = match ions::salt_name(&ions) {
-            Ok(n) => NameResult::Ok(n),
-            Err(r) => NameResult::Unsupported(r),
+        names[i] = match (ions::salt_name(&ions), refused_ion) {
+            (Ok(n), _) => NameResult::Ok(n),
+            (Err(_), Some(r)) | (Err(r), None) => NameResult::Unsupported(r),
         };
     }
     (names, notes)
 }
 
-/// The name of one connected structure and its net charge: a cation of the table, or a
-/// structure named by the substitutive engine (a neutral compound, an anion, a substituent).
-/// The notes on its stereogenic units go to `notes`.
+/// What one connected structure is.
+enum Component {
+    /// A neutral compound, by its name.
+    Neutral(String),
+    /// Ions of a salt: one drawn on its own, or a salt drawn with bonds ("Na–Cl").
+    Ions(Vec<ions::Ion>),
+}
+
+/// The name of one connected structure: a cation of the table, an inorganic structure
+/// (`inorganic.rs`), or one named by the substitutive engine (a neutral compound, an anion, a
+/// substituent). The notes on its stereogenic units go to `notes`.
 fn name_component(
     mol: &Molecule,
     atoms: &[usize],
     config: &Config,
     notes: &mut Vec<String>,
-) -> Result<ions::Ion, String> {
+) -> Result<Component, String> {
     if let Some(c) = ions::recognise_cation(mol, atoms) {
-        return Ok(ions::Ion {
-            name: c.name.into(),
+        return Ok(Component::Ions(vec![ions::Ion {
+            name: ions::IonName::Table {
+                name: c.name,
+                compound: false,
+            },
             charge: c.charge.into(),
+        }]));
+    }
+    let raw = graph::expand(mol, atoms, config)?;
+    if let Some(found) = inorganic::name(&raw) {
+        return Ok(match found? {
+            inorganic::Inorganic::Element(e) => Component::Neutral(e.english()),
+            inorganic::Inorganic::Ions(ions) => Component::Ions(ions),
         });
     }
-    let g = graph::build(mol, atoms, config)?;
+    let g = graph::to_graph(&raw)?;
     let p = graph::perceive(&g)?;
     let units = stereo::units(&g);
     let namer = engine::Namer::new(&g, &p).with_stereo(&units);
     let name = namer.name()?;
     notes.extend(namer.notes());
-    Ok(ions::Ion {
-        name,
-        charge: g.net_charge(),
+    let charge = g.net_charge();
+    Ok(if charge == 0 {
+        Component::Neutral(name)
+    } else {
+        Component::Ions(vec![ions::Ion {
+            name: ions::IonName::Organic(name),
+            charge,
+        }])
     })
 }
 
