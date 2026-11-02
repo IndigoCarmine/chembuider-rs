@@ -2264,6 +2264,62 @@ fn manual_bond_orders_forget_a_press_leftover() {
     assert_eq!(e.molecule, reloaded.molecule);
 }
 
+#[test]
+fn deleting_and_redrawing_a_bond_forgets_a_press_leftover() {
+    let mut e = naphthalene(0.0);
+    let bond = peri_bond(&e.molecule);
+    press_on_bond(&mut e, bond, "a");
+    assert_eq!(e.molecule.press_leftovers, BTreeSet::from([24]));
+    let removed = e.molecule.bond_by_id(27).unwrap().clone();
+    assert!(e.delete_bond(27));
+    e.molecule
+        .add_bond(removed.begin, removed.end, removed.order);
+    assert!(e.molecule.press_leftovers.is_empty());
+
+    let json = serde_json::to_string(&e.molecule).unwrap();
+    let mut reloaded = fresh(&serde_json::from_str(&json).unwrap());
+    press_on_bond(&mut reloaded, 9, "a");
+    press_on_bond(&mut e, 9, "a");
+    assert_still_saturated(&e.molecule, &[24], "the deleted and redrawn drawing");
+    assert_eq!(e.molecule, reloaded.molecule);
+}
+
+#[test]
+fn drawing_a_bond_forgets_a_press_leftover() {
+    for existing_target in [false, true] {
+        let mut e = naphthalene(0.0);
+        let bond = peri_bond(&e.molecule);
+        press_on_bond(&mut e, bond, "a");
+        assert_eq!(e.molecule.press_leftovers, BTreeSet::from([24]));
+        let p = e.molecule.atom_by_id(24).unwrap().pos;
+        let tip = [p[0] + 2.0 * L, p[1] + 2.0 * L];
+        let target = existing_target.then(|| e.molecule.add_atom("C".into(), tip, 0));
+        e.tool = super::Tool::Bond;
+        let start = e.mol_to_screen(p, CANVAS.center());
+        let end = e.mol_to_screen(tip, CANVAS.center());
+        let ctx = egui::Context::default();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        run_frame(&ctx, CANVAS, &mut e, vec![egui::Event::PointerMoved(start)]);
+        run_frame(&ctx, CANVAS, &mut e, vec![button(start, true)]);
+        run_frame(&ctx, CANVAS, &mut e, vec![egui::Event::PointerMoved(end)]);
+        run_frame(&ctx, CANVAS, &mut e, vec![button(end, false)]);
+        let drawn = e.molecule.bonds_for_atom(24);
+        assert_eq!(drawn.len(), 3, "the substituent was drawn");
+        if let Some(target) = target {
+            assert!(e.molecule.bond_between(24, target).is_some());
+        }
+        assert!(
+            e.molecule.press_leftovers.is_empty(),
+            "existing target: {existing_target}"
+        );
+    }
+}
+
 /// The record is not in the file, and a leftover read back from one is a plain CH₂: it stays one,
 /// which is a sound drawing, one double bond short of the most it could have.
 #[test]

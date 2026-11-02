@@ -494,6 +494,11 @@ impl Molecule {
     }
 
     pub fn remove_bond(&mut self, id: u32) {
+        if let Some(bond) = self.bond_by_id(id) {
+            let (begin, end) = (bond.begin, bond.end);
+            self.press_leftovers.remove(&begin);
+            self.press_leftovers.remove(&end);
+        }
         self.bonds.retain(|b| b.id != id);
         self.drop_broken_ring_fills();
     }

@@ -169,6 +169,8 @@ pub fn process_bond_tool(
                     } else {
                         let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
                         if bid != 0 {
+                            editor.molecule.press_leftovers.remove(&src_id);
+                            editor.molecule.press_leftovers.remove(&target_id);
                             if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
                                 bond.stereo = editor.current_bond_stereo.clone();
                             }
@@ -199,6 +201,8 @@ pub fn process_bond_tool(
                 } else {
                     let bid = editor.molecule.add_bond(atom_id, new_id, editor.current_bond_order.clone());
                     if bid != 0 {
+                        editor.molecule.press_leftovers.remove(&atom_id);
+                        editor.molecule.press_leftovers.remove(&new_id);
                         if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
                             bond.stereo = editor.current_bond_stereo.clone();
                         }
