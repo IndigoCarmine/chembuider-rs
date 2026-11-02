@@ -691,6 +691,8 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
 
     for (key, _shift, ctrl, alt) in &keys {
         if *ctrl || *alt { continue; }
+        let target = editor.keyboard_target();
+        let repeat = take_ring_repeat(editor, key);
 
         // Hotspot / navigation keys
         match key.as_str() {
@@ -743,32 +745,24 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
         // A ring with nowhere to go changes nothing, and must not become a step that undo spends
         // a press on, or wipe the redo history; so the snapshot waits for the outcome.
         if let Some(atom_id) = editor.hovered_atom {
-            let before = editor.molecule.clone();
-            if dispatch_atom_key(editor, atom_id, key) {
-                push_undo_of(editor, before);
-                modified = true;
-            }
+            modified |= press_on_atom(editor, atom_id, key, target);
         } else if place_element_at_cursor(editor, key) {
             modified = true;
         } else if let Some(bond_id) = editor.hovered_bond.or(editor.hotspot_bond) {
-            let before = editor.molecule.clone();
+            let before = (editor.molecule.clone(), target);
             let outcome = dispatch_bond_key(editor, bond_id, key);
-            if outcome != BondKeyOutcome::Nothing {
+            if outcome != KeyOutcome::Nothing {
                 push_undo_of(editor, before);
                 modified = true;
             }
             // The mouse aims for itself, so only the keyboard's own target moves on.
-            if let (BondKeyOutcome::RingDrawn(ring), None) = (outcome, editor.hovered_bond)
+            if let (KeyOutcome::RingDrawn(ring), None) = (outcome, editor.hovered_bond)
                 && let Some(next) = next_bond_round_ring(editor, &ring, key)
             {
                 editor.hotspot_bond = Some(next);
             }
-        } else if let Some(atom_id) = editor.hotspot_atom {
-            let before = editor.molecule.clone();
-            if dispatch_atom_key(editor, atom_id, key) {
-                push_undo_of(editor, before);
-                modified = true;
-            }
+        } else if let Some(atom_id) = repeat.or(editor.hotspot_atom) {
+            modified |= press_on_atom(editor, atom_id, key, target);
         }
     }
 
@@ -816,10 +810,32 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
     modified
 }
 
-/// Record `before`, the drawing as it was before the press just made, as an undo step.
-fn push_undo_of(editor: &mut ChemStructEditor, before: crate::molecule::Molecule) {
-    let after = std::mem::replace(&mut editor.molecule, before);
-    editor.push_undo();
+/// Press `key` on atom `atom_id` as one undo step, if it changes anything, with `target` as where
+/// undo goes back to aiming. Returns whether it did.
+fn press_on_atom(
+    editor: &mut ChemStructEditor,
+    atom_id: u32,
+    key: &str,
+    target: super::KeyboardTarget,
+) -> bool {
+    let before = (editor.molecule.clone(), target);
+    let outcome = dispatch_atom_key(editor, atom_id, key);
+    let modified = outcome != KeyOutcome::Nothing;
+    if modified {
+        push_undo_of(editor, before);
+    }
+    aim_ring_repeat(editor, outcome, key);
+    modified
+}
+
+/// Record `before`, the drawing as it was before the press just made and where the keyboard was
+/// aiming, as an undo step.
+fn push_undo_of(
+    editor: &mut ChemStructEditor,
+    (molecule, target): (crate::molecule::Molecule, super::KeyboardTarget),
+) {
+    let after = std::mem::replace(&mut editor.molecule, molecule);
+    editor.push_undo_aimed_at(target);
     editor.molecule = after;
 }
 
@@ -860,15 +876,65 @@ fn next_bond_round_ring(editor: &mut ChemStructEditor, ring: &[u32], key: &str) 
 /// Whether `key` on `bond_id` would draw a ring. Asking the press itself means the answer cannot
 /// differ from what the press then does.
 fn would_draw_ring(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> bool {
+    try_press(editor, |editor| dispatch_bond_key(editor, bond_id, key))
+}
+
+/// [`would_draw_ring`], for `key` on atom `atom_id`.
+fn would_draw_ring_at_atom(editor: &mut ChemStructEditor, atom_id: u32, key: &str) -> bool {
+    editor.molecule.atom_by_id(atom_id).is_some()
+        && try_press(editor, |editor| dispatch_atom_key(editor, atom_id, key))
+}
+
+/// Whether `press` adds a ring, leaving everything as it found it.
+fn try_press(
+    editor: &mut ChemStructEditor,
+    press: impl FnOnce(&mut ChemStructEditor) -> KeyOutcome,
+) -> bool {
     let molecule = editor.molecule.clone();
     let selected = editor.selected_atoms.clone();
-    let drawn = matches!(
-        dispatch_bond_key(editor, bond_id, key),
-        BondKeyOutcome::RingDrawn(_)
-    );
+    let target = editor.hotspot_atom;
+    let bonds = molecule.bonds.len();
+    let drawn =
+        matches!(press(editor), KeyOutcome::RingDrawn(_)) && editor.molecule.bonds.len() > bonds;
     editor.molecule = molecule;
     editor.selected_atoms = selected;
+    editor.hotspot_atom = target;
     drawn
+}
+
+/// After `key` drew a ring from an atom, work out where pressing it again should go on from.
+///
+/// The press has left the hotspot on the ring's last atom, and that is where the arrows walk on
+/// from. But it can be an existing atom the ring merged with, a ring-fusion atom with rings all
+/// round it, on which the next press would do nothing. As on a bond ([`next_bond_round_ring`]) the
+/// target has to move on for repeated presses to go on drawing, so the same key straight after
+/// acts on the last atom of the ring where it can ([`RingRepeat`](super::RingRepeat)).
+fn aim_ring_repeat(editor: &mut ChemStructEditor, outcome: KeyOutcome, key: &str) {
+    let (KeyOutcome::RingDrawn(ring), Some(from)) = (outcome, editor.hotspot_atom) else {
+        return;
+    };
+    let next = std::iter::once(from)
+        .chain(ring.iter().rev().copied())
+        .find(|&id| would_draw_ring_at_atom(editor, id, key));
+    editor.ring_repeat = next
+        .filter(|&atom| atom != from)
+        .map(|atom| super::RingRepeat {
+            key: key.to_string(),
+            from,
+            atom,
+        });
+}
+
+/// The atom this press of `key` is the repeat of a ring press on, if it is one. Any press but a
+/// chord ends the repeat, so an arrow or another key finds the hotspot as the ring left it, and
+/// Ctrl+Z does not spend the repeat it has just put back.
+fn take_ring_repeat(editor: &mut ChemStructEditor, key: &str) -> Option<u32> {
+    editor
+        .ring_repeat
+        .take()
+        .filter(|r| r.key == key && editor.hotspot_atom == Some(r.from))
+        .map(|r| r.atom)
+        .filter(|&id| editor.molecule.atom_by_id(id).is_some())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -880,6 +946,12 @@ fn handle_keys_select_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool
     let keys = pressed_key_strings(ui);
 
     for (key, _shift, ctrl, alt) in &keys {
+        let repeat = if *ctrl || *alt {
+            None
+        } else {
+            take_ring_repeat(editor, key)
+        };
+
         // Hotspot keys
         match key.as_str() {
             "Enter" => {
@@ -905,9 +977,11 @@ fn handle_keys_select_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool
         }
 
         if !ctrl && !alt {
-            let atom_target = editor.hovered_atom.or(editor.hotspot_atom);
+            let atom_target = editor.hovered_atom.or(repeat).or(editor.hotspot_atom);
             if let Some(atom_id) = atom_target {
-                if dispatch_atom_key(editor, atom_id, key) { modified = true; }
+                let outcome = dispatch_atom_key(editor, atom_id, key);
+                modified |= outcome != KeyOutcome::Nothing;
+                aim_ring_repeat(editor, outcome, key);
             }
         }
 
@@ -953,7 +1027,7 @@ fn handle_keys_select_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool
 // Config-driven dispatch
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn dispatch_atom_key(editor: &mut ChemStructEditor, atom_id: u32, key: &str) -> bool {
+fn dispatch_atom_key(editor: &mut ChemStructEditor, atom_id: u32, key: &str) -> KeyOutcome {
     let actions: Vec<AtomAction> = editor.config.atom_shortcuts.iter()
         .filter(|s| s.key == key && !s.ctrl && !s.alt)
         .map(|s| s.action.clone())
@@ -965,22 +1039,22 @@ fn dispatch_atom_key(editor: &mut ChemStructEditor, atom_id: u32, key: &str) -> 
             return apply_atom_action(editor, atom_id, resolved);
         }
     }
-    false
+    KeyOutcome::Nothing
 }
 
-/// What a key did to a bond.
+/// What a key did to the atom or bond it was pressed on.
 #[derive(PartialEq)]
-enum BondKeyOutcome {
+enum KeyOutcome {
     /// Nothing changed: no such key, or no room for what it draws.
     Nothing,
-    /// The bond was edited, or something with no ring through it was drawn on it.
+    /// The target was edited, or something with no ring through it was drawn on it.
     Edited,
-    /// A ring was drawn on the bond: its atoms, walking round from one end of the bond to the
-    /// other.
+    /// A ring was drawn. On a bond: its atoms, walking round from one end of the bond to the
+    /// other. On an atom: its atoms in the fragment's order.
     RingDrawn(Vec<u32>),
 }
 
-fn dispatch_bond_key(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> BondKeyOutcome {
+fn dispatch_bond_key(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> KeyOutcome {
     let actions: Vec<BondAction> = editor.config.bond_shortcuts.iter()
         .filter(|s| s.key == key && !s.ctrl && !s.alt)
         .map(|s| s.action.clone())
@@ -988,11 +1062,11 @@ fn dispatch_bond_key(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> 
 
     for action in &actions {
         let outcome = apply_bond_action(editor, bond_id, action);
-        if outcome != BondKeyOutcome::Nothing {
+        if outcome != KeyOutcome::Nothing {
             return outcome;
         }
     }
-    BondKeyOutcome::Nothing
+    KeyOutcome::Nothing
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1008,13 +1082,13 @@ fn is_heteroatom(element: &str) -> bool {
     !matches!(element, "C" | "H" | "D" | "T")
 }
 
-/// Apply `action` to an atom. Returns whether it did anything: a ring with nowhere to go at that
-/// atom leaves everything as it was.
+/// Apply `action` to an atom. A ring with nowhere to go at that atom leaves everything as it was.
 fn apply_atom_action(
     editor: &mut ChemStructEditor,
     atom_id: u32,
     action: ResolvedAtomAction,
-) -> bool {
+) -> KeyOutcome {
+    let mut outcome = KeyOutcome::Edited;
     match action {
         ResolvedAtomAction::InsertFragment(frag) => {
             // Single-atom fragment with no bonds = change the element of the existing atom
@@ -1068,8 +1142,9 @@ fn apply_atom_action(
                 } else {
                     let Some(atoms) = draw_ring_at_atom(editor, &frag, atom_id, angle, flip) else {
                         editor.molecule = before;
-                        return false;
+                        return KeyOutcome::Nothing;
                     };
+                    outcome = KeyOutcome::RingDrawn(atoms.clone());
                     let mut new_ids: Vec<u32> = Vec::new();
                     for id in atoms {
                         if id != atom_id && !new_ids.contains(&id) {
@@ -1106,14 +1181,14 @@ fn apply_atom_action(
             }
         }
     }
-    true
+    outcome
 }
 
 fn apply_bond_action(
     editor: &mut ChemStructEditor,
     bond_id: u32,
     action: &BondAction,
-) -> BondKeyOutcome {
+) -> KeyOutcome {
     match action {
         BondAction::Stereo { stereo } => {
             if let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
@@ -1124,7 +1199,7 @@ fn apply_bond_action(
                     bond.stereo = stereo.clone();
                 }
             }
-            BondKeyOutcome::Edited
+            KeyOutcome::Edited
         }
         BondAction::Order { order } => {
             if let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
@@ -1140,7 +1215,7 @@ fn apply_bond_action(
                     consume_group_h(editor, &[begin, end]);
                 }
             }
-            BondKeyOutcome::Edited
+            KeyOutcome::Edited
         }
         // Fuse ring onto the bond (bond becomes one edge of the ring)
         BondAction::Ring { ring } => fuse_ring_onto_bond(editor, bond_id, *ring),
@@ -1149,7 +1224,7 @@ fn apply_bond_action(
         BondAction::Fragment { fragment } => editor
             .config
             .resolve_fragment(fragment)
-            .map_or(BondKeyOutcome::Nothing, |frag| {
+            .map_or(KeyOutcome::Nothing, |frag| {
                 fuse_fragment_onto_bond(editor, bond_id, &frag)
             }),
     }
@@ -1208,9 +1283,9 @@ fn extend_chain(editor: &mut ChemStructEditor, from_atom_id: u32, n: usize) {
 ///
 /// The ring goes on the left of the bond's begin→end direction unless that side is taken, in
 /// which case it goes on the other, as anything drawn on a bond does ([`fuse_on_bond`]).
-fn fuse_ring_onto_bond(editor: &mut ChemStructEditor, bond_id: u32, n: usize) -> BondKeyOutcome {
+fn fuse_ring_onto_bond(editor: &mut ChemStructEditor, bond_id: u32, n: usize) -> KeyOutcome {
     if n < 3 {
-        return BondKeyOutcome::Nothing;
+        return KeyOutcome::Nothing;
     }
     let frag = crate::molecule::fragment::Fragment::ring(n);
     // `Fragment::ring` lies on the right of its first edge, so its left is the mirror image.
@@ -1227,7 +1302,7 @@ fn fuse_fragment_onto_bond(
     editor: &mut ChemStructEditor,
     bond_id: u32,
     frag: &crate::molecule::fragment::Fragment,
-) -> BondKeyOutcome {
+) -> KeyOutcome {
     let atoms = fuse_on_bond(editor, bond_id, frag, None);
     bond_key_outcome(frag, atoms)
 }
@@ -1236,14 +1311,14 @@ fn fuse_fragment_onto_bond(
 fn bond_key_outcome(
     frag: &crate::molecule::fragment::Fragment,
     atoms: Option<Vec<u32>>,
-) -> BondKeyOutcome {
+) -> KeyOutcome {
     let Some(atoms) = atoms else {
-        return BondKeyOutcome::Nothing;
+        return KeyOutcome::Nothing;
     };
     let (attach, next) = (frag.attach_idx, (frag.attach_idx + 1) % frag.atoms.len());
     match crate::molecule::fragment::ring_through_bond(frag, attach, next) {
-        Some(cycle) => BondKeyOutcome::RingDrawn(cycle.iter().map(|&i| atoms[i]).collect()),
-        None => BondKeyOutcome::Edited,
+        Some(cycle) => KeyOutcome::RingDrawn(cycle.iter().map(|&i| atoms[i]).collect()),
+        None => KeyOutcome::Edited,
     }
 }
 
@@ -1262,9 +1337,11 @@ fn insert_keeping_carbons_sound(
 ) -> Option<Vec<u32>> {
     let before = editor.molecule.clone();
     let new_ids = editor.molecule.insert_fragment(frag, atom_id, angle, flip);
-    let over_bonded = editor.molecule.atoms.iter().any(|a| {
-        a.element == "C" && is_over_bonded(&before, &editor.molecule, a.id)
-    });
+    let over_bonded = editor
+        .molecule
+        .atoms
+        .iter()
+        .any(|a| a.element == "C" && is_over_bonded(&before, &editor.molecule, a.id));
     if over_bonded {
         editor.molecule = before;
         return None;
@@ -1462,9 +1539,8 @@ fn fuse_on_bond(
         min_clear
     };
 
-    let preferred = flip.unwrap_or_else(|| {
-        !neighbors.is_empty() && clearance(true) > clearance(false)
-    });
+    let preferred =
+        flip.unwrap_or_else(|| !neighbors.is_empty() && clearance(true) > clearance(false));
 
     [preferred, !preferred].into_iter().find_map(|flip| {
         let positions: Vec<[f32; 2]> = frag
@@ -1502,7 +1578,10 @@ fn draw_unless_over_bonded(
 ) -> Option<Vec<u32>> {
     let before = editor.molecule.clone();
     let atoms = draw_fragment_on(editor, frag, positions, on);
-    if atoms.iter().any(|&id| is_over_bonded(&before, &editor.molecule, id)) {
+    if atoms
+        .iter()
+        .any(|&id| is_over_bonded(&before, &editor.molecule, id))
+    {
         editor.molecule = before;
         return None;
     }
@@ -1552,6 +1631,7 @@ fn draw_fragment_on(
     let on_ring = crate::molecule::fragment::ring_membership(frag);
 
     let mut new_ring_bonds: Vec<(u32, u32)> = Vec::new();
+    let mut rewritten: Vec<u32> = Vec::new();
     for fb in &frag.bonds {
         let (u, v) = (id_map[fb.begin], id_map[fb.end]);
         if u == v { continue; }
@@ -1580,7 +1660,10 @@ fn draw_fragment_on(
     // valid on a plain fusion keeps it.
     let clash = id_map.iter().any(|&id| {
         double_count(&editor.molecule, id) > 1
-            || editor.molecule.valence_excess(id).is_some_and(|excess| excess > 0)
+            || editor
+                .molecule
+                .valence_excess(id)
+                .is_some_and(|excess| excess > 0)
     });
     if unsaturated && (merged || clash) {
         // The pre-existing bond was already consistent with the rest of the molecule; the
@@ -1601,13 +1684,17 @@ fn draw_fragment_on(
         }
         // Trying the new bonds first, in fragment order, is the walk from one fusion atom to the
         // other that gives a ring fused on one edge its pattern.
-        let ring_atoms: Vec<u32> = (0..id_map.len()).filter(|&i| on_ring[i]).map(|i| id_map[i]).collect();
-        editor.molecule.rekekulize(&ring_atoms, &new_ring_bonds);
+        let ring_atoms: Vec<u32> = (0..id_map.len())
+            .filter(|&i| on_ring[i])
+            .map(|i| id_map[i])
+            .collect();
+        rewritten = editor.molecule.rekekulize(&ring_atoms, &new_ring_bonds);
     }
 
-    // Last, once every order has settled: the fused ring is new valence on the shared atoms, so
-    // any group hydrogen they no longer have room for goes.
+    // Last, once every order has settled: the fused ring is new valence on the shared atoms, and
+    // a rewrite on whatever it paired up, so any group hydrogen they no longer have room for goes.
     consume_group_h(editor, &id_map);
+    consume_group_h(editor, &rewritten);
     id_map
 }
 

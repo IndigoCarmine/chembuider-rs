@@ -1,7 +1,5 @@
 pub mod mol2;
 pub mod fragment;
-mod fusion;
-mod kekule;
 pub mod canonical;
 pub mod cleanup;
 pub mod smiles;
@@ -26,6 +24,9 @@ mod chemdraw_look_tests;
 pub mod image;
 #[cfg(windows)]
 pub mod ole;
+
+mod fusion;
+mod kekule;
 
 use serde::{Deserialize, Serialize};
 

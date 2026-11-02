@@ -275,7 +275,13 @@ pub fn ring_through_bond(frag: &Fragment, u: usize, v: usize) -> Option<Vec<usiz
             return Some(cycle);
         }
         for b in &frag.bonds {
-            let to = if b.begin == at { b.end } else if b.end == at { b.begin } else { continue };
+            let to = if b.begin == at {
+                b.end
+            } else if b.end == at {
+                b.begin
+            } else {
+                continue;
+            };
             let is_the_bond = (at == v && to == u) || (at == u && to == v);
             if !is_the_bond && to < n && previous[to].is_none() {
                 previous[to] = Some(at);

@@ -1502,3 +1502,431 @@ fn a_press_that_adds_no_ring_leaves_the_target_alone() {
     press_on_bond(&mut e, bond, "2");
     assert_eq!(e.hotspot_bond, Some(bond), "an order key draws no ring");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Partly saturated systems
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The atom at `p`.
+fn atom_at(mol: &Molecule, p: [f32; 2]) -> u32 {
+    mol.atoms
+        .iter()
+        .find(|a| (a.pos[0] - p[0]).hypot(a.pos[1] - p[1]) < 0.1)
+        .expect("an atom on that vertex")
+        .id
+}
+
+/// The atoms of `hex`.
+fn atoms_of(mol: &Molecule, lattice: Lattice, hex: Hex) -> Vec<u32> {
+    lattice
+        .vertices(hex)
+        .into_iter()
+        .map(|p| atom_at(mol, p))
+        .collect()
+}
+
+/// The atoms only `hex` has among `hexes`.
+fn own_atoms(mol: &Molecule, lattice: Lattice, hexes: &[Hex], hex: Hex) -> Vec<u32> {
+    let shared: BTreeSet<u32> = hexes
+        .iter()
+        .filter(|&&h| h != hex)
+        .flat_map(|&h| atoms_of(mol, lattice, h))
+        .collect();
+    atoms_of(mol, lattice, hex)
+        .into_iter()
+        .filter(|id| !shared.contains(id))
+        .collect()
+}
+
+/// `atoms`, which form an unbroken chain, walked from one end of it to the other.
+fn in_chain_order(mol: &Molecule, atoms: &[u32]) -> Vec<u32> {
+    let neighbours = |id: u32| -> Vec<u32> {
+        mol.neighbor_atom_ids(id)
+            .into_iter()
+            .filter(|n| atoms.contains(n))
+            .collect()
+    };
+    let start = atoms
+        .iter()
+        .copied()
+        .find(|&id| neighbours(id).len() < 2)
+        .expect("a chain has an end");
+    let mut walk = vec![start];
+    while let Some(next) = neighbours(*walk.last().unwrap())
+        .into_iter()
+        .find(|n| !walk.contains(n))
+    {
+        walk.push(next);
+    }
+    assert_eq!(walk.len(), atoms.len(), "the atoms form one chain");
+    walk
+}
+
+/// Pair off `atoms` along bonds, every one of them, or say it cannot be done.
+fn pair_off(mol: &Molecule, atoms: &mut Vec<u32>, pairs: &mut Vec<(u32, u32)>) -> bool {
+    let Some(first) = atoms.pop() else {
+        return true;
+    };
+    for partner in mol.neighbor_atom_ids(first) {
+        if let Some(at) = atoms.iter().position(|&id| id == partner) {
+            atoms.remove(at);
+            pairs.push((first, partner));
+            if pair_off(mol, atoms, pairs) {
+                return true;
+            }
+            pairs.pop();
+            atoms.insert(at, partner);
+        }
+    }
+    atoms.push(first);
+    false
+}
+
+/// Redraw the double bonds of `mol` as a Kekulé pattern of everything but `saturated`, whatever
+/// they were. `false`, with the bonds as they were, if there is no such pattern.
+fn kekulize_all_but(mol: &mut Molecule, saturated: &[u32]) -> bool {
+    let mut atoms: Vec<u32> = mol
+        .atoms
+        .iter()
+        .map(|a| a.id)
+        .filter(|id| !saturated.contains(id))
+        .collect();
+    let mut pairs = Vec::new();
+    if !pair_off(mol, &mut atoms, &mut pairs) {
+        return false;
+    }
+    for b in &mut mol.bonds {
+        b.order = if pairs.contains(&(b.begin, b.end)) || pairs.contains(&(b.end, b.begin)) {
+            BondOrder::Double
+        } else {
+            BondOrder::Single
+        };
+    }
+    true
+}
+
+/// A flake of `hexes` and the lattice it lies on, drawn with the keys.
+fn lattice_flake(hexes: &[Hex]) -> (Molecule, Lattice) {
+    let (mut e, lattice) = benzene();
+    let mut drawn = vec![hexes[0]];
+    for &hex in &hexes[1..] {
+        grow(&mut e, lattice, &mut drawn, hex);
+    }
+    (e.molecule, lattice)
+}
+
+/// `a` on the outer bonds of the benzene ring (0, 0) that `edges` picks. `kept` is out of reach of
+/// the aromatic system that press extends: every bond of those atoms stays as it was, unless the
+/// new ring itself runs through the atom.
+fn assert_a_leaves_alone(
+    mol: &Molecule,
+    lattice: Lattice,
+    edges: std::ops::Range<usize>,
+    kept: &[u32],
+    what: &str,
+) {
+    let hex = (0, 0);
+    let mut rings_drawn = 0;
+    for k in edges {
+        let far = Lattice::neighbour(hex, k);
+        let Some(bond) = lattice.bond_at(mol, lattice.edge_mid(hex, k)) else {
+            continue;
+        };
+        if lattice.is_drawn(mol, far) {
+            continue;
+        }
+        let mut e = fresh(mol);
+        press_on_bond(&mut e, bond, "a");
+        let what = format!("{what}, edge {k}");
+        assert_valences(&e.molecule, &what);
+        if !lattice.is_drawn(&e.molecule, far) {
+            assert_eq!(&e.molecule, mol, "{what}: no ring, no change");
+            continue;
+        }
+        rings_drawn += 1;
+
+        let on_new_ring = atoms_of(&e.molecule, lattice, far);
+        let off_the_ring = |id: u32| kept.contains(&id) && !on_new_ring.contains(&id);
+        for b in &mol.bonds {
+            if off_the_ring(b.begin) || off_the_ring(b.end) {
+                assert_eq!(
+                    e.molecule.bond_by_id(b.id).unwrap().order,
+                    b.order,
+                    "{what}: bond {}–{} changed",
+                    b.begin,
+                    b.end
+                );
+            }
+        }
+    }
+    assert!(rings_drawn > 0, "{what}: some bond has to take a ring");
+}
+
+/// Naphthalene with ring (0, 0) benzene and the two given positions of ring (1, 0) saturated, and
+/// that ring's four own atoms from one end to the other.
+fn dihydronaphthalene(positions: [usize; 2]) -> (Molecule, Lattice, Vec<u32>) {
+    let (mut mol, lattice) = lattice_flake(NAPHTHALENE);
+    let own = own_atoms(&mol, lattice, NAPHTHALENE, (1, 0));
+    let run = in_chain_order(&mol, &own);
+    let saturated = positions.map(|i| run[i]);
+    assert!(kekulize_all_but(&mut mol, &saturated));
+    (mol, lattice, run)
+}
+
+#[test]
+fn a_leaves_the_saturated_carbons_of_12_dihydronaphthalene() {
+    let (mol, lattice, run) = dihydronaphthalene([0, 1]);
+    assert_eq!(count_doubles(&mol), 4);
+    assert_a_leaves_alone(&mol, lattice, 0..6, &run, "1,2-dihydronaphthalene");
+}
+
+#[test]
+fn a_leaves_the_saturated_carbons_of_14_dihydronaphthalene() {
+    let (mol, lattice, run) = dihydronaphthalene([0, 3]);
+    assert_eq!(count_doubles(&mol), 4);
+    assert_a_leaves_alone(&mol, lattice, 0..6, &run, "1,4-dihydronaphthalene");
+}
+
+#[test]
+fn a_leaves_the_saturated_carbons_of_910_dihydroanthracene() {
+    const ANTHRACENE: &[Hex] = &[(0, 0), (1, 0), (2, 0)];
+    let (mut mol, lattice) = lattice_flake(ANTHRACENE);
+    let mut kept = own_atoms(&mol, lattice, ANTHRACENE, (1, 0));
+    assert_eq!(kept.len(), 2, "C9 and C10");
+    assert!(kekulize_all_but(&mut mol, &kept));
+    kept.extend(atoms_of(&mol, lattice, (2, 0)));
+    assert_a_leaves_alone(&mol, lattice, 0..6, &kept, "9,10-dihydroanthracene");
+}
+
+#[test]
+fn a_leaves_the_saturated_carbons_of_910_dihydrophenanthrene() {
+    const PHENANTHRENE: &[Hex] = &[(0, 0), (1, 0), (1, 1)];
+    let (mut mol, lattice) = lattice_flake(PHENANTHRENE);
+    let mut kept = own_atoms(&mol, lattice, PHENANTHRENE, (1, 0));
+    assert_eq!(kept.len(), 2, "C9 and C10");
+    assert!(kekulize_all_but(&mut mol, &kept));
+    kept.extend(atoms_of(&mol, lattice, (1, 1)));
+    assert_a_leaves_alone(&mol, lattice, 0..6, &kept, "9,10-dihydrophenanthrene");
+}
+
+#[test]
+fn a_leaves_the_saturated_carbons_of_1_indanone() {
+    let (mut e, lattice) = benzene();
+    let bond = lattice
+        .bond_at(&e.molecule, lattice.edge_mid((0, 0), 0))
+        .unwrap();
+    press_on_bond(&mut e, bond, "5");
+    let benzene_atoms = atoms_of(&e.molecule, lattice, (0, 0));
+    let own: Vec<u32> = e
+        .molecule
+        .atoms
+        .iter()
+        .map(|a| a.id)
+        .filter(|id| !benzene_atoms.contains(id))
+        .collect();
+    assert_eq!(own.len(), 3, "the five-membered ring's own carbons");
+    let c2 = own
+        .iter()
+        .copied()
+        .find(|&id| {
+            let m = &e.molecule;
+            m.neighbor_atom_ids(id).iter().all(|n| own.contains(n))
+        })
+        .expect("the carbon between the other two");
+    let c1 = own.iter().copied().find(|&id| id != c2).unwrap();
+    let c3 = own
+        .iter()
+        .copied()
+        .find(|&id| id != c2 && id != c1)
+        .unwrap();
+
+    let [x, y] = e.molecule.atom_by_id(c1).unwrap().pos;
+    let [cx, cy] = lattice.origin;
+    let scale = L / (x - cx).hypot(y - cy);
+    let at = [x + (x - cx) * scale, y + (y - cy) * scale];
+    let oxygen = e.molecule.add_atom("O".into(), at, 0);
+    e.molecule.add_bond(c1, oxygen, BondOrder::Double);
+
+    // The two bonds beside the five-membered ring have no hexagon of the lattice to take.
+    let kept = [c1, c2, c3, oxygen];
+    assert_a_leaves_alone(&e.molecule, lattice, 2..5, &kept, "1-indanone");
+}
+
+/// The wedge says which way a substituent points on an sp³ carbon: a double bond there would
+/// contradict the drawing, whatever pattern it completed.
+#[test]
+fn a_leaves_a_wedged_stereocentre_saturated() {
+    let (mut mol, lattice, run) = dihydronaphthalene([0, 1]);
+    let c1 = run[0];
+    let [x, y] = mol.atom_by_id(c1).unwrap().pos;
+    let [cx, cy] = lattice.centre((1, 0));
+    let scale = L / (x - cx).hypot(y - cy);
+    let tip = mol.add_atom("C".into(), [x + (x - cx) * scale, y + (y - cy) * scale], 0);
+    let wedge = mol.add_bond(c1, tip, BondOrder::Single);
+    mol.bond_by_id_mut(wedge).unwrap().stereo = BondStereo::WedgeUp;
+
+    let mut kept = run;
+    kept.push(tip);
+    assert_a_leaves_alone(&mol, lattice, 0..6, &kept, "the wedged stereocentre");
+}
+
+/// A carbon a rewrite gives a double bond to has to make room for it, wherever in the system it
+/// is. Here it is phenalene's leftover, across the molecule from the ring that pairs it up.
+#[test]
+fn a_rewrite_consumes_the_hydrogens_it_leaves_no_room_for() {
+    const PHENALENE: &[Hex] = &[(0, 0), (1, 0), (0, 1)];
+    let (mut mol, lattice) = lattice_flake(PHENALENE);
+    let leftover = own_atoms(&mol, lattice, PHENALENE, (0, 1))
+        .into_iter()
+        .find(|&id| kekulize_all_but(&mut mol, &[id]))
+        .expect("the far ring has an atom phenalene can do without");
+    let [x, y] = mol.atom_by_id(leftover).unwrap().pos;
+    let [cx, cy] = lattice.centre((0, 1));
+    for turn in [-30.0, 30.0] {
+        let [dx, dy] = turned([x - cx, y - cy], turn);
+        let h = mol.add_fragment_atom("H".into(), [x + dx * 0.7, y + dy * 0.7], 0);
+        mol.add_bond(leftover, h, BondOrder::Single);
+    }
+    assert_eq!(mol.bond_order_sum(leftover), 4);
+
+    let mut e = fresh(&mol);
+    let bond = lattice.bond_at(&mol, lattice.edge_mid((0, 0), 5)).unwrap();
+    press_on_bond(&mut e, bond, "a");
+
+    assert!(lattice.is_drawn(&e.molecule, (1, -1)), "the ring is drawn");
+    assert!(
+        e.molecule
+            .bonds_for_atom(leftover)
+            .iter()
+            .any(|b| b.order == BondOrder::Double),
+        "the leftover pairs up: all of pyrene's sixteen carbons do"
+    );
+    assert_eq!(
+        e.molecule.bond_order_sum(leftover),
+        4,
+        "no pentavalent carbon"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// The keyboard target from an atom, and undo
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The atom target goes on as the bond target does. The atom a ring ends on can be a ring-fusion
+/// atom with nowhere to go, and that must not be the end of the sheet.
+#[test]
+fn repeated_a_from_an_atom_target_grows_a_sheet() {
+    let mut e = type_keys("c a");
+    assert!(e.hotspot_bond.is_none(), "the target is the atom");
+    press_repeatedly(&mut e, "a", 36);
+    assert_eq!(ring_count(&e.molecule), 37);
+}
+
+/// The arrows walk from where the ring left the hotspot, however it would have gone on: going on
+/// is what the same key does, and nothing else.
+#[test]
+fn only_the_same_key_goes_on_from_the_next_atom() {
+    let mut e = type_keys("c a");
+    let ctx = egui::Context::default();
+    while e.ring_repeat.is_none() {
+        kbd_frame(&ctx, &mut e, "a");
+        assert!(
+            ring_count(&e.molecule) < 25,
+            "a press has to end on a full atom"
+        );
+    }
+    let parked = e.hotspot_atom.unwrap();
+    assert_eq!(e.ring_repeat.as_ref().unwrap().from, parked);
+    assert_ne!(e.ring_repeat.as_ref().unwrap().atom, parked);
+
+    let mut other_key = fresh(&e.molecule);
+    other_key.hotspot_atom = e.hotspot_atom;
+    other_key.ring_repeat = e.ring_repeat.clone();
+    kbd_frame(&ctx, &mut other_key, "v");
+    assert!(
+        other_key.ring_repeat.is_none(),
+        "another key ends the repeat"
+    );
+
+    let rings = ring_count(&e.molecule);
+    let (dx, dy) = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+        .into_iter()
+        .find(|&(dx, dy)| {
+            crate::widget::interact::navigate_direction(&e.molecule, parked, dx, dy).is_some()
+        })
+        .expect("a ring atom has a neighbour");
+    let arrow = match (dx as i32, dy as i32) {
+        (1, _) => "ArrowRight",
+        (-1, _) => "ArrowLeft",
+        (_, 1) => "ArrowDown",
+        _ => "ArrowUp",
+    };
+    let walked = crate::widget::interact::navigate_direction(&e.molecule, parked, dx, dy);
+    kbd_frame(&ctx, &mut e, arrow);
+    assert_eq!(e.hotspot_atom, walked, "the arrow walks from the hotspot");
+    assert!(e.ring_repeat.is_none(), "and ends the repeat");
+    assert_eq!(ring_count(&e.molecule), rings);
+}
+
+/// A ring key from an atom is the same press with a different ring.
+#[test]
+fn repeated_ring_key_from_an_atom_target_keeps_adding_rings() {
+    let mut e = type_keys("c 6");
+    let ctx = egui::Context::default();
+    for rings in 2..=12 {
+        kbd_frame(&ctx, &mut e, "6");
+        assert_eq!(ring_count(&e.molecule), rings);
+    }
+    assert_sound(&e.molecule, "saturated rings from an atom");
+}
+
+/// The Select tool's `a` presses on the same atom target.
+#[test]
+fn repeated_a_from_an_atom_target_in_the_select_tool() {
+    let mut e = type_keys("c a");
+    e.tool = crate::widget::Tool::Select;
+    let ctx = egui::Context::default();
+    for rings in 2..=12 {
+        kbd_frame(&ctx, &mut e, "a");
+        assert_eq!(ring_count(&e.molecule), rings);
+    }
+}
+
+/// Overshoot, undo, carry on: the natural way to draw a sheet. The press after the undo does what
+/// the undone one did, from a bond target and from an atom target, at every depth: some of these
+/// presses go on from the hotspot and some from the next atom.
+#[test]
+fn a_a_undo_a_carries_on_from_the_same_target() {
+    for start in ["c a Shift+ArrowRight", "c a"] {
+        for presses in 1..=7 {
+            let what = format!("{start}, {presses} presses");
+            let mut e = type_keys(start);
+            press_repeatedly(&mut e, "a", presses);
+            let before = e.molecule.clone();
+            press_repeatedly(&mut e, "a", 1);
+            let after = e.molecule.clone();
+
+            kbd_frame(&egui::Context::default(), &mut e, "Ctrl+Z");
+            assert_eq!(e.molecule, before, "{what}: undo takes one press back");
+
+            press_repeatedly(&mut e, "a", 1);
+            assert_eq!(e.molecule, after, "{what}: the press is drawn again");
+        }
+    }
+}
+
+/// Redo puts the target where the redone press left it, so a redo does not stop the next press
+/// either.
+#[test]
+fn a_undo_redo_a_carries_on_from_the_same_target() {
+    for start in ["c a Shift+ArrowRight", "c a"] {
+        for presses in 1..=7 {
+            let mut e = type_keys(start);
+            press_repeatedly(&mut e, "a", presses);
+            let ctx = egui::Context::default();
+            kbd_frame(&ctx, &mut e, "Ctrl+Z");
+            kbd_frame(&ctx, &mut e, "Ctrl+Y");
+            press_repeatedly(&mut e, "a", 1);
+        }
+    }
+}
