@@ -2242,6 +2242,28 @@ fn edits_between_presses_keep_the_record_true() {
     assert!(deleted.press_leftovers.is_empty());
 }
 
+/// Manually choosing a bond order makes its ends part of the drawing, even after changing back.
+#[test]
+fn manual_bond_orders_forget_a_press_leftover() {
+    let mut e = naphthalene(0.0);
+    let bond = peri_bond(&e.molecule);
+    press_on_bond(&mut e, bond, "a");
+    assert_eq!(e.molecule.atoms.len(), 13);
+    assert_eq!(e.molecule.press_leftovers, BTreeSet::from([24]));
+
+    for key in ["1", "2", "1"] {
+        press_on_bond(&mut e, 27, key);
+    }
+    assert_eq!(e.molecule.bond_by_id(27).unwrap().order, BondOrder::Single);
+    let json = serde_json::to_string(&e.molecule).unwrap();
+    let mut reloaded = fresh(&serde_json::from_str(&json).unwrap());
+    press_on_bond(&mut reloaded, 9, "a");
+    press_on_bond(&mut e, 9, "a");
+    assert_still_saturated(&reloaded.molecule, &[24], "the reloaded drawing");
+    assert_still_saturated(&e.molecule, &[24], "the manually edited drawing");
+    assert_eq!(e.molecule, reloaded.molecule);
+}
+
 /// The record is not in the file, and a leftover read back from one is a plain CH₂: it stays one,
 /// which is a sound drawing, one double bond short of the most it could have.
 #[test]

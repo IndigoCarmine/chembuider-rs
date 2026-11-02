@@ -472,14 +472,7 @@ impl ChemStructEditor {
             return false;
         }
         self.push_undo();
-        let Some(bond) = self.molecule.bond_by_id_mut(bond_id) else { return false };
-        let grew = order.valence() > bond.order.valence();
-        bond.order = order;
-        bond.stereo = stereo;
-        let (begin, end) = (bond.begin, bond.end);
-        if grew {
-            interact::consume_group_h(self, &[begin, end]);
-        }
+        interact::edit_bond_type(self, bond_id, order, stereo);
         true
     }
 

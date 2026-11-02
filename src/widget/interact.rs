@@ -33,11 +33,28 @@ pub(crate) fn consume_group_h(editor: &mut ChemStructEditor, atoms: &[u32]) {
 /// Cycle a bond's order (the mouse gesture for "make this a double bond"), consuming any
 /// group hydrogen the *increase* leaves no room for. A wrap back to single removes nothing.
 fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
-    let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) else { return };
-    let next = bond.order.cycle();
-    let grew = next.valence() > bond.order.valence();
-    bond.order = next;
+    let Some(bond) = editor.molecule.bond_by_id(bond_id) else {
+        return;
+    };
+    edit_bond_type(editor, bond_id, bond.order.cycle(), bond.stereo.clone());
+}
+
+/// Apply a manual bond edit. Ring matching writes orders directly and keeps its own record.
+pub(crate) fn edit_bond_type(
+    editor: &mut ChemStructEditor,
+    bond_id: u32,
+    order: BondOrder,
+    stereo: BondStereo,
+) {
+    let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) else {
+        return;
+    };
+    let grew = order.valence() > bond.order.valence();
+    bond.order = order;
+    bond.stereo = stereo;
     let (begin, end) = (bond.begin, bond.end);
+    editor.molecule.press_leftovers.remove(&begin);
+    editor.molecule.press_leftovers.remove(&end);
     if grew {
         consume_group_h(editor, &[begin, end]);
     }
@@ -1219,30 +1236,19 @@ fn apply_bond_action(
 ) -> KeyOutcome {
     match action {
         BondAction::Stereo { stereo } => {
-            if let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
+            if let Some(bond) = editor.molecule.bond_by_id(bond_id) {
                 // Cycle through stereo if same type pressed again
-                if bond.stereo == *stereo {
-                    bond.stereo = BondStereo::None;
+                let next = if bond.stereo == *stereo {
+                    BondStereo::None
                 } else {
-                    bond.stereo = stereo.clone();
-                }
+                    stereo.clone()
+                };
+                edit_bond_type(editor, bond_id, bond.order.clone(), next);
             }
             KeyOutcome::Edited
         }
         BondAction::Order { order } => {
-            if let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
-                // Raising the order consumes valence on both ends — this is the key that turns
-                // two `n`-inserted NH₂ nitrogens into the N=N of an azobenzene, and their group
-                // hydrogens have to go with the valence they were standing in for. Lowering it
-                // frees valence instead, and must not take a hydrogen with it.
-                let grew = order.valence() > bond.order.valence();
-                bond.order = order.clone();
-                bond.stereo = BondStereo::None;
-                let (begin, end) = (bond.begin, bond.end);
-                if grew {
-                    consume_group_h(editor, &[begin, end]);
-                }
-            }
+            edit_bond_type(editor, bond_id, order.clone(), BondStereo::None);
             KeyOutcome::Edited
         }
         // Fuse ring onto the bond (bond becomes one edge of the ring)
@@ -1584,7 +1590,14 @@ fn fuse_on_bond(
             .iter()
             .map(|fa| transform(fa.pos, flip))
             .collect();
-        fuse_at(editor, frag, &positions, (attach, next), (a_id, b_id), aimed)
+        fuse_at(
+            editor,
+            frag,
+            &positions,
+            (attach, next),
+            (a_id, b_id),
+            aimed,
+        )
     })
 }
 
