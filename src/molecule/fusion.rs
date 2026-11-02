@@ -214,6 +214,62 @@ impl Molecule {
         }
     }
 
+    /// `positions`, moved to lie as closely as they will over the atoms they land on, when those
+    /// are more than the two ends of the bond `shared`. The arguments are as for
+    /// [`fusion_fits`](Self::fusion_fits).
+    ///
+    /// Placed from the shared bond alone, a ring's far side swings with whatever error that one
+    /// short bond has, a little further out than the bond itself. The next ring is placed from
+    /// the far side of this one, so the error grows by a constant factor per ring: on a spiral of
+    /// fused hexagons the rounding of `f32` had a bond 4% out by the thirteenth ring, and by the
+    /// seventeenth rings no longer met the atoms they should have merged with. Where a ring
+    /// lands on more atoms it is held by all of them, and what is new sits between what is there.
+    ///
+    /// This is the similarity (rotation, scale, translation) with the least squared distance,
+    /// which for the two ends of a bond alone is the placement already given.
+    pub(crate) fn fit_to_atoms(
+        &self,
+        positions: &[[f32; 2]],
+        edge: (usize, usize),
+        shared: (u32, u32),
+    ) -> Vec<[f32; 2]> {
+        let held: Vec<([f32; 2], [f32; 2])> = positions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &p)| {
+                let id = match i {
+                    _ if i == edge.0 => shared.0,
+                    _ if i == edge.1 => shared.1,
+                    _ => self.fusion_snap(p)?,
+                };
+                Some((p, self.atom_by_id(id)?.pos))
+            })
+            .collect();
+        if held.len() < 3 {
+            return positions.to_vec();
+        }
+
+        let from = centroid(held.iter().map(|h| h.0));
+        let to = centroid(held.iter().map(|h| h.1));
+        // In complex numbers, the multiplier taking `p - from` as near as it goes to `q - to`.
+        let (mut re, mut im, mut norm) = (0.0, 0.0, 0.0);
+        for (p, q) in held {
+            let (px, py) = (p[0] - from[0], p[1] - from[1]);
+            let (qx, qy) = (q[0] - to[0], q[1] - to[1]);
+            re += px * qx + py * qy;
+            im += px * qy - py * qx;
+            norm += px * px + py * py;
+        }
+        let (a, b) = (re / norm, im / norm);
+        positions
+            .iter()
+            .map(|p| {
+                let (x, y) = (p[0] - from[0], p[1] - from[1]);
+                [to[0] + a * x - b * y, to[1] + b * x + a * y]
+            })
+            .collect()
+    }
+
     /// Whether the side of the bond `shared` that `point` lies on is the inside of a ring: walking
     /// the bonds round that side comes back to the bond having enclosed an area.
     ///

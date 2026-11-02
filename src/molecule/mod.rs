@@ -379,7 +379,7 @@ impl Molecule {
 
     /// Add an atom that a fragment brings with it. A fragment's hydrogens belong to the group
     /// it draws (see [`Atom::group_h`]); everything else is an ordinary atom.
-    fn add_fragment_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
+    pub(crate) fn add_fragment_atom(&mut self, element: String, pos: [f32; 2], charge: i8) -> u32 {
         let id = self.alloc_id();
         let group_h = element == "H";
         self.atoms.push(Atom { id, element, pos, charge, group_h, color: None, shadow: None });

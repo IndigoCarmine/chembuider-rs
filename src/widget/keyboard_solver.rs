@@ -565,8 +565,8 @@ fn nav_paths(mol: &Molecule, start: u32) -> Vec<(u32, String)> {
 
 /// A bond action: aim at the bond with `Shift+<arrow>`, act, then repeat the arrow **unshifted**.
 ///
-/// That trailing arrow is not cosmetic. A bond target survives its own action, and while one is
-/// set every atom key is routed to the bond instead of the atom — so without clearing it the
+/// That trailing arrow is not cosmetic. A bond target outlives its own action (a ring moves it on
+/// to a bond of that ring, ready for the next), and while one is set every atom key is routed to the bond instead of the atom — so without clearing it the
 /// next move would be silently misinterpreted. Space would clear it too, but Space also drops
 /// the atom hotspot, which nothing can re-acquire from the keyboard. The unshifted arrow is
 /// always available here: `Shift+<arrow>` only found a bond because that direction has a

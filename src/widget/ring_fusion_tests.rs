@@ -1018,3 +1018,487 @@ fn a_vertex_on_a_full_carbon_is_no_fit() {
         "no room for the ring, so no ring"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// On an atom
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Press `key` with `atom_id` targeted from the keyboard.
+fn press_on_atom(e: &mut ChemStructEditor, atom_id: u32, key: &str) {
+    e.hotspot_bond = None;
+    e.hotspot_atom = Some(atom_id);
+    kbd_frame(&egui::Context::default(), e, key);
+}
+
+/// Press `key` with the pointer resting on `atom_id`.
+fn hover_atom_and_press(e: &mut ChemStructEditor, atom_id: u32, key: &str) {
+    let at = e.mol_to_screen(
+        e.molecule.atom_by_id(atom_id).expect("atom exists").pos,
+        CANVAS.center(),
+    );
+    let ctx = egui::Context::default();
+    run_frame(&ctx, CANVAS, e, vec![egui::Event::PointerMoved(at)]);
+    run_frame(&ctx, CANVAS, e, vec![egui::Event::PointerMoved(at)]);
+    assert_eq!(
+        e.hovered_atom,
+        Some(atom_id),
+        "the pointer should be resting on the atom"
+    );
+    let (mut events, modifiers) = chord(key);
+    events.insert(0, egui::Event::PointerMoved(at));
+    run_frame_with_modifiers(&ctx, CANVAS, e, events, modifiers);
+}
+
+/// A flake of the given rings, in the middle of the canvas, and the atoms on a bond that has a
+/// free side: those are the atoms a ring can still be drawn at.
+fn flake(hexes: &[Hex]) -> (Molecule, BTreeSet<u32>) {
+    let (mut e, lattice) = benzene();
+    let mut drawn = vec![hexes[0]];
+    for &hex in &hexes[1..] {
+        grow(&mut e, lattice, &mut drawn, hex);
+    }
+    let mut rim = BTreeSet::new();
+    for &hex in hexes {
+        for k in 0..6 {
+            if !hexes.contains(&Lattice::neighbour(hex, k)) {
+                let id = lattice
+                    .bond_at(&e.molecule, lattice.edge_mid(hex, k))
+                    .unwrap();
+                let bond = e.molecule.bond_by_id(id).unwrap();
+                rim.extend([bond.begin, bond.end]);
+            }
+        }
+    }
+    centre(&mut e.molecule);
+    (e.molecule.clone(), rim)
+}
+
+const NAPHTHALENE: &[Hex] = &[(0, 0), (1, 0)];
+const PYRENE: &[Hex] = &[(0, 0), (1, 0), (0, 1), (1, -1)];
+const CORONENE: &[Hex] = &[(0, 0), (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1)];
+
+/// The reported press: `a` on any atom of a polycyclic. Where a ring can go it goes, as soundly
+/// as on a bond; where it cannot (an atom with rings all round it) nothing happens and undo has
+/// nothing to spend a press on.
+#[test]
+fn a_on_every_atom_of_a_polycyclic() {
+    for (name, hexes) in [
+        ("naphthalene", NAPHTHALENE),
+        ("pyrene", PYRENE),
+        ("coronene", CORONENE),
+    ] {
+        let (base, rim) = flake(hexes);
+        let rings = ring_count(&base);
+        for hover in [false, true] {
+            for atom in base.atoms.iter().map(|a| a.id) {
+                let mut e = fresh(&base);
+                if hover {
+                    hover_atom_and_press(&mut e, atom, "a");
+                } else {
+                    press_on_atom(&mut e, atom, "a");
+                }
+                let what = format!("{name} atom {atom} hover {hover}");
+                if rim.contains(&atom) {
+                    assert!(
+                        ring_count(&e.molecule) > rings,
+                        "{what}: a ring must appear"
+                    );
+                    assert_eq!(e.undo_stack.len(), 1, "{what}: one press, one step");
+                    assert_sound(&e.molecule, &what);
+                    assert_eq!(
+                        count_doubles(&e.molecule),
+                        max_double_bonds(&e.molecule),
+                        "{what}: double bonds"
+                    );
+                } else {
+                    assert_eq!(e.molecule, base, "{what}: rings all round, no room");
+                    assert!(e.undo_stack.is_empty(), "{what}: nothing to undo");
+                }
+            }
+        }
+    }
+}
+
+/// | atoms       | what `a` gives                 | atoms | bonds |
+/// |-------------|--------------------------------|-------|-------|
+/// | 6 outer CH  | anthracene or phenanthrene     | 14    | 16    |
+/// | 2 outer CH  | phenalene (peri fusion)        | 13    | 15    |
+/// | 2 fusion    | phenalene, on a free bond      | 13    | 15    |
+#[test]
+fn a_on_each_kind_of_naphthalene_atom() {
+    let (base, _) = flake(NAPHTHALENE);
+    let mut outer = HashMap::<(usize, usize), usize>::new();
+    for a in &base.atoms {
+        let mut e = fresh(&base);
+        press_on_atom(&mut e, a.id, "a");
+        let size = (e.molecule.atoms.len(), e.molecule.bonds.len());
+        if degree(&base, a.id) == 3 {
+            assert_eq!(size, (13, 15), "a fusion atom takes a peri ring");
+        } else {
+            *outer.entry(size).or_default() += 1;
+        }
+    }
+    assert_eq!(outer, HashMap::from([((14, 16), 6), ((13, 15), 2)]));
+}
+
+/// The ring keys take the same road on an atom: no over-bonded carbon, and no step for nothing.
+#[test]
+fn ring_keys_on_every_atom_of_a_polycyclic() {
+    for (name, hexes) in [
+        ("naphthalene", NAPHTHALENE),
+        ("pyrene", PYRENE),
+        ("coronene", CORONENE),
+    ] {
+        let (base, rim) = flake(hexes);
+        for key in ["4", "5", "6", "7", "8"] {
+            for atom in base.atoms.iter().map(|a| a.id) {
+                let mut e = fresh(&base);
+                press_on_atom(&mut e, atom, key);
+                let what = format!("`{key}` on {name} atom {atom}");
+                assert_valences(&e.molecule, &what);
+                assert_eq!(
+                    e.undo_stack.len(),
+                    usize::from(e.molecule != base),
+                    "{what}: a step is a change"
+                );
+                if !rim.contains(&atom) {
+                    assert_eq!(e.molecule, base, "{what}: rings all round, no room");
+                }
+            }
+        }
+    }
+}
+
+/// What was sound on an atom before stays. A chain end grows a phenyl (`c 1 1 a` is what the
+/// biphenyl and triphenylphosphine goldens are built with), and an aromatic CH does not make a
+/// biaryl and never did: its hexagon lies on the ring bond, so the result is a fused ring.
+#[test]
+fn a_keeps_what_was_sound_on_an_atom() {
+    let (toluene, methyl, _) = toluene();
+    let mut e = fresh(&toluene.molecule);
+    press_on_atom(&mut e, methyl, "a");
+    assert_eq!(e.molecule.atoms.len(), 12, "two rings on one bond");
+    assert_eq!(e.molecule.bonds.len(), 13);
+    assert_eq!(count_doubles(&e.molecule), 6, "two whole benzene rings");
+
+    let ethane = type_keys("c 1").molecule;
+    for a in &ethane.atoms {
+        let mut e = fresh(&ethane);
+        press_on_atom(&mut e, a.id, "a");
+        assert_eq!(e.molecule.atoms.len(), 7, "a phenyl on a chain end");
+        assert_eq!(e.molecule.bonds.len(), 7);
+        assert_eq!(count_doubles(&e.molecule), 3);
+        assert_valences(&e.molecule, "a phenyl on a chain end");
+    }
+
+    let (base, _) = benzene();
+    for a in &base.molecule.atoms {
+        let mut e = fresh(&base.molecule);
+        press_on_atom(&mut e, a.id, "a");
+        assert_eq!(e.molecule.atoms.len(), 10, "a ring carbon's `a` fuses");
+        assert_eq!(e.molecule.bonds.len(), 11);
+        assert_eq!(count_doubles(&e.molecule), 5, "naphthalene");
+        assert_sound(&e.molecule, "`a` on benzene's carbon");
+    }
+}
+
+/// An atom inside a chain: the hexagon lies along one of its bonds, and that bond is then a ring
+/// bond of a benzene like any other.
+#[test]
+fn a_inside_a_chain_draws_a_whole_benzene_on_its_bond() {
+    let propane = type_keys("c 1 1").molecule;
+    let middle = propane
+        .atoms
+        .iter()
+        .find(|a| degree(&propane, a.id) == 2)
+        .unwrap()
+        .id;
+    let mut e = fresh(&propane);
+    press_on_atom(&mut e, middle, "a");
+    assert_eq!(e.molecule.atoms.len(), 7, "toluene's carbons");
+    assert_eq!(e.molecule.bonds.len(), 7);
+    assert_eq!(count_doubles(&e.molecule), 3, "and its three double bonds");
+    assert_valences(&e.molecule, "toluene from propane");
+}
+
+/// Atoms that could not hold what was drawn on them, off the polycyclics. An `=CH₂` keeps its
+/// double bond and gets a ring with one fewer; a tertiary carbon has no room for two new bonds,
+/// so the ring goes on one of the bonds it already has.
+#[test]
+fn a_never_over_bonds_a_carbon() {
+    let ethene = type_keys("c 1 Shift+ArrowLeft 2").molecule;
+    for a in &ethene.atoms {
+        let mut e = fresh(&ethene);
+        press_on_atom(&mut e, a.id, "a");
+        assert_eq!(e.molecule.atoms.len(), 7, "the ring is drawn");
+        assert_valences(&e.molecule, "`a` on =CH₂");
+    }
+
+    let isobutane = type_keys("c 1 1 ArrowLeft 1").molecule;
+    let tertiary = isobutane
+        .atoms
+        .iter()
+        .find(|a| degree(&isobutane, a.id) == 3)
+        .unwrap()
+        .id;
+    let mut e = fresh(&isobutane);
+    press_on_atom(&mut e, tertiary, "a");
+    assert_eq!(ring_count(&e.molecule), 1, "the ring is drawn");
+    assert_valences(&e.molecule, "`a` on a tertiary carbon");
+
+    let (toluene, _, ipso) = toluene();
+    let mut e = fresh(&toluene.molecule);
+    press_on_atom(&mut e, ipso, "a");
+    assert_eq!(ring_count(&e.molecule), 2, "the ring is drawn");
+    assert_valences(&e.molecule, "`a` on a ring carbon with a substituent");
+}
+
+/// Neopentane's middle carbon, charged so that the press would have rewritten it: there is no
+/// bond to spare for a ring anywhere, so nothing may change, not even the atom.
+#[test]
+fn a_where_no_ring_can_go_is_no_undo_step() {
+    let mut base = ChemStructEditor::default();
+    let middle = base.molecule.add_atom("C".into(), [0.0, 0.0], 1);
+    let mut far = 0;
+    for pos in [[L, 0.0], [-L, 0.0], [0.0, L], [0.0, -L]] {
+        far = base.molecule.add_atom("C".into(), pos, 0);
+        base.molecule.add_bond(middle, far, BondOrder::Single);
+    }
+
+    let mut e = fresh(&base.molecule);
+    press_on_atom(&mut e, far, "1");
+    assert!(e.undo());
+    assert_eq!(e.redo_stack.len(), 1);
+    let undo_len = e.undo_stack.len();
+
+    press_on_atom(&mut e, middle, "a");
+
+    assert_eq!(e.molecule, base.molecule, "no room, so nothing changes");
+    assert_eq!(e.undo_stack.len(), undo_len, "nothing to undo");
+    assert_eq!(e.redo_stack.len(), 1, "and nothing was lost");
+}
+
+/// A heteroatom is left as the key has always left it, but a carbon next to one is held to four:
+/// on quinoline's nitrogen, the ring goes on bonds the carbons can take, or nowhere.
+#[test]
+fn a_on_a_ring_nitrogen_does_not_over_bond_its_carbons() {
+    let (base, _) = flake(NAPHTHALENE);
+    for n in base.atoms.iter().map(|a| a.id) {
+        let mut hetero = base.clone();
+        hetero.atom_by_id_mut(n).unwrap().element = "N".into();
+        let mut e = fresh(&hetero);
+        press_on_atom(&mut e, n, "a");
+        for a in e.molecule.atoms.iter().filter(|a| a.element == "C") {
+            assert!(
+                e.molecule.bond_order_sum(a.id) <= 4,
+                "`a` on N at {n}: carbon {} over-bonded",
+                a.id
+            );
+        }
+    }
+}
+
+/// One press on an atom is one undo step, and undo puts back what re-deriving the pattern moved.
+#[test]
+fn a_on_an_atom_is_one_undo_step() {
+    let (base, rim) = flake(PYRENE);
+    for &atom in &rim {
+        let mut e = fresh(&base);
+        press_on_atom(&mut e, atom, "a");
+        assert!(e.undo());
+        assert_eq!(e.molecule, base, "atom {atom}: undo goes back to pyrene");
+        assert!(!e.undo(), "atom {atom}: and that was the only step");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shift+A
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// `A` on a bond is `a`, whichever way the bond is targeted.
+#[test]
+fn shift_a_on_a_bond_is_a() {
+    let base = naphthalene(0.0).molecule;
+    for bond in base.bonds.iter().map(|b| b.id) {
+        for hover in [false, true] {
+            let mut lower = fresh(&base);
+            let mut upper = fresh(&base);
+            if hover {
+                hover_and_press(&mut lower, bond, "a");
+                hover_and_press(&mut upper, bond, "A");
+            } else {
+                press_on_bond(&mut lower, bond, "a");
+                press_on_bond(&mut upper, bond, "A");
+            }
+            assert_eq!(upper.molecule, lower.molecule, "bond {bond} hover {hover}");
+            assert_eq!(upper.undo_stack.len(), lower.undo_stack.len());
+        }
+    }
+}
+
+/// `A` on an atom already means something, and goes on meaning it: an acetyl group.
+#[test]
+fn shift_a_on_an_atom_is_still_acetyl() {
+    let mut e = type_keys("c 1");
+    let end = e.hotspot_atom.unwrap();
+    press_on_atom(&mut e, end, "A");
+    let oxygens = e.molecule.atoms.iter().filter(|a| a.element == "O").count();
+    assert_eq!(oxygens, 1, "the acetyl's carbonyl oxygen");
+    assert_eq!(
+        e.molecule.atoms.len(),
+        4,
+        "the end carbon is now the C=O of C(=O)CH₃"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// The keyboard target
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Press `key` `presses` times with nothing else in between, each one having to add a ring.
+fn press_repeatedly(e: &mut ChemStructEditor, key: &str, presses: usize) {
+    let ctx = egui::Context::default();
+    for press in 1..=presses {
+        let rings = ring_count(&e.molecule);
+        let steps = e.undo_stack.len();
+        kbd_frame(&ctx, e, key);
+        let what = format!("`{key}` press {press}");
+        assert_eq!(ring_count(&e.molecule), rings + 1, "{what}: one more ring");
+        assert_eq!(e.undo_stack.len(), steps + 1, "{what}: one more step");
+        assert_sound(&e.molecule, &what);
+        assert_eq!(
+            count_doubles(&e.molecule),
+            max_double_bonds(&e.molecule),
+            "{what}: double bonds"
+        );
+    }
+}
+
+/// Pressing `a` over and over from any bond of benzene draws a sheet, not a ribbon: the rings go
+/// round the first one, which is coronene at seven, and round that, which is circumcoronene at
+/// nineteen.
+#[test]
+fn repeated_a_with_no_other_input_grows_a_sheet() {
+    let (base, _) = benzene();
+    for bond in base.molecule.bonds.iter().map(|b| b.id) {
+        let mut e = fresh(&base.molecule);
+        e.hotspot_bond = Some(bond);
+
+        press_repeatedly(&mut e, "a", 6);
+        assert_eq!(e.molecule.atoms.len(), 24, "coronene has 24 carbons");
+        assert_eq!(e.molecule.bonds.len(), 30, "coronene has 30 bonds");
+
+        press_repeatedly(&mut e, "a", 12);
+        assert_eq!(ring_count(&e.molecule), 19);
+        assert_eq!(e.molecule.atoms.len(), 54, "circumcoronene has 54 carbons");
+        assert_eq!(e.molecule.bonds.len(), 72, "circumcoronene has 72 bonds");
+    }
+}
+
+/// Far enough out that rounding would have ruined the lattice if each ring were placed from one
+/// bond: three shells round the first ring, with every bond still a bond long.
+#[test]
+fn a_sheet_stays_on_its_lattice() {
+    let (base, _) = benzene();
+    let mut e = fresh(&base.molecule);
+    e.hotspot_bond = Some(base.molecule.bonds[0].id);
+    press_repeatedly(&mut e, "a", 36);
+    assert_eq!(ring_count(&e.molecule), 37);
+    assert_eq!(e.molecule.atoms.len(), 96, "three shells have 96 carbons");
+    assert_eq!(e.molecule.bonds.len(), 132);
+}
+
+/// The real sequence, keys only, and `A` repeats as well as `a` does.
+#[test]
+fn repeated_a_straight_after_aiming_with_the_arrows() {
+    for key in ["a", "A"] {
+        let mut e = type_keys("c a Shift+ArrowRight");
+        press_repeatedly(&mut e, key, 8);
+        assert_eq!(ring_count(&e.molecule), 9);
+    }
+}
+
+/// The start need not be a lone ring: from every rim bond of a flake that takes a ring, it goes
+/// on taking them.
+#[test]
+fn repeated_a_keeps_going_from_a_flake() {
+    for hexes in [NAPHTHALENE, PYRENE, CORONENE] {
+        let (base, _) = flake(hexes);
+        for bond in base.bonds.iter().map(|b| b.id) {
+            let mut e = fresh(&base);
+            press_on_bond(&mut e, bond, "a");
+            if ring_count(&e.molecule) > ring_count(&base) {
+                press_repeatedly(&mut e, "a", 8);
+            }
+        }
+    }
+}
+
+/// The target lands on a bond of the ring just drawn, with room on its far side, and the atom
+/// hotspot stays so that the arrows walk on from where they were.
+#[test]
+fn the_target_moves_to_an_outer_bond_of_the_new_ring() {
+    let (base, lattice) = benzene();
+    let start = lattice
+        .bond_at(&base.molecule, lattice.edge_mid((0, 0), 0))
+        .unwrap();
+    let mut e = fresh(&base.molecule);
+    e.hotspot_atom = base.hotspot_atom;
+    e.hotspot_bond = Some(start);
+
+    kbd_frame(&egui::Context::default(), &mut e, "a");
+
+    let target = e.hotspot_bond.expect("a target remains");
+    assert_ne!(target, start, "the old bond has rings on both sides");
+    let on_new_ring = (0..6)
+        .filter_map(|k| lattice.bond_at(&e.molecule, lattice.edge_mid((1, 0), k)))
+        .any(|b| b == target);
+    assert!(on_new_ring, "the target is on the ring just drawn");
+    assert_eq!(e.hotspot_atom, base.hotspot_atom);
+}
+
+/// A ring key moves the target too: it is the same press with a different ring.
+#[test]
+fn a_ring_key_moves_the_target_too() {
+    let mut e = type_keys("c 6 Shift+ArrowRight");
+    let ctx = egui::Context::default();
+    for rings in 2..=7 {
+        kbd_frame(&ctx, &mut e, "6");
+        assert_eq!(ring_count(&e.molecule), rings);
+    }
+    assert_sound(&e.molecule, "saturated rings round a saturated ring");
+    assert_eq!(count_doubles(&e.molecule), 0);
+}
+
+/// The mouse has its own target, and a hovered press leaves the keyboard's where it was.
+#[test]
+fn a_hovered_press_does_not_move_the_keyboard_target() {
+    let (base, lattice) = benzene();
+    let hovered = lattice
+        .bond_at(&base.molecule, lattice.edge_mid((0, 0), 0))
+        .unwrap();
+    let parked = lattice
+        .bond_at(&base.molecule, lattice.edge_mid((0, 0), 3))
+        .unwrap();
+    for target in [None, Some(parked)] {
+        let mut e = fresh(&base.molecule);
+        e.hotspot_bond = target;
+        centre(&mut e.molecule);
+        hover_and_press(&mut e, hovered, "a");
+        assert_eq!(e.molecule.atoms.len(), 10, "the ring is drawn");
+        assert_eq!(e.hotspot_bond, target, "the keyboard target stays put");
+    }
+}
+
+/// A press that adds no ring does not move the target: there was no room, or it was not a ring.
+#[test]
+fn a_press_that_adds_no_ring_leaves_the_target_alone() {
+    let mut e = naphthalene(0.0);
+    let fusion = fusion_bond(&e.molecule);
+    press_on_bond(&mut e, fusion, "a");
+    assert_eq!(e.hotspot_bond, Some(fusion));
+
+    let bond = peri_bond(&e.molecule);
+    press_on_bond(&mut e, bond, "2");
+    assert_eq!(e.hotspot_bond, Some(bond), "an order key draws no ring");
+}
