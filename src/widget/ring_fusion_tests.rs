@@ -1778,8 +1778,8 @@ fn a_rewrite_consumes_the_hydrogens_it_leaves_no_room_for() {
     let (mut mol, lattice) = lattice_flake(PHENALENE);
     let leftover = own_atoms(&mol, lattice, PHENALENE, (0, 1))
         .into_iter()
-        .find(|&id| kekulize_all_but(&mut mol, &[id]))
-        .expect("the far ring has an atom phenalene can do without");
+        .find(|&id| mol.bond_order_sum(id) == 2)
+        .expect("the last ring's press left one of its atoms over");
     let [x, y] = mol.atom_by_id(leftover).unwrap().pos;
     let [cx, cy] = lattice.centre((0, 1));
     for turn in [-30.0, 30.0] {
@@ -1809,6 +1809,460 @@ fn a_rewrite_consumes_the_hydrogens_it_leaves_no_room_for() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Carbons drawn saturated
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Two benzene rings on a central ring, and what bridges them: a lone CH₂, and for a six-membered
+/// centre whatever the caller makes of `centre[2]`. The centre runs `centre[0]`, `centre[1]`, … and
+/// the rings stand on `centre[0]`–`centre[1]` and the bond opposite it. Each ring is listed as a
+/// walk starting along that bond backwards, so `rings[i][1]` is the lower-numbered centre atom and
+/// `rings[i][2]` the benzene atom beside it.
+struct Bridged {
+    mol: Molecule,
+    centre: Vec<u32>,
+    rings: [Vec<u32>; 2],
+    ch2: u32,
+}
+
+/// Give `ring`, a walk round six atoms, a Kekulé pattern: `phase` 0 starts on the bond from
+/// `ring[0]` to `ring[1]`, and 1 on the next one.
+fn alternate(mol: &mut Molecule, ring: &[u32], phase: usize) {
+    for k in (phase..ring.len()).step_by(2) {
+        let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+        let id = mol.bond_between(a, b).unwrap().id;
+        mol.bond_by_id_mut(id).unwrap().order = BondOrder::Double;
+    }
+}
+
+fn bridged(n: usize, phases: [usize; 2]) -> Bridged {
+    let mut e = ChemStructEditor::default();
+    let centre = polygon(&mut e, n, None);
+    let far = n / 2;
+    let rings = [(0, 1), (far, far + 1)].map(|(a, b)| {
+        let edge = (centre[b], centre[a]);
+        polygon(&mut e, 6, Some(edge))
+    });
+    for (ring, phase) in rings.iter().zip(phases) {
+        alternate(&mut e.molecule, ring, phase);
+    }
+    Bridged {
+        mol: e.molecule,
+        ch2: centre[n - 1],
+        centre,
+        rings,
+    }
+}
+
+fn fluorene(phases: [usize; 2]) -> Bridged {
+    bridged(5, phases)
+}
+
+/// The six-membered centre with `element` opposite the CH₂: xanthene, thioxanthene and
+/// 9,10-dihydroacridine.
+fn bridged_by(element: &str, phases: [usize; 2]) -> Bridged {
+    let mut b = bridged(6, phases);
+    b.mol.atom_by_id_mut(b.centre[2]).unwrap().element = element.into();
+    b
+}
+
+fn anthrone(phases: [usize; 2]) -> Bridged {
+    let mut b = bridged(6, phases);
+    let carbonyl = b.centre[2];
+    let [x, y] = b.mol.atom_by_id(carbonyl).unwrap().pos;
+    let n = b.centre.len() as f32;
+    let middle = |axis: usize| {
+        b.centre
+            .iter()
+            .map(|&id| b.mol.atom_by_id(id).unwrap().pos[axis])
+            .sum::<f32>()
+            / n
+    };
+    let (cx, cy) = (middle(0), middle(1));
+    let scale = L / (x - cx).hypot(y - cy);
+    let oxygen = b
+        .mol
+        .add_atom("O".into(), [x + (x - cx) * scale, y + (y - cy) * scale], 0);
+    b.mol.add_bond(carbonyl, oxygen, BondOrder::Double);
+    b
+}
+
+/// Every Kekulé pattern of the two benzene rings.
+const PHASES: [[usize; 2]; 4] = [[0, 0], [0, 1], [1, 0], [1, 1]];
+
+/// That no atom of `saturated` has come by a double bond, and nothing is over-bonded.
+fn assert_still_saturated(mol: &Molecule, saturated: &[u32], what: &str) {
+    for &id in saturated {
+        let doubles: Vec<(u32, u32)> = mol
+            .bonds_for_atom(id)
+            .iter()
+            .filter(|b| b.order == BondOrder::Double)
+            .map(|b| (b.begin, b.end))
+            .collect();
+        assert!(doubles.is_empty(), "{what}: {id} gained {doubles:?}");
+    }
+    assert_valences(mol, what);
+}
+
+/// `a` on every bond of `mol`, and from each result `a` again, both on every bond and wherever the
+/// target moved to by itself: no atom of `saturated` may come out with a double bond.
+fn assert_a_keeps_saturated(mol: &Molecule, saturated: &[u32], what: &str) {
+    let mut rings_drawn = 0;
+    for first in mol.bonds.iter().map(|b| b.id) {
+        let mut once = fresh(mol);
+        press_on_bond(&mut once, first, "a");
+        let what = format!("{what}, bond {first}");
+        assert_still_saturated(&once.molecule, saturated, &what);
+        if once.molecule.bonds.len() == mol.bonds.len() {
+            continue;
+        }
+        rings_drawn += 1;
+
+        let mut twice = fresh(mol);
+        press_on_bond(&mut twice, first, "a");
+        kbd_frame(&egui::Context::default(), &mut twice, "a");
+        let moved_on = format!("{what}, then wherever the target went");
+        assert_still_saturated(&twice.molecule, saturated, &moved_on);
+
+        for second in once.molecule.bonds.iter().map(|b| b.id) {
+            let mut twice = fresh(&once.molecule);
+            press_on_bond(&mut twice, second, "a");
+            let what = format!("{what}, then {second}");
+            assert_still_saturated(&twice.molecule, saturated, &what);
+        }
+    }
+    assert!(rings_drawn > 0, "{what}: some bond has to take a ring");
+}
+
+#[test]
+fn a_leaves_the_ch2_of_fluorene() {
+    for phases in PHASES {
+        let f = fluorene(phases);
+        assert_a_keeps_saturated(&f.mol, &[f.ch2], &format!("fluorene {phases:?}"));
+    }
+}
+
+#[test]
+fn a_leaves_the_ch2_of_xanthene() {
+    for phases in PHASES {
+        let f = bridged_by("O", phases);
+        assert_a_keeps_saturated(&f.mol, &[f.ch2], &format!("xanthene {phases:?}"));
+    }
+}
+
+#[test]
+fn a_leaves_the_ch2_of_dihydroacridine() {
+    for phases in PHASES {
+        let f = bridged_by("N", phases);
+        let saturated = [f.ch2, f.centre[2]];
+        assert_a_keeps_saturated(&f.mol, &saturated, &format!("dihydroacridine {phases:?}"));
+    }
+}
+
+#[test]
+fn a_leaves_the_ch2_of_thioxanthene() {
+    for phases in PHASES {
+        let f = bridged_by("S", phases);
+        assert_a_keeps_saturated(&f.mol, &[f.ch2], &format!("thioxanthene {phases:?}"));
+    }
+}
+
+#[test]
+fn a_leaves_the_ch2_of_anthrone() {
+    for phases in PHASES {
+        let f = anthrone(phases);
+        assert_a_keeps_saturated(&f.mol, &[f.ch2], &format!("anthrone {phases:?}"));
+    }
+}
+
+/// Two lone CH₂ groups: a ring through the one must not make the other look like a leftover.
+#[test]
+fn a_leaves_the_ch2_groups_of_dihydroanthracene() {
+    for phases in PHASES {
+        let f = bridged(6, phases);
+        let saturated = [f.ch2, f.centre[2]];
+        let what = format!("dihydroanthracene {phases:?}");
+        assert_a_keeps_saturated(&f.mol, &saturated, &what);
+    }
+}
+
+/// Indene, drawn both ways round: the CH₂ can sit on either side of the five-membered ring's C=C.
+#[test]
+fn a_leaves_the_ch2_of_indene() {
+    for phase in [0, 1] {
+        for (ch2, double) in [(4, (2, 3)), (2, (3, 4))] {
+            let mut e = ChemStructEditor::default();
+            let five = polygon(&mut e, 5, None);
+            let six = polygon(&mut e, 6, Some((five[1], five[0])));
+            alternate(&mut e.molecule, &six, phase);
+            let id = e
+                .molecule
+                .bond_between(five[double.0], five[double.1])
+                .unwrap()
+                .id;
+            e.molecule.bond_by_id_mut(id).unwrap().order = BondOrder::Double;
+            let what = format!("indene, phase {phase}, CH2 at {ch2}");
+            assert_a_keeps_saturated(&e.molecule, &[five[ch2]], &what);
+        }
+    }
+}
+
+/// The hexagon on these bonds comes down on the CH₂ itself: the outer bonds beside the bridge and
+/// the bridge's own bonds. The ring is still drawn, the CH₂ stays one, and the rest of the ring
+/// takes the best pattern there is around it.
+#[test]
+fn a_ring_drawn_through_a_ch2_goes_round_it() {
+    type Make = fn([usize; 2]) -> Bridged;
+    let molecules: [(&str, Make); 3] = [
+        ("anthrone", anthrone),
+        ("xanthene", |p| bridged_by("O", p)),
+        ("dihydroacridine", |p| bridged_by("N", p)),
+    ];
+    for (name, make) in molecules {
+        for phases in PHASES {
+            let f = make(phases);
+            let ch2 = f.ch2;
+            let (first, last) = (f.centre[0], f.centre[4]);
+            for (u, v) in [
+                (f.rings[0][2], first),
+                (f.rings[1][5], last),
+                (last, ch2),
+                (ch2, first),
+            ] {
+                let what = format!("{name} {phases:?}, bond {u}-{v}");
+                let bond = f.mol.bond_between(u, v).unwrap().id;
+                let mut e = fresh(&f.mol);
+                press_on_bond(&mut e, bond, "a");
+                let m = &e.molecule;
+                assert_eq!(ring_count(m), ring_count(&f.mol) + 1, "{what}: the ring");
+                assert_still_saturated(m, &[ch2], &what);
+                for end in [first, last] {
+                    assert_eq!(
+                        m.bond_between(end, ch2).unwrap().order,
+                        BondOrder::Single,
+                        "{what}: the bridge's bonds stay single"
+                    );
+                }
+
+                // All that can carry a double bond here is the skeleton left without the CH₂ and
+                // the atoms that speak for themselves: heteroatoms, and the carbonyl's carbon.
+                let carbonyl = m
+                    .atoms
+                    .iter()
+                    .filter(|a| a.element == "O" && degree(m, a.id) == 1)
+                    .map(|a| m.neighbor_atom_ids(a.id)[0]);
+                let elsewhere = m.atoms.iter().filter(|a| a.element != "C").map(|a| a.id);
+                let inert: Vec<u32> = elsewhere.chain(carbonyl).chain([ch2]).collect();
+                let mut rest = m.clone();
+                for &id in &inert {
+                    rest.remove_atom(id);
+                }
+                assert_eq!(
+                    count_doubles(&rest),
+                    max_double_bonds(&rest),
+                    "{what}: double bonds"
+                );
+            }
+        }
+    }
+}
+
+/// Pointing at the CH₂ itself is asking for the ring there: it joins the ring's pattern, and the
+/// exception goes no further than that one atom. The next CH₂ along is nobody's target.
+#[test]
+fn a_aimed_at_a_ch2_is_the_users_to_ask_for() {
+    let f = bridged_by("O", [0, 0]);
+    let mut e = fresh(&f.mol);
+    press_on_atom(&mut e, f.ch2, "a");
+    assert_eq!(ring_count(&e.molecule), ring_count(&f.mol) + 1);
+    assert!(
+        e.molecule
+            .bonds_for_atom(f.ch2)
+            .iter()
+            .any(|b| b.order == BondOrder::Double),
+        "the atom the user pointed at takes part"
+    );
+    assert_valences(&e.molecule, "`a` on the CH2");
+
+    const PHENANTHRENE: &[Hex] = &[(0, 0), (1, 0), (1, 1)];
+    let (mut mol, lattice) = lattice_flake(PHENANTHRENE);
+    let both = own_atoms(&mol, lattice, PHENANTHRENE, (1, 0));
+    assert!(kekulize_all_but(&mut mol, &both));
+    let (aimed, other) = (both[0], both[1]);
+    // On the bond out of the benzene ring, not the one between the two CH₂ groups, so that the
+    // press has to rewrite the pattern.
+    let mut e = fresh(&mol);
+    let beside = mol
+        .neighbor_atom_ids(aimed)
+        .into_iter()
+        .find(|&id| id != other)
+        .unwrap();
+    let bond = mol.bond_between(aimed, beside).unwrap().id;
+    press_on_bond(&mut e, bond, "a");
+    assert_still_saturated(&e.molecule, &both, "the bond beside it");
+    let mut e = fresh(&mol);
+    press_on_atom(&mut e, aimed, "a");
+    assert_eq!(ring_count(&e.molecule), ring_count(&mol) + 1);
+    assert_still_saturated(&e.molecule, &[other], "the other CH2");
+}
+
+/// Repeated presses from an atom go on from wherever the last ring left off, and that can be a CH₂
+/// a ring went through. Pressing on from there is not the user pointing at it. Going there with
+/// the arrows is.
+#[test]
+fn repeated_a_from_an_atom_does_not_count_as_aiming_at_a_ch2() {
+    type Make = fn([usize; 2]) -> Bridged;
+    let molecules: [(&str, Make); 3] = [
+        ("xanthene", |p| bridged_by("O", p)),
+        ("thioxanthene", |p| bridged_by("S", p)),
+        ("anthrone", anthrone),
+    ];
+    let mut went_on_from_it = 0;
+    for (name, make) in molecules {
+        for phases in PHASES {
+            let f = make(phases);
+            let carbons = f.mol.atoms.iter().filter(|a| a.element == "C");
+            for start in carbons.map(|a| a.id).filter(|&id| id != f.ch2) {
+                let mut e = fresh(&f.mol);
+                press_on_atom(&mut e, start, "a");
+                let ctx = egui::Context::default();
+                for press in 2..=10 {
+                    let next = e.ring_repeat.as_ref().map(|r| r.atom);
+                    went_on_from_it += usize::from(next == Some(f.ch2));
+                    kbd_frame(&ctx, &mut e, "a");
+                    let what = format!("{name} {phases:?}, from {start}, press {press}");
+                    assert_still_saturated(&e.molecule, &[f.ch2], &what);
+                }
+            }
+        }
+    }
+    assert!(went_on_from_it > 0, "some repeat has to go on from the CH2");
+
+    // The same atom, reached with the arrows, is pointed at.
+    let f = bridged_by("O", [0, 0]);
+    let start = f.centre[0];
+    let mut e = fresh(&f.mol);
+    e.hotspot_atom = Some(start);
+    let [dx, dy] = {
+        let (p, q) = (
+            f.mol.atom_by_id(start).unwrap().pos,
+            f.mol.atom_by_id(f.ch2).unwrap().pos,
+        );
+        [q[0] - p[0], q[1] - p[1]]
+    };
+    let arrow = if dx.abs() > dy.abs() {
+        if dx > 0.0 { "ArrowRight" } else { "ArrowLeft" }
+    } else if dy > 0.0 {
+        "ArrowDown"
+    } else {
+        "ArrowUp"
+    };
+    let ctx = egui::Context::default();
+    kbd_frame(&ctx, &mut e, arrow);
+    assert_eq!(e.hotspot_atom, Some(f.ch2), "the arrow goes to the CH2");
+    kbd_frame(&ctx, &mut e, "a");
+    assert!(
+        e.molecule
+            .bonds_for_atom(f.ch2)
+            .iter()
+            .any(|b| b.order == BondOrder::Double),
+        "pressed there on purpose"
+    );
+}
+
+/// What a press left over is what the next one may pair, for as long as it is still in the
+/// history: undone with the press that made it, and back with the redo.
+#[test]
+fn a_leftover_follows_undo_and_redo() {
+    let mut e = naphthalene(0.0);
+    let bond = peri_bond(&e.molecule);
+    press_on_bond(&mut e, bond, "a");
+    let phenalene = e.molecule.clone();
+    assert_eq!(phenalene.press_leftovers.len(), 1, "13 carbons, 6 pairs");
+
+    assert!(e.undo());
+    assert!(e.molecule.press_leftovers.is_empty());
+    assert!(e.redo());
+    assert_eq!(e.molecule, phenalene);
+    assert_eq!(e.molecule.press_leftovers, phenalene.press_leftovers);
+}
+
+/// Working out where the target goes next tries presses and takes them back, and those can pair
+/// the leftover up. None of that may reach the record.
+#[test]
+fn a_press_taken_back_records_nothing() {
+    let mut e = naphthalene(0.0);
+    let bond = peri_bond(&e.molecule);
+    press_on_bond(&mut e, bond, "a");
+    assert_ne!(e.hotspot_bond, Some(bond), "the trial presses ran");
+
+    let single: BTreeSet<u32> = e
+        .molecule
+        .atoms
+        .iter()
+        .map(|a| a.id)
+        .filter(|&id| {
+            let bonds = e.molecule.bonds_for_atom(id);
+            bonds.iter().all(|b| b.order == BondOrder::Single)
+        })
+        .collect();
+    assert_eq!(e.molecule.press_leftovers, single, "the one left over");
+}
+
+/// The record is of the drawing, not a licence: a wedge drawn on the leftover since says it is
+/// sp³, deleting it forgets it, and pairing it by hand or by a ring strikes it off.
+#[test]
+fn edits_between_presses_keep_the_record_true() {
+    const PHENALENE: &[Hex] = &[(0, 0), (1, 0), (0, 1)];
+    let (mol, lattice) = lattice_flake(PHENALENE);
+    let leftover = *mol.press_leftovers.first().expect("phenalene leaves one");
+    let bond = lattice.bond_at(&mol, lattice.edge_mid((0, 0), 5)).unwrap();
+
+    let mut paired = fresh(&mol);
+    press_on_bond(&mut paired, bond, "a");
+    assert!(
+        paired.molecule.press_leftovers.is_empty(),
+        "pyrene has none left: {:?}",
+        paired.molecule.press_leftovers
+    );
+
+    let mut wedged = mol.clone();
+    let [x, y] = mol.atom_by_id(leftover).unwrap().pos;
+    let [cx, cy] = lattice.centre((0, 1));
+    let scale = L / (x - cx).hypot(y - cy);
+    let tip = wedged.add_atom("C".into(), [x + (x - cx) * scale, y + (y - cy) * scale], 0);
+    let wedge = wedged.add_bond(leftover, tip, BondOrder::Single);
+    wedged.bond_by_id_mut(wedge).unwrap().stereo = BondStereo::WedgeUp;
+    let mut e = fresh(&wedged);
+    press_on_bond(&mut e, bond, "a");
+    assert!(lattice.is_drawn(&e.molecule, (1, -1)), "the ring is drawn");
+    assert_still_saturated(&e.molecule, &[leftover], "the wedged leftover");
+
+    let mut deleted = mol.clone();
+    deleted.remove_atom(leftover);
+    assert!(deleted.press_leftovers.is_empty());
+}
+
+/// The record is not in the file, and a leftover read back from one is a plain CH₂: it stays one,
+/// which is a sound drawing, one double bond short of the most it could have.
+#[test]
+fn a_leftover_is_not_saved() {
+    const PHENALENE: &[Hex] = &[(0, 0), (1, 0), (0, 1)];
+    let (mol, lattice) = lattice_flake(PHENALENE);
+    let leftover = *mol.press_leftovers.first().expect("phenalene leaves one");
+
+    let json = serde_json::to_string(&mol).unwrap();
+    assert!(!json.contains("press_leftovers"), "{json}");
+    let read: Molecule = serde_json::from_str(&json).unwrap();
+    assert!(read.press_leftovers.is_empty());
+
+    let bond = lattice.bond_at(&read, lattice.edge_mid((0, 0), 5)).unwrap();
+    let mut e = fresh(&read);
+    press_on_bond(&mut e, bond, "a");
+    assert!(lattice.is_drawn(&e.molecule, (1, -1)), "the ring is drawn");
+    assert_still_saturated(&e.molecule, &[leftover], "a CH2 read from a file");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // The keyboard target from an atom, and undo
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1828,7 +2282,7 @@ fn repeated_a_from_an_atom_target_grows_a_sheet() {
 fn only_the_same_key_goes_on_from_the_next_atom() {
     let mut e = type_keys("c a");
     let ctx = egui::Context::default();
-    while e.ring_repeat.is_none() {
+    while e.ring_repeat.as_ref().is_none_or(|r| r.atom == r.from) {
         kbd_frame(&ctx, &mut e, "a");
         assert!(
             ring_count(&e.molecule) < 25,

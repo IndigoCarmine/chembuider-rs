@@ -225,7 +225,7 @@ pub struct ChemStructEditor {
     /// moving the atom hotspot.
     pub hotspot_bond: Option<u32>,
 
-    /// Set while the next press of a ring key should go on from another atom than the hotspot.
+    /// Set while the next press of a ring key would go on from where a ring left off.
     ring_repeat: Option<RingRepeat>,
 
     /// Loaded keyboard/fragment configuration (from JSON).
@@ -386,7 +386,8 @@ pub(crate) struct KeyboardTarget {
     ring_repeat: Option<RingRepeat>,
 }
 
-/// Where pressing a ring key again goes on from, when the hotspot it drew from has no room.
+/// Where pressing a ring key again goes on from: the hotspot the ring left, or if that has no room
+/// another atom of the ring.
 #[derive(Clone)]
 pub(crate) struct RingRepeat {
     /// The key that drew the ring.

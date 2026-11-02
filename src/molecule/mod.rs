@@ -29,6 +29,7 @@ mod fusion;
 mod kekule;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub use page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TableEntry, TextAlign};
 pub use bracket::{Bracket, BracketShape, BracketUsage, RepeatPattern};
@@ -310,10 +311,17 @@ pub struct Molecule {
     /// from the same allocator as atoms and bonds, so one id never names two things.
     pub objects: Vec<PageObject>,
     next_id: u32,
+    /// The atoms a ring press drew and could not give a partner: phenalene's odd carbon, which
+    /// looks just like a CH₂ the user drew but which the next ring may pair up
+    /// ([`rekekulize`](Self::rekekulize)). It lives here so that undo, redo and a press taken back
+    /// carry it with the drawing. A record of how the drawing came about, not part of it: it is
+    /// not saved, and a leftover read from a file is simply a CH₂.
+    pub(crate) press_leftovers: BTreeSet<u32>,
 }
 
 /// What a saved [`Molecule`] holds: everything but the id allocator, which is re-derived on
-/// load so a new atom or bond never reuses an id already in the file.
+/// load so a new atom or bond never reuses an id already in the file, and the record of what
+/// presses left over.
 #[derive(Serialize, Deserialize)]
 struct MoleculeData {
     name: String,
@@ -342,6 +350,7 @@ impl From<MoleculeData> for Molecule {
             ring_fills: d.ring_fills,
             objects: d.objects,
             next_id: max_id.map_or(1, |m| m + 1),
+            press_leftovers: BTreeSet::new(),
         }
     }
 }
@@ -361,6 +370,7 @@ impl Default for Molecule {
             ring_fills: Vec::new(),
             objects: Vec::new(),
             next_id: 1,
+            press_leftovers: BTreeSet::new(),
         }
     }
 }
@@ -448,6 +458,7 @@ impl Molecule {
     pub fn remove_atom(&mut self, id: u32) {
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
+        self.press_leftovers.remove(&id);
         self.drop_broken_ring_fills();
         self.drop_atom_from_brackets(id);
     }

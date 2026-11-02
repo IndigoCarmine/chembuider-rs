@@ -12,11 +12,12 @@
 //! no perfect matching exists (phenalene's 13 carbons) the result is a maximum one: an atom left
 //! over simply has single bonds, which is a valid CH₂ and never an over-bonded carbon.
 //!
-//! Which atoms the matching gets to touch is the other half of it. A carbon the drawing leaves
-//! without a double bond is one of two things, and the graph tells them apart: if a pattern could
-//! have paired it, it was drawn saturated and stays that way (the CH₂ groups of a dihydroarene);
-//! if none could, it is what a matching leaves over, and the next ring may be what pairs it
-//! (phenalene's, on the way to pyrene).
+//! Which atoms the matching gets to touch is the other half of it. A ring atom the drawing leaves
+//! without a double bond is one of two things, and the graph cannot tell them apart: fluorene's
+//! CH₂ is as unpairable as phenalene's leftover. One was drawn saturated and stays that way, even
+//! as a vertex of the new ring; the other is what a press left over, and the next ring may be what
+//! pairs it, on the way to pyrene. So the press writes down what it leaves over, in
+//! [`press_leftovers`](Molecule::press_leftovers), and everything else stays out.
 
 use super::{BondOrder, BondStereo, Molecule, charged_valence};
 use std::collections::{HashMap, HashSet};
@@ -46,9 +47,18 @@ impl Molecule {
     /// ([`aromatic_system`](Self::aromatic_system)). Inside it, what may change is a single or
     /// double bond between atoms that can carry a double bond (see
     /// [`takes_double_bond`](Self::takes_double_bond)). Left as they are: anything outside the
-    /// system, any bond with stereo, and any double bond to a heteroatom. A heteroatom's own ring
-    /// (a pyridine fused in) therefore keeps its C=N, and the carbon of it is simply spoken for.
-    pub(crate) fn rekekulize(&mut self, ring: &[u32], new_bonds: &[(u32, u32)]) -> Vec<u32> {
+    /// system, the atoms of `saturated` (see
+    /// [`saturated_ring_atoms`](Self::saturated_ring_atoms)), any bond with stereo, and any double
+    /// bond to a heteroatom. A heteroatom's own ring (a pyridine fused in) therefore keeps its
+    /// C=N, and the carbon of it is simply spoken for.
+    ///
+    /// What the press leaves over goes in [`press_leftovers`](Self::press_leftovers).
+    pub(crate) fn rekekulize(
+        &mut self,
+        ring: &[u32],
+        new_bonds: &[(u32, u32)],
+        saturated: &HashSet<u32>,
+    ) -> Vec<u32> {
         let Some(&seed) = ring.first() else {
             return Vec::new();
         };
@@ -56,6 +66,7 @@ impl Molecule {
         let system = self.aromatic_system(ring, seed, new_bonds);
         let candidates = system
             .into_iter()
+            .filter(|id| !saturated.contains(id))
             .filter(|&id| self.takes_double_bond(id, in_ring.contains(&id)))
             .collect();
         let mut pattern = self.pattern_over(candidates);
@@ -78,6 +89,7 @@ impl Molecule {
         for root in ours.into_iter().chain(theirs) {
             augment(&pattern.adjacent, &mut pattern.mate, root);
         }
+        self.record_leftovers(&pattern, new_bonds);
 
         let mut changed = Vec::new();
         for &(id, i, j) in &pattern.edges {
@@ -98,6 +110,54 @@ impl Molecule {
         changed
     }
 
+    /// Keep the record of [`press_leftovers`](Self::press_leftovers) true after matching: an atom
+    /// that found a partner is no longer left over, and a new atom that found none now is. Only a
+    /// new one: an old atom with no partner here was left out or left single by the drawing.
+    fn record_leftovers(&mut self, pattern: &Pattern, new_bonds: &[(u32, u32)]) {
+        for (i, &id) in pattern.atoms.iter().enumerate() {
+            if pattern.mate[i] != NONE {
+                self.press_leftovers.remove(&id);
+            } else if self
+                .bonds_for_atom(id)
+                .iter()
+                .all(|b| is_new(new_bonds, b.begin, b.end))
+            {
+                self.press_leftovers.insert(id);
+            }
+        }
+    }
+
+    /// The ring atoms that were saturated before `new_bonds` were drawn, of the structure `ring`
+    /// is part of: the atoms of the rings already there that are not
+    /// [conjugated](Self::conjugated_atoms). An atom that was only on a chain is not one: a ring
+    /// drawn along a chain is that chain's benzene.
+    ///
+    /// Call this with the old bonds back at the orders they had before the press.
+    pub(crate) fn saturated_ring_atoms(
+        &self,
+        ring: &[u32],
+        new_bonds: &[(u32, u32)],
+    ) -> HashSet<u32> {
+        let Some(&seed) = ring.first() else {
+            return HashSet::new();
+        };
+        let (before, rings) = self.before_press(seed, new_bonds);
+        let conjugated = before.conjugated_atoms();
+        rings
+            .into_iter()
+            .flatten()
+            .filter(|id| !conjugated.contains(id))
+            .collect()
+    }
+
+    /// The drawing as it stood before `new_bonds` were added, and the rings it had around `seed`.
+    fn before_press(&self, seed: u32, new_bonds: &[(u32, u32)]) -> (Molecule, Vec<Vec<u32>>) {
+        let mut before = self.clone();
+        before.bonds.retain(|b| !is_new(new_bonds, b.begin, b.end));
+        let rings = before.rings_from_atoms(&self.connected_atoms(seed));
+        (before, rings)
+    }
+
     /// `ring` plus every aromatic ring reachable from it through rings that share a bond.
     ///
     /// Aromatic is a judgement on the drawing as it stood before the press, which is why
@@ -105,12 +165,8 @@ impl Molecule {
     /// [conjugated](Self::conjugated_atoms). The atoms of `ring` itself are in whatever they were,
     /// because the press has just made them part of a new aromatic ring.
     fn aromatic_system(&self, ring: &[u32], seed: u32, new_bonds: &[(u32, u32)]) -> HashSet<u32> {
-        let mut before = self.clone();
-        before.bonds.retain(|b| {
-            !new_bonds.contains(&(b.begin, b.end)) && !new_bonds.contains(&(b.end, b.begin))
-        });
-        let mut rings = before.rings_from_atoms(&self.connected_atoms(seed));
-        let conjugated = before.conjugated_atoms(&rings);
+        let (before, mut rings) = self.before_press(seed, new_bonds);
+        let conjugated = before.conjugated_atoms();
         rings.retain(|r| {
             r.iter()
                 .all(|&id| conjugated.contains(&id) || !self.is_carbon(id))
@@ -133,39 +189,20 @@ impl Molecule {
         }
     }
 
-    /// The atoms with a double bond, and the atoms of `rings` a matching has to leave over: no
-    /// pattern on the skeleton of `rings` could give them a partner.
-    ///
-    /// An atom that could have had a partner is out, however few of its neighbours lack one:
-    /// the two CH₂ groups of a 9,10-dihydroanthracene are three bonds apart and pair up along the
-    /// ring between them just as adjacent ones do. A pattern a press has grown is maximum (that
-    /// is what [`augment`] leaves behind), so its leftovers really are left over and all stay in.
-    /// An atom on a wedge is out whatever the graph says: the wedge has already said it is sp³.
-    fn conjugated_atoms(&self, rings: &[Vec<u32>]) -> HashSet<u32> {
-        let mut conjugated: HashSet<u32> = self
+    /// The atoms with a double bond, and those a press [left over](Self::press_leftovers). A wedge
+    /// put on a leftover since then takes it out: the wedge says it is sp³.
+    fn conjugated_atoms(&self) -> HashSet<u32> {
+        let doubly_bonded = self
             .bonds
             .iter()
             .filter(|b| b.order == BondOrder::Double)
-            .flat_map(|b| [b.begin, b.end])
-            .collect();
-        let candidates = rings
+            .flat_map(|b| [b.begin, b.end]);
+        let left_over = self
+            .press_leftovers
             .iter()
-            .flatten()
             .copied()
-            .filter(|&id| self.takes_double_bond(id, false))
-            .collect();
-        let pattern = self.pattern_over(candidates);
-        for (i, &id) in pattern.atoms.iter().enumerate() {
-            let free = pattern.mate[i] == NONE && !conjugated.contains(&id);
-            if free && !self.has_stereo_bond(id) {
-                let mut trial = pattern.mate.clone();
-                augment(&pattern.adjacent, &mut trial, i);
-                if trial[i] == NONE {
-                    conjugated.insert(id);
-                }
-            }
-        }
-        conjugated
+            .filter(|&id| !self.has_stereo_bond(id));
+        doubly_bonded.chain(left_over).collect()
     }
 
     /// The Kekulé pattern as drawn on those of `candidates` it may change: an atom whose double
@@ -260,6 +297,11 @@ impl Molecule {
             .count() as i16;
         sigma < valence
     }
+}
+
+/// Whether the bond between `u` and `v` is one of `new_bonds`, which run either way.
+fn is_new(new_bonds: &[(u32, u32)], u: u32, v: u32) -> bool {
+    new_bonds.contains(&(u, v)) || new_bonds.contains(&(v, u))
 }
 
 /// Grow the matching by one pair along an augmenting path from `root`, if it is unmatched and
@@ -412,7 +454,7 @@ mod tests {
             &[(0, 1, false), (1, 2, true), (2, 3, false), (3, 4, false)],
         );
         let moved = m.bond_between(ids[1], ids[2]).unwrap().id;
-        m.rekekulize(&ids[..4], &[]);
+        m.rekekulize(&ids[..4], &[], &HashSet::new());
         assert_eq!(doubles(&m), 2, "0–1=2–3 becomes 0=1–2=3");
         assert_eq!(m.bond_by_id(moved).unwrap().order, BondOrder::Single);
         assert_eq!(
@@ -438,7 +480,7 @@ mod tests {
                 (5, 0, false),
             ],
         );
-        m.rekekulize(&ids, &[]);
+        m.rekekulize(&ids, &[], &HashSet::new());
         assert_eq!(doubles(&m), 3, "5=0, 1=2, 3=4 pairs all six");
         assert_at_most_one_double_each(&m);
         assert_eq!(
@@ -462,7 +504,7 @@ mod tests {
                 (6, 0, false),
             ],
         );
-        m.rekekulize(&ids, &[]);
+        m.rekekulize(&ids, &[], &HashSet::new());
         assert_eq!(doubles(&m), 3);
         assert_at_most_one_double_each(&m);
     }
@@ -484,7 +526,7 @@ mod tests {
                 (0, 7, false),
             ],
         );
-        m.rekekulize(&ids[..6], &[]);
+        m.rekekulize(&ids[..6], &[], &HashSet::new());
         for b in m.bonds_for_atom(ids[0]) {
             assert_eq!(b.order, BondOrder::Single, "atom 0 has four neighbours");
         }
@@ -500,7 +542,7 @@ mod tests {
     fn a_bond_with_stereo_is_left_alone() {
         let (mut m, ids) = skeleton(2, &[(0, 1, false)]);
         m.bonds[0].stereo = BondStereo::WedgeUp;
-        m.rekekulize(&ids, &[]);
+        m.rekekulize(&ids, &[], &HashSet::new());
         assert_eq!(doubles(&m), 0);
     }
 
@@ -527,7 +569,7 @@ mod tests {
         );
         let ring = [ids[0], ids[6], ids[7], ids[8], ids[9], ids[5]];
         let kept = m.bond_between(ids[2], ids[3]).unwrap().id;
-        m.rekekulize(&ring, &[]);
+        m.rekekulize(&ring, &[], &HashSet::new());
         assert_eq!(m.bond_by_id(kept).unwrap().order, BondOrder::Double);
         assert_eq!(
             doubles(&m),
@@ -562,7 +604,7 @@ mod tests {
             .iter()
             .map(|&(a, b)| (ids[a], ids[b]))
             .collect();
-        m.rekekulize(&ring, &new_bonds);
+        m.rekekulize(&ring, &new_bonds, &HashSet::new());
         for (a, b, order) in [
             (5, 0, BondOrder::Single),
             (4, 5, BondOrder::Single),
@@ -585,7 +627,7 @@ mod tests {
             4,
             &[(0, 1, false), (1, 2, false), (2, 3, false), (3, 0, false)],
         );
-        m.rekekulize(&ids, &[(ids[1], ids[2])]);
+        m.rekekulize(&ids, &[(ids[1], ids[2])], &HashSet::new());
         assert_eq!(
             m.bond_between(ids[1], ids[2]).unwrap().order,
             BondOrder::Double
