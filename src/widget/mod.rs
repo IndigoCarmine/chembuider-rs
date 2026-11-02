@@ -12,6 +12,8 @@ mod page_tests;
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]
+mod ring_fusion_tests;
+#[cfg(test)]
 mod appearance_tests;
 pub mod rich_text;
 pub mod scene;

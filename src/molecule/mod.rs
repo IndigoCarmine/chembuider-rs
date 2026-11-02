@@ -1,5 +1,7 @@
 pub mod mol2;
 pub mod fragment;
+mod fusion;
+mod kekule;
 pub mod canonical;
 pub mod cleanup;
 pub mod smiles;
