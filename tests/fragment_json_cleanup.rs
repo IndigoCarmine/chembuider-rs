@@ -171,10 +171,20 @@ fn load_cleanup_save_roundtrip() {
         }
 
         // ── Save + verify it reloads ──────────────────────────────────────────
+        // `target/` is shared by every `cargo test` running in this checkout, and saving truncates
+        // before it writes: reloading `<name>.json` itself can read another run's empty file. So
+        // the round trip goes through a file of this process's own, which then takes the name.
         let out_path = out_dir.join(format!("{name}.json"));
-        cleaned.save(&out_path).unwrap_or_else(|e| panic!("save {name}: {e}"));
-        let reloaded = Fragment::load(&out_path).expect("cleaned JSON reloads");
+        let own_path = out_dir.join(format!("{name}.{}.tmp", std::process::id()));
+        cleaned
+            .save(&own_path)
+            .unwrap_or_else(|e| panic!("save {name}: {e}"));
+        let reloaded = Fragment::load(&own_path).expect("cleaned JSON reloads");
         assert_eq!(reloaded.atoms.len(), cleaned.atoms.len(), "{name}: saved JSON round-trips");
+        if std::fs::rename(&own_path, &out_path).is_err() {
+            // Another run got there at the same moment, with the same content.
+            let _ = std::fs::remove_file(&own_path);
+        }
 
         // Report how much cleanup moved things (max atom displacement).
         let moved = cleaned

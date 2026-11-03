@@ -257,6 +257,41 @@ impl Fragment {
     }
 }
 
+/// The smallest ring through the fragment's atoms `u` and `v`, joined by a bond, as atom indices
+/// in cyclic order from `u`. `None` when that bond is on no ring.
+pub fn ring_through_bond(frag: &Fragment, u: usize, v: usize) -> Option<Vec<usize>> {
+    let n = frag.atoms.len();
+    let mut previous = vec![None; n];
+    previous[v] = Some(v);
+    let mut queue = std::collections::VecDeque::from([v]);
+    while let Some(at) = queue.pop_front() {
+        if at == u {
+            let mut cycle = vec![u];
+            let mut step = u;
+            while step != v {
+                step = previous[step]?;
+                cycle.push(step);
+            }
+            return Some(cycle);
+        }
+        for b in &frag.bonds {
+            let to = if b.begin == at {
+                b.end
+            } else if b.end == at {
+                b.begin
+            } else {
+                continue;
+            };
+            let is_the_bond = (at == v && to == u) || (at == u && to == v);
+            if !is_the_bond && to < n && previous[to].is_none() {
+                previous[to] = Some(at);
+                queue.push_back(to);
+            }
+        }
+    }
+    None
+}
+
 /// Which of a fragment's atoms sit on one of its rings.
 ///
 /// Leaves are pruned until none are left; whatever survives is on a cycle. Used by

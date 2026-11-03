@@ -260,7 +260,7 @@ impl Config {
     pub fn load() -> Self {
         // ── Shortcuts ────────────────────────────────────────────────────────
         let mut cfg: Config = if let Ok(text) = std::fs::read_to_string("chembuilder_config.json") {
-            serde_json::from_str::<Config>(&text).unwrap_or_else(|e| {
+            Self::from_saved(&text).unwrap_or_else(|e| {
                 eprintln!("Warning: failed to parse chembuilder_config.json: {e}");
                 serde_json::from_str(DEFAULT_SHORTCUTS).expect("embedded shortcuts valid")
             })
@@ -273,6 +273,37 @@ impl Config {
         let inline = std::mem::take(&mut cfg.fragments);
         cfg.fragments = load_fragments(inline, std::path::Path::new("fragments"));
         cfg
+    }
+
+    /// The text of a saved `chembuilder_config.json` as a config, brought up to date.
+    fn from_saved(text: &str) -> serde_json::Result<Self> {
+        let mut cfg: Config = serde_json::from_str(text)?;
+        cfg.add_shift_a_on_bonds();
+        Ok(cfg)
+    }
+
+    /// Give a config saved before `A` drew a benzene on a bond that binding.
+    ///
+    /// A saved config replaces the defaults whole, so without this `A` on a bond would do nothing
+    /// for anyone who had ever saved. Only a config that still has the default `a` gets it: `A` is
+    /// the same press as `a`, and with `a` rebound or `A` taken the keys are the user's own. There
+    /// is no telling a binding that was never there from one deleted by hand, so deleting this one
+    /// from the file does not stick; bind `A` to something else instead.
+    fn add_shift_a_on_bonds(&mut self) {
+        let plain = |s: &&BondShortcut, key: &str| s.key == key && !s.ctrl && !s.alt;
+        if self.bond_shortcuts.iter().any(|s| plain(&s, "A")) {
+            return;
+        }
+        let Some(lower) = self.bond_shortcuts.iter().find(|s| plain(s, "a")) else {
+            return;
+        };
+        if matches!(&lower.action, BondAction::Fragment { fragment } if fragment == "benzene") {
+            let upper = BondShortcut {
+                key: "A".into(),
+                ..lower.clone()
+            };
+            self.bond_shortcuts.push(upper);
+        }
     }
 
     /// Save shortcuts to `chembuilder_config.json` and each fragment to `fragments/<name>.json`.
@@ -539,6 +570,87 @@ mod tests {
 
     fn ring_action(ring: usize) -> Option<ResolvedAtomAction> {
         cfg().atom_action_to_fragment(&AtomAction::Ring { ring })
+    }
+
+    /// The shipped shortcuts as a config saved before `A` on a bond existed holds them.
+    fn saved_without_bond_a() -> serde_json::Value {
+        let mut saved: serde_json::Value = serde_json::from_str(DEFAULT_SHORTCUTS).unwrap();
+        let bonds = saved["bond_shortcuts"].as_array_mut().unwrap();
+        let before = bonds.len();
+        bonds.retain(|b| b["key"] != "A");
+        assert_eq!(bonds.len(), before - 1, "the defaults bind `A` on a bond");
+        saved
+    }
+
+    fn bond_actions(cfg: &Config, key: &str) -> Vec<String> {
+        cfg.bond_shortcuts
+            .iter()
+            .filter(|s| s.key == key)
+            .map(|s| format!("{:?}", s.action))
+            .collect()
+    }
+
+    /// A saved config replaces the defaults whole, so a binding added to them after it was saved
+    /// would never reach whoever saved it. `A` on a bond is `a` for them too.
+    #[test]
+    fn a_config_saved_before_shift_a_gets_it() {
+        let saved = Config::from_saved(&saved_without_bond_a().to_string()).unwrap();
+        assert_eq!(bond_actions(&saved, "A").len(), 1);
+        assert_eq!(bond_actions(&saved, "A"), bond_actions(&saved, "a"));
+    }
+
+    /// `A` already bound to something else on a bond is a choice, and it stands.
+    #[test]
+    fn a_custom_shift_a_on_a_bond_stays() {
+        let mut saved = saved_without_bond_a();
+        saved["bond_shortcuts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "key": "A", "ring": 5 }));
+        let saved = Config::from_saved(&saved.to_string()).unwrap();
+        assert_eq!(
+            bond_actions(&saved, "A"),
+            vec![format!("{:?}", BondAction::Ring { ring: 5 })]
+        );
+    }
+
+    /// With `a` on a bond rebound or removed the config is not the old default, and what `A`
+    /// should do there is not ours to guess.
+    #[test]
+    fn a_customised_a_on_a_bond_gets_no_shift_a() {
+        let mut rebound = saved_without_bond_a();
+        for b in rebound["bond_shortcuts"].as_array_mut().unwrap() {
+            if b["key"] == "a" {
+                *b = serde_json::json!({ "key": "a", "ring": 5 });
+            }
+        }
+        let rebound = Config::from_saved(&rebound.to_string()).unwrap();
+        assert!(bond_actions(&rebound, "A").is_empty());
+
+        let mut removed = saved_without_bond_a();
+        removed["bond_shortcuts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["key"] != "a");
+        let removed = Config::from_saved(&removed.to_string()).unwrap();
+        assert!(bond_actions(&removed, "A").is_empty());
+    }
+
+    /// A chord on `A` is a different binding, and leaves plain `A` as free as it was.
+    #[test]
+    fn a_chord_on_shift_a_does_not_count_as_shift_a() {
+        let mut saved = saved_without_bond_a();
+        saved["bond_shortcuts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "key": "A", "ctrl": true, "ring": 5 }));
+        let saved = Config::from_saved(&saved.to_string()).unwrap();
+        let plain = saved
+            .bond_shortcuts
+            .iter()
+            .filter(|s| s.key == "A" && !s.ctrl && !s.alt)
+            .count();
+        assert_eq!(plain, 1);
     }
 
     /// The editor draws in ChemDraw's proportions — what a ChemDraw document holds: 10 pt

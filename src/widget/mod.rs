@@ -18,6 +18,9 @@ pub mod scene;
 pub mod text_format;
 pub mod view;
 
+#[cfg(test)]
+mod ring_fusion_tests;
+
 pub use view::{FitOptions, ViewTransform};
 
 use crate::config::Config;
@@ -222,6 +225,9 @@ pub struct ChemStructEditor {
     /// moving the atom hotspot.
     pub hotspot_bond: Option<u32>,
 
+    /// Set while the next press of a ring key would go on from where a ring left off.
+    ring_repeat: Option<RingRepeat>,
+
     /// Loaded keyboard/fragment configuration (from JSON).
     pub config: Config,
 
@@ -235,6 +241,14 @@ pub struct ChemStructEditor {
     /// Redo history (molecule snapshots undone via `undo`, newest at back). Cleared
     /// whenever a new edit is pushed onto `undo_stack` — the usual undo/redo contract.
     pub redo_stack: VecDeque<crate::molecule::Molecule>,
+
+    /// Where the keyboard was aiming at each state of `undo_stack`, last to last. A press moves
+    /// the target onto what it just drew, so undoing the press has to put the target back: the
+    /// keyboard has no other way to get one once its target is gone.
+    undo_targets: VecDeque<KeyboardTarget>,
+
+    /// The same for `redo_stack`.
+    redo_targets: VecDeque<KeyboardTarget>,
 
     /// Stereo type applied to newly drawn bonds.
     pub current_bond_stereo: BondStereo,
@@ -333,10 +347,13 @@ impl Default for ChemStructEditor {
             drag_origin_screen: None,
             hotspot_atom: None,
             hotspot_bond: None,
+            ring_repeat: None,
             config: Config::default(),
             label_edit: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
+            undo_targets: VecDeque::new(),
+            redo_targets: VecDeque::new(),
             current_bond_stereo: BondStereo::None,
             last_mouse_mol: [0.0; 2],
             pointer_active: false,
@@ -360,10 +377,45 @@ impl Default for ChemStructEditor {
     }
 }
 
+/// Where the keyboard is aiming: [`hotspot_atom`](ChemStructEditor::hotspot_atom) and
+/// [`hotspot_bond`](ChemStructEditor::hotspot_bond).
+#[derive(Clone, Default)]
+pub(crate) struct KeyboardTarget {
+    atom: Option<u32>,
+    bond: Option<u32>,
+    ring_repeat: Option<RingRepeat>,
+}
+
+/// Where pressing a ring key again goes on from: the hotspot the ring left, or if that has no room
+/// another atom of the ring.
+#[derive(Clone)]
+pub(crate) struct RingRepeat {
+    /// The key that drew the ring.
+    pub(crate) key: String,
+    /// The hotspot it left, the only one this applies to.
+    pub(crate) from: u32,
+    /// The atom to act on instead.
+    pub(crate) atom: u32,
+}
+
+/// Drop the oldest of `targets` beyond `len`, the size of the history they go with. The histories
+/// are public and can be cleared without them; what is aligned is the newest end.
+fn keep_newest(targets: &mut VecDeque<KeyboardTarget>, len: usize) {
+    while targets.len() > len {
+        targets.pop_front();
+    }
+}
+
 impl ChemStructEditor {
     /// Push a snapshot of the current molecule state for undo.
     /// Deduplicates: does nothing if the state is identical to the last snapshot.
     pub fn push_undo(&mut self) {
+        self.push_undo_aimed_at(self.keyboard_target());
+    }
+
+    /// [`push_undo`](Self::push_undo), with `target` as what undo goes back to aiming at: a press
+    /// has already moved the target by the time it is known to be an undo step.
+    pub(crate) fn push_undo_aimed_at(&mut self, target: KeyboardTarget) {
         let same = self.undo_stack.back().map_or(false, |s| s == &self.molecule);
         if !same {
             if self.undo_stack.len() >= 50 {
@@ -371,7 +423,29 @@ impl ChemStructEditor {
             }
             self.undo_stack.push_back(self.molecule.clone());
             self.redo_stack.clear();
+            self.redo_targets.clear();
+            self.undo_targets.push_back(target);
+            keep_newest(&mut self.undo_targets, self.undo_stack.len());
         }
+    }
+
+    pub(crate) fn keyboard_target(&self) -> KeyboardTarget {
+        KeyboardTarget {
+            atom: self.hotspot_atom,
+            bond: self.hotspot_bond,
+            ring_repeat: self.ring_repeat.clone(),
+        }
+    }
+
+    /// Aim the keyboard at `target`, or at as much of it as the drawing still has.
+    fn aim_at(&mut self, target: KeyboardTarget) {
+        self.hotspot_atom = target
+            .atom
+            .filter(|&id| self.molecule.atom_by_id(id).is_some());
+        self.hotspot_bond = target
+            .bond
+            .filter(|&id| self.molecule.bond_by_id(id).is_some());
+        self.ring_repeat = target.ring_repeat;
     }
 
     /// The bond the canvas was right-clicked on, for the host's context menu. The pointer is
@@ -398,14 +472,7 @@ impl ChemStructEditor {
             return false;
         }
         self.push_undo();
-        let Some(bond) = self.molecule.bond_by_id_mut(bond_id) else { return false };
-        let grew = order.valence() > bond.order.valence();
-        bond.order = order;
-        bond.stereo = stereo;
-        let (begin, end) = (bond.begin, bond.end);
-        if grew {
-            interact::consume_group_h(self, &[begin, end]);
-        }
+        interact::edit_bond_type(self, bond_id, order, stereo);
         true
     }
 
@@ -1086,6 +1153,7 @@ impl ChemStructEditor {
     pub fn undo(&mut self) -> bool {
         let cancelled_cleanup = self.cancel_cleanup();
         if let Some(prev) = self.undo_stack.pop_back() {
+            let target = self.undo_targets.pop_back().unwrap_or_default();
             if cancelled_cleanup {
                 self.molecule = prev;
             } else {
@@ -1093,8 +1161,11 @@ impl ChemStructEditor {
                     self.redo_stack.pop_front();
                 }
                 self.redo_stack.push_back(std::mem::replace(&mut self.molecule, prev));
+                self.redo_targets.push_back(self.keyboard_target());
+                keep_newest(&mut self.redo_targets, self.redo_stack.len());
             }
             self.clear_transient_state();
+            self.aim_at(target);
             true
         } else {
             false
@@ -1108,11 +1179,15 @@ impl ChemStructEditor {
     pub fn redo(&mut self) -> bool {
         self.cancel_cleanup();
         if let Some(next) = self.redo_stack.pop_back() {
+            let target = self.redo_targets.pop_back().unwrap_or_default();
             if self.undo_stack.len() >= 50 {
                 self.undo_stack.pop_front();
             }
             self.undo_stack.push_back(std::mem::replace(&mut self.molecule, next));
+            self.undo_targets.push_back(self.keyboard_target());
+            keep_newest(&mut self.undo_targets, self.undo_stack.len());
             self.clear_transient_state();
+            self.aim_at(target);
             true
         } else {
             false
