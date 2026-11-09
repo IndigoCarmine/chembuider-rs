@@ -4,32 +4,24 @@
     {
       "element": "C",
       "pos": [
-        -2.9999995,
-        3.5762787e-7
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        -2.2499995,
-        1.2990385
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        -0.7499995,
-        1.2990384
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
         0.0,
         0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.5,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.25,
+        -1.2990381
       ],
       "charge": 0
     }
@@ -44,12 +36,7 @@
       "begin": 1,
       "end": 2,
       "order": "Single"
-    },
-    {
-      "begin": 2,
-      "end": 3,
-      "order": "Single"
     }
   ],
-  "attach_idx": 3
+  "attach_idx": 0
 }

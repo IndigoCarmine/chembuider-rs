@@ -937,6 +937,18 @@ fn heavy_degree(mol: &Molecule, id: u32) -> usize {
         .count()
 }
 
+/// Each built-in alkyl fragment `CnH(2n+1)` expands to exactly n carbons: the labelled atom
+/// itself becomes the chain's first carbon, as with `Me` and `Et`, so no extra carbon is added.
+#[test]
+fn alkyl_labels_expand_to_their_carbon_count() {
+    let carbons = |label: &str| expand("", label).atoms.iter().filter(|a| a.element == "C").count();
+    for n in 2..=12 {
+        let label = format!("C{n}H{}", 2 * n + 1);
+        assert_eq!(carbons(&label), n, "{label}");
+    }
+    assert_eq!(carbons("C2H5"), carbons("Et"), "C2H5 and Et are both ethyl");
+}
+
 /// The headline case: three fragment names run together expand to the three fragments bonded
 /// in that order. On a bare atom `MeOPh` is exactly anisole, CH3–O–C6H5.
 #[test]
