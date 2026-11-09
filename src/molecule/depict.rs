@@ -6,7 +6,7 @@
 
 use super::lookup::AtomLookup;
 use super::{charged_max_valence, charged_valence};
-use crate::widget::rich_text::RichText;
+use crate::widget::rich_text::{RichText, Script, SpanStyle};
 
 /// Which side of the element symbol the displayed hydrogens go on.
 /// `Right` is the normal reading order ("OH", "NH2"); `Left` mirrors it ("HO", "H2N")
@@ -46,6 +46,9 @@ pub(crate) fn h_side(mol: &impl AtomLookup, atom_id: u32) -> HSide {
 pub struct AtomLabel {
     pub rich: RichText,
     pub anchor_chars: std::ops::Range<usize>,
+    /// The label is written mirrored, toward the left ("HO", `C₂H₅O`): it ends on the atom
+    /// instead of starting there, which a file writer records as right alignment.
+    pub mirrored: bool,
 }
 
 /// Length in chars of the leading element token of a parsed label's flat text: the first
@@ -60,11 +63,88 @@ fn element_token_len(flat: &str) -> usize {
     1 + chars.take_while(|c| c.is_ascii_lowercase()).count()
 }
 
+/// A condensed label written mirrored, for when its bonds come from the right: its formula
+/// units in reverse, so the first one — the attachment atom — ends on the atom and the rest
+/// extend into the free space on the left, as ChemDraw writes them. A unit is an element token
+/// (an uppercase letter on the baseline and its lowercase letters), its count, and the hydrogens
+/// that follow it; a unit of one heavy atom with hydrogens is mirrored too, the hydrogens going
+/// first as on a plain element label. So `OC_2H_5` → `C₂H₅O`, `OCH_3` → `H₃CO`, `CH_2OH` →
+/// `HOH₂C`, `CO_2Et` → `EtO₂C`, `NO_2` → `O₂N`. Every character keeps the style it was typed
+/// with, so counts stay subscripts.
+///
+/// Returns the mirrored text and the char index the attachment atom's symbol starts at, or
+/// `None` when there is nothing to mirror (a single unit: `Ph`, `Cl`) or the label is not a
+/// plain run of element tokens and counts (italic `tBu`, `N(CH_3)_2`): those are kept as typed.
+fn mirrored_condensed_label(element: &RichText) -> Option<(RichText, usize)> {
+    type Run = Vec<(char, SpanStyle)>;
+    #[derive(Default)]
+    struct Unit {
+        symbol: Run,
+        count: Run,
+        hydrogens: Run,
+    }
+    let chars: Run = element.spans.iter().flat_map(|s| s.text.chars().map(|c| (c, s.style))).collect();
+    let normal = |style: &SpanStyle| style.script == Script::Normal;
+    let mut units: Vec<Unit> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let (c, style) = chars[i];
+        if !(c.is_ascii_uppercase() && normal(&style)) {
+            return None;
+        }
+        let mut symbol = vec![chars[i]];
+        i += 1;
+        while i < chars.len() && chars[i].0.is_ascii_lowercase() && normal(&chars[i].1) {
+            symbol.push(chars[i]);
+            i += 1;
+        }
+        let mut count = Vec::new();
+        while i < chars.len() && chars[i].0.is_ascii_digit() {
+            count.push(chars[i]);
+            i += 1;
+        }
+        let is_h = symbol.len() == 1 && symbol[0].0 == 'H';
+        match units.last_mut() {
+            // Hydrogens belong to the heavy atom (or group) before them: CH₃, C₂H₅, OH.
+            Some(unit) if is_h && unit.hydrogens.is_empty() => {
+                unit.hydrogens = symbol;
+                unit.hydrogens.extend(count);
+            }
+            _ => units.push(Unit { symbol, count, hydrogens: Vec::new() }),
+        }
+    }
+    if units.len() < 2 {
+        return None;
+    }
+
+    let mut out: Run = Vec::new();
+    let mut anchor_start = 0usize;
+    for (k, unit) in units.iter().enumerate().rev() {
+        // One heavy atom and its hydrogens reads mirrored too (H₃C, HO); a counted formula
+        // (C₂H₅) is kept as written.
+        let h_first = !unit.hydrogens.is_empty() && unit.count.is_empty();
+        if h_first {
+            out.extend(&unit.hydrogens);
+        }
+        if k == 0 {
+            anchor_start = out.len();
+        }
+        out.extend(&unit.symbol);
+        out.extend(&unit.count);
+        if !h_first {
+            out.extend(&unit.hydrogens);
+        }
+    }
+    let rich = out.into_iter().fold(RichText::new(), |rich, (c, style)| rich.span(c.to_string(), style));
+    Some((rich, anchor_start))
+}
+
 /// Build the styled atom label: hydrogen count as a true subscript (CH₃, NH₂), the charge
-/// as a trailing superscript (N⁺, SO₄²⁻), and the hydrogens flipped to the atom's free
-/// side ("HO", "H₂N" when the bonds come from the right). The element text itself goes
-/// through the rich-text markup parser, so custom labels typed into the editor can use
-/// `_`/`^` scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
+/// as a trailing superscript (N⁺, SO₄²⁻), and the label mirrored toward the atom's free
+/// side when the bonds come from the right: the hydrogens first ("HO", "H₂N"), and a condensed
+/// label unit by unit in reverse (`OC₂H₅` → `C₂H₅O`, see [`mirrored_condensed_label`]). The
+/// element text itself goes through the rich-text markup parser, so custom labels typed into
+/// the editor can use `_`/`^` scripts, `**bold**` and `//italic//` (e.g. `CO_2Et`, `//t//Bu`).
 pub(crate) fn atom_label(
     mol: &impl AtomLookup,
     atom: &crate::molecule::Atom,
@@ -72,22 +152,32 @@ pub(crate) fn atom_label(
     let element = RichText::parse(&atom.element);
     let element_flat: String = element.spans.iter().map(|s| s.text.as_str()).collect();
     let h = displayed_h_count(mol, atom.id);
-    let side = if h >= 1 { h_side(mol, atom.id) } else { HSide::Right };
+    // A condensed label (no hydrogens of its own) is mirrored when it has units to move.
+    let mirror = if h == 0 { mirrored_condensed_label(&element) } else { None };
+    let side = if h >= 1 || mirror.is_some() { h_side(mol, atom.id) } else { HSide::Right };
 
     let mut rich = RichText::new();
     let mut anchor_start = 0usize;
-    if side == HSide::Left {
-        // Hydrogens first: "H", then the count subscript ("H₂N").
-        rich = rich.text("H");
-        anchor_start = 1;
-        if h > 1 {
-            let count = h.to_string();
-            anchor_start += count.chars().count();
-            rich = rich.subscript(count);
+    match (side, mirror) {
+        (HSide::Left, Some((mirrored, start))) => {
+            rich = mirrored;
+            anchor_start = start;
         }
-    }
-    for span in element.spans {
-        rich = rich.span(span.text, span.style);
+        _ => {
+            if side == HSide::Left {
+                // Hydrogens first: "H", then the count subscript ("H₂N").
+                rich = rich.text("H");
+                anchor_start = 1;
+                if h > 1 {
+                    let count = h.to_string();
+                    anchor_start += count.chars().count();
+                    rich = rich.subscript(count);
+                }
+            }
+            for span in element.spans {
+                rich = rich.span(span.text, span.style);
+            }
+        }
     }
     if side == HSide::Right && h >= 1 {
         rich = rich.text("H");
@@ -108,7 +198,7 @@ pub(crate) fn atom_label(
     // Anchor on the element token; degenerate labels fall back to the first char.
     let token_len = element_token_len(&element_flat);
     let (start, len) = if token_len == 0 { (0, 1) } else { (anchor_start, token_len) };
-    AtomLabel { rich, anchor_chars: start..start + len }
+    AtomLabel { rich, anchor_chars: start..start + len, mirrored: side == HSide::Left }
 }
 
 /// A hydrogen that is drawn inside its heavy neighbour's label instead of on the canvas,

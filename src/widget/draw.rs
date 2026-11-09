@@ -965,6 +965,99 @@ mod tests {
         });
     }
 
+    /// A condensed label whose bond comes from the right is written mirrored, group by group,
+    /// so its attachment atom stays on the atom and the rest extends away from the bond:
+    /// `OC_2H_5` reads `C₂H₅O` with the O on the atom, its counts still subscripts. From the
+    /// left it keeps its reading order.
+    #[test]
+    fn condensed_labels_mirror_toward_the_free_side() {
+        use crate::widget::rich_text::Script;
+        let scripts = |label: &crate::molecule::depict::AtomLabel| -> Vec<(String, Script)> {
+            label.rich.spans.iter().map(|s| (s.text.clone(), s.style.script)).collect()
+        };
+
+        // Ring carbon to the lower right of the substituent: the bond points right → mirror.
+        let mut m = Molecule::default();
+        let x = m.add_atom("OC_2H_5".to_string(), [0.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [1.3, 0.75], 0);
+        m.add_bond(x, c, BondOrder::Single);
+        let label = atom_label(&m, m.atom_by_id(x).unwrap());
+        assert_eq!(scripts(&label), vec![
+            ("C".to_string(), Script::Normal),
+            ("2".to_string(), Script::Sub),
+            ("H".to_string(), Script::Normal),
+            ("5".to_string(), Script::Sub),
+            ("O".to_string(), Script::Normal),
+        ]);
+        assert_eq!(label.anchor_chars, 4..5, "the O, now last, sits on the atom");
+        assert!(label.mirrored);
+
+        // Bond from the left: unchanged reading order, anchored on the leading O.
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".to_string(), [-1.3, 0.75], 0);
+        let x = m.add_atom("OC_2H_5".to_string(), [0.0, 0.0], 0);
+        m.add_bond(c, x, BondOrder::Single);
+        let label = atom_label(&m, m.atom_by_id(x).unwrap());
+        let flat: String = label.rich.spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(flat, "OC2H5");
+        assert_eq!(label.anchor_chars, 0..1);
+        assert!(!label.mirrored);
+
+        // Units move whole, a one-atom unit with hydrogens is mirrored too, and the anchor is the
+        // attachment atom's symbol.
+        for (text, mirrored, anchor) in [
+            ("CO_2Et", "EtO2C", 4..5),
+            ("OMe", "MeO", 2..3),
+            ("NO_2", "O2N", 2..3),
+            ("OCH_3", "H3CO", 3..4),
+            ("CH_2OH", "HOH2C", 4..5),
+        ] {
+            let mut m = Molecule::default();
+            let x = m.add_atom(text.to_string(), [0.0, 0.0], 0);
+            let c = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+            m.add_bond(x, c, BondOrder::Single);
+            let label = atom_label(&m, m.atom_by_id(x).unwrap());
+            let flat: String = label.rich.spans.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(flat, mirrored, "{text}");
+            assert_eq!(label.anchor_chars, anchor, "{text}");
+        }
+
+        // One unit (Ph), or not a plain run of element tokens (italic tBu, N(CH3)2): kept as typed.
+        for text in ["Ph", "//t//Bu", "N(CH_3)_2"] {
+            let mut m = Molecule::default();
+            let x = m.add_atom(text.to_string(), [0.0, 0.0], 0);
+            let c = m.add_atom("C".to_string(), [1.5, 0.0], 0);
+            m.add_bond(x, c, BondOrder::Single);
+            let label = atom_label(&m, m.atom_by_id(x).unwrap());
+            assert!(!label.mirrored, "{text}");
+        }
+    }
+
+    /// The mirrored label is laid out to the left of the atom with its O on it, so the bond
+    /// from the right, trimmed at the label rect, reaches the O instead of running under C₂H₅.
+    #[test]
+    fn mirrored_condensed_label_extends_left_of_the_atom() {
+        let ctx = egui::Context::default();
+        let mut editor = ChemStructEditor::default();
+        let x = editor.molecule.add_atom("OC_2H_5".to_string(), [0.0, 0.0], 0);
+        let c = editor.molecule.add_atom("C".to_string(), [1.3, 0.75], 0);
+        editor.molecule.add_bond(x, c, BondOrder::Single);
+
+        let center = egui::pos2(200.0, 150.0);
+        let _ = crate::testkit::run_ui(&ctx, egui::RawInput::default(), |ui| {
+            let layouts = compute_label_layouts(&editor, ui.painter(), center);
+            let layout = &layouts[&x];
+            let sp = editor.mol_to_screen([0.0, 0.0], center);
+            let label = atom_label(&editor.molecule, editor.molecule.atom_by_id(x).unwrap());
+            let a = layout.galley.char_range_rect(label.anchor_chars).unwrap();
+            let anchor_screen = layout.rect.min + a.center().to_vec2();
+            assert!((anchor_screen.x - sp.x).abs() < 0.75, "{anchor_screen:?} vs {sp:?}");
+            // The label ends at the O: all of it but half the O lies left of the atom.
+            assert!(layout.rect.max.x <= sp.x + a.width(), "{:?} vs {sp:?}", layout.rect);
+            assert!(layout.rect.min.x < sp.x - 2.0 * a.width());
+        });
+    }
+
     /// Bond lines stop at the label boundary instead of striking through the text.
     #[test]
     fn editor_frame_trims_bonds_at_labels() {
