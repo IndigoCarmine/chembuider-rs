@@ -835,7 +835,7 @@ impl ChemStructEditor {
     /// the "ChemDraw Interchange Format" so the structure can be pasted into ChemDraw.
     #[cfg(windows)]
     fn copy_to_clipboard(&self, _ctx: &egui::Context, text: String) {
-        let emf = crate::molecule::image::molecule_to_emf(&self.molecule);
+        let emf = crate::molecule::image::molecule_to_emf_styled(&self.molecule, &self.config.style);
         let png = crate::molecule::image::molecule_to_png(&self.molecule);
         let dib = crate::molecule::image::molecule_to_dib(&self.molecule);
         let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
