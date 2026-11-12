@@ -233,7 +233,7 @@ pub fn process_bond_tool(
     }
 
     // ── Keyboard shortcuts ───────────────────────────────────────────────────
-    modified |= handle_keys_bond_tool(editor, ui);
+    modified |= handle_keys_bond_tool(editor, response, center, ui);
 
     modified
 }
@@ -706,12 +706,31 @@ pub fn process_text_tool(
 // Key handling (Bond tool)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
+fn handle_keys_bond_tool(
+    editor: &mut ChemStructEditor,
+    response: &egui::Response,
+    center: egui::Pos2,
+    ui: &egui::Ui,
+) -> bool {
     let mut modified = false;
-    let keys = pressed_key_strings(ui);
+    // The hover `ChemStructEditor::show` worked out, where the pointer ended the frame.
+    let end_hover = Hover::of(editor);
+    let end_pointer = response.hover_pos().filter(|p| response.rect.contains(*p));
 
-    for (key, _shift, ctrl, alt) in &keys {
-        if *ctrl || *alt { continue; }
+    // Every key is taken in the order it was pressed, arrows included: a frame holding
+    // `ArrowLeft a` (a quick typist, or a slow frame) must aim the `a` where the arrow went,
+    // exactly as when the two keys arrive in frames of their own.
+    for PressedKey { key, shift, ctrl, alt, repeat: held, index } in &pressed_keys(ui) {
+        if let Some((dx, dy)) = arrow_direction(key) {
+            // A press like any other, it ends a ring repeat (see `take_ring_repeat`).
+            if !(*ctrl || *alt) {
+                editor.ring_repeat = None;
+            }
+            walk_keyboard_target(editor, dx, dy, *shift);
+            continue;
+        }
+        if *held || *ctrl || *alt { continue; }
+        hover_at_key(editor, ui, response, center, *index, end_pointer, end_hover);
         let target = editor.keyboard_target();
         let repeat = take_ring_repeat(editor, key);
 
@@ -751,7 +770,17 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
                     .map(|a| a.element.clone())
                     .unwrap_or_default();
                 editor.label_edit = Some((atom_id, current));
-                continue;
+                // Whatever follows the backtick in this frame is the label's text, not more
+                // shortcuts: `` `Ph `` in one frame used to fire `P` (benzene) and `h` here.
+                // The editor first reads input next frame, so it gets them then.
+                // (Ahead of any keystrokes an undo chord already handed on: they came later.)
+                let mut carry = keystrokes_after(ui, *index);
+                carry.append(&mut editor.carried_keys);
+                editor.carried_keys = carry;
+                if !editor.carried_keys.is_empty() {
+                    ui.ctx().request_repaint();
+                }
+                break;
             }
         }
 
@@ -788,49 +817,124 @@ fn handle_keys_bond_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
             modified |= press_on_atom(editor, atom_id, key, target, Aim::User);
         }
     }
+    // The frame ends with the pointer where it ended up, for drawing and its own gestures.
+    end_hover.restore(editor);
 
-    // Arrow key navigation (with or without repeat).
-    //
-    // Plain arrow walks the hotspot atom to the neighbour in that direction. Shift+arrow
-    // instead targets the *bond* to that neighbour: bond actions (order, stereo, ring and
-    // fragment fusion) are otherwise reachable only by hovering a bond, so without this the
-    // keyboard cannot express a double bond or a fused ring at all.
-    let (dir, shift) = ui.input(|i| {
-        let d = if i.key_pressed(egui::Key::ArrowRight) { Some((1.0_f32,  0.0_f32)) }
-            else if i.key_pressed(egui::Key::ArrowLeft)  { Some((-1.0, 0.0)) }
-            else if i.key_pressed(egui::Key::ArrowUp)    { Some((0.0, -1.0)) }
-            else if i.key_pressed(egui::Key::ArrowDown)  { Some((0.0,  1.0)) }
-            else { None };
-        (d, i.modifiers.shift)
-    });
+    modified
+}
 
-    if let Some((dx, dy)) = dir {
-        match editor.hotspot_atom {
-            Some(src_id) => {
-                if let Some(next) = navigate_direction(&editor.molecule, src_id, dx, dy) {
-                    if shift {
-                        editor.hotspot_bond =
-                            editor.molecule.bond_between(src_id, next).map(|b| b.id);
-                    } else {
-                        editor.hotspot_atom = Some(next);
-                        // A bond target from the old position would be stale and would
-                        // silently steer the next bond key at the wrong bond.
-                        editor.hotspot_bond = None;
-                    }
-                }
-            }
-            // With no hotspot the arrows move the *insertion cursor* instead. Without this,
-            // `last_mouse_mol` never changes in keyboard-only use, so every seeded atom lands
-            // on the same coordinate and a second, separate component cannot be placed at all
-            // (it snaps into the first). Space/Tab drops the hotspot to get here.
-            None => {
-                editor.last_mouse_mol[0] += dx * DEFAULT_BOND_LENGTH;
-                editor.last_mouse_mol[1] += dy * DEFAULT_BOND_LENGTH;
-            }
+/// The hover state [`ChemStructEditor::show`] sets each frame.
+#[derive(Clone, Copy)]
+struct Hover {
+    atom: Option<u32>,
+    bond: Option<u32>,
+    object: Option<u32>,
+    /// The pointer in molecule coordinates, if one is over the canvas. With none,
+    /// `last_mouse_mol` is the keyboard's insertion cursor, which the arrows move, and is left be.
+    mouse_mol: Option<[f32; 2]>,
+}
+
+impl Hover {
+    fn of(editor: &ChemStructEditor) -> Self {
+        Self {
+            atom: editor.hovered_atom,
+            bond: editor.hovered_bond,
+            object: editor.hovered_object,
+            mouse_mol: editor.pointer_active.then_some(editor.last_mouse_mol),
         }
     }
 
-    modified
+    fn restore(self, editor: &mut ChemStructEditor) {
+        editor.hovered_atom = self.atom;
+        editor.hovered_bond = self.bond;
+        editor.hovered_object = self.object;
+        editor.pointer_active = self.mouse_mol.is_some();
+        if let Some(mouse_mol) = self.mouse_mol {
+            editor.last_mouse_mol = mouse_mol;
+        }
+    }
+}
+
+/// Point the hover state at where the pointer was when the key at event `index` was pressed.
+///
+/// [`ChemStructEditor::show`] hit-tests once a frame, where the pointer ends up. So a key
+/// pressed before the pointer moved on in the same frame — `a` over one atom while already
+/// sweeping to the next — acted where the pointer arrived instead: on the next atom, or, past
+/// the atoms, on the keyboard hotspot. Likewise a key pressed just before the pointer left the
+/// canvas. `end_pointer` and `end_hover` are where the frame ends and the hover there.
+fn hover_at_key(
+    editor: &mut ChemStructEditor,
+    ui: &egui::Ui,
+    response: &egui::Response,
+    center: egui::Pos2,
+    index: usize,
+    end_pointer: Option<egui::Pos2>,
+    end_hover: Hover,
+) {
+    let moved = ui.input(|i| {
+        i.events.iter().take(index).rev().find_map(|e| match e {
+            egui::Event::PointerMoved(p) => Some(Some(*p)),
+            egui::Event::PointerGone => Some(None),
+            _ => None,
+        })
+    });
+    // With no pointer event ahead of the key, the pointer was where the last frame left it.
+    let at = moved
+        .unwrap_or(editor.pointer_screen)
+        .filter(|p| response.rect.contains(*p));
+    if at == end_pointer {
+        end_hover.restore(editor);
+    } else {
+        editor.hover_at(at, center);
+    }
+}
+
+/// The direction an arrow key walks in, if `key` is one.
+fn arrow_direction(key: &str) -> Option<(f32, f32)> {
+    match key {
+        "ArrowRight" => Some((1.0, 0.0)),
+        "ArrowLeft" => Some((-1.0, 0.0)),
+        "ArrowUp" => Some((0.0, -1.0)),
+        "ArrowDown" => Some((0.0, 1.0)),
+        _ => None,
+    }
+}
+
+/// Arrow key navigation (Bond tool), auto-repeat included.
+///
+/// Plain arrow walks the hotspot atom to the neighbour in that direction. Shift+arrow
+/// instead targets the *bond* to that neighbour: bond actions (order, stereo, ring and
+/// fragment fusion) are otherwise reachable only by hovering a bond, so without this the
+/// keyboard cannot express a double bond or a fused ring at all.
+///
+/// `shift` is the Shift state of the arrow press itself. The frame's modifier state is the one
+/// at the *end* of the frame, so a Shift released in the arrow's frame made Shift+arrow walk
+/// the atom instead, and a Shift pressed for the next key (`ArrowLeft E`) made a plain arrow
+/// target a bond.
+fn walk_keyboard_target(editor: &mut ChemStructEditor, dx: f32, dy: f32, shift: bool) {
+    match editor.hotspot_atom {
+        Some(src_id) => {
+            if let Some(next) = navigate_direction(&editor.molecule, src_id, dx, dy) {
+                if shift {
+                    editor.hotspot_bond =
+                        editor.molecule.bond_between(src_id, next).map(|b| b.id);
+                } else {
+                    editor.hotspot_atom = Some(next);
+                    // A bond target from the old position would be stale and would
+                    // silently steer the next bond key at the wrong bond.
+                    editor.hotspot_bond = None;
+                }
+            }
+        }
+        // With no hotspot the arrows move the *insertion cursor* instead. Without this,
+        // `last_mouse_mol` never changes in keyboard-only use, so every seeded atom lands
+        // on the same coordinate and a second, separate component cannot be placed at all
+        // (it snaps into the first). Space/Tab drops the hotspot to get here.
+        None => {
+            editor.last_mouse_mol[0] += dx * DEFAULT_BOND_LENGTH;
+            editor.last_mouse_mol[1] += dy * DEFAULT_BOND_LENGTH;
+        }
+    }
 }
 
 /// Press `key` on atom `atom_id` as one undo step, if it changes anything, with `target` as where
@@ -1848,16 +1952,58 @@ fn rotate_atoms(editor: &mut ChemStructEditor, ids: &[u32], angle: f32) {
 
 /// Returns (key_str, shift, ctrl, alt) for each key pressed this frame (no repeat).
 fn pressed_key_strings(ui: &egui::Ui) -> Vec<(String, bool, bool, bool)> {
+    pressed_keys(ui)
+        .into_iter()
+        .filter(|k| !k.repeat)
+        .map(|k| (k.key, k.shift, k.ctrl, k.alt))
+        .collect()
+}
+
+/// A key pressed this frame, in the order the presses came.
+struct PressedKey {
+    /// As [`key_to_str`] names it.
+    key: String,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    /// An auto-repeat of a key held down.
+    repeat: bool,
+    /// Where the press sits in this frame's `InputState::events`.
+    index: usize,
+}
+
+/// Every key pressed this frame that [`key_to_str`] names, auto-repeats included, each with
+/// the modifiers held *at that press* (not the frame's final modifier state).
+fn pressed_keys(ui: &egui::Ui) -> Vec<PressedKey> {
     ui.input(|i| {
-        i.events.iter().filter_map(|event| {
-            match event {
-                egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } => {
-                    let s = key_to_str(*key, modifiers.shift)?;
-                    Some((s, modifiers.shift, modifiers.ctrl, modifiers.alt))
-                }
-                _ => None,
-            }
+        i.events.iter().enumerate().filter_map(|(index, event)| match event {
+            egui::Event::Key { key, pressed: true, modifiers, repeat, .. } => Some(PressedKey {
+                key: key_to_str(*key, modifiers.shift)?,
+                shift: modifiers.shift,
+                ctrl: modifiers.ctrl,
+                alt: modifiers.alt,
+                repeat: *repeat,
+                index,
+            }),
+            _ => None,
         }).collect()
+    })
+}
+
+/// The keystrokes (key and text events) after the press at `index` in this frame's events,
+/// less the text the press itself typed.
+fn keystrokes_after(ui: &egui::Ui, index: usize) -> Vec<egui::Event> {
+    ui.input(|i| {
+        // The press's own character (a backtick's "`") comes after it, before the next press.
+        let mut own_text = true;
+        i.events.iter().skip(index + 1).filter(|e| match e {
+            egui::Event::Key { pressed, .. } => {
+                own_text &= !*pressed;
+                true
+            }
+            egui::Event::Text(_) => !own_text,
+            _ => false,
+        }).cloned().collect()
     })
 }
 
