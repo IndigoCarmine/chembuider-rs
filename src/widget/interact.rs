@@ -1930,7 +1930,7 @@ pub(crate) fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
 /// The label may also *chain* names (`MeOPh` = Me–O–Ph); see
 /// [`label_chain`](crate::label_chain), which welds such a chain into one fragment so the
 /// insertion below is the same either way.
-fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
+pub(crate) fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
     let element = match editor.molecule.atom_by_id(atom_id) {
         Some(a) => a.element.clone(),
         None    => return false,
