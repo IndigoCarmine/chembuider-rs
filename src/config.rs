@@ -434,6 +434,8 @@ const BUILTIN_FRAGMENT_STRS: &[&str] = &[
     include_str!("../assets/fragments/Ts.json"),
     include_str!("../assets/fragments/Benz.json"),
     include_str!("../assets/fragments/TEG.json"),
+    include_str!("../assets/fragments/C2H5.json"),
+    include_str!("../assets/fragments/C3H7.json"),
     include_str!("../assets/fragments/C4H9.json"),
     include_str!("../assets/fragments/C5H11.json"),
     include_str!("../assets/fragments/C6H13.json"),

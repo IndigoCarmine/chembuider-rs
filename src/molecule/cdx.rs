@@ -284,13 +284,13 @@ pub(super) fn node_rules(mol: &impl AtomLookup, atom: &super::Atom) -> NodeRules
     let shown = depict::should_show_label(mol, atom.id);
     let num_hydrogens = (z.is_some() && shown).then(|| depict::displayed_h_count(mol, atom.id) as i16);
     let label = shown.then(|| {
-        let (mut runs, text) = runs_of(&depict::atom_label(mol, atom).rich);
+        let shown = depict::atom_label(mol, atom);
+        let (mut runs, text) = runs_of(&shown.rich);
         // An element's label is a formula, written the way ChemDraw writes its own.
         if z.is_some() {
             runs = vec![(0, FACE_FORMULA)];
         }
-        let right = depict::displayed_h_count(mol, atom.id) > 0 && depict::h_side(mol, atom.id) == depict::HSide::Left;
-        NodeLabel { runs, text, right }
+        NodeLabel { runs, text, right: shown.mirrored }
     });
     NodeRules { kind, num_hydrogens, charge: atom.charge, label }
 }
