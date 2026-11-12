@@ -1030,6 +1030,56 @@ fn chained_labels_are_case_sensitive() {
     assert!(!phenyl.atoms.iter().any(|a| a.element == "P"));
 }
 
+/// Write `label` on the middle atom of C–label–C, then press `x` with that atom as the hotspot.
+fn expand_between_two_carbons(label: &str) -> (Molecule, u32) {
+    let mut editor = crate::ChemStructEditor::default();
+    let mol = &mut editor.molecule;
+    let a = mol.add_atom("C".into(), [0.0, 0.0], 0);
+    let x = mol.add_atom(label.into(), [1.3, -0.75], 0);
+    let b = mol.add_atom("C".into(), [2.6, 0.0], 0);
+    mol.add_bond(a, x, BondOrder::Single);
+    mol.add_bond(x, b, BondOrder::Single);
+    editor.hotspot_atom = Some(x);
+    crate::testkit::type_keys_into(&mut editor, "x");
+    (editor.molecule, x)
+}
+
+/// A fragment whose attach atom has no room for the label atom's bonds is not expanded.
+///
+/// `Ph` is a monovalent group: its ipso carbon already has three bond orders inside the ring,
+/// so a `Ph` written between two carbons used to become a pentavalent ipso carbon (or, with
+/// the ring snapped onto the second neighbour, a broken ring). Like a label with no reading,
+/// it is now left as it is.
+#[test]
+fn a_label_with_more_bonds_than_its_fragment_takes_is_left_alone() {
+    for label in ["Ph", "OMe", "CO2Me"] {
+        let (mol, x) = expand_between_two_carbons(label);
+        let element = &mol.atom_by_id(x).unwrap().element;
+        assert_eq!((mol.atoms.len(), mol.bonds.len()), (3, 2), "{label}");
+        assert_eq!(element, label, "{label}: the label survives");
+    }
+    // Room for both bonds: still expanded as before.
+    for (label, atoms) in [("Me", 3), ("NH", 3), ("Et", 4)] {
+        let (mol, x) = expand_between_two_carbons(label);
+        let heavy = mol.atoms.iter().filter(|a| a.element != "H").count();
+        assert_ne!(mol.atom_by_id(x).unwrap().element, label, "{label} expands");
+        assert!(heavy >= atoms, "{label}");
+        for a in &mol.atoms {
+            let limit = crate::molecule::charged_max_valence(&a.element, a.charge);
+            let over = limit.is_some_and(|l| mol.bond_order_sum(a.id) > l);
+            assert!(!over, "{label}: {} over-valent", a.element);
+        }
+    }
+}
+
+/// `DDP` has no chain reading: D–D–P would put the middle deuterium on two bonds.
+#[test]
+fn a_hydrogen_isotope_is_not_read_inside_a_chained_label() {
+    let mol = expand("1", "DDP");
+    assert!(mol.atoms.iter().any(|a| a.element == "DDP"));
+    assert!(!mol.atoms.iter().any(|a| a.element == "D"));
+}
+
 /// A name that only *looks* splittable must not be nibbled apart: `NO2` is the nitro group,
 /// `CO2Me` the methyl ester, and neither may be read as a chain starting with `N` or `C`.
 #[test]
