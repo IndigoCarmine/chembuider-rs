@@ -39,6 +39,51 @@ fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
     edit_bond_type(editor, bond_id, bond.order.cycle(), bond.stereo.clone());
 }
 
+/// What the Bond tool does to an existing bond it is pointed at (a click on the bond, or a
+/// drag along it from `narrow` to its other atom).
+///
+/// With a stereo style chosen (wedge, hash, bold, …) a single bond is *replaced* by that
+/// style rather than cycled to a double bond:
+///
+/// - a bond of another style (plain included) takes the chosen one. A style with a direction
+///   (the wedges, the dative arrow) starts at `narrow`: the atom nearer the click, or the one
+///   the drag began on;
+/// - a bond already of the chosen style is turned round when the style has a direction, and
+///   goes back to a plain bond when it has none (as pressing the style's key twice does).
+///
+/// Anything else (no style chosen, or a double or triple bond) cycles the bond's order as
+/// before.
+fn retype_bond_with_tool(editor: &mut ChemStructEditor, bond_id: u32, narrow: Option<u32>) {
+    let chosen = editor.current_bond_stereo.clone();
+    let Some(bond) = editor.molecule.bond_by_id(bond_id) else {
+        return;
+    };
+    if chosen == BondStereo::None || bond.order != BondOrder::Single {
+        cycle_bond_order(editor, bond_id);
+        return;
+    }
+    let directed = matches!(
+        chosen,
+        BondStereo::WedgeUp | BondStereo::WedgeDown | BondStereo::HollowWedge | BondStereo::Dative
+    );
+    let (same, begin, end) = (bond.stereo == chosen, bond.begin, bond.end);
+    let reverse = if same { directed } else { directed && narrow == Some(end) };
+    let stereo = if same && !directed { BondStereo::None } else { chosen };
+    edit_bond_type(editor, bond_id, BondOrder::Single, stereo);
+    if reverse && let Some(bond) = editor.molecule.bond_by_id_mut(bond_id) {
+        (bond.begin, bond.end) = (end, begin);
+    }
+}
+
+/// The atom of `bond_id` nearer to `pos` (molecule coordinates).
+fn nearer_bond_atom(editor: &ChemStructEditor, bond_id: u32, pos: [f32; 2]) -> Option<u32> {
+    let bond = editor.molecule.bond_by_id(bond_id)?;
+    let dist = |id: u32| {
+        editor.molecule.atom_by_id(id).map(|a| (a.pos[0] - pos[0]).powi(2) + (a.pos[1] - pos[1]).powi(2))
+    };
+    Some(if dist(bond.end)? < dist(bond.begin)? { bond.end } else { bond.begin })
+}
+
 /// Apply a manual bond edit. Ring matching writes orders directly and keeps its own record.
 pub(crate) fn edit_bond_type(
     editor: &mut ChemStructEditor,
@@ -164,7 +209,7 @@ pub fn process_bond_tool(
                     });
                 if target_id != src_id {
                     if let Some(existing) = editor.molecule.bond_between(src_id, target_id).map(|b| b.id) {
-                        cycle_bond_order(editor, existing);
+                        retype_bond_with_tool(editor, existing, Some(src_id));
                         modified = true;
                     } else {
                         let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
@@ -214,7 +259,10 @@ pub fn process_bond_tool(
             editor.hotspot_atom = Some(new_id);
         } else if let Some(bond_id) = editor.hovered_bond {
             if editor.molecule.bond_by_id_mut(bond_id).is_some() {
-                cycle_bond_order(editor, bond_id);
+                // With a wedge (or another stereo style) chosen, a single bond becomes that
+                // style, its narrow end at the atom nearer the click.
+                let narrow = nearer_bond_atom(editor, bond_id, editor.screen_to_mol(mouse, center));
+                retype_bond_with_tool(editor, bond_id, narrow);
                 modified = true;
             }
         } else {
@@ -2622,6 +2670,129 @@ mod tests {
 
         assert_eq!(editor.molecule.bond_by_id(bond).unwrap().order, BondOrder::Double);
         assert!(editor.selected_bonds.is_empty() && editor.selected_atoms.is_empty());
+    }
+
+    /// The Bond tool with `stereo` chosen, over a single bond from (0, 0) (at `MID`) to
+    /// (3, 0), and that bond's id and atoms.
+    fn bond_tool_over_single_bond(stereo: BondStereo) -> (ChemStructEditor, u32, [u32; 2]) {
+        let mut editor = ChemStructEditor {
+            tool: crate::Tool::Bond,
+            current_bond_stereo: stereo,
+            ..Default::default()
+        };
+        let a = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [3.0, 0.0], 0);
+        let bond = editor.molecule.add_bond(a, b, BondOrder::Single);
+        (editor, bond, [a, b])
+    }
+
+    /// The screen point `t` of the way along the bond from `a` to `b`.
+    fn along_bond(editor: &ChemStructEditor, a: u32, b: u32, t: f32) -> egui::Pos2 {
+        let (p, q) = (editor.molecule.atom_by_id(a).unwrap().pos, editor.molecule.atom_by_id(b).unwrap().pos);
+        editor.mol_to_screen([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t], MID)
+    }
+
+    fn click_at(editor: &mut ChemStructEditor, at: egui::Pos2) {
+        primary_drag_along(editor, &[at], Default::default());
+    }
+
+    /// Wedge tool: a click on a single bond makes it a wedge instead of a double bond, with
+    /// the narrow end (the bond's `begin`) at the atom nearer the click; one undo puts the
+    /// plain bond back.
+    #[test]
+    fn wedge_tool_click_on_a_single_bond_replaces_it_with_a_wedge() {
+        for stereo in [BondStereo::WedgeUp, BondStereo::WedgeDown, BondStereo::HollowWedge] {
+            // Nearer `a`: the bond keeps its direction.
+            let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(stereo.clone());
+            let before = editor.molecule.clone();
+            let at = along_bond(&editor, a, b, 0.35);
+            click_at(&mut editor, at);
+            let after = editor.molecule.bond_by_id(bond).unwrap().clone();
+            assert_eq!(after.order, BondOrder::Single, "the bond stays single");
+            assert_eq!(after.stereo, stereo);
+            assert_eq!((after.begin, after.end), (a, b), "narrow end at the atom nearer the click");
+            assert_eq!(editor.molecule.bonds.len(), 1, "no bond is added");
+            assert_eq!(editor.molecule.atoms.len(), 2, "no atom is added");
+            assert!(editor.undo(), "the replacement is undoable");
+            assert_eq!(editor.molecule, before, "one undo restores the plain bond");
+
+            // Nearer `b`: the wedge starts there.
+            let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(stereo.clone());
+            let at = along_bond(&editor, a, b, 0.65);
+            click_at(&mut editor, at);
+            let after = editor.molecule.bond_by_id(bond).unwrap();
+            assert_eq!(after.stereo, stereo);
+            assert_eq!((after.begin, after.end), (b, a), "narrow end at the atom nearer the click");
+        }
+    }
+
+    /// Wedge tool: a click on a bond that is already that wedge turns it round; a wedge of
+    /// another kind is replaced, starting at the atom nearer the click.
+    #[test]
+    fn wedge_tool_click_on_a_wedge_reverses_or_replaces_it() {
+        let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(BondStereo::WedgeUp);
+        let at = along_bond(&editor, a, b, 0.35);
+        click_at(&mut editor, at);
+        click_at(&mut editor, at);
+        let after = editor.molecule.bond_by_id(bond).unwrap().clone();
+        assert_eq!(after.stereo, BondStereo::WedgeUp);
+        assert_eq!((after.begin, after.end), (b, a), "the second click turns the wedge round");
+        click_at(&mut editor, at);
+        let after = editor.molecule.bond_by_id(bond).unwrap().clone();
+        assert_eq!((after.begin, after.end), (a, b), "and the third turns it back");
+
+        editor.current_bond_stereo = BondStereo::WedgeDown;
+        let at = along_bond(&editor, a, b, 0.65);
+        click_at(&mut editor, at);
+        let after = editor.molecule.bond_by_id(bond).unwrap();
+        assert_eq!(after.stereo, BondStereo::WedgeDown, "another wedge replaces it");
+        assert_eq!((after.begin, after.end), (b, a), "from the atom nearer the click");
+    }
+
+    /// A style without a direction (bold) replaces a single bond the same way, keeps the
+    /// bond's atoms as they were, and a second click takes it off again.
+    #[test]
+    fn bold_tool_click_on_a_single_bond_toggles_the_style() {
+        let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(BondStereo::Bold);
+        let at = along_bond(&editor, a, b, 0.65);
+        click_at(&mut editor, at);
+        let after = editor.molecule.bond_by_id(bond).unwrap().clone();
+        assert_eq!((after.order, after.stereo), (BondOrder::Single, BondStereo::Bold));
+        assert_eq!((after.begin, after.end), (a, b));
+        click_at(&mut editor, at);
+        assert_eq!(editor.molecule.bond_by_id(bond).unwrap().stereo, BondStereo::None);
+    }
+
+    /// Wedge tool: a double bond is not a wedge's to replace; the click cycles its order as it
+    /// always did. And with no style chosen a single bond still becomes a double bond.
+    #[test]
+    fn wedge_tool_leaves_multiple_bonds_to_the_order_cycle() {
+        let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(BondStereo::WedgeUp);
+        editor.molecule.bond_by_id_mut(bond).unwrap().order = BondOrder::Double;
+        let at = along_bond(&editor, a, b, 0.5);
+        click_at(&mut editor, at);
+        let after = editor.molecule.bond_by_id(bond).unwrap();
+        assert_eq!((after.order.clone(), after.stereo.clone()), (BondOrder::Triple, BondStereo::None));
+
+        let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(BondStereo::None);
+        let at = along_bond(&editor, a, b, 0.5);
+        click_at(&mut editor, at);
+        assert_eq!(editor.molecule.bond_by_id(bond).unwrap().order, BondOrder::Double);
+    }
+
+    /// Wedge tool: dragging from one atom of a single bond to the other replaces the bond with
+    /// a wedge that starts where the drag did.
+    #[test]
+    fn wedge_tool_drag_along_a_single_bond_replaces_it_from_the_drag_start() {
+        let (mut editor, bond, [a, b]) = bond_tool_over_single_bond(BondStereo::WedgeUp);
+        let (from, to) = (along_bond(&editor, a, b, 1.0), along_bond(&editor, a, b, 0.0));
+        let path: Vec<egui::Pos2> = (0..=10).map(|k| from + (to - from) * (k as f32 / 10.0)).collect();
+        primary_drag_along(&mut editor, &path, Default::default());
+        let after = editor.molecule.bond_by_id(bond).unwrap();
+        assert_eq!((after.order.clone(), after.stereo.clone()), (BondOrder::Single, BondStereo::WedgeUp));
+        assert_eq!((after.begin, after.end), (b, a), "the wedge starts on the atom the drag began on");
+        assert_eq!(editor.molecule.bonds.len(), 1);
+        assert_eq!(editor.undo_stack.len(), 1, "one undo step");
     }
 
     fn frag_shortcut(key: &str, fragment: &str) -> AtomShortcut {
