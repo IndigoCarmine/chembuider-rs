@@ -481,6 +481,25 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// A small clockwise arrow in `rect`: three quarters of a circle ending in an arrowhead. It
+/// stands before the angle box's field to say which way a positive angle turns.
+pub(crate) fn clockwise_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let (c, r) = (rect.center(), rect.width().min(rect.height()) * 0.36);
+    let stroke = egui::Stroke::new(1.3, color);
+    // Screen y points down, so a growing angle runs clockwise.
+    let at = |deg: f32| {
+        let a = deg.to_radians();
+        c + r * egui::vec2(a.cos(), a.sin())
+    };
+    let points: Vec<egui::Pos2> = (0..=18).map(|k| at(-240.0 + 15.0 * k as f32)).collect();
+    painter.add(egui::Shape::line(points, stroke));
+    let (tip, a) = (at(30.0), 30.0_f32.to_radians());
+    let along = egui::vec2(-a.sin(), a.cos());
+    let across = egui::vec2(a.cos(), a.sin());
+    painter.line_segment([tip, tip - 3.5 * along + 3.0 * across], stroke);
+    painter.line_segment([tip, tip - 3.5 * along - 3.0 * across], stroke);
+}
+
 /// Draw a dashed circle (used as the over-valence warning ring).
 fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32, stroke_width: f32) {
     const SEGMENTS: usize = 20;
