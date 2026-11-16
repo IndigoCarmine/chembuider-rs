@@ -229,6 +229,22 @@ impl PageObject {
         }
     }
 
+    /// Mirror the object's reference points in the line through `a` and `b` (two different
+    /// points). As with [`rotate_about`](Self::rotate_about), a text keeps its orientation, as
+    /// does a table; only their anchors move.
+    pub fn reflect_about(&mut self, a: [f32; 2], b: [f32; 2]) {
+        let reflect = |p: &mut [f32; 2]| *p = reflect_point(*p, a, b);
+        match self {
+            PageObject::Arrow(arrow) => {
+                reflect(&mut arrow.tail);
+                reflect(&mut arrow.head);
+            }
+            PageObject::Text(t) => reflect(&mut t.pos),
+            PageObject::Table(t) => reflect(&mut t.pos),
+            PageObject::Bracket(_) => {}
+        }
+    }
+
     /// The points that stand for the object in a lasso or a bounding box: an arrow's two ends,
     /// a text's anchor, a table's top-left corner. Brackets have none (their atoms stand for
     /// them).
@@ -272,6 +288,20 @@ impl PageObject {
 
 /// The default length of an arrow placed with a click: three bonds.
 pub const DEFAULT_ARROW_LENGTH: f32 = 4.5;
+
+/// The mirror image of `p` in the line through `a` and `b`; `p` itself when the two are one
+/// point and there is no line.
+pub fn reflect_point(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f32::EPSILON {
+        return p;
+    }
+    // The foot of the perpendicular from `p`, and as far again beyond it.
+    let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2;
+    let foot = [a[0] + t * dx, a[1] + t * dy];
+    [2.0 * foot[0] - p[0], 2.0 * foot[1] - p[1]]
+}
 
 /// `head` moved so the direction `tail → head` is a multiple of `step_deg` degrees, keeping
 /// its length.
