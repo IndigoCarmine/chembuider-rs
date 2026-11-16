@@ -415,6 +415,10 @@ pub fn process_select_tool(
     // Double-click an atom or bond → select that whole connected molecule.
     if click_on_handle {
         editor.lasso_path.clear();
+        // A double-click on the handle asks for the angle instead of a drag.
+        if response.double_clicked() {
+            editor.open_rotate_input();
+        }
     } else if response.double_clicked() {
         editor.lasso_path.clear();
         let seed = editor.hovered_atom.or_else(|| {
@@ -694,7 +698,7 @@ impl RotateDrag {
 /// The step the rotation handle turns the selection in, in degrees (Shift turns it freely).
 pub(crate) const ROTATE_SNAP_DEG: f32 = 15.0;
 /// How far above the selection its rotation handle sits, in screen pixels.
-const ROTATE_HANDLE_GAP: f32 = 26.0;
+pub(crate) const ROTATE_HANDLE_GAP: f32 = 26.0;
 /// The radius the rotation handle is drawn with, and the one it is grabbed within (pixels).
 pub(crate) const ROTATE_HANDLE_RADIUS: f32 = 5.0;
 const ROTATE_HANDLE_HIT: f32 = 9.0;
@@ -706,6 +710,12 @@ pub(crate) fn rotation_handle_anchor(editor: &ChemStructEditor, center: egui::Po
     if editor.tool != crate::Tool::Select {
         return None;
     }
+    selection_top(editor, center)
+}
+
+/// The top-centre of the selected atoms' bounding box on screen, whatever the tool; `None`
+/// with fewer than two atoms selected.
+pub(crate) fn selection_top(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
     let mut bounds: Option<egui::Rect> = None;
     let mut count = 0;
     for &id in &editor.selected_atoms {
@@ -2067,7 +2077,7 @@ fn move_atoms(editor: &mut ChemStructEditor, ids: &[u32], delta: [f32; 2]) {
 }
 
 /// Centroid (molecule coords) of the current selection, or origin when empty.
-fn selection_centroid(editor: &ChemStructEditor) -> [f32; 2] {
+pub(crate) fn selection_centroid(editor: &ChemStructEditor) -> [f32; 2] {
     let (mut cx, mut cy, mut n) = (0.0_f32, 0.0_f32, 0u32);
     for &id in &editor.selected_atoms {
         if let Some(a) = editor.molecule.atom_by_id(id) {
@@ -2081,7 +2091,7 @@ fn selection_centroid(editor: &ChemStructEditor) -> [f32; 2] {
 
 /// Turn the selection (atoms and page objects) by `angle` about `pivot`. Only positions change:
 /// a bond keeps its two atoms in their order, so a wedge keeps its narrow end.
-fn rotate_selection(editor: &mut ChemStructEditor, pivot: [f32; 2], angle: f32) {
+pub(crate) fn rotate_selection(editor: &mut ChemStructEditor, pivot: [f32; 2], angle: f32) {
     let (sin_a, cos_a) = angle.sin_cos();
     for id in editor.selected_atoms.clone() {
         if let Some(atom) = editor.molecule.atom_by_id_mut(id) {
@@ -2758,6 +2768,218 @@ mod tests {
         primary_drag_along(&mut editor, &[handle], Default::default());
         assert_eq!(editor.selected_atoms, [a, b].into_iter().collect());
         assert!(editor.undo_stack.is_empty());
+    }
+
+    /// `rotate_selection_by` turns the selection by the angle given, clockwise on screen for a
+    /// positive one (y grows downward, so that is the positive sense of `atan2`), about its
+    /// centroid, as one undo step.
+    #[test]
+    fn rotate_selection_by_turns_clockwise_about_the_centroid() {
+        let (mut editor, [a, b, c], wedge) = selected_wedge();
+        let before = editor.molecule.clone();
+
+        assert!(editor.rotate_selection_by(30.0));
+
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 30.0).abs() < 1e-3, "a positive angle turns clockwise on screen, got {turned}");
+        let (pa, pb) = (editor.molecule.atom_by_id(a).unwrap().pos, editor.molecule.atom_by_id(b).unwrap().pos);
+        assert!(pb[1] > 0.0, "the right-hand atom went down the screen");
+        assert!((pa[0] + pb[0]).abs() < 1e-4 && (pa[1] + pb[1]).abs() < 1e-4, "the centroid stays at (0, 0)");
+        let length = ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2)).sqrt();
+        assert!((length - 3.0).abs() < 1e-4, "the bond keeps its length, got {length}");
+        assert_eq!(editor.molecule.atom_by_id(c).unwrap().pos, [3.0, 2.0], "an unselected atom stays");
+        let bond = editor.molecule.bond_by_id(wedge).unwrap();
+        assert_eq!((bond.begin, bond.end, bond.stereo.clone()), (a, b, BondStereo::WedgeUp), "the wedge is kept");
+
+        assert_eq!(editor.undo_stack.len(), 1, "one undo step");
+        assert!(editor.undo());
+        assert_eq!(editor.molecule, before, "undo restores the positions");
+    }
+
+    /// A negative angle turns the other way, and a decimal one is taken as it is.
+    #[test]
+    fn rotate_selection_by_takes_negative_and_decimal_angles() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        assert!(editor.rotate_selection_by(-12.5));
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned + 12.5).abs() < 1e-3, "got {turned}");
+    }
+
+    /// Nothing to turn, or no turn at all: nothing changes and nothing is pushed for undo.
+    #[test]
+    fn rotate_selection_by_refuses_what_is_no_rotation() {
+        let (mut editor, [_, b, _], _) = selected_wedge();
+        let before = editor.molecule.clone();
+        assert!(!editor.rotate_selection_by(0.0));
+        assert!(!editor.rotate_selection_by(360.0));
+        assert!(!editor.rotate_selection_by(f32::NAN));
+        editor.selected_atoms.remove(&b);
+        assert!(!editor.can_rotate_selection());
+        assert!(!editor.rotate_selection_by(30.0), "a single atom has nothing to turn");
+        assert!(!editor.open_rotate_input(), "and no angle box opens for it");
+        assert_eq!(editor.molecule, before);
+        assert!(editor.undo_stack.is_empty());
+    }
+
+    /// Ctrl+R opens the angle box with the last angle offered; typing replaces it, and Enter
+    /// turns the selection by what was typed, as one undo step, and closes the box.
+    #[test]
+    fn angle_box_turns_the_selection_by_the_typed_angle() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let before = editor.molecule.clone();
+        let ctx = egui::Context::default();
+
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Ctrl+R");
+        assert_eq!(editor.rotate_edit.as_ref().map(|e| e.text.as_str()), Some("90"), "the box opens, offering 90");
+        assert_eq!(editor.molecule, before, "nothing turns until Enter");
+        crate::testkit::kbd_frame(&ctx, &mut editor, "text:30");
+        assert_eq!(editor.rotate_edit.as_ref().map(|e| e.text.as_str()), Some("30"), "typing replaces the offer");
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Enter");
+
+        assert!(!editor.is_rotate_input_open(), "Enter closes the box");
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 30.0).abs() < 1e-3, "turned by the typed 30°, got {turned}");
+        assert_eq!(editor.selected_atoms, [a, b].into_iter().collect(), "the selection is kept");
+        assert_eq!(editor.undo_stack.len(), 1, "one undo step");
+
+        // The angle is remembered: Ctrl+R, Enter turns by it again.
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Ctrl+R");
+        assert_eq!(editor.rotate_edit.as_ref().map(|e| e.text.as_str()), Some("30"));
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Enter");
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 60.0).abs() < 1e-3, "30° more, got {turned}");
+        assert_eq!(editor.undo_stack.len(), 2);
+
+        assert!(editor.undo() && editor.undo());
+        assert_eq!(editor.molecule, before, "undo twice restores the drawing");
+    }
+
+    /// Digits typed in the very frame the box opens in are not dropped: Ctrl+R, 4, 5 and Enter
+    /// all in one frame turn by 45°.
+    #[test]
+    fn angle_box_takes_what_is_typed_in_the_frame_it_opens_in() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let ctx = egui::Context::default();
+        let (mut events, _) = crate::testkit::chord("Ctrl+R");
+        events.push(egui::Event::Text("45".to_string()));
+        crate::testkit::run_frame(&ctx, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0)), &mut editor, events);
+        assert_eq!(editor.rotate_edit.as_ref().map(|e| e.text.as_str()), Some("45"));
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Enter");
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 45.0).abs() < 1e-3, "got {turned}");
+    }
+
+    /// Escape closes the box and turns nothing: the drawing, the undo stack and the selection
+    /// are as they were.
+    #[test]
+    fn angle_box_escape_changes_nothing() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let before = editor.molecule.clone();
+        let ctx = egui::Context::default();
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Ctrl+R");
+        crate::testkit::kbd_frame(&ctx, &mut editor, "text:45");
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Escape");
+        assert!(!editor.is_rotate_input_open(), "Escape closes the box");
+        assert_eq!(editor.molecule, before, "nothing turned");
+        assert!(editor.undo_stack.is_empty(), "nothing to undo");
+        assert_eq!(editor.selected_atoms, [a, b].into_iter().collect(), "the selection is kept");
+        // The cancelled angle is not the one remembered.
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Ctrl+R");
+        assert_eq!(editor.rotate_edit.as_ref().map(|e| e.text.as_str()), Some("90"));
+    }
+
+    /// While the box is open its keys are its own: Backspace and Delete edit the text instead
+    /// of deleting the selection, digits and letters fire no atom or bond shortcut, Ctrl+Z is
+    /// the box's, and the Enter that closes it does nothing else. Afterwards the canvas has
+    /// its keys back.
+    #[test]
+    fn angle_box_keys_do_not_reach_the_canvas_shortcuts() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        editor.push_undo(); // something Ctrl+Z could take back
+        let before = editor.molecule.clone();
+        let ctx = egui::Context::default();
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Ctrl+R");
+        for key in ["text:1", "1", "text:2", "2", "Backspace", "Delete", "text:n", "n", "o", "a", "Ctrl+Z", "Ctrl+0", "Ctrl+R"] {
+            crate::testkit::kbd_frame(&ctx, &mut editor, key);
+            assert!(editor.is_rotate_input_open(), "{key:?} leaves the box open");
+            assert_eq!(editor.molecule, before, "{key:?} does not reach the drawing");
+            assert_eq!(editor.selected_atoms, [a, b].into_iter().collect(), "{key:?} leaves the selection");
+            assert_eq!(editor.undo_stack.len(), 1, "{key:?} leaves the undo stack");
+            assert_eq!((editor.zoom, editor.pan), (1.0, egui::Vec2::ZERO), "{key:?} leaves the view");
+        }
+        // Not an angle: Enter turns nothing and the box stays for it to be put right.
+        crate::testkit::kbd_frame(&ctx, &mut editor, "text:x");
+        assert!(editor.rotate_edit.as_ref().is_some_and(|e| e.text.contains('x')), "the box takes the typing");
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Enter");
+        assert!(editor.is_rotate_input_open(), "Enter on what is not an angle keeps the box");
+        assert_eq!(editor.molecule, before);
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Escape");
+        assert!(!editor.is_rotate_input_open());
+        assert_eq!(editor.molecule, before);
+
+        // The canvas takes keys again from the next frame on.
+        crate::testkit::kbd_frame(&ctx, &mut editor, "Delete");
+        assert!(editor.molecule.atom_by_id(a).is_none(), "Delete removes the selection again");
+    }
+
+    /// A double-click on the rotation handle opens the angle box, and leaves the selection and
+    /// the drawing alone.
+    #[test]
+    fn double_click_on_the_rotation_handle_opens_the_angle_box() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let before = editor.molecule.clone();
+        let handle = rotation_handle(&editor, MID).unwrap();
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let button = |pressed| egui::Event::PointerButton {
+            pos: handle,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        crate::testkit::run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(handle)]);
+        for pressed in [true, false, true, false] {
+            crate::testkit::run_frame(&ctx, screen_rect, &mut editor, vec![button(pressed)]);
+        }
+        assert!(editor.is_rotate_input_open(), "the double-click opens the box");
+        assert_eq!(editor.selected_atoms, [a, b].into_iter().collect());
+        assert_eq!(editor.molecule, before);
+
+        // It stays open over the following frames, and takes typing.
+        crate::testkit::run_frame(&ctx, screen_rect, &mut editor, Vec::new());
+        crate::testkit::run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::Text("15".to_string())]);
+        assert_eq!(editor.rotate_edit.as_ref().map(|e| e.text.as_str()), Some("15"));
+
+        // A click on the canvas closes it without turning anything, and is spent on that: the
+        // selection is not cleared by it.
+        let away = MID + egui::vec2(200.0, 150.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos: away,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        crate::testkit::run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(away)]);
+        crate::testkit::run_frame(&ctx, screen_rect, &mut editor, vec![click(true)]);
+        crate::testkit::run_frame(&ctx, screen_rect, &mut editor, vec![click(false)]);
+        assert!(!editor.is_rotate_input_open(), "a click elsewhere closes the box");
+        assert_eq!(editor.molecule, before, "and turns nothing");
+        assert_eq!(editor.selected_atoms, [a, b].into_iter().collect(), "the click is spent closing it");
+    }
+
+    /// What counts as an angle.
+    #[test]
+    fn parse_angle_reads_degrees() {
+        use crate::widget::parse_angle;
+        assert_eq!(parse_angle("30"), Some(30.0));
+        assert_eq!(parse_angle(" -12.5° "), Some(-12.5));
+        assert_eq!(parse_angle("+7,5"), Some(7.5));
+        assert_eq!(parse_angle("４５"), Some(45.0));
+        assert_eq!(parse_angle("－９０．５"), Some(-90.5));
+        assert_eq!(parse_angle(""), None);
+        assert_eq!(parse_angle("abc"), None);
+        assert_eq!(parse_angle("inf"), None);
+        assert_eq!(parse_angle("NaN"), None);
     }
 
     /// Select tool: a click on an atom (no movement) only toggles the selection; it changes no
