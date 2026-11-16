@@ -353,8 +353,21 @@ pub fn process_select_tool(
     let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
     let drag = PrimaryDrag::of(response, ui);
 
+    // The rotation handle of the selection: a grab cursor over it, and a click on it is not a
+    // click on what lies under it (it must not toggle or clear the selection).
+    let handle = rotation_handle(editor, center);
+    let on_handle = |p: egui::Pos2| handle.is_some_and(|h| h.distance(p) <= ROTATE_HANDLE_HIT);
+    let rotating = editor.rotate_drag.is_some();
+    if rotating || ui.input(|i| i.pointer.hover_pos()).is_some_and(on_handle) {
+        ui.ctx().set_cursor_icon(if rotating { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    }
+    let click_on_handle = (response.clicked() || response.double_clicked())
+        && response.interact_pointer_pos().is_some_and(on_handle);
+
     // Double-click an atom or bond → select that whole connected molecule.
-    if response.double_clicked() {
+    if click_on_handle {
+        editor.lasso_path.clear();
+    } else if response.double_clicked() {
         editor.lasso_path.clear();
         let seed = editor.hovered_atom.or_else(|| {
             editor.hovered_bond
@@ -410,15 +423,27 @@ pub fn process_select_tool(
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
         lasso_begin(editor, origin);
         editor.object_drag = None;
-        // Alt+drag with a selection rotates the molecule around its centroid.
-        if ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty() {
+        // A drag of the rotation handle, or Alt+drag anywhere with a selection, rotates the
+        // selection around its centroid. The handle turns in 15° steps (Shift: freely), as an
+        // arrow's end does; Alt+drag is free.
+        let by_handle = on_handle(origin);
+        if by_handle || (ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty()) {
             editor.push_undo();
-            let c = selection_centroid(editor);
-            let mp = editor.screen_to_mol(mouse, center);
-            editor.rotate_last_angle = Some((mp[1] - c[1]).atan2(mp[0] - c[0]));
+            let pivot = selection_centroid(editor);
+            // The handle is grabbed where it was pressed; Alt+drag starts where the drag did.
+            let grab = editor.screen_to_mol(if by_handle { origin } else { mouse }, center);
+            let handle_at = handle.map_or(grab, |h| editor.screen_to_mol(h, center));
+            editor.rotate_drag = Some(RotateDrag {
+                pivot,
+                last_angle: (grab[1] - pivot[1]).atan2(grab[0] - pivot[0]),
+                turned: 0.0,
+                applied: 0.0,
+                snap: by_handle,
+                handle_offset: [handle_at[0] - pivot[0], handle_at[1] - pivot[1]],
+            });
             editor.dragging_atom = None;
         } else {
-            editor.rotate_last_angle = None;
+            editor.rotate_drag = None;
             editor.dragging_atom = None;
             if let Some(end) = arrow_end_at(editor, origin, center) {
                 // An end of the lone selected arrow: drag that end.
@@ -440,20 +465,17 @@ pub fn process_select_tool(
     }
 
     if drag.dragged {
-        if let Some(last) = editor.rotate_last_angle {
+        if let Some(mut rot) = editor.rotate_drag.clone() {
             // Rotate the selection by the change in cursor angle about its centroid.
-            let c = selection_centroid(editor);
             let mp = editor.screen_to_mol(mouse, center);
-            let angle = (mp[1] - c[1]).atan2(mp[0] - c[0]);
-            let ids: Vec<u32> = editor.selected_atoms.iter().copied().collect();
-            rotate_atoms(editor, &ids, angle - last);
-            for id in editor.selected_objects.clone() {
-                if let Some(o) = editor.molecule.object_by_id_mut(id) {
-                    o.rotate_about(c, angle - last);
-                }
+            let angle = (mp[1] - rot.pivot[1]).atan2(mp[0] - rot.pivot[0]);
+            let free = !rot.snap || ui.input(|i| i.modifiers.shift);
+            let delta = rot.advance(angle, free);
+            if delta != 0.0 {
+                rotate_selection(editor, rot.pivot, delta);
+                modified = true;
             }
-            editor.rotate_last_angle = Some(angle);
-            modified = true;
+            editor.rotate_drag = Some(rot);
         } else if let Some(atom_id) = editor.dragging_atom {
             let [dx, dy] = editor.view(center).screen_delta_to_mol(response.drag_delta());
             let with_selection = editor.selected_atoms.contains(&atom_id);
@@ -503,7 +525,7 @@ pub fn process_select_tool(
     }
 
     if drag.stopped {
-        if editor.rotate_last_angle.take().is_some() {
+        if editor.rotate_drag.take().is_some() {
             // rotation finished
         } else if editor.dragging_atom.is_some() {
             editor.dragging_atom = None;
@@ -573,6 +595,92 @@ pub(crate) enum ObjectDrag {
     Move { id: u32, with_selection: bool },
     /// Dragging one end of arrow `id` (its head, or its tail).
     ArrowEnd { id: u32, head: bool },
+}
+
+/// A rotation of the selection in progress (Select tool): Alt+drag, or a drag of the rotation
+/// handle. All angles are in radians, in molecule coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RotateDrag {
+    /// The point the selection turns about: its centroid when the drag began.
+    pub(crate) pivot: [f32; 2],
+    /// The pointer's angle about the pivot last frame.
+    last_angle: f32,
+    /// How far the pointer has turned about the pivot since the drag began.
+    turned: f32,
+    /// How far the selection has been turned so far: `turned`, or its nearest step.
+    pub(crate) applied: f32,
+    /// Turn in [`ROTATE_SNAP_DEG`] steps unless Shift is held (the handle; Alt+drag is free).
+    snap: bool,
+    /// Where the handle was, from the pivot, when the drag began; it turns with the selection.
+    handle_offset: [f32; 2],
+}
+
+impl RotateDrag {
+    /// Take the pointer's new angle about the pivot, and return how much further the selection
+    /// has to turn. `free` turns it exactly as far as the pointer; otherwise in steps.
+    fn advance(&mut self, angle: f32, free: bool) -> f32 {
+        use std::f32::consts::{PI, TAU};
+        // The shorter way round: the pointer's angle wraps at ±π.
+        let step = (angle - self.last_angle + PI).rem_euclid(TAU) - PI;
+        self.last_angle = angle;
+        self.turned += step;
+        let target = if free {
+            self.turned
+        } else {
+            let unit = ROTATE_SNAP_DEG.to_radians();
+            (self.turned / unit).round() * unit
+        };
+        let delta = target - self.applied;
+        self.applied = target;
+        delta
+    }
+
+    /// Where the handle is now: turned with the selection.
+    pub(crate) fn handle_pos(&self) -> [f32; 2] {
+        let (s, c) = self.applied.sin_cos();
+        let [dx, dy] = self.handle_offset;
+        [self.pivot[0] + dx * c - dy * s, self.pivot[1] + dx * s + dy * c]
+    }
+}
+
+/// The step the rotation handle turns the selection in, in degrees (Shift turns it freely).
+pub(crate) const ROTATE_SNAP_DEG: f32 = 15.0;
+/// How far above the selection its rotation handle sits, in screen pixels.
+const ROTATE_HANDLE_GAP: f32 = 26.0;
+/// The radius the rotation handle is drawn with, and the one it is grabbed within (pixels).
+pub(crate) const ROTATE_HANDLE_RADIUS: f32 = 5.0;
+const ROTATE_HANDLE_HIT: f32 = 9.0;
+
+/// The top-centre of the selected atoms' bounding box on screen, which the rotation handle
+/// stands over. `None` unless the Select tool has two atoms or more selected: turning a single
+/// atom about itself moves nothing.
+pub(crate) fn rotation_handle_anchor(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
+    if editor.tool != crate::Tool::Select {
+        return None;
+    }
+    let mut bounds: Option<egui::Rect> = None;
+    let mut count = 0;
+    for &id in &editor.selected_atoms {
+        if let Some(a) = editor.molecule.atom_by_id(id) {
+            let p = editor.mol_to_screen(a.pos, center);
+            bounds = Some(bounds.map_or(egui::Rect::from_min_max(p, p), |r| r.union(egui::Rect::from_min_max(p, p))));
+            count += 1;
+        }
+    }
+    bounds.filter(|_| count >= 2).map(|r| r.center_top())
+}
+
+/// Where the selection's rotation handle is on screen: above the selected atoms, or, during a
+/// rotation, wherever it has been turned to. `None` when there is no handle (see
+/// [`rotation_handle_anchor`]), and while the selection is being moved or a lasso drawn.
+pub(crate) fn rotation_handle(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
+    if let Some(rot) = &editor.rotate_drag {
+        return Some(editor.mol_to_screen(rot.handle_pos(), center));
+    }
+    if editor.dragging_atom.is_some() || editor.object_drag.is_some() || editor.drag_origin_screen.is_some() {
+        return None;
+    }
+    rotation_handle_anchor(editor, center).map(|top| top - egui::vec2(0.0, ROTATE_HANDLE_GAP))
 }
 
 /// The arrow that is the whole selection, whose ends can then be dragged.
@@ -1923,6 +2031,23 @@ fn selection_centroid(editor: &ChemStructEditor) -> [f32; 2] {
     if n == 0 { [0.0, 0.0] } else { [cx / n as f32, cy / n as f32] }
 }
 
+/// Turn the selection (atoms and page objects) by `angle` about `pivot`. Only positions change:
+/// a bond keeps its two atoms in their order, so a wedge keeps its narrow end.
+fn rotate_selection(editor: &mut ChemStructEditor, pivot: [f32; 2], angle: f32) {
+    let (sin_a, cos_a) = angle.sin_cos();
+    for id in editor.selected_atoms.clone() {
+        if let Some(atom) = editor.molecule.atom_by_id_mut(id) {
+            let (dx, dy) = (atom.pos[0] - pivot[0], atom.pos[1] - pivot[1]);
+            atom.pos = [pivot[0] + dx * cos_a - dy * sin_a, pivot[1] + dx * sin_a + dy * cos_a];
+        }
+    }
+    for id in editor.selected_objects.clone() {
+        if let Some(o) = editor.molecule.object_by_id_mut(id) {
+            o.rotate_about(pivot, angle);
+        }
+    }
+}
+
 fn rotate_atoms(editor: &mut ChemStructEditor, ids: &[u32], angle: f32) {
     // Centroid
     let (mut cx, mut cy) = (0.0_f32, 0.0_f32);
@@ -2456,6 +2581,135 @@ mod tests {
         assert_eq!(editor.undo_stack.len(), 1, "one rotation pushes exactly one undo snapshot");
         assert!(editor.undo(), "the rotation is undoable");
         assert_eq!(editor.molecule, before, "undo restores the pre-rotation positions");
+    }
+
+    /// A wedge from `a` to `b`, with a third atom `c` hanging off `b`, `a` and `b` selected.
+    /// The selection's centroid is mol (0, 0), which is at `MID`.
+    fn selected_wedge() -> (ChemStructEditor, [u32; 3], u32) {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [-1.5, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [1.5, 0.0], 0);
+        let c = editor.molecule.add_atom("N".to_string(), [3.0, 2.0], 0);
+        let wedge = editor.molecule.add_bond(a, b, BondOrder::Single);
+        editor.molecule.bond_by_id_mut(wedge).unwrap().stereo = BondStereo::WedgeUp;
+        editor.molecule.add_bond(b, c, BondOrder::Single);
+        editor.selected_atoms.extend([a, b]);
+        (editor, [a, b, c], wedge)
+    }
+
+    /// The direction of the bond from `from` to `to`, in degrees.
+    fn direction_deg(editor: &ChemStructEditor, from: u32, to: u32) -> f32 {
+        let (p, q) = (editor.molecule.atom_by_id(from).unwrap().pos, editor.molecule.atom_by_id(to).unwrap().pos);
+        (q[1] - p[1]).atan2(q[0] - p[0]).to_degrees()
+    }
+
+    /// A path from the selection's rotation handle round `MID` by `degrees`, in small steps.
+    fn handle_sweep(editor: &ChemStructEditor, degrees: f32) -> Vec<egui::Pos2> {
+        let handle = rotation_handle(editor, MID).expect("a selection of two atoms has a handle");
+        let (r, start) = ((handle - MID).length(), (handle - MID).angle());
+        (0..=20)
+            .map(|k| {
+                let t = start + (degrees * k as f32 / 20.0).to_radians();
+                MID + r * egui::vec2(t.cos(), t.sin())
+            })
+            .collect()
+    }
+
+    /// The rotation handle stands above the selection, and only for the Select tool with two
+    /// atoms or more selected.
+    #[test]
+    fn rotation_handle_stands_above_a_selection_of_two_atoms() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let handle = rotation_handle(&editor, MID).unwrap();
+        assert_eq!(handle.x, MID.x, "over the middle of the selection");
+        assert!(handle.y < MID.y, "above it");
+
+        editor.selected_atoms.remove(&b);
+        assert!(rotation_handle(&editor, MID).is_none(), "a single atom has nothing to turn");
+        editor.selected_atoms.insert(b);
+        editor.tool = crate::Tool::Bond;
+        assert!(rotation_handle(&editor, MID).is_none(), "the handle belongs to the Select tool");
+        let _ = a;
+    }
+
+    /// Dragging the handle turns the selection about its centroid in 15° steps: a 50° sweep
+    /// lands on 45°. Bond lengths and the pivot stay, the unselected atom stays, and the wedge
+    /// still runs from the same atom to the same atom.
+    #[test]
+    fn handle_drag_rotates_the_selection_in_steps_about_its_centroid() {
+        let (mut editor, [a, b, c], wedge) = selected_wedge();
+        let before = editor.molecule.clone();
+
+        let path = handle_sweep(&editor, 50.0);
+        primary_drag_along(&mut editor, &path, Default::default());
+
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 45.0).abs() < 1e-3, "50° of sweep snaps to 45°, got {turned}");
+        let (pa, pb) = (editor.molecule.atom_by_id(a).unwrap().pos, editor.molecule.atom_by_id(b).unwrap().pos);
+        assert!((pa[0] + pb[0]).abs() < 1e-4 && (pa[1] + pb[1]).abs() < 1e-4, "the centroid stays at (0, 0)");
+        let length = ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2)).sqrt();
+        assert!((length - 3.0).abs() < 1e-4, "the bond keeps its length, got {length}");
+        assert_eq!(editor.molecule.atom_by_id(c).unwrap().pos, [3.0, 2.0], "an unselected atom stays");
+
+        let bond = editor.molecule.bond_by_id(wedge).unwrap();
+        assert_eq!((bond.begin, bond.end), (a, b), "the wedge keeps its narrow end on the same atom");
+        assert_eq!(bond.stereo, BondStereo::WedgeUp);
+        assert_eq!(editor.selected_atoms, [a, b].into_iter().collect(), "the selection is kept");
+        assert!(editor.rotate_drag.is_none(), "the rotation ends with the drag");
+
+        assert_eq!(editor.undo_stack.len(), 1, "one rotation pushes exactly one undo snapshot");
+        assert!(editor.undo(), "the rotation is undoable");
+        assert_eq!(editor.molecule, before, "undo restores the pre-rotation positions");
+        assert!(editor.redo(), "the rotation is redoable");
+        assert!((direction_deg(&editor, a, b) - 45.0).abs() < 1e-3, "redo turns it again");
+    }
+
+    /// With Shift held the handle turns the selection freely, by the pointer's own angle.
+    #[test]
+    fn handle_drag_with_shift_rotates_freely() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let path = handle_sweep(&editor, 50.0);
+        primary_drag_along(&mut editor, &path, egui::Modifiers::SHIFT);
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 50.0).abs() < 0.01, "Shift follows the pointer: 50°, got {turned}");
+    }
+
+    /// The other way round, and past half a turn: the pointer's angle wraps, the rotation does
+    /// not.
+    #[test]
+    fn handle_drag_rotates_backwards_and_past_half_a_turn() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let path = handle_sweep(&editor, -200.0);
+        primary_drag_along(&mut editor, &path, Default::default());
+        // 200° backwards snaps to −195°, which is the same direction as +165°.
+        let turned = direction_deg(&editor, a, b);
+        assert!((turned - 165.0).abs() < 1e-2, "got {turned}");
+    }
+
+    /// A page object in the selection turns with the atoms, about the same pivot.
+    #[test]
+    fn handle_drag_rotates_selected_page_objects_too() {
+        let (mut editor, _, _) = selected_wedge();
+        let arrow = editor.molecule.add_arrow([0.0, 0.0], [2.0, 0.0], ArrowKind::default());
+        editor.selected_objects.insert(arrow);
+
+        let path = handle_sweep(&editor, 90.0);
+        primary_drag_along(&mut editor, &path, Default::default());
+
+        let Some(PageObject::Arrow(arrow)) = editor.molecule.object_by_id(arrow) else { panic!("the arrow is kept") };
+        assert!(arrow.tail[0].abs() < 1e-4 && arrow.tail[1].abs() < 1e-4, "its tail is on the pivot");
+        assert!(arrow.head[0].abs() < 1e-4 && (arrow.head[1] - 2.0).abs() < 1e-4, "its head turned a quarter: {:?}", arrow.head);
+    }
+
+    /// A click on the handle is not a click on the canvas under it: the selection stays, and
+    /// nothing is pushed onto the undo stack.
+    #[test]
+    fn click_on_the_rotation_handle_keeps_the_selection() {
+        let (mut editor, [a, b, _], _) = selected_wedge();
+        let handle = rotation_handle(&editor, MID).unwrap();
+        primary_drag_along(&mut editor, &[handle], Default::default());
+        assert_eq!(editor.selected_atoms, [a, b].into_iter().collect());
+        assert!(editor.undo_stack.is_empty());
     }
 
     /// Select tool: a click on an atom (no movement) only toggles the selection; it changes no

@@ -293,8 +293,8 @@ pub struct ChemStructEditor {
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
-    /// While rotating the selection (Alt+drag): the cursor angle from the last frame.
-    rotate_last_angle: Option<f32>,
+    /// While rotating the selection (Alt+drag, or a drag of the rotation handle).
+    pub(crate) rotate_drag: Option<interact::RotateDrag>,
 
     /// Screen rects of the atom labels painted last frame, for hit testing (wide labels
     /// like "CO2Et" should be clickable over their whole text, not just a small circle).
@@ -381,7 +381,7 @@ impl Default for ChemStructEditor {
             cleanup_job: None,
             cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
-            rotate_last_angle: None,
+            rotate_drag: None,
             last_label_rects: std::collections::HashMap::new(),
             fit_requested: false,
             context_bond: None,

@@ -443,6 +443,29 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
         }
     }
 
+    // The selection's rotation handle (Select tool): a knob on a stem above the selection.
+    // During a rotation it turns with the selection, on a spoke from the pivot, with the angle
+    // turned so far beside it.
+    if let Some(handle) = super::interact::rotation_handle(editor, center) {
+        let blue = egui::Color32::from_rgb(80, 130, 255);
+        if let Some(rot) = &editor.rotate_drag {
+            let pivot = editor.mol_to_screen(rot.pivot, center);
+            painter.line_segment([pivot, handle], egui::Stroke::new(1.0, blue));
+            painter.circle_filled(pivot, 2.5, blue);
+            // Screen y points down, so a positive turn is clockwise on screen.
+            painter.text(
+                handle + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{:.0}°", rot.applied.to_degrees()),
+                egui::FontId::proportional(12.0),
+                blue,
+            );
+        } else if let Some(top) = super::interact::rotation_handle_anchor(editor, center) {
+            painter.line_segment([top - egui::vec2(0.0, 8.0), handle], egui::Stroke::new(1.0, blue));
+        }
+        painter.circle(handle, super::interact::ROTATE_HANDLE_RADIUS, egui::Color32::WHITE, egui::Stroke::new(1.5, blue));
+    }
+
     // Lasso
     if editor.lasso_path.len() > 1 {
         let pts: Vec<egui::Pos2> = editor.lasso_path.clone();
