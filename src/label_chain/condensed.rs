@@ -55,7 +55,7 @@ const MAX_STEPS: usize = 20_000;
 /// Other spellings of a built-in fragment's name: a prefix written with a hyphen, the *n*- of
 /// a straight chain, and the names a group is as often written by. A fragment a user saves
 /// under one of these spellings is found first and wins.
-const ALIASES: [(&str, &str); 11] = [
+pub(crate) const ALIASES: [(&str, &str); 11] = [
     ("t-Bu", "tBu"),
     ("i-Pr", "iPr"),
     ("i-Bu", "iBu"),

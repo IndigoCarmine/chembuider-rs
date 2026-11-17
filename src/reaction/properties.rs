@@ -278,19 +278,20 @@ mod tests {
         assert_eq!(f.isotope_pattern(0.1).unwrap()[0].mz, f.exact_mass().unwrap());
     }
 
-    /// A group label makes the isotope-dependent values unknown, without panicking.
+    /// A label that is no element and no group makes the isotope-dependent values unknown,
+    /// without panicking.
     #[test]
     fn group_labels_are_unknown() {
         let mut m = Molecule::default();
         let c = m.add_atom("C".into(), [0.0, 0.0], 0);
-        let g = m.add_atom("OMe".into(), [1.5, 0.0], 0);
+        let g = m.add_atom("Xyz".into(), [1.5, 0.0], 0);
         m.add_bond(c, g, BondOrder::Single);
         let a = FormulaAnalysis::of(&m);
         assert_eq!(a.exact_mass, None);
-        assert_eq!(a.isotope_pattern, Err(IonError::UnknownElement("OMe".into())));
+        assert_eq!(a.isotope_pattern, Err(IonError::UnknownElement("Xyz".into())));
         assert_eq!(a.elemental_analysis, None);
-        assert!(a.report().contains("Exact mass: — (unknown: OMe)"));
-        assert!(a.report().contains("m/z: — (unknown: OMe)"));
+        assert!(a.report().contains("Exact mass: — (unknown: Xyz)"));
+        assert!(a.report().contains("m/z: — (unknown: Xyz)"));
     }
 
     /// With an ion chosen, the m/z line is that ion's; the rest stays the neutral molecule's.

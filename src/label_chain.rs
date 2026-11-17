@@ -62,6 +62,8 @@
 
 mod condensed;
 
+pub(crate) use condensed::ALIASES;
+
 use crate::config::Config;
 use crate::molecule::fragment::{FragAtom, FragBond, Fragment};
 use crate::molecule::BondOrder;

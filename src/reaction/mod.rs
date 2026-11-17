@@ -45,6 +45,7 @@ pub mod demo;
 pub mod edit;
 pub mod formula;
 pub mod ion;
+pub mod label_formula;
 pub mod isotopes;
 pub mod model;
 pub mod properties;
@@ -64,6 +65,7 @@ pub use edit::{
 };
 pub use formula::{MolecularFormula, PolymerFormula, atomic_weight, formula_of, molecular_weight};
 pub use ion::{Adduct, ELECTRON_MASS, Ion, IonError};
+pub use label_formula::{FormulaGroup, LabelFormulaError, fragment_groups, set_formula_groups};
 pub use isotopes::isotopes;
 pub use model::{
     Analysis, FILE_FORMAT, FILE_VERSION, Mass, Product, Reactant, Reaction, StructureRole,
