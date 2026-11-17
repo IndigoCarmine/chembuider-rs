@@ -1941,6 +1941,31 @@ fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
     // Change attach atom's element to match fragment's root atom
     let root_elem   = frag.atoms[frag.attach_idx].element.clone();
     let root_charge = frag.atoms[frag.attach_idx].charge;
+
+    // The label atom's bonds all go to the fragment's attach atom. When that atom has no room
+    // for them (`Ph` written between two carbons: the ipso carbon already has three bond orders
+    // in the ring), the expansion would be over-valent, so the label is left as it is, like a
+    // label with no reading. The fragment's own hydrogens do not count: an excess one is
+    // dropped below (`SiH3` on a silicon with two bonds).
+    if let Some(limit) = crate::molecule::charged_max_valence(&root_elem, root_charge) {
+        let internal: i16 = frag
+            .bonds
+            .iter()
+            .filter_map(|b| {
+                let other = if b.begin == frag.attach_idx {
+                    b.end
+                } else if b.end == frag.attach_idx {
+                    b.begin
+                } else {
+                    return None;
+                };
+                (frag.atoms.get(other)?.element != "H").then(|| b.order.valence())
+            })
+            .sum();
+        if editor.molecule.bond_order_sum(atom_id) + internal > limit {
+            return false;
+        }
+    }
     if let Some(atom) = editor.molecule.atom_by_id_mut(atom_id) {
         atom.element = root_elem;
         atom.charge  = root_charge;
