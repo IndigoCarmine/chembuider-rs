@@ -1262,6 +1262,35 @@ impl ChemStructEditor {
         true
     }
 
+    /// Whether the selection can be flipped ([`flip_selection`](Self::flip_selection)): two
+    /// atoms or more are selected, and exactly one bond leaves the selection.
+    pub fn can_flip_selection(&self) -> bool {
+        interact::flip_axis(self).is_some()
+    }
+
+    /// Flip the selection over the one bond that leaves it: every selected atom (and the
+    /// arrows and texts selected with them) is mirrored in the line through that bond's two
+    /// atoms, as one undo step. The bond's own atoms are on the line and stay, so the part
+    /// selected is laid over to the other side of the bond.
+    ///
+    /// Mirroring a drawing inverts what its wedges say, so the wedges are swapped to keep it
+    /// (as turning that part of the molecule half round about the bond does): solid and
+    /// hashed wedges that start (narrow end) on a selected atom change places, and so do bold
+    /// and plain hashed bonds between two selected atoms. A double bond inside the selection
+    /// keeps its E/Z; only when the bond flipped over is itself a double bond does its E/Z
+    /// change, which is then the point of flipping it.
+    ///
+    /// Returns false, changing nothing, unless
+    /// [`can_flip_selection`](Self::can_flip_selection).
+    pub fn flip_selection(&mut self) -> bool {
+        let Some((inside, outside)) = interact::flip_axis(self) else {
+            return false;
+        };
+        self.push_undo();
+        interact::flip_selection_over(self, inside, outside);
+        true
+    }
+
     /// Open the angle box by the selection: a small field that takes an angle in degrees
     /// (clockwise positive; a decimal is fine) and, on Enter, turns the selection by it
     /// ([`rotate_selection_by`](Self::rotate_selection_by)). Escape, or a click elsewhere,
@@ -2217,6 +2246,14 @@ impl ChemStructEditor {
         if !text_input && ui.input(|i| chord_pressed(i, egui::Key::R, |m| m.ctrl && !m.shift && !m.alt)) {
             self.open_rotate_input();
         }
+        // Ctrl+Shift+F: flip the selection over the one bond that leaves it. The key is spent
+        // here, so that it is not also read by the tools.
+        let flip_chord = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
+            if modifiers.ctrl && modifiers.shift && !modifiers.alt);
+        let flipped = !text_input && ui.input(|i| i.events.iter().any(flip_chord)) && {
+            ui.ctx().input_mut(|i| i.events.retain(|e| !flip_chord(e)));
+            self.flip_selection()
+        };
 
         // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
         // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
@@ -2532,7 +2569,7 @@ impl ChemStructEditor {
         if canvas_input && ui.input(|i| i.pointer.middle_down()) {
             self.pan += ui.input(|i| i.pointer.delta());
         }
-        let modified = cleanup_toggle | label_confirmed | text_committed | rotate_committed | tool_modified | cleaning | did_undo | did_redo;
+        let modified = cleanup_toggle | label_confirmed | text_committed | rotate_committed | flipped | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
         // crossing bonds, and labels paint the cached galleys. Keep the rects for next

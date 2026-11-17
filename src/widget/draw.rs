@@ -466,6 +466,27 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
         painter.circle(handle, super::interact::ROTATE_HANDLE_RADIUS, egui::Color32::WHITE, egui::Stroke::new(1.5, blue));
     }
 
+    // The flip button beside the handle, when one bond leaves the selection to flip it over:
+    // a shape and its mirror image either side of a dashed line.
+    if let Some(at) = super::interact::flip_button(editor, center) {
+        let blue = egui::Color32::from_rgb(80, 130, 255);
+        let stroke = egui::Stroke::new(1.2, blue);
+        painter.rect_filled(egui::Rect::from_center_size(at, egui::vec2(18.0, 16.0)), 3.0, egui::Color32::WHITE);
+        for k in 0..3 {
+            let y = at.y - 7.0 + 5.0 * k as f32;
+            painter.line_segment([egui::pos2(at.x, y), egui::pos2(at.x, y + 3.0)], stroke);
+        }
+        let wing = |side: f32| {
+            vec![
+                egui::pos2(at.x + side * 2.5, at.y - 5.0),
+                egui::pos2(at.x + side * 2.5, at.y + 5.0),
+                egui::pos2(at.x + side * 8.0, at.y + 5.0),
+            ]
+        };
+        painter.add(egui::Shape::closed_line(wing(-1.0), stroke));
+        painter.add(egui::Shape::convex_polygon(wing(1.0), blue, stroke));
+    }
+
     // Lasso
     if editor.lasso_path.len() > 1 {
         let pts: Vec<egui::Pos2> = editor.lasso_path.clone();

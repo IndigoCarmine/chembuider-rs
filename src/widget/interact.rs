@@ -412,8 +412,20 @@ pub fn process_select_tool(
     let click_on_handle = (response.clicked() || response.double_clicked())
         && response.interact_pointer_pos().is_some_and(on_handle);
 
+    // The flip button beside it: a click flips the selection over the bond that leaves it.
+    let flip_at = flip_button(editor, center);
+    let on_flip = |p: egui::Pos2| flip_at.is_some_and(|f| f.distance(p) <= ROTATE_HANDLE_HIT);
+    if !rotating && ui.input(|i| i.pointer.hover_pos()).is_some_and(on_flip) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let click_on_flip = (response.clicked() || response.double_clicked())
+        && response.interact_pointer_pos().is_some_and(on_flip);
+
     // Double-click an atom or bond → select that whole connected molecule.
-    if click_on_handle {
+    if click_on_flip {
+        editor.lasso_path.clear();
+        modified |= editor.flip_selection();
+    } else if click_on_handle {
         editor.lasso_path.clear();
         // A double-click on the handle asks for the angle instead of a drag.
         if response.double_clicked() {
@@ -739,6 +751,93 @@ pub(crate) fn rotation_handle(editor: &ChemStructEditor, center: egui::Pos2) -> 
         return None;
     }
     rotation_handle_anchor(editor, center).map(|top| top - egui::vec2(0.0, ROTATE_HANDLE_GAP))
+}
+
+/// Where the flip button is on screen: left of the rotation handle, while the handle is shown
+/// at rest and one bond leaves the selection ([`flip_axis`]). `None` otherwise.
+pub(crate) fn flip_button(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
+    if editor.rotate_drag.is_some() {
+        return None;
+    }
+    let handle = rotation_handle(editor, center)?;
+    flip_axis(editor).map(|_| handle - egui::vec2(FLIP_BUTTON_OFFSET, 0.0))
+}
+
+/// How far left of the rotation handle the flip button sits, in screen pixels.
+const FLIP_BUTTON_OFFSET: f32 = 24.0;
+
+/// The bond a selection can be flipped over: the only bond with one atom selected and the
+/// other not, as (the selected atom, the other). `None` when no bond leaves the selection (a
+/// whole molecule), when two or more do, when fewer than two atoms are selected, or when the
+/// bond's atoms are drawn on one point and give no line.
+pub(crate) fn flip_axis(editor: &ChemStructEditor) -> Option<(u32, u32)> {
+    let selected = &editor.selected_atoms;
+    if selected.iter().filter(|id| editor.molecule.atom_by_id(**id).is_some()).count() < 2 {
+        return None;
+    }
+    let mut leaving = editor.molecule.bonds.iter().filter_map(|b| {
+        match (selected.contains(&b.begin), selected.contains(&b.end)) {
+            (true, false) => Some((b.begin, b.end)),
+            (false, true) => Some((b.end, b.begin)),
+            _ => None,
+        }
+    });
+    let axis = leaving.next()?;
+    if leaving.next().is_some() {
+        return None;
+    }
+    let (a, b) = (editor.molecule.atom_by_id(axis.0)?.pos, editor.molecule.atom_by_id(axis.1)?.pos);
+    ((a[0] - b[0]).abs() > f32::EPSILON || (a[1] - b[1]).abs() > f32::EPSILON).then_some(axis)
+}
+
+/// Mirror the selection (atoms and page objects) in the line through the atoms `inside` and
+/// `outside`, the bond that leaves it, and swap the wedges the mirroring would otherwise
+/// invert. See [`ChemStructEditor::flip_selection`], which is this with an undo step.
+///
+/// The wedge rule: laying the selected part over to the other side of the bond is, in three
+/// dimensions, turning it half round about that bond, which puts what was toward the viewer
+/// away from them. A wedge is read at its narrow end (`begin`), so every solid or hashed wedge
+/// that begins on a selected atom is swapped, the bond flipped over included when its narrow
+/// end is the selected atom; one that begins on the unselected atom of that bond describes a
+/// centre that did not move, and is kept. Bold and plain hashed bonds have no narrow end: they
+/// are swapped when both their atoms are selected.
+pub(crate) fn flip_selection_over(editor: &mut ChemStructEditor, inside: u32, outside: u32) {
+    let (Some(a), Some(b)) = (
+        editor.molecule.atom_by_id(inside).map(|x| x.pos),
+        editor.molecule.atom_by_id(outside).map(|x| x.pos),
+    ) else {
+        return;
+    };
+    for id in editor.selected_atoms.clone() {
+        if let Some(atom) = editor.molecule.atom_by_id_mut(id) {
+            atom.pos = crate::molecule::page::reflect_point(atom.pos, a, b);
+        }
+    }
+    // The selected atom of the bond is on the line: keep it exactly where it was.
+    if let Some(atom) = editor.molecule.atom_by_id_mut(inside) {
+        atom.pos = a;
+    }
+    for id in editor.selected_objects.clone() {
+        if let Some(o) = editor.molecule.object_by_id_mut(id) {
+            o.reflect_about(a, b);
+        }
+    }
+    let selected = editor.selected_atoms.clone();
+    for bond in &mut editor.molecule.bonds {
+        let (begin_in, end_in) = (selected.contains(&bond.begin), selected.contains(&bond.end));
+        bond.stereo = match &bond.stereo {
+            BondStereo::WedgeUp if begin_in => BondStereo::WedgeDown,
+            BondStereo::WedgeDown if begin_in => BondStereo::WedgeUp,
+            BondStereo::Bold if begin_in && end_in => BondStereo::Hashed,
+            BondStereo::Hashed if begin_in && end_in => BondStereo::Bold,
+            other => other.clone(),
+        };
+        // Left and right of a mirrored bond have changed places: keep a double bond's second
+        // line on the side of the drawing it was on.
+        if begin_in && end_in {
+            bond.double_position = bond.double_position.reversed();
+        }
+    }
 }
 
 /// The arrow that is the whole selection, whose ends can then be dragged.
@@ -3005,6 +3104,276 @@ mod tests {
         assert_eq!(parse_angle("abc"), None);
         assert_eq!(parse_angle("inf"), None);
         assert_eq!(parse_angle("NaN"), None);
+    }
+
+    /// A chain drawn as a zigzag, C0 – C1 – C2 – C3 – C4, one bond 1.5 long each, C1 at mol
+    /// (0, 0) (`MID` on screen) and the C0–C1 bond slanted. Returns the editor (Select tool,
+    /// nothing selected) and the atoms.
+    fn zigzag() -> (ChemStructEditor, [u32; 5]) {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let pos = [[-1.3, 0.75], [0.0, 0.0], [1.3, 0.75], [2.6, 0.0], [3.9, 0.75]];
+        let ids = pos.map(|p| editor.molecule.add_atom("C".to_string(), p, 0));
+        for pair in ids.windows(2) {
+            editor.molecule.add_bond(pair[0], pair[1], BondOrder::Single);
+        }
+        (editor, ids)
+    }
+
+    fn pos_of(editor: &ChemStructEditor, id: u32) -> [f32; 2] {
+        editor.molecule.atom_by_id(id).unwrap().pos
+    }
+
+    fn dist(p: [f32; 2], q: [f32; 2]) -> f32 {
+        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt()
+    }
+
+    /// Flipping lays the selected part over the bond that leaves it: the bond's own atoms stay,
+    /// every selected atom goes to its mirror image in the bond's line, distances are kept,
+    /// the unselected part stays, and a second flip puts everything back. One undo step each.
+    #[test]
+    fn flip_mirrors_the_selection_in_the_bond_that_leaves_it() {
+        let (mut editor, ids) = zigzag();
+        let [c0, c1, c2, c3, c4] = ids;
+        editor.selected_atoms.extend([c1, c2, c3, c4]);
+        let before = editor.molecule.clone();
+        assert_eq!(flip_axis(&editor), Some((c1, c0)), "the C0–C1 bond is the one that leaves");
+        assert!(editor.can_flip_selection());
+
+        assert!(editor.flip_selection());
+
+        assert_eq!(pos_of(&editor, c0), [-1.3, 0.75], "the unselected atom stays");
+        assert_eq!(pos_of(&editor, c1), [0.0, 0.0], "the selected atom of the bond is on the line and stays");
+        // C2 was at (1.3, 0.75); its mirror image in the line through (0, 0) and (-1.3, 0.75).
+        let axis = (0.75_f32).atan2(-1.3);
+        let was = (0.75_f32).atan2(1.3);
+        let now = 2.0 * axis - was;
+        let c2_now = pos_of(&editor, c2);
+        assert!(dist(c2_now, [1.3_f32.hypot(0.75) * now.cos(), 1.3_f32.hypot(0.75) * now.sin()]) < 1e-3, "C2 is mirrored: {c2_now:?}");
+        assert!(dist(c2_now, [1.3, 0.75]) > 0.5, "and so has moved");
+        for (k, pair) in ids.windows(2).enumerate() {
+            let (was, now) = (
+                dist(before.atom_by_id(pair[0]).unwrap().pos, before.atom_by_id(pair[1]).unwrap().pos),
+                dist(pos_of(&editor, pair[0]), pos_of(&editor, pair[1])),
+            );
+            assert!((was - now).abs() < 1e-4, "bond {k} keeps its length");
+        }
+        let (was, now) = (
+            dist(before.atom_by_id(c2).unwrap().pos, before.atom_by_id(c4).unwrap().pos),
+            dist(pos_of(&editor, c2), pos_of(&editor, c4)),
+        );
+        assert!((was - now).abs() < 1e-4, "distances inside the selection are kept");
+        // A mirror image: the turn C2 → C3 → C4 has changed its sense.
+        let turn = |e: &crate::molecule::Molecule| {
+            let p = [c2, c3, c4].map(|id| e.atom_by_id(id).unwrap().pos);
+            (p[1][0] - p[0][0]) * (p[2][1] - p[1][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[1][0])
+        };
+        assert!(turn(&before) * turn(&editor.molecule) < 0.0, "the selected part is a mirror image");
+        assert_eq!(editor.selected_atoms.len(), 4, "the selection is kept");
+        assert_eq!(editor.undo_stack.len(), 1, "one undo step");
+
+        assert!(editor.flip_selection(), "flipping again");
+        for id in ids {
+            assert!(dist(pos_of(&editor, id), before.atom_by_id(id).unwrap().pos) < 1e-4, "puts every atom back");
+        }
+        assert!(editor.undo() && editor.undo());
+        assert_eq!(editor.molecule, before, "undo restores the drawing exactly");
+    }
+
+    /// Only a selection that one bond leaves can be flipped: a whole molecule (none), the
+    /// middle of a chain (two) and a single atom change nothing and push nothing for undo.
+    #[test]
+    fn flip_needs_exactly_one_bond_leaving_the_selection() {
+        let (mut editor, [c0, c1, c2, c3, c4]) = zigzag();
+        let before = editor.molecule.clone();
+        for selection in [vec![c0, c1, c2, c3, c4], vec![c1, c2, c3], vec![c4], vec![]] {
+            editor.selected_atoms = selection.iter().copied().collect();
+            assert!(!editor.can_flip_selection(), "{selection:?}");
+            assert!(!editor.flip_selection(), "{selection:?}");
+            assert!(flip_button(&editor, MID).is_none(), "no button for {selection:?}");
+            assert_eq!(editor.molecule, before);
+            assert!(editor.undo_stack.is_empty());
+        }
+        // A ring bond closes a second way out: C0–C2 added, {C1, C2 …} now has two bonds out.
+        editor.molecule.add_bond(c0, c2, BondOrder::Single);
+        editor.selected_atoms = [c1, c2, c3, c4].into_iter().collect();
+        assert!(!editor.can_flip_selection());
+    }
+
+    /// The wedges are swapped where the mirroring would invert what they say: those that begin
+    /// (narrow end) on a selected atom, and bold/hashed bonds between two selected atoms. The
+    /// narrow ends stay where they are, and a wedge that begins on the unselected atom is kept.
+    #[test]
+    fn flip_swaps_the_wedges_that_begin_in_the_selection() {
+        let (mut editor, [c0, c1, c2, c3, c4]) = zigzag();
+        let set = |editor: &mut ChemStructEditor, a: u32, b: u32, stereo: BondStereo| {
+            let id = editor.molecule.bond_between(a, b).unwrap().id;
+            let bond = editor.molecule.bond_by_id_mut(id).unwrap();
+            (bond.begin, bond.end, bond.stereo) = (a, b, stereo);
+            id
+        };
+        let outer = set(&mut editor, c0, c1, BondStereo::WedgeUp); // narrow end outside
+        let solid = set(&mut editor, c2, c1, BondStereo::WedgeUp); // both inside
+        let hash = set(&mut editor, c2, c3, BondStereo::WedgeDown);
+        let bold = set(&mut editor, c3, c4, BondStereo::Bold);
+        editor.selected_atoms.extend([c1, c2, c3, c4]);
+
+        assert!(editor.flip_selection());
+
+        let bond = |id: u32| editor.molecule.bond_by_id(id).unwrap().clone();
+        assert_eq!((bond(outer).begin, bond(outer).end, bond(outer).stereo), (c0, c1, BondStereo::WedgeUp), "kept: its centre did not move");
+        assert_eq!((bond(solid).begin, bond(solid).end, bond(solid).stereo), (c2, c1, BondStereo::WedgeDown));
+        assert_eq!((bond(hash).begin, bond(hash).end, bond(hash).stereo), (c2, c3, BondStereo::WedgeUp));
+        assert_eq!(bond(bold).stereo, BondStereo::Hashed);
+
+        // The bond flipped over, when its narrow end is the selected atom, is swapped too.
+        let (mut editor, [c0, c1, c2, c3, c4]) = zigzag();
+        let outer = set(&mut editor, c1, c0, BondStereo::WedgeDown);
+        editor.selected_atoms.extend([c1, c2, c3, c4]);
+        assert!(editor.flip_selection());
+        let bond = editor.molecule.bond_by_id(outer).unwrap();
+        assert_eq!((bond.begin, bond.end, bond.stereo.clone()), (c1, c0, BondStereo::WedgeUp));
+    }
+
+    /// (2R)-butan-2-ol and friends: C1 – C2(OH) – C3 – C4 as a zigzag, the hydroxyl up the page
+    /// from C2 on a solid wedge that starts at C2. Returns the atoms C1, C2, C3, C4, O.
+    fn butan_2_ol() -> (ChemStructEditor, [u32; 5]) {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let pos = [[-1.3, 0.75], [0.0, 0.0], [1.3, 0.75], [2.6, 0.0]];
+        let c = pos.map(|p| editor.molecule.add_atom("C".to_string(), p, 0));
+        for pair in c.windows(2) {
+            editor.molecule.add_bond(pair[0], pair[1], BondOrder::Single);
+        }
+        let o = editor.molecule.add_atom("O".to_string(), [0.0, -1.5], 0);
+        let wedge = editor.molecule.add_bond(c[1], o, BondOrder::Single);
+        editor.molecule.bond_by_id_mut(wedge).unwrap().stereo = BondStereo::WedgeUp;
+        (editor, [c[0], c[1], c[2], c[3], o])
+    }
+
+    fn name_of(editor: &ChemStructEditor) -> String {
+        crate::naming::iupac_name(&editor.molecule).name().expect("the structure has a name").to_string()
+    }
+
+    /// The configuration survives a flip, whichever side of the bond the centre is on: the name
+    /// with its R/S descriptor is the same before and after. (Mirroring alone, without the
+    /// wedge swap, gives the other enantiomer: the check that this test can tell.)
+    #[test]
+    fn flip_keeps_the_configuration_of_stereocentres() {
+        // The centre is in the part flipped: {C2, O, C1} over the C2–C3 bond.
+        let (mut editor, [c1, c2, c3, _c4, o]) = butan_2_ol();
+        let before = name_of(&editor);
+        assert!(before.starts_with("(2R)-") || before.starts_with("(2S)-"), "a descriptor to keep: {before}");
+        editor.selected_atoms.extend([c1, c2, o]);
+        assert_eq!(flip_axis(&editor), Some((c2, c3)));
+        assert!(editor.flip_selection());
+        assert_ne!(pos_of(&editor, o), [0.0, -1.5], "the hydroxyl has moved");
+        assert_eq!(name_of(&editor), before, "the centre keeps its configuration");
+
+        // Without the swap the same mirroring inverts it.
+        let wedge = editor.molecule.bond_between(c2, o).unwrap().id;
+        editor.molecule.bond_by_id_mut(wedge).unwrap().stereo = BondStereo::WedgeUp;
+        assert_ne!(name_of(&editor), before, "mirroring alone would invert the centre");
+
+        // The centre is on the far side of the bond: {C3, C4} over the C2–C3 bond.
+        let (mut editor, [_c1, c2, c3, c4, _o]) = butan_2_ol();
+        let before = name_of(&editor);
+        editor.selected_atoms.extend([c3, c4]);
+        assert_eq!(flip_axis(&editor), Some((c3, c2)));
+        assert!(editor.flip_selection());
+        assert_ne!(pos_of(&editor, c4), [2.6, 0.0], "the ethyl end has moved");
+        assert_eq!(name_of(&editor), before, "a centre outside the selection is untouched");
+
+        // A wedge from the centre to the part flipped ({O} alone is one atom; take the centre's
+        // other neighbour): the wedge begins outside the selection and is kept.
+        let (mut editor, [c1, c2, c3, c4, o]) = butan_2_ol();
+        let wedge = editor.molecule.bond_between(c2, o).unwrap().id;
+        editor.molecule.bond_by_id_mut(wedge).unwrap().stereo = BondStereo::None;
+        let to_c3 = editor.molecule.bond_between(c2, c3).unwrap().id;
+        editor.molecule.bond_by_id_mut(to_c3).unwrap().stereo = BondStereo::WedgeUp;
+        let before = name_of(&editor);
+        assert!(before.starts_with("(2R)-") || before.starts_with("(2S)-"), "a descriptor to keep: {before}");
+        editor.selected_atoms.extend([c3, c4]);
+        assert!(editor.flip_selection());
+        assert_eq!(editor.molecule.bond_by_id(to_c3).unwrap().stereo, BondStereo::WedgeUp);
+        assert_eq!(name_of(&editor), before);
+        let _ = c1;
+    }
+
+    /// A double bond inside the part flipped keeps its E/Z (a mirror image has the same sides
+    /// together). Flipping one end of a double bond over that bond itself is the one case that
+    /// changes it: E becomes Z.
+    #[test]
+    fn flip_keeps_e_z_inside_the_selection() {
+        // C0 – C1 – C2 = C3 – C4 as a zigzag: (E)-pent-2-ene.
+        let (mut editor, [c0, c1, c2, c3, c4]) = zigzag();
+        let double = editor.molecule.bond_between(c2, c3).unwrap().id;
+        editor.molecule.bond_by_id_mut(double).unwrap().order = BondOrder::Double;
+        let before = name_of(&editor);
+        assert!(before.contains("(2E)") || before.contains("(E)"), "an E double bond to keep: {before}");
+
+        editor.selected_atoms.extend([c1, c2, c3, c4]);
+        assert!(editor.flip_selection());
+        assert_eq!(name_of(&editor), before, "E stays E inside the flipped part");
+
+        // Over the double bond itself: {C3, C4} about C2=C3.
+        editor.selected_atoms = [c3, c4].into_iter().collect();
+        assert_eq!(flip_axis(&editor), Some((c3, c2)));
+        assert!(editor.flip_selection());
+        let after = name_of(&editor);
+        assert!(after.contains('Z'), "flipping an end over its own double bond turns E into Z: {after}");
+        let _ = c0;
+    }
+
+    /// A selected arrow is mirrored with the atoms.
+    #[test]
+    fn flip_mirrors_selected_page_objects_too() {
+        let mut editor = ChemStructEditor { tool: crate::Tool::Select, ..Default::default() };
+        let a = editor.molecule.add_atom("C".to_string(), [-1.5, 0.0], 0);
+        let b = editor.molecule.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let c = editor.molecule.add_atom("C".to_string(), [1.0, 1.0], 0);
+        editor.molecule.add_bond(a, b, BondOrder::Single);
+        editor.molecule.add_bond(b, c, BondOrder::Single);
+        let arrow = editor.molecule.add_arrow([2.0, 1.0], [3.0, 2.0], ArrowKind::default());
+        editor.selected_atoms.extend([b, c]);
+        editor.selected_objects.insert(arrow);
+
+        assert!(editor.flip_selection());
+
+        assert_eq!(pos_of(&editor, c), [1.0, -1.0], "mirrored in the x axis, the line of the a–b bond");
+        let Some(PageObject::Arrow(arrow)) = editor.molecule.object_by_id(arrow) else { panic!("the arrow is kept") };
+        assert_eq!((arrow.tail, arrow.head), ([2.0, -1.0], [3.0, -2.0]));
+    }
+
+    /// The two ways in: Ctrl+Shift+F, and a click on the button beside the rotation handle.
+    /// Either is one undo step and keeps the selection.
+    #[test]
+    fn flip_by_shortcut_and_by_its_button() {
+        let (mut editor, [_c0, c1, c2, c3, c4]) = zigzag();
+        editor.selected_atoms.extend([c1, c2, c3, c4]);
+        let before = editor.molecule.clone();
+
+        crate::testkit::type_keys_into(&mut editor, "Ctrl+Shift+F");
+        assert_ne!(editor.molecule, before, "the shortcut flips");
+        assert_eq!(editor.molecule.atoms.len(), 5, "and the F draws nothing");
+        assert_eq!(editor.undo_stack.len(), 1);
+        let flipped = editor.molecule.clone();
+
+        let button = flip_button(&editor, MID).expect("one bond leaves the selection: there is a button");
+        let handle = rotation_handle(&editor, MID).unwrap();
+        assert!(button.x < handle.x && button.y == handle.y, "left of the rotation handle");
+        primary_drag_along(&mut editor, &[button], Default::default());
+        assert_ne!(editor.molecule, flipped, "a click on the button flips");
+        assert_eq!(editor.undo_stack.len(), 2);
+        assert_eq!(editor.selected_atoms, [c1, c2, c3, c4].into_iter().collect(), "the selection is kept");
+        for atom in &before.atoms {
+            assert!(dist(pos_of(&editor, atom.id), atom.pos) < 1e-4, "twice is back where it began");
+        }
+
+        // With nothing to flip the shortcut does nothing.
+        editor.selected_atoms.clear();
+        let now = editor.molecule.clone();
+        crate::testkit::type_keys_into(&mut editor, "Ctrl+Shift+F");
+        assert_eq!(editor.molecule, now);
+        assert_eq!(editor.undo_stack.len(), 2);
     }
 
     /// Select tool: a click on an atom (no movement) only toggles the selection; it changes no
