@@ -201,7 +201,8 @@ impl MolecularFormula {
     /// (`R`, `NBS`) — nor a label with more than [`MAX_GROUP_DEPTH`] braces: every markup group
     /// opens at a `{`, so that bounds how deeply groups nest, and with it the rich-text parser's
     /// per-character work. [`LabelFormulaError::UnknownGroup`] when one unit of an otherwise
-    /// well-formed formula is neither an element nor a known group.
+    /// well-formed formula is neither an element nor a known group, and
+    /// [`LabelFormulaError::UnbalancedBrackets`] when its brackets do not match.
     pub fn of_label(label: &str) -> Result<Self, LabelFormulaError> {
         use crate::molecule::elements::GROUP_LABELS;
         // `Ac`, `Pr` and `Ts` are acetyl, propyl and tosyl in a label, never the elements.
@@ -770,6 +771,16 @@ mod tests {
             Err(LabelFormulaError::UnknownGroup("TEMDA".into()))
         );
         assert_eq!(MolecularFormula::of_label("C"), Err(LabelFormulaError::NotAFormula));
+        // Nested parentheses, lower-case names and full-width brackets, as the label is typed.
+        for label in ["((Ph3P)2Pd(OAc))2", "((Ph_3P)_2Pd(OAc))_2", "\u{ff08}\u{ff08}Ph3P\u{ff09}2Pd(OAc)\u{ff09}\u{ff12}"] {
+            assert_eq!(lone(label).plain(), "C76H66O4P4Pd2", "{label}");
+            assert_eq!(format!("{:.2}", lone(label).weight().unwrap()), "1380.10", "{label}");
+        }
+        // Unbalanced brackets: the whole label is unknown, with no weight.
+        let open = lone("((Ph3P)2Pd(OAc)2");
+        assert_eq!(open.weight(), None);
+        assert_eq!(open.unknown_elements(), vec!["((Ph3P)2Pd(OAc)2"]);
+        assert_eq!(MolecularFormula::of_label("((Ph3P)2Pd(OAc)2"), Err(LabelFormulaError::UnbalancedBrackets));
     }
 
     /// An atom label that reads as a written formula (`NaH`, `CN`, `CH_3`) counts as the atoms

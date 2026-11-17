@@ -20,32 +20,36 @@
 //! ```text
 //! label := part ( '·' part )*            an adduct or hydrate: CuSO4·5H2O
 //! part  := [count] item+
-//! item  := ( '(' item+ ')' | '[' item+ ']' | element | group ) [count]
+//! item  := ( '(' item+ ')' | '[' item+ ']' | '{' item+ '}' | element | group ) [count]
 //! ```
+//!
+//! Brackets nest to any depth and in any mix (`((tmeda)Zn(OH)(OTf))3`, `[Ir(cod)Cl]2`), each
+//! closed by its own kind; one that is not gives [`LabelFormulaError::UnbalancedBrackets`].
+//! Full-width forms — `（` `）` `［` `］`, digits, letters, and `・` for the dot — are read as
+//! their ASCII equivalents, so a label typed with an input method left in full-width mode
+//! reads the same.
 //!
 //! # Which reading wins
 //!
 //! A *unit* is a whole part, or everything inside one pair of brackets.
 //!
-//! 1. A unit that is exactly a group's name (or one of its spellings) is that group.
-//! 2. A unit that, ignoring case, is the name of exactly one *written* group (one given by its
-//!    formula: a ligand such as `cod`, `dppf`, `bpy`) is that group — even when its letters
-//!    also spell elements, so `Ni(COD)2` holds cyclooctadiene, not C, O and D. Fragments are
-//!    not matched this way: `BN`, `CO` and `PH` stay formulas, never benzyl, cobalt or phenyl.
-//! 3. Otherwise the unit is read token by token as written: element symbols and group names,
-//!    the longest first (`Co` is cobalt, `CO` carbon and oxygen, `Cp` the group), a group
-//!    before an element of the same length (`Pr` is propyl), going back to a shorter token
-//!    when the rest cannot be read.
-//! 4. Only when the label has no reading at all by 1–3 are group names also matched ignoring
-//!    case (`Pd(DPPF)Cl2` needs none of this, `ZnCl2(thf)2` and `Pd(Dba)2` do): a token as
-//!    written still comes first, and a spelling that fits two groups (`ipr`: `iPr`, `IPr`)
-//!    fits neither. Element symbols are never matched ignoring case.
+//! Everything is matched exactly as written, case included: `tmeda` is a group only if a group
+//! lists that spelling, and `Cod` is nothing.
+//!
+//! 1. A unit that is exactly a group's name (or one of its spellings) is that group — even when
+//!    its letters also spell elements, so `Ni(COD)2` holds cyclooctadiene where `COD` is listed
+//!    as a spelling of `cod`, not C, O and D.
+//! 2. Otherwise the unit is read token by token: element symbols and group names, the longest
+//!    first (`Co` is cobalt, `CO` carbon and oxygen, `Cp` the group), a group before an element
+//!    of the same length (`Pr` is propyl), going back to a shorter token when the rest cannot
+//!    be read. A group whose spelling reads as element symbols (`COD`, `DBU`) is no token: only
+//!    a whole unit is taken for it (rule 1), so `CH3COD` stays acetaldehyde-d.
 //!
 //! A label with no reading has no formula, and so no weight — never a partial one. When what
 //! could not be read is one unit of an otherwise well-formed formula, the error names it
 //! ([`LabelFormulaError::UnknownGroup`]: `TEMDA` in `[(TEMDA)Zn(OH)(OTf)]3`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use super::formula::{
@@ -60,13 +64,12 @@ use crate::molecule::BondOrder;
 pub struct FormulaGroup {
     /// The name as it is usually written: `Ph`, `dppf`, `Cp*`.
     pub name: String,
-    /// Other spellings read as the same group (`t-Bu` for `tBu`). Case variants need not be
-    /// listed; see the [module docs](self).
+    /// Other spellings read as the same group (`t-Bu` for `tBu`, `COD` for `cod`). Names are
+    /// matched exactly, so a spelling in another case counts only when it is listed.
     pub aliases: Vec<String>,
     /// The atoms the group stands for, as it is written in a compound: `OAc` is C2H3O2.
     pub formula: MolecularFormula,
-    /// Given by its formula rather than drawn ([`FormulaGroup::written`]): a unit of this name
-    /// is the group whatever its case, even when its letters spell elements.
+    /// Given by its formula ([`FormulaGroup::written`]) rather than drawn as a fragment.
     pub written: bool,
 }
 
@@ -146,6 +149,8 @@ pub enum LabelFormulaError {
     NotAFormula,
     /// The label is a formula but for this unit, which is no element and no known group.
     UnknownGroup(String),
+    /// A bracket is never closed, closed without being opened, or closed by another kind.
+    UnbalancedBrackets,
 }
 
 impl std::fmt::Display for LabelFormulaError {
@@ -153,6 +158,7 @@ impl std::fmt::Display for LabelFormulaError {
         match self {
             Self::NotAFormula => f.write_str("not a formula"),
             Self::UnknownGroup(name) => write!(f, "unknown group: {name}"),
+            Self::UnbalancedBrackets => f.write_str("the brackets do not match"),
         }
     }
 }
@@ -165,8 +171,8 @@ pub struct GroupTable {
     groups: Vec<FormulaGroup>,
     /// Spelling → group. A later group takes a spelling an earlier one had.
     exact: HashMap<String, usize>,
-    /// Lower-cased spelling → the groups it fits (each once).
-    folded: HashMap<String, Vec<usize>>,
+    /// The spellings that also read as a formula of elements (`COD`, `DBU`).
+    spelled: HashSet<String>,
     /// The longest spelling, in characters.
     longest: usize,
 }
@@ -180,16 +186,9 @@ impl GroupTable {
                 exact.insert(spelling.clone(), i);
             }
         }
-        let mut folded: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut longest = 0;
-        for (spelling, &i) in &exact {
-            longest = longest.max(spelling.chars().count());
-            let fits = folded.entry(spelling.to_lowercase()).or_default();
-            if !fits.contains(&i) {
-                fits.push(i);
-            }
-        }
-        Self { groups, exact, folded, longest }
+        let longest = exact.keys().map(|spelling| spelling.chars().count()).max().unwrap_or(0);
+        let spelled = exact.keys().filter(|spelling| MolecularFormula::parse(spelling).is_some()).cloned().collect();
+        Self { groups, exact, spelled, longest }
     }
 
     /// The groups, in the order given.
@@ -201,12 +200,10 @@ impl GroupTable {
         self.exact.get(text).map(|&i| &self.groups[i])
     }
 
-    /// The one group `text` names ignoring case; `written_only` leaves fragments out.
-    fn folded(&self, text: &str, written_only: bool) -> Option<&FormulaGroup> {
-        let fits = self.folded.get(&text.to_lowercase())?;
-        let mut fits = fits.iter().map(|&i| &self.groups[i]).filter(|g| g.written || !written_only);
-        let first = fits.next()?;
-        fits.next().is_none().then_some(first)
+    /// The group the token `text` stands for inside a run: one of that spelling which does not
+    /// read as elements.
+    fn token(&self, text: &str) -> Option<&FormulaGroup> {
+        if self.spelled.contains(text) { None } else { self.exact(text) }
     }
 }
 
@@ -235,16 +232,36 @@ pub fn set_formula_groups(groups: Vec<FormulaGroup>) {
 // ─── Reading ──────────────────────────────────────────────────────────────────
 
 fn is_open(c: char) -> bool {
-    c == '(' || c == '['
+    matches!(c, '(' | '[' | '{')
 }
 
 fn is_close(c: char) -> bool {
-    c == ')' || c == ']'
+    matches!(c, ')' | ']' | '}')
 }
 
-/// The dot between the parts of an adduct or hydrate: `·` (middle dot), `•` or `⋅`.
+/// The bracket that closes `open`.
+fn closer(open: char) -> char {
+    match open {
+        '(' => ')',
+        '[' => ']',
+        _ => '}',
+    }
+}
+
+/// The dot between the parts of an adduct or hydrate: `·` (middle dot), `•`, `⋅`, or the
+/// katakana middle dot `・` a Japanese input method types for it (`･` when half-width).
 fn is_adduct_dot(c: char) -> bool {
-    matches!(c, '\u{b7}' | '\u{2022}' | '\u{22c5}')
+    matches!(c, '\u{b7}' | '\u{2022}' | '\u{22c5}' | '\u{30fb}' | '\u{ff65}')
+}
+
+/// `c` as its ASCII equivalent when it is a full-width form (`（` `）` `［` `３` `Ｚ`, the
+/// ideographic space): what an input method left in full-width mode types.
+fn narrow(c: char) -> char {
+    match c {
+        '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
+        '\u{3000}' => ' ',
+        _ => c,
+    }
 }
 
 type Counts = BTreeMap<String, usize>;
@@ -260,45 +277,48 @@ enum Unread {
 /// Read `text` (plain, no markup) as a formula of elements and `table`'s groups; see the
 /// [module docs](self).
 pub fn parse_with_groups(text: &str, table: &GroupTable) -> Result<MolecularFormula, LabelFormulaError> {
-    let chars: Vec<char> = text.chars().collect();
-    // Nesting is bounded before anything recurses: labels are user input.
-    let (mut depth, mut deepest) = (0usize, 0usize);
+    let chars: Vec<char> = text.chars().map(narrow).collect();
+    let text: String = chars.iter().collect();
+    let text = text.as_str();
+    // Brackets are matched, and their nesting bounded, before anything recurses: labels are
+    // user input.
+    let mut open: Vec<char> = Vec::new();
+    let mut deepest = 0usize;
     for &c in &chars {
         if is_open(c) {
-            depth += 1;
-            deepest = deepest.max(depth);
-        } else if is_close(c) {
-            depth = depth.checked_sub(1).ok_or(LabelFormulaError::NotAFormula)?;
+            open.push(c);
+            deepest = deepest.max(open.len());
+        } else if is_close(c) && open.pop().map(closer) != Some(c) {
+            return Err(LabelFormulaError::UnbalancedBrackets);
         }
     }
-    if depth != 0 || deepest > MAX_GROUP_DEPTH || chars.is_empty() {
+    if !open.is_empty() {
+        return Err(LabelFormulaError::UnbalancedBrackets);
+    }
+    if deepest > MAX_GROUP_DEPTH || chars.is_empty() {
         return Err(LabelFormulaError::NotAFormula);
     }
     // Reagent abbreviations that happen to spell elements (`NBS`), unless a group has the name.
-    let named = table.exact(text).or_else(|| table.folded(text, true)).is_some();
-    if ABBREVIATIONS.contains(&text) && !named {
+    if ABBREVIATIONS.contains(&text) && table.exact(text).is_none() {
         return Err(LabelFormulaError::NotAFormula);
     }
     // A hole can be named only in a label with some structure around it; a label that is one
     // unreadable run is just no formula.
     let structured = chars.iter().any(|&c| is_open(c) || is_adduct_dot(c));
-    let whole = |fold: bool| -> Result<Counts, Unread> {
+    let whole = || -> Result<Counts, Unread> {
         let mut counts = Counts::new();
         for part in chars.split(|&c| is_adduct_dot(c)) {
             let part = trim(part);
             let digits = part.iter().take_while(|c| c.is_ascii_digit()).count();
             let times = if digits == 0 { 1 } else { number(&part[..digits]).ok_or(Unread::Malformed)? };
-            merge(&mut counts, read_unit(trim(&part[digits..]), table, fold)?, times)?;
+            merge(&mut counts, read_unit(trim(&part[digits..]), table)?, times)?;
         }
         Ok(counts)
     };
-    let counts = match whole(false) {
-        Ok(counts) => counts,
-        Err(_) => whole(true).map_err(|unread| match unread {
-            Unread::Unknown(run) if structured => LabelFormulaError::UnknownGroup(run),
-            _ => LabelFormulaError::NotAFormula,
-        })?,
-    };
+    let counts = whole().map_err(|unread| match unread {
+        Unread::Unknown(run) if structured => LabelFormulaError::UnknownGroup(run),
+        _ => LabelFormulaError::NotAFormula,
+    })?;
     if counts.is_empty() {
         return Err(LabelFormulaError::NotAFormula);
     }
@@ -343,14 +363,13 @@ fn group_counts(group: &FormulaGroup) -> Counts {
     group.formula.counts.iter().cloned().collect()
 }
 
-/// Read one unit: a group by its whole name, or its items one after another. `fold`: group
-/// names inside it may differ in case (rule 4).
-fn read_unit(unit: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Unread> {
+/// Read one unit: a group by its whole name, or its items one after another.
+fn read_unit(unit: &[char], table: &GroupTable) -> Result<Counts, Unread> {
     if unit.is_empty() {
         return Err(Unread::Malformed);
     }
     let text: String = unit.iter().collect();
-    if let Some(group) = table.exact(&text).or_else(|| table.folded(&text, true)) {
+    if let Some(group) = table.exact(&text) {
         return Ok(group_counts(group));
     }
     let mut counts = Counts::new();
@@ -358,7 +377,7 @@ fn read_unit(unit: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Un
     while pos < unit.len() {
         let item = if is_open(unit[pos]) {
             let close = closing(unit, pos).ok_or(Unread::Malformed)?;
-            let inner = read_unit(&unit[pos + 1..close], table, fold)?;
+            let inner = read_unit(&unit[pos + 1..close], table)?;
             pos = close + 1;
             let digits = unit[pos..].iter().take_while(|c| c.is_ascii_digit()).count();
             let times = if digits == 0 { 1 } else { number(&unit[pos..pos + digits]).ok_or(Unread::Malformed)? };
@@ -369,7 +388,7 @@ fn read_unit(unit: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Un
         } else {
             // A run of tokens, up to the next bracket.
             let end = unit[pos..].iter().position(|&c| is_open(c) || is_close(c)).map_or(unit.len(), |n| pos + n);
-            let run = read_run(&unit[pos..end], table, fold)?;
+            let run = read_run(&unit[pos..end], table)?;
             pos = end;
             (run, 1)
         };
@@ -378,8 +397,7 @@ fn read_unit(unit: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Un
     Ok(counts)
 }
 
-/// The index of the bracket closing the one at `open`. Either kind closes either: `[…)` is
-/// not worth refusing.
+/// The index of the bracket closing the one at `open` (their kinds were matched already).
 fn closing(unit: &[char], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (i, &c) in unit.iter().enumerate().skip(open) {
@@ -401,30 +419,26 @@ struct Token {
     counts: Counts,
 }
 
-/// The tokens that can start at `run[pos]`, best first: as written, the longest first and a
-/// group before an element of its length; then, with `fold`, group names in another case.
-fn tokens_at(run: &[char], pos: usize, table: &GroupTable, fold: bool) -> Vec<Token> {
-    let mut as_written: Vec<Token> = Vec::new();
-    let mut folded: Vec<Token> = Vec::new();
+/// The tokens that can start at `run[pos]`, best first: the longest first, and a group before
+/// an element of its length.
+fn tokens_at(run: &[char], pos: usize, table: &GroupTable) -> Vec<Token> {
+    let mut tokens: Vec<Token> = Vec::new();
     for len in (1..=table.longest.max(2).min(run.len() - pos)).rev() {
         let text: String = run[pos..pos + len].iter().collect();
-        if let Some(group) = table.exact(&text) {
-            as_written.push(Token { len, counts: group_counts(group) });
-        } else if fold && let Some(group) = table.folded(&text, false) {
-            folded.push(Token { len, counts: group_counts(group) });
+        if let Some(group) = table.token(&text) {
+            tokens.push(Token { len, counts: group_counts(group) });
         }
         // `Ar` (aryl) and `Pr` (propyl) are abbreviations in a label, never argon or
         // praseodymium — as the reading of a label for Expand has it.
         if len <= 2 && atomic_weight(&text).is_some() && !ABBREVIATION_SYMBOLS.contains(&text.as_str()) {
-            as_written.push(Token { len, counts: Counts::from([(text, 1)]) });
+            tokens.push(Token { len, counts: Counts::from([(text, 1)]) });
         }
     }
-    as_written.extend(folded);
-    as_written
+    tokens
 }
 
 /// Read a run of tokens with their counts (`PdCl2`, `PPh3`, `CH2Cl2`): no brackets inside.
-fn read_run(run: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Unread> {
+fn read_run(run: &[char], table: &GroupTable) -> Result<Counts, Unread> {
     let unknown = || Unread::Unknown(run.iter().collect());
     // After a token, its count: all the digits that follow.
     let after = |pos: usize, token: &Token| {
@@ -436,7 +450,7 @@ fn read_run(run: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Unre
     let mut readable = vec![false; run.len() + 1];
     readable[run.len()] = true;
     for pos in (0..run.len()).rev() {
-        readable[pos] = tokens_at(run, pos, table, fold).iter().any(|t| readable[after(pos, t)]);
+        readable[pos] = tokens_at(run, pos, table).iter().any(|t| readable[after(pos, t)]);
     }
     if !readable[0] {
         return Err(unknown());
@@ -444,7 +458,7 @@ fn read_run(run: &[char], table: &GroupTable, fold: bool) -> Result<Counts, Unre
     let mut counts = Counts::new();
     let mut pos = 0;
     while pos < run.len() {
-        let token = tokens_at(run, pos, table, fold).into_iter().find(|t| readable[after(pos, t)]).ok_or_else(unknown)?;
+        let token = tokens_at(run, pos, table).into_iter().find(|t| readable[after(pos, t)]).ok_or_else(unknown)?;
         let digits_at = pos + token.len;
         let end = after(pos, &token);
         let times = if end == digits_at { 1 } else { number(&run[digits_at..end]).ok_or(Unread::Malformed)? };
@@ -462,11 +476,12 @@ mod tests {
     /// The built-in fragments and a few ligands, as an app would register them.
     fn table() -> GroupTable {
         let mut groups = vec![
-            FormulaGroup::written("cod", &[], "C8H12").unwrap(),
+            FormulaGroup::written("cod", &["COD"], "C8H12").unwrap(),
             FormulaGroup::written("dppf", &[], "C34H28FeP2").unwrap(),
             FormulaGroup::written("amphos", &[], "C16H28NP").unwrap(),
             FormulaGroup::written("dba", &[], "C17H14O").unwrap(),
-            FormulaGroup::written("TMEDA", &[], "C6H16N2").unwrap(),
+            FormulaGroup::written("TMEDA", &["tmeda"], "C6H16N2").unwrap(),
+            FormulaGroup::written("DBU", &[], "C9H16N2").unwrap(),
             FormulaGroup::written("bpy", &["bipy"], "C10H8N2").unwrap(),
             FormulaGroup::written("Cp", &[], "C5H5").unwrap(),
             FormulaGroup::written("Cp*", &[], "C10H15").unwrap(),
@@ -558,36 +573,45 @@ mod tests {
     /// The precedence rules of the module docs, one by one.
     #[test]
     fn elements_and_groups_do_not_pass_for_each_other() {
-        // 1–2: a whole unit that names a ligand is the ligand, whatever its case.
+        // 1: a whole unit that is a group's spelling is the group, even one that spells elements.
         assert_eq!(read("Ni(COD)2").as_deref(), Ok("C16H24Ni"));
-        assert_eq!(read("Ni(Cod)2").as_deref(), Ok("C16H24Ni"));
-        assert_eq!(read("Pd(DPPF)Cl2"), read("Pd(dppf)Cl2"));
-        assert_eq!(read("PdCl2(AmPhos)2"), read("PdCl2(amphos)2"));
         assert_eq!(read("COD").as_deref(), Ok("C8H12"));
-        // … but not a fragment: these are formulas of elements.
+        assert_eq!(read("DBU").as_deref(), Ok("C9H16N2"));
+        assert_eq!(read("ZnCl2(tmeda)"), read("ZnCl2(TMEDA)"));
+        // … but inside a run of tokens such a spelling is its elements.
+        assert_eq!(read("CH3COD").as_deref(), Ok("C2H3DO"));
+        assert_eq!(read("NaCOD").as_deref(), Ok("CDNaO"));
+        // Case is part of the name: a spelling that is not listed is no group.
+        assert_eq!(read("Ni(Cod)2"), Err(LabelFormulaError::UnknownGroup("Cod".into())));
+        assert_eq!(read("Cod"), Err(LabelFormulaError::NotAFormula));
+        // An upper-case spelling that is not listed reads as the elements its letters spell, as
+        // any text does: a group written that way must list the spelling (as `cod` lists `COD`).
+        assert_eq!(read("Pd(DPPF)Cl2").as_deref(), Ok("Cl2DFP2Pd"));
+        assert_eq!(read("PdCl2(AmPhos)2"), Err(LabelFormulaError::UnknownGroup("AmPhos".into())));
+        assert_eq!(read("Pd(Dba)2"), Err(LabelFormulaError::UnknownGroup("Dba".into())));
+        assert_eq!(read("Zn(Tmeda)Cl2"), Err(LabelFormulaError::UnknownGroup("Tmeda".into())));
+        assert_eq!(read("boc"), Err(LabelFormulaError::NotAFormula));
+        assert_eq!(read("Ti(Oipr)4"), Err(LabelFormulaError::UnknownGroup("Oipr".into())));
+        // These are formulas of elements, never benzyl, cobalt, phenyl or Boc.
         assert_eq!(read("BN").as_deref(), Ok("BN"));
         assert_eq!(read("CO").as_deref(), Ok("CO"));
+        assert_eq!(read("Co").as_deref(), Ok("Co"));
         assert_eq!(read("PH3").as_deref(), Ok("H3P"));
+        assert_eq!(read("BOC").as_deref(), Ok("CBO"));
         assert_eq!(read("Fe(CO)5").as_deref(), Ok("C5FeO5"));
-        // 3: as written, the longest token first; cobalt is never a piece of `cod`.
+        // 2: the longest token first; cobalt is never a piece of `cod`.
         assert_eq!(read("CoCl2").as_deref(), Ok("Cl2Co"));
         assert_eq!(read("Co(cod)2").as_deref(), Ok("C16H24Co"));
         assert_eq!(read("Co2(CO)8").as_deref(), Ok("C8Co2O8"));
         assert_eq!(read("CpCo(CO)2").as_deref(), Ok("C7H5CoO2"));
+        assert_eq!(read("Zn(tmeda)(PH3)").as_deref(), Ok("C6H19N2PZn"));
         // `Pr` is propyl and `Ar` no element, as for Expand.
         assert_eq!(read("OPr").as_deref(), Ok("C3H7O"));
         assert_eq!(read("OAr"), Err(LabelFormulaError::NotAFormula));
-        // `iPr` and `IPr` differ only in case: each is itself, and no other case is either.
+        // `iPr` and `IPr` differ only in case: each is itself.
         assert_eq!(read("Zn(iPr)2").as_deref(), Ok("C6H14Zn"));
         assert_eq!(read("Pd(IPr)Cl2").as_deref(), Ok("C27H36Cl2N2Pd"));
         assert_eq!(read("Ti(OiPr)4").as_deref(), Ok("C12H28O4Ti"));
-        assert_eq!(read("Ti(Oipr)4"), Err(LabelFormulaError::UnknownGroup("Oipr".into())));
-        // 4: another case is read only where nothing reads as written, a token as written first.
-        assert_eq!(read("ZnCl2(tmeda)"), read("ZnCl2(TMEDA)"));
-        assert_eq!(read("Pd(Dba)2").as_deref(), Ok("C34H28O2Pd"));
-        assert_eq!(read("boc").as_deref(), Ok("C5H9O2"));
-        assert_eq!(read("BOC").as_deref(), Ok("CBO"), "reads as elements, so it is not Boc");
-        assert_eq!(read("Zn(tmeda)(PH3)").as_deref(), Ok("C6H19N2PZn"), "PH3 is not Ph3");
     }
 
     #[test]
@@ -595,13 +619,69 @@ mod tests {
         assert_eq!(read("[(TEMDA)Zn(OH)(OTf)]3"), Err(LabelFormulaError::UnknownGroup("TEMDA".into())));
         assert_eq!(read("Pd(xyzphos)Cl2"), Err(LabelFormulaError::UnknownGroup("xyzphos".into())));
         assert_eq!(read("Pd(dppf)Qq2"), Err(LabelFormulaError::UnknownGroup("Qq2".into())));
-        for text in ["", "Qq", "R", "cat.", "rt", "Pd(OAc", "Pd)OAc(", "()", "Pd()2", "Pd(OAc)0", "24 h", "NH4+"] {
+        for text in ["", "Qq", "R", "cat.", "rt", "()", "Pd()2", "Pd(OAc)0", "24 h", "NH4+"] {
             assert_eq!(read(text), Err(LabelFormulaError::NotAFormula), "{text:?}");
         }
         let huge = format!("Pd(OAc){}", usize::MAX);
         assert_eq!(read(&huge), Err(LabelFormulaError::NotAFormula));
         let deep = format!("{}C{}", "(".repeat(MAX_GROUP_DEPTH + 1), ")".repeat(MAX_GROUP_DEPTH + 1));
         assert_eq!(read(&deep), Err(LabelFormulaError::NotAFormula));
+    }
+
+    /// Brackets of every kind nest to any depth, and a group's listed spellings are read at
+    /// every level.
+    #[test]
+    fn brackets_nest_in_any_mix() {
+        let trimer = Ok("C21H51F9N6O12S3Zn3".to_string());
+        for text in [
+            "((tmeda)Zn(OH)(OTf))3",
+            "((TMEDA)Zn(OH)(OTf))3",
+            "[(tmeda)Zn(OH)(OTf)]3",
+            "[(TMEDA)Zn(OH)(OTf)]3",
+            "{[(tmeda)Zn(OH)(OTf)]}3",
+            "(((tmeda))Zn((OH))((OTf)))3",
+        ] {
+            assert_eq!(read(text), trimer, "{text}");
+            assert_eq!(weight(text), "1042.97", "{text}");
+        }
+        assert_eq!(read("(Pd(dppf)Cl2)2").as_deref(), Ok("C68H56Cl4Fe2P4Pd2"));
+        assert_eq!(weight("(Pd(dppf)Cl2)2"), "1463.42");
+        assert_eq!(read("((cod)IrCl)2").as_deref(), Ok("C16H24Cl2Ir2"));
+        assert_eq!(read("((COD)IrCl)2"), read("[Ir(cod)Cl]2"));
+        assert_eq!(read("((Tmeda)Zn(OH)(OTf))3"), Err(LabelFormulaError::UnknownGroup("Tmeda".into())));
+        assert_eq!(weight("((cod)IrCl)2"), "671.71");
+        assert_eq!(read("(((((Pd(((dppf)))Cl2)))))").as_deref(), Ok("C34H28Cl2FeP2Pd"));
+    }
+
+    /// Full-width brackets, digits and letters — an input method left in full-width mode —
+    /// read as their ASCII equivalents, and the katakana middle dot as the adduct dot.
+    #[test]
+    fn full_width_forms_read_as_ascii() {
+        let wide = "\u{ff08}\u{ff08}tmeda\u{ff09}Zn\u{ff08}OH\u{ff09}\u{ff08}OTf\u{ff09}\u{ff09}\u{ff13}";
+        assert_eq!(read(wide), read("((tmeda)Zn(OH)(OTf))3"));
+        assert_eq!(weight(wide), "1042.97");
+        assert_eq!(read("\u{ff3b}Ir\u{ff08}cod\u{ff09}Cl\u{ff3d}\u{ff12}"), read("[Ir(cod)Cl]2"));
+        assert_eq!(read("\u{ff2b}\u{ff12}\u{ff23}\u{ff2f}\u{ff13}").as_deref(), Ok("CK2O3"), "Ｋ２ＣＯ３");
+        assert_eq!(read("CuSO4\u{30fb}\u{ff15}H2O").as_deref(), Ok("CuH10O9S"));
+        assert_eq!(read("\u{ff08}\u{ff08}tmeda\u{ff09}Zn"), Err(LabelFormulaError::UnbalancedBrackets));
+    }
+
+    /// A bracket left open, closed twice or closed by another kind: no formula, no weight,
+    /// and the error says it is the brackets.
+    #[test]
+    fn unbalanced_brackets_are_refused_as_such() {
+        for text in [
+            "((tmeda)Zn(OH)(OTf)3",
+            "(tmeda)Zn(OH)(OTf))3",
+            "Pd(OAc",
+            "Pd)OAc(",
+            "[(tmeda)Zn(OH)(OTf))3",
+            "(Pd[dppf)Cl2]",
+            "Pd(OAc)2)",
+            "(",
+        ] {
+            assert_eq!(read(text), Err(LabelFormulaError::UnbalancedBrackets), "{text:?}");
+        }
     }
 
     #[test]
@@ -625,6 +705,8 @@ mod tests {
                 assert!(parse_with_groups(&"CoCOCNOMe".repeat(2_000), &table).is_ok());
                 assert!(parse_with_groups(&format!("{}q", "CO".repeat(10_000)), &table).is_err());
                 assert!(parse_with_groups(&"(".repeat(20_000), &table).is_err());
+                let deep = format!("{}C{}", "(".repeat(20_000), ")".repeat(20_000));
+                assert_eq!(parse_with_groups(&deep, &table), Err(LabelFormulaError::NotAFormula));
             })
             .unwrap()
             .join()
