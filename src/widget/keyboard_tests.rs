@@ -1020,7 +1020,7 @@ fn a_single_fragment_label_still_expands_on_its_own() {
 /// A label with no reading is left untouched — expansion never half-applies or invents atoms.
 #[test]
 fn an_unreadable_label_is_left_alone() {
-    for label in ["Qq", "MeQq", "Si", "P", "ME"] {
+    for label in ["Qq", "MeQq", "Si", "P", "BOC", "COC"] {
         let mol = expand("", label);
         assert_eq!(mol.atoms.len(), 1, "{label}: nothing should have been added");
         assert!(mol.bonds.is_empty(), "{label}: nothing should have been bonded");
@@ -1037,7 +1037,7 @@ fn chained_labels_are_case_sensitive() {
     let phenyl = expand("", "MeOPh");
     let phosphino = expand("", "MeOPH2");
     assert_eq!(phenyl.atoms.len(), 8, "Me–O–C6H5");
-    assert_eq!(phosphino.atoms.len(), 5, "Me–O–PH2 (P plus two explicit H)");
+    assert_eq!(phosphino.atoms.len(), 3, "Me–O–PH2 (the hydrogens are the label's, not atoms)");
     assert!(phosphino.atoms.iter().any(|a| a.element == "P"));
     assert!(!phenyl.atoms.iter().any(|a| a.element == "P"));
 }
@@ -1057,4 +1057,152 @@ fn multi_character_fragment_names_are_not_split() {
         got.sort_unstable();
         assert_eq!(got, want_elements, "{label}");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Condensed formulas and abbreviations as labels
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The orders of the bonds between two elements, sorted.
+fn orders_between(mol: &Molecule, a: &str, b: &str) -> Vec<i16> {
+    let element = |id: u32| mol.atom_by_id(id).map(|atom| atom.element.as_str());
+    let mut orders: Vec<i16> = mol
+        .bonds
+        .iter()
+        .filter(|bond| {
+            let ends = (element(bond.begin), element(bond.end));
+            ends == (Some(a), Some(b)) || ends == (Some(b), Some(a))
+        })
+        .map(|bond| bond.order.valence())
+        .collect();
+    orders.sort_unstable();
+    orders
+}
+
+fn over_bonded(mol: &Molecule) -> Vec<String> {
+    mol.atoms
+        .iter()
+        .filter(|a| crate::molecule::depict::is_valence_invalid(mol, a.id))
+        .map(|a| a.element.clone())
+        .collect()
+}
+
+/// `CN`, `CHO` and `COOH` on the end of a chain are a nitrile, an aldehyde and a carboxylic
+/// acid — not the single-bonded chains C–N, C–H–O and C–O–O–H they used to expand into.
+#[test]
+fn cn_cho_and_cooh_expand_with_their_multiple_bonds() {
+    let nitrile = expand("1", "CN");
+    assert_eq!(nitrile.atoms.len(), 3, "C–C≡N");
+    assert_eq!(orders_between(&nitrile, "C", "N"), [3]);
+
+    let aldehyde = expand("1", "CHO");
+    assert_eq!(aldehyde.atoms.len(), 3, "C–C(=O)H, the hydrogen implicit");
+    assert_eq!(orders_between(&aldehyde, "C", "O"), [2]);
+    assert!(aldehyde.atoms.iter().all(|a| a.element != "H"));
+
+    for label in ["COOH", "CO2H"] {
+        let acid = expand("1", label);
+        assert_eq!(orders_between(&acid, "C", "O"), [1, 2], "{label}: C(=O)–OH");
+        assert!(orders_between(&acid, "O", "O").is_empty(), "{label}: no peroxide");
+        assert_eq!(acid.atoms.iter().filter(|a| a.element == "C").count(), 2, "{label}");
+        assert_eq!(over_bonded(&acid), Vec::<String>::new(), "{label}");
+    }
+}
+
+/// Every atom of an expanded group arrives, on a chain end and on a ring, and none of them is
+/// over-bonded: nothing is lost to the insertion snap and the bond orders fit the valences.
+#[test]
+fn expanded_groups_arrive_whole_and_within_valence() {
+    let config = crate::Config::embedded();
+    for prefix in ["1", "a 1"] {
+        for label in [
+            "CN", "CHO", "COOH", "CO2Et", "COMe", "CONMe2", "CCl3", "NMe2", "NHBoc", "NHAc", "OAc",
+            "OTf", "OMs", "OTs", "OBn", "OtBu", "SO2Me", "SO3H", "SiMe3", "OSiMe3", "CH2Ph",
+            "Bn", "Bz", "tBu", "iPr", "Pr", "Bu", "Tf", "Ms", "Ts", "Fmoc", "TIPS", "TBDPS", "Piv",
+            "BPin", "Tr", "PMB", "Cy", "TES", "iBu", "sBu", "Si(iPr)3", "CPh3", "NBn2", "OTBDPS", "OTIPS",
+        ] {
+            let before = type_keys(&format!("c {prefix}")).molecule;
+            let frag = crate::label_chain::resolve_label_on(&config, label, Some(1))
+                .unwrap_or_else(|| panic!("{label} has a reading"));
+            let mol = expand(prefix, label);
+            // The labelled atom is the fragment's attachment atom, so that one is not new.
+            assert_eq!(mol.atoms.len(), before.atoms.len() + frag.atoms.len() - 1, "{label} after {prefix:?}: atoms");
+            assert_eq!(mol.bonds.len(), before.bonds.len() + frag.bonds.len(), "{label} after {prefix:?}: bonds");
+            assert_eq!(over_bonded(&mol), Vec::<String>::new(), "{label} after {prefix:?}");
+        }
+    }
+}
+
+/// An abbreviation joins the structure through the atom its name implies: the sulfur of `Ts`,
+/// the boron of `BPin`, the CH2 of `Bn` — the labelled atom becomes that atom, and no carbon
+/// is put in between.
+#[test]
+fn abbreviations_attach_through_their_own_atom() {
+    for (label, element, atoms) in [("Ts", "S", 10), ("Ms", "S", 4), ("BPin", "B", 9), ("Bn", "C", 7), ("TIPS", "Si", 10)] {
+        let editor = type_keys(&format!("c 1 ` text:{label} Enter x"));
+        let mol = &editor.molecule;
+        assert_eq!(mol.atoms.len(), 1 + atoms, "{label}");
+        let first = mol.atoms[0].id;
+        let attached: Vec<&str> = mol
+            .neighbor_atom_ids(first)
+            .into_iter()
+            .filter_map(|id| mol.atom_by_id(id).map(|a| a.element.as_str()))
+            .collect();
+        assert_eq!(attached, [element], "{label}: what the chain carbon is bonded to");
+    }
+}
+
+/// A formula is held to the bonds its atom has: `CO` on a chain end — where it would turn into
+/// an aldehyde — is left as the label it is, and reported.
+#[test]
+fn a_formula_that_does_not_fit_its_atom_is_left_alone() {
+    let end = type_keys("c 1 ` text:CO Enter x");
+    assert_eq!(end.molecule.atoms.len(), 2);
+    assert!(end.molecule.atoms.iter().any(|a| a.element == "CO"), "the label stays");
+    assert_eq!(end.unexpanded_label.as_deref(), Some("CO"));
+
+    // The same label on an atom between two others is a ketone carbon.
+    let mut inside = type_keys("c 1 1");
+    let middle = inside
+        .molecule
+        .atoms
+        .iter()
+        .map(|a| a.id)
+        .find(|&id| inside.molecule.neighbor_atom_ids(id).len() == 2)
+        .expect("a chain of three has a middle atom");
+    inside.molecule.atom_by_id_mut(middle).unwrap().element = "CO".to_string();
+    inside.hotspot_atom = Some(middle);
+    crate::testkit::type_keys_into(&mut inside, "x");
+    assert_eq!(inside.molecule.atoms.len(), 4, "C–C(=O)–C");
+    assert_eq!(orders_between(&inside.molecule, "C", "O"), [2]);
+    assert_eq!(over_bonded(&inside.molecule), Vec::<String>::new());
+}
+
+/// `x` on a label with no reading changes nothing, leaves no undo step, and says which label
+/// it was; on a plain element there is nothing to say.
+#[test]
+fn x_on_an_unreadable_label_reports_it_and_leaves_no_undo_step() {
+    let labelled = type_keys("c 1 ` text:Qq Enter");
+    let mut editor = type_keys("c 1 ` text:Qq Enter x");
+    assert_eq!(editor.molecule, labelled.molecule);
+    assert_eq!(editor.undo_stack.len(), labelled.undo_stack.len(), "no undo step for nothing");
+    assert_eq!(editor.unexpanded_label.take().as_deref(), Some("Qq"));
+
+    let plain = type_keys("c 1 x");
+    assert_eq!(plain.unexpanded_label, None, "a carbon has nothing to expand");
+    let expanded = type_keys("c 1 ` text:CN Enter x");
+    assert_eq!(expanded.unexpanded_label, None);
+}
+
+/// One undo takes an expansion back to the label it came from, and redo expands it again.
+#[test]
+fn undo_takes_an_expansion_back_to_its_label() {
+    let labelled = type_keys("c 1 ` text:CO2Et Enter");
+    let mut editor = type_keys("c 1 ` text:CO2Et Enter x");
+    let expanded = editor.molecule.clone();
+    assert_eq!(expanded.atoms.len(), 6, "C–C(=O)–O–C–C");
+    assert!(editor.undo());
+    assert_eq!(editor.molecule, labelled.molecule, "the label is back");
+    assert!(editor.redo());
+    assert_eq!(editor.molecule, expanded);
 }

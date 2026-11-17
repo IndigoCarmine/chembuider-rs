@@ -237,6 +237,11 @@ pub struct ChemStructEditor {
     /// While Some, keyboard input goes to the text field instead of shortcuts.
     pub label_edit: Option<(u32, String)>,
 
+    /// The label `x` was last pressed on without effect, because it has no reading
+    /// ([`label_chain::resolve_label_on`](crate::label_chain::resolve_label_on)). The editor
+    /// only sets it; a host that tells the user takes it (`Option::take`) after `show`.
+    pub unexpanded_label: Option<String>,
+
     /// Keystrokes (key and text events) this frame could not take in their place, handed on to
     /// the start of the next frame, ahead of anything typed since.
     ///
@@ -369,6 +374,7 @@ impl Default for ChemStructEditor {
             ring_repeat: None,
             config: Config::default(),
             label_edit: None,
+            unexpanded_label: None,
             carried_keys: Vec::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),

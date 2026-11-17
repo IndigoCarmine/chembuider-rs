@@ -1,29 +1,43 @@
-//! Chained fragment labels: writing `MeOPh` on an atom means `Me–O–Ph`.
+//! What an atom label stands for: a fragment name, or a condensed formula spelled from names.
 //!
 //! An atom label is normally *one* fragment name — `OMe`, `NO2`, `Boc` — which
-//! [`Config::resolve_fragment`] looks up by exact name. This module adds the second reading:
-//! when the label is not a name of its own, it is split into a **sequence** of tokens — fragment
-//! names and element symbols — and those are welded head-to-tail into one composite
-//! [`Fragment`], which the caller then inserts exactly as it would insert any other fragment.
-//! An element token is a lone atom of that element, so `NaH` reads as Na–H.
+//! [`Config::resolve_fragment`] looks up by exact name. [`resolve_label`] tries that **first**,
+//! so a label that is a fragment name always resolves to that very fragment. A label that is
+//! not one is read, in this order:
 //!
-//! The entry point is [`resolve_label`]. It tries the exact name **first**, so every label
-//! that resolved before resolves to the identical fragment now; the chain reading is only ever
-//! reached by labels that previously expanded to nothing.
+//! 1. without its rich-text markup (`CO_2H` is `CO2H`, `//t//Bu` is `tBu`), as a fragment name
+//!    or one of the other spellings of a built-in one (`t-Bu`, `nBu`, `Bpin`);
+//! 2. as a **condensed formula** ([`condensed`]): fragment names and element symbols with
+//!    counts and parentheses, joined with the bond orders their valences demand —
 //!
-//! ```text
-//!   "MeOPh"  →  ["Me", "O", "Ph"]  →  CH3–O–C6H5
-//!   "NaOMe"  →  ["Na", "OMe"]       →  Na–O–CH3
-//!   "NO2"    →  exact fragment name, never split
-//!   "Qq"     →  no reading at all → the label is left alone
-//! ```
+//!    ```text
+//!      "MeOPh"  →  CH3–O–C6H5        "CN"     →  C≡N
+//!      "NaOMe"  →  Na–O–CH3          "CHO"    →  C(=O)H
+//!      "NMe2"   →  N(CH3)2           "CO2Et"  →  C(=O)–O–CH2CH3
+//!    ```
 //!
-//! # Direction and the three rules
+//!    and only when every atom comes out with its valence exactly filled;
+//! 3. the same with its units in reverse, for a label typed the way it is drawn on the left
+//!    of a structure (`HOOC`, `MeO`, `O2N`, `EtO2C`);
+//! 4. as the one fragment name it matches but for case (`ph`, `boc`), and only when the label
+//!    as typed does not even split into element symbols and names — `CO`, `NO`, `BN` and `PH`
+//!    are formulas, never cobalt, nobelium, benzyl or phenyl.
+//!
+//! A label with none of these readings resolves to `None` and is left alone: `Qq`, a bare
+//! element symbol (`Si`), a whole formula (`H2O`, `K2CO3`), or anything whose valences do not
+//! come out.
+//!
+//! # The older chain reading
+//!
+//! Before condensed formulas were read, a label was split into names by [`tokenize`] and
+//! welded head-to-tail with single bonds by [`compose`], each fragment continuing from its
+//! [`exit_idx`]. Those three remain as they were for callers that use them, and the rest of
+//! this section describes them; [`resolve_label`] no longer goes through them, because a chain
+//! of single bonds read `CN` as C–N and `COOH` as C–O–O–H.
 //!
 //! **1. The leftmost token attaches to the parent atom.** The composite's `attach_idx` is the
 //! entry atom of the first token, so `OMe` written on a ring carbon still joins through its
-//! oxygen — the same end it joins through today. Reading left-to-right, each token hangs off
-//! the one before it.
+//! oxygen. Reading left-to-right, each token hangs off the one before it.
 //!
 //! **2. A fragment's *entry* atom is its `attach_idx`.** That is what fragment JSON already
 //! declares, and it is the atom the previous link in the chain bonds to.
@@ -35,29 +49,18 @@
 //! > by the lowest index in the fragment's own atom list. If the fragment has no non-hydrogen
 //! > atom other than the entry, **the exit is the entry itself**.
 //!
-//! Which gives, for the fragments that ship with the app:
-//!
-//! | fragment | entry | exit | chain reading |
-//! |---|---|---|---|
-//! | `Me`, `O`, `H`, `Cl`, … | the lone atom | itself | trivially unambiguous |
-//! | `OMe` | O | the methyl C | `…–O–CH2–…` |
-//! | `Et` | CH2 | the terminal CH3 | `…–CH2CH2–…` |
-//! | `Ph` | ipso C | the **para** C | `…–C6H4–…`, the conventional reading |
-//! | `N3` | N1 | N3 | `…–N=N=N–…` |
-//! | `OH`, `NH2`, `SH` | the heteroatom | itself (only H beyond it) | the H stays put |
-//!
-//! Hydrogens are excluded on purpose: routing a chain *through* an H (`OH` + `Me` giving
-//! O–H–C) is never what anyone means, and the H would end up divalent.
-//!
 //! Links between tokens are **single bonds**. A fragment's own internal bond orders are
 //! copied verbatim, so `Ph` keeps its Kekulé pattern and `NO2` keeps its charges.
 //!
 //! # What the parent atom's own bonds do
 //!
-//! Nothing here, and that is the point. `MeOPh` on a *bare* atom yields CH3–O–C6H5 (anisole);
-//! on an atom that already carries one bond it yields –CH2–O–C6H5, because the leading carbon
-//! simply has one more neighbour. Hydrogens are implicit — they are counted at draw time from
-//! valence (`molecule::depict`), never stored — so the difference costs this module no code at all.
+//! `MeOPh` on a *bare* atom yields CH3–O–C6H5 (anisole); on an atom that already carries one
+//! bond it yields –CH2–O–C6H5, because the leading carbon simply has one more neighbour.
+//! Hydrogens are implicit — they are counted at draw time from valence (`molecule::depict`),
+//! never stored. A condensed formula that *starts with an element* says how many bonds its
+//! first atom has left, and [`resolve_label_on`] holds it to the bonds the atom really has.
+
+mod condensed;
 
 use crate::config::Config;
 use crate::molecule::fragment::{FragAtom, FragBond, Fragment};
@@ -81,30 +84,39 @@ const ZIGZAG: f32 = std::f32::consts::FRAC_PI_6;
 ///
 /// Drop-in replacement for [`Config::resolve_fragment`] on the label-expansion path: an exact
 /// fragment name resolves through `resolve_fragment` unchanged, and only a label that is *not*
-/// a fragment name is considered as a chain. Returns `None` when the label has no reading at
-/// all, which callers must treat as "leave the label alone".
+/// a fragment name is read any other way (see the [module docs](self)). Returns `None` when the
+/// label has no reading at all, which callers must treat as "leave the label alone".
 pub fn resolve_label(config: &Config, label: &str) -> Option<Fragment> {
+    resolve_label_on(config, label, None)
+}
+
+/// [`resolve_label`] for a label written on an atom that already has `bonds` bond orders to
+/// the rest of the structure (`None`: not known).
+///
+/// The bonds matter to a condensed formula that starts with an element, whose first atom must
+/// have exactly that many valences left: `CO` is the carbonyl of a ketone on an atom with two
+/// bonds and has no reading at a chain end, where it would come out as an aldehyde. An atom
+/// with no bond yet takes any group. Fragment names are not held to this.
+pub fn resolve_label_on(config: &Config, label: &str, bonds: Option<i16>) -> Option<Fragment> {
     // Exact name first — this is the pre-existing behaviour, bit for bit.
     if let Some(frag) = config.resolve_fragment(label) {
         return Some(frag);
     }
 
-    let names = tokenize(config, label)?;
-    // A one-token split means the label *is* a fragment name, which the branch above already
-    // took, or a bare element symbol (`Na`), which stays the plain atom it already is.
-    if names.len() < 2 {
-        return None;
-    }
-
-    // A name that is both a fragment and an element symbol is the fragment (see `tokenize`).
-    let parts: Vec<Fragment> = names
-        .iter()
-        .map(|n| config.resolve_fragment(n).or_else(|| element_atom(n)))
-        .collect::<Option<Vec<_>>>()?;
-
-    let mut composite = compose(&parts)?;
-    composite.name = label.to_string();
-    Some(composite)
+    let plain = condensed::plain(label);
+    let read = |text: &str, element_first: bool| {
+        condensed::fragment_named(config, text)
+            .or_else(|| condensed::read(config, text, bonds, element_first))
+    };
+    let mut frag = read(&plain, false)
+        .or_else(|| condensed::reversed(config, &plain).and_then(|text| read(&text, true)))
+        .or_else(|| {
+            (!condensed::splits(config, &plain))
+                .then(|| condensed::fragment_but_for_case(config, &plain))
+                .flatten()
+        })?;
+    frag.name = label.to_string();
+    Some(frag)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -462,6 +474,8 @@ mod tests {
     fn an_unreadable_label_has_no_split() {
         for label in ["", "Qq", "MeQq", "QqMe", "Benzene", "H2O", "CH3"] {
             assert!(split(label).is_none(), "{label:?} must not tokenize");
+        }
+        for label in ["", "Qq", "MeQq", "QqMe", "H2O"] {
             assert!(
                 resolve_label(&cfg(), label).is_none(),
                 "{label:?} must not expand",
@@ -612,8 +626,7 @@ mod tests {
     fn composed_atoms_stay_far_enough_apart_to_survive_insertion() {
         let min_gap = crate::molecule::Molecule::SNAP_RADIUS;
         for label in [
-            "MeOPh", "PhOMe", "MeOMe", "EtOEt", "PhPh", "MeOHMe", "MeNH2Me", "PhOPhOPh",
-            "MeCF3", "MeNO2", "MeTMS", "BocOMe",
+            "MeOPh", "PhOMe", "MeOMe", "EtOEt", "PhPh", "PhOPhOPh", "MeCF3", "MeNO2", "MeTMS",
         ] {
             let f = resolve_label(&cfg(), label).unwrap_or_else(|| panic!("{label} expands"));
             for i in 0..f.atoms.len() {
@@ -674,11 +687,14 @@ mod tests {
     }
 
     /// A count is not a token: `H4` is no element and no fragment, so `LiAlH4` — like `H2O`
-    /// and `CH3` — has no chain reading, and the label is left alone.
+    /// and `CH3` — has no chain reading. A whole formula has no reading as a group either, and
+    /// the label is left alone.
     #[test]
     fn counted_element_labels_still_have_no_split() {
         for label in ["LiAlH4", "NaBH4", "H2O", "CH3", "K2CO3"] {
             assert!(split(label).is_none(), "{label:?} must not tokenize");
+        }
+        for label in ["LiAlH4", "NaBH4", "H2O", "K2CO3", "CH4", "NH3", "CO2", "PPh3"] {
             assert!(resolve_label(&cfg(), label).is_none(), "{label:?} must not expand");
         }
     }
@@ -701,12 +717,15 @@ mod tests {
         config.fragments.clear();
         assert!(tokenize(&config, "Ac").is_none(), "Ac is a group label even with no fragment");
         assert!(tokenize(&config, "Ts").is_none(), "Ts is a group label even with no fragment");
-        // `Ar` and `Pr` are aryl and propyl in a label, as `MolecularFormula::parse` reads them.
-        for label in ["OAr", "OPr", "ArH", "PrOH"] {
-            assert!(split(label).is_none(), "{label:?}: Ar/Pr are abbreviations, not elements");
+        // `Ar` is aryl in a label, as `MolecularFormula::parse` reads it, and `Pr` is the propyl
+        // fragment, never praseodymium.
+        for label in ["OAr", "ArH"] {
+            assert!(split(label).is_none(), "{label:?}: Ar is an abbreviation, not an element");
         }
-        // `B` + `u` is no reading of `Bu`: lowercase `u` starts no token.
-        assert!(split("Bu").is_none());
+        assert_eq!(names("OPr"), ["O", "Pr"]);
+        assert_eq!(resolve_label(&cfg(), "OPr").unwrap().atoms.len(), 4, "O and three carbons");
+        // `B` + `u` is no reading of `Bu`: it is the butyl fragment.
+        assert_eq!(names("Bu"), ["Bu"]);
     }
 
     /// A label that is a fragment name is still never split, element symbols or not.
@@ -769,5 +788,407 @@ mod tests {
             let after = resolve_label(&config, name).expect("name still resolves");
             assert_eq!(after.atoms.len(), before.atoms.len(), "{name}");
         }
+    }
+
+    // ── Condensed formulas ───────────────────────────────────────────────────
+
+    /// The molecule a spec such as `"C0=O1 C0-O2"` spells: atoms named element + index, joined
+    /// by `-`, `=` or `#`. Atom 0 is the attachment atom.
+    fn graph(spec: &str) -> Molecule {
+        let mut mol = Molecule::default();
+        let mut ids: std::collections::BTreeMap<String, u32> = Default::default();
+        let mut atom = |mol: &mut Molecule, name: &str| {
+            let element = name.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+            *ids.entry(name.to_string()).or_insert_with(|| mol.add_atom(element, [0.0, 0.0], 0))
+        };
+        for part in spec.split_whitespace() {
+            match part.find(['-', '=', '#']) {
+                None => {
+                    atom(&mut mol, part);
+                }
+                Some(at) => {
+                    let order = match &part[at..=at] {
+                        "=" => BondOrder::Double,
+                        "#" => BondOrder::Triple,
+                        _ => BondOrder::Single,
+                    };
+                    let (a, b) = (atom(&mut mol, &part[..at]), atom(&mut mol, &part[at + 1..]));
+                    mol.add_bond(a, b, order);
+                }
+            }
+        }
+        mol
+    }
+
+    /// `frag` without the hydrogens a fragment such as `OH` carries as atoms, and the index its
+    /// attachment atom has in the result.
+    fn heavy(frag: &Fragment) -> (Molecule, u32) {
+        let mut mol = Molecule::default();
+        let ids: Vec<Option<u32>> = frag
+            .atoms
+            .iter()
+            .map(|a| (a.element != "H").then(|| mol.add_atom(a.element.clone(), a.pos, a.charge)))
+            .collect();
+        for b in &frag.bonds {
+            if let (Some(a), Some(c)) = (ids[b.begin], ids[b.end]) {
+                mol.add_bond(a, c, b.order.clone());
+            }
+        }
+        (mol, ids[frag.attach_idx].expect("the attachment atom is no hydrogen"))
+    }
+
+    /// Assert that `label` reads as `spec`, attached through the spec's atom 0.
+    #[track_caller]
+    fn reads_on(label: &str, bonds: Option<i16>, spec: &str) {
+        let frag = resolve_label_on(&cfg(), label, bonds).unwrap_or_else(|| panic!("{label} has a reading"));
+        let (got, attach) = heavy(&frag);
+        let want = graph(spec);
+        assert!(
+            is_isomorphic(&got, &want),
+            "{label} read as {}, want {spec}",
+            crate::molecule::smiles::to_smiles(&got),
+        );
+        let root = &want.atoms[0];
+        let at = got.atom_by_id(attach).unwrap();
+        assert_eq!(at.element, root.element, "{label}: attachment atom");
+        assert_eq!(
+            got.bond_order_sum(attach),
+            want.bond_order_sum(root.id),
+            "{label}: bonds of the attachment atom",
+        );
+        // Nothing may be lost to `insert_fragment`'s snap radius.
+        for (i, a) in frag.atoms.iter().enumerate() {
+            for b in &frag.atoms[i + 1..] {
+                let d = (a.pos[0] - b.pos[0]).hypot(a.pos[1] - b.pos[1]);
+                assert!(d > Molecule::SNAP_RADIUS, "{label}: two atoms {d:.2} apart");
+            }
+        }
+        for b in &frag.bonds {
+            let (p, q) = (frag.atoms[b.begin].pos, frag.atoms[b.end].pos);
+            let d = (p[0] - q[0]).hypot(p[1] - q[1]);
+            assert!((d - 1.5).abs() < 0.05, "{label}: a bond {d:.2} long");
+        }
+    }
+
+    #[track_caller]
+    fn reads(label: &str, spec: &str) {
+        reads_on(label, None, spec);
+        reads_on(label, Some(1), spec);
+    }
+
+    const PH: &str = "C1-C2 C2=C3 C3-C4 C4=C5 C5-C6 C6=C1";
+
+    /// The three labels that used to expand into chains of single bonds.
+    #[test]
+    fn cn_cho_and_cooh_are_not_single_bonded_chains() {
+        reads("CN", "C0#N1");
+        reads("CHO", "C0=O1");
+        reads("COOH", "C0=O1 C0-O2");
+        reads("CO2H", "C0=O1 C0-O2");
+        // With the markup the label editor accepts for a subscript.
+        reads("CO_2H", "C0=O1 C0-O2");
+    }
+
+    /// Bond orders and branches come from the valences: a carbon keeps its four bonds, an
+    /// oxygen its two, whatever the label makes of them.
+    #[test]
+    fn condensed_formulas_read_with_the_bonds_their_valences_demand() {
+        for (label, spec) in [
+            ("CH3", "C0"),
+            ("CH2CH3", "C0-C1"),
+            ("CCl3", "C0-Cl1 C0-Cl2 C0-Cl3"),
+            ("CHCl2", "C0-Cl1 C0-Cl2"),
+            ("CD3", "C0-D1 C0-D2 C0-D3"),
+            ("CH2OH", "C0-O1"),
+            ("CH2OMe", "C0-O1 O1-C2"),
+            ("OCH3", "O0-C1"),
+            ("OCF3", "O0-C1 C1-F2 C1-F3 C1-F4"),
+            ("CO2Et", "C0=O1 C0-O2 O2-C3 C3-C4"),
+            ("COOMe", "C0=O1 C0-O2 O2-C3"),
+            ("COOEt", "C0=O1 C0-O2 O2-C3 C3-C4"),
+            ("COOtBu", "C0=O1 C0-O2 O2-C3 C3-C4 C3-C5 C3-C6"),
+            ("COMe", "C0=O1 C0-C2"),
+            ("COCl", "C0=O1 C0-Cl2"),
+            ("CONH2", "C0=O1 C0-N2"),
+            ("CONMe2", "C0=O1 C0-N2 N2-C3 N2-C4"),
+            ("OAc", "O0-C1 C1=O2 C1-C3"),
+            ("OCOMe", "O0-C1 C1=O2 C1-C3"),
+            ("NMe2", "N0-C1 N0-C2"),
+            ("NEt2", "N0-C1 C1-C2 N0-C3 C3-C4"),
+            ("NHMe", "N0-C1"),
+            ("NHAc", "N0-C1 C1=O2 C1-C3"),
+            ("NHCOMe", "N0-C1 C1=O2 C1-C3"),
+            ("NHBoc", "N0-C1 C1=O2 C1-O3 O3-C4 C4-C5 C4-C6 C4-C7"),
+            ("NCO", "N0=C1 C1=O2"),
+            ("NCS", "N0=C1 C1=S2"),
+            ("SCN", "S0-C1 C1#N2"),
+            ("SMe", "S0-C1"),
+            ("SSMe", "S0-S1 S1-C2"),
+            ("SOMe", "S0=O1 S0-C2"),
+            ("SO2Me", "S0=O1 S0=O2 S0-C3"),
+            ("SO2NH2", "S0=O1 S0=O2 S0-N3"),
+            ("SO3H", "S0=O1 S0=O2 S0-O3"),
+            ("OMs", "O0-S1 S1=O2 S1=O3 S1-C4"),
+            ("OSO2Me", "O0-S1 S1=O2 S1=O3 S1-C4"),
+            ("OTf", "O0-S1 S1=O2 S1=O3 S1-C4 C4-F5 C4-F6 C4-F7"),
+            ("SiMe3", "Si0-C1 Si0-C2 Si0-C3"),
+            ("OSiMe3", "O0-Si1 Si1-C2 Si1-C3 Si1-C4"),
+            ("OTMS", "O0-Si1 Si1-C2 Si1-C3 Si1-C4"),
+            ("OtBu", "O0-C1 C1-C2 C1-C3 C1-C4"),
+            ("CCH", "C0#C1"),
+            ("CHCH2", "C0=C1"),
+            ("CH2CHCH2", "C0-C1 C1=C2"),
+            ("CH2CN", "C0-C1 C1#N2"),
+            ("CH2CO2Et", "C0-C1 C1=O2 C1-O3 O3-C4 C4-C5"),
+            ("PPh2", &format!("P0-C1 {PH} P0-C7 C7-C8 C8=C9 C9-C10 C10=C11 C11-C12 C12=C7")),
+            ("POPh2", &format!("P0=O20 P0-C1 {PH} P0-C7 C7-C8 C8=C9 C9-C10 C10=C11 C11-C12 C12=C7")),
+            ("CH2Ph", &format!("C0-C1 {PH}")),
+            ("OCH2Ph", &format!("O0-C7 C7-C1 {PH}")),
+            ("OPh", &format!("O0-C1 {PH}")),
+        ] {
+            reads(label, spec);
+        }
+    }
+
+    /// A parenthesised group hangs as a whole from the atom it is attached to.
+    #[test]
+    fn parenthesised_groups_branch() {
+        reads("CH(CH3)2", "C0-C1 C0-C2");
+        reads("C(CH3)3", "C0-C1 C0-C2 C0-C3");
+        reads("N(CH3)2", "N0-C1 N0-C2");
+        reads("B(OH)2", "B0-O1 B0-O2");
+        reads("C(O)Me", "C0=O1 C0-C2");
+        reads("OC(O)Me", "O0-C1 C1=O2 C1-C3");
+        reads("PO(OEt)2", "P0=O1 P0-O2 O2-C3 C3-C4 P0-O5 O5-C6 C6-C7");
+        reads("P(O)(OEt)2", "P0=O1 P0-O2 O2-C3 C3-C4 P0-O5 O5-C6 C6-C7");
+        reads("Si(iPr)3", "Si0-C1 C1-C2 C1-C3 Si0-C4 C4-C5 C4-C6 Si0-C7 C7-C8 C7-C9");
+        for label in ["C(CH3", "CCH3)", "C()", "(CH3)2", "CH((CH3))2"] {
+            assert!(resolve_label(&cfg(), label).is_none(), "{label:?} must not expand");
+        }
+    }
+
+    /// The abbreviations that were missing, each attached through the atom its name implies.
+    #[test]
+    fn the_common_abbreviations_are_built_in() {
+        let ring = |first: usize| {
+            let c = |k: usize| format!("C{}", first + k);
+            (0..6)
+                .map(|k| format!("{}{}{}", c(k), if k % 2 == 0 { "-" } else { "=" }, c((k + 1) % 6)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for (label, spec) in [
+            ("Pr", "C0-C1 C1-C2".to_string()),
+            ("iPr", "C0-C1 C0-C2".to_string()),
+            ("Bu", "C0-C1 C1-C2 C2-C3".to_string()),
+            ("iBu", "C0-C1 C1-C2 C1-C3".to_string()),
+            ("sBu", "C0-C1 C1-C2 C0-C3".to_string()),
+            ("tBu", "C0-C1 C0-C2 C0-C3".to_string()),
+            ("Cy", "C0-C1 C1-C2 C2-C3 C3-C4 C4-C5 C5-C0".to_string()),
+            ("Bn", format!("C0-C10 {}", ring(10))),
+            ("Bz", format!("C0=O1 C0-C10 {}", ring(10))),
+            ("PMB", format!("C0-C10 {} C13-O2 O2-C3", ring(10))),
+            ("Tr", format!("C0-C10 {} C0-C20 {} C0-C30 {}", ring(10), ring(20), ring(30))),
+            ("Piv", "C0=O1 C0-C2 C2-C3 C2-C4 C2-C5".to_string()),
+            ("Ms", "S0=O1 S0=O2 S0-C3".to_string()),
+            ("Tf", "S0=O1 S0=O2 S0-C3 C3-F4 C3-F5 C3-F6".to_string()),
+            ("Ts", format!("S0=O1 S0=O2 S0-C10 {} C13-C3", ring(10))),
+            ("TES", "Si0-C1 C1-C2 Si0-C3 C3-C4 Si0-C5 C5-C6".to_string()),
+            ("TIPS", "Si0-C1 C1-C2 C1-C3 Si0-C4 C4-C5 C4-C6 Si0-C7 C7-C8 C7-C9".to_string()),
+            ("TBDPS", format!("Si0-C1 C1-C2 C1-C3 C1-C4 Si0-C10 {} Si0-C20 {}", ring(10), ring(20))),
+            (
+                "Fmoc",
+                // C(=O)–O–CH2–C9 of fluorene: C9, C9a, C4a, C4b, C8a and the two benzo rings.
+                "C0=O1 C0-O2 O2-C3 C3-C9 C9-C10 C10-C11 C11-C12 C12-C13 C13-C9 \
+                 C10=C20 C20-C21 C21=C22 C22-C23 C23=C11 C12=C30 C30-C31 C31=C32 C32-C33 C33=C13"
+                    .to_string(),
+            ),
+            ("BPin", "B0-O1 O1-C2 C2-C3 C3-O4 O4-B0 C2-C5 C2-C6 C3-C7 C3-C8".to_string()),
+        ] {
+            let exact = cfg().resolve_fragment(label).unwrap_or_else(|| panic!("{label} is built in"));
+            assert_eq!(exact.attach_idx, 0, "{label}");
+            reads(label, &spec);
+        }
+        // Groups hung from a heteroatom, as they are mostly written.
+        reads("OTs", &format!("O0-S1 S1=O2 S1=O3 S1-C10 {} C13-C4", ring(10)));
+        reads("OBn", &format!("O0-C1 C1-C10 {}", ring(10)));
+        reads("OBz", &format!("O0-C1 C1=O2 C1-C10 {}", ring(10)));
+        reads("NHTs", &format!("N0-S1 S1=O2 S1=O3 S1-C10 {} C13-C4", ring(10)));
+        reads("OTBS", "O0-Si1 Si1-C2 Si1-C3 Si1-C4 C4-C5 C4-C6 C4-C7");
+        reads("OTIPS", "O0-Si1 Si1-C2 C2-C3 C2-C4 Si1-C5 C5-C6 C5-C7 Si1-C8 C8-C9 C8-C10");
+        reads("NBn2", &format!("N0-C1 C1-C10 {} N0-C2 C2-C20 {}", ring(10), ring(20)));
+    }
+
+    /// Other spellings of a built-in name, alone and inside a formula.
+    #[test]
+    fn other_spellings_resolve_to_the_same_fragment() {
+        for (spelled, name) in [
+            ("t-Bu", "tBu"),
+            ("t\u{2011}Bu", "tBu"),
+            ("//t//Bu", "tBu"),
+            ("i-Pr", "iPr"),
+            ("n-Bu", "Bu"),
+            ("nBu", "Bu"),
+            ("n-Pr", "Pr"),
+            ("s-Bu", "sBu"),
+            ("i-Bu", "iBu"),
+            ("Bpin", "BPin"),
+            ("TBDMS", "TBS"),
+            ("C6H5", "Ph"),
+            ("SiMe3", "TMS"),
+            ("Ot-Bu", "OtBu"),
+            ("OTBDMS", "OTBS"),
+            ("CO2t-Bu", "COOtBu"),
+        ] {
+            let a = resolve_label(&cfg(), spelled).unwrap_or_else(|| panic!("{spelled} has a reading"));
+            let b = resolve_label(&cfg(), name).unwrap_or_else(|| panic!("{name} has a reading"));
+            assert!(is_isomorphic(&a.to_molecule(), &b.to_molecule()), "{spelled} is {name}");
+            assert_eq!(a.atoms[a.attach_idx].element, b.atoms[b.attach_idx].element, "{spelled}");
+        }
+        // A fragment the user saved under such a spelling is the one found.
+        let mut config = cfg();
+        config.fragments.push(lone_atom_def("t-Bu"));
+        assert_eq!(resolve_label(&config, "t-Bu").unwrap().atoms.len(), 1);
+    }
+
+    /// A label typed the way it is drawn on the left of a structure reads as its mirror image.
+    #[test]
+    fn a_label_written_toward_the_left_reads_reversed() {
+        for (reversed, forward) in [
+            ("HOOC", "COOH"),
+            ("HO2C", "CO2H"),
+            ("NC", "CN"),
+            ("O2N", "NO2"),
+            ("MeO", "OMe"),
+            ("HO", "OH"),
+            ("H2N", "NH2"),
+            ("H3C", "CH3"),
+            ("F3C", "CF3"),
+            ("Cl3C", "CCl3"),
+            ("EtO2C", "CO2Et"),
+            ("MeO2C", "CO2Me"),
+            ("HOH2C", "CH2OH"),
+            ("Me2N", "NMe2"),
+            ("Me3Si", "SiMe3"),
+            ("BocHN", "NHBoc"),
+            ("AcO", "OAc"),
+            ("TsO", "OTs"),
+            ("tBuO", "OtBu"),
+            ("(CH3)2N", "N(CH3)2"),
+        ] {
+            let a = resolve_label_on(&cfg(), reversed, Some(1))
+                .unwrap_or_else(|| panic!("{reversed} has a reading"));
+            let b = resolve_label_on(&cfg(), forward, Some(1)).unwrap();
+            assert!(is_isomorphic(&a.to_molecule(), &b.to_molecule()), "{reversed} is {forward}");
+            assert_eq!(a.atoms[a.attach_idx].element, b.atoms[b.attach_idx].element, "{reversed}");
+        }
+        // A label that reads as written is not turned round: both of these are anisole, the
+        // first attached through its methyl carbon.
+        let chain = resolve_label(&cfg(), "MeOPh").unwrap();
+        assert_eq!(chain.atoms.len(), 8);
+        // Only a label that then starts with an element is read backwards.
+        for label in ["AcOMe", "ClAc"] {
+            assert!(resolve_label(&cfg(), label).is_none(), "{label:?} must not expand");
+        }
+    }
+
+    /// The first atom of a formula keeps exactly the valences the labelled atom's bonds take.
+    #[test]
+    fn a_formula_must_fit_the_bonds_of_its_atom() {
+        // `CO` between two atoms is a ketone carbon; at a chain end it would be an aldehyde,
+        // which is not what it says.
+        reads_on("CO", Some(2), "C0=O1");
+        assert!(resolve_label_on(&cfg(), "CO", Some(1)).is_none());
+        reads_on("NMe", Some(2), "N0-C1");
+        assert!(resolve_label_on(&cfg(), "NMe", Some(1)).is_none());
+        reads_on("COH", Some(3), "C0-O1");
+        assert!(resolve_label_on(&cfg(), "COH", Some(1)).is_none());
+        reads_on("CH2", Some(2), "C0");
+        reads_on("SO2", Some(2), "S0=O1 S0=O2");
+        assert!(resolve_label_on(&cfg(), "CH3", Some(2)).is_none());
+        assert!(resolve_label_on(&cfg(), "CN", Some(2)).is_none());
+        // The same label reads differently where the atom's bonds leave only the other reading:
+        // a carbon with three bonds labelled `COMe` carries a methoxy group.
+        reads_on("COMe", Some(1), "C0=O1 C0-C2");
+        reads_on("COMe", Some(3), "C0-O1 O1-C2");
+        // An atom with no bonds yet takes the group as if it had one.
+        reads_on("CO2Et", Some(0), "C0=O1 C0-O2 O2-C3 C3-C4");
+    }
+
+    /// Nothing is expanded on a guess. Each of these splits into names, and none has a reading
+    /// in which every valence comes out exact.
+    #[test]
+    fn a_label_whose_valences_do_not_come_out_is_left_alone() {
+        for label in [
+            // No way to bond these as written (a nitrile cannot be entered at N, …).
+            "CC", "CCC", "OO", "NN", "CF4", "OMe2", "NMe3", "CH5", "OH2", "ClMe", "CON",
+            // Charged groups are not spelled by a neutral formula.
+            "CO2", "SO3", "PPh3",
+            // A formula of a compound, not a group: more than one first atom, or none left over.
+            "H2O", "K2CO3", "CH4", "Me2", "O2",
+            // A group with one point of attachment ends its branch; nothing continues from it.
+            "AcCl", "TsCl", "MsCl", "BnBr", "BocOMe", "TMSCl", "MeOHMe", "MeNH2Me",
+            // Hydrogens are counted, never passed through.
+            "MeHMe", "DDP", "NHH", "LiAlH4", "NaBH4",
+            // Case is not relaxed for a label that reads as elements.
+            "BN", "BOC", "PH3", "CO2ET",
+        ] {
+            for bonds in [None, Some(0), Some(1)] {
+                assert!(
+                    resolve_label_on(&cfg(), label, bonds).is_none(),
+                    "{label:?} must not expand (bonds {bonds:?})",
+                );
+            }
+        }
+    }
+
+    /// Elements with no standard valence bond singly, as they did when labels were chains.
+    #[test]
+    fn metals_keep_their_single_bonds() {
+        let nah = resolve_label_on(&cfg(), "NaH", Some(0)).unwrap();
+        assert!(is_isomorphic(&nah.to_molecule(), &graph("Na0-H1")));
+        reads_on("NaOMe", Some(0), "Na0-O1 O1-C2");
+        reads_on("NaOEt", Some(0), "Na0-O1 O1-C2 C2-C3");
+        reads_on("SnBu3", Some(1), "Sn0-C1 C1-C2 C2-C3 C3-C4 Sn0-C5 C5-C6 C6-C7 C7-C8 Sn0-C9 C9-C10 C10-C11 C11-C12");
+        let hcl = resolve_label_on(&cfg(), "HCl", Some(0)).unwrap();
+        assert!(is_isomorphic(&hcl.to_molecule(), &graph("H0-Cl1")));
+        assert!(resolve_label_on(&cfg(), "HCl", Some(1)).is_none(), "HCl is no substituent");
+        assert!(resolve_label(&cfg(), "SeO2").is_none(), "no double bond to an unknown valence");
+    }
+
+    /// A name matches whatever its case only when the label has no other reading at all and the
+    /// name is the only one it could be.
+    #[test]
+    fn case_is_relaxed_only_where_nothing_else_reads() {
+        for (typed, name) in [("ph", "Ph"), ("me", "Me"), ("boc", "Boc"), ("tbs", "TBS"), ("bn", "Bn"), ("bpin", "BPin"), ("tbu", "tBu"), ("OME", "OMe"), ("Benzene", "benzene")] {
+            let a = resolve_label(&cfg(), typed).unwrap_or_else(|| panic!("{typed} has a reading"));
+            let b = cfg().resolve_fragment(name).unwrap();
+            assert!(is_isomorphic(&a.to_molecule(), &b.to_molecule()), "{typed} is {name}");
+        }
+        // These read as element symbols, so they are never a name in another case: cobalt,
+        // nobelium and copernicium stay atoms, `PH` a phosphorus with a hydrogen.
+        for label in ["Co", "No", "Cn", "Cs", "Hf", "Os", "Nb"] {
+            assert!(resolve_label(&cfg(), label).is_none(), "{label:?} is an element");
+        }
+        for label in ["co", "cn", "no", "qq"] {
+            assert!(resolve_label(&cfg(), label).is_none(), "{label:?} is no name");
+        }
+        assert_eq!(resolve_label_on(&cfg(), "PH", Some(2)).unwrap().atoms.len(), 1);
+        assert!(resolve_label_on(&cfg(), "PH", Some(1)).is_none(), "PH is not Ph");
+        // Two names that differ only in case leave the label unread.
+        let mut config = cfg();
+        config.fragments.push(lone_atom_def("PH"));
+        config.fragments.retain(|f| f.name != "PH2");
+        assert!(resolve_label(&config, "ph").is_none());
+    }
+
+    /// A long or deeply ambiguous label is given up on, not searched without end.
+    #[test]
+    fn hopeless_labels_are_given_up_quickly() {
+        let start = std::time::Instant::now();
+        for label in ["CO".repeat(30), "C".repeat(64), "(C".repeat(30), "CoCOCNOMe".repeat(7), "Na".repeat(5_000)] {
+            let _ = resolve_label(&cfg(), &label);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
     }
 }
