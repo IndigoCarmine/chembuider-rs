@@ -157,6 +157,10 @@ pub fn resolve_label_on(config: &Config, label: &str, bonds: Option<i16>) -> Opt
 ///   two readings are the same atom for every built-in one, and a user's fragment of that name
 ///   is what the user means.
 ///
+/// A **hydrogen token** (`H`, `D`, or a fragment attached through one) may only be the first or
+/// the last token: inside the chain it would be bonded on both sides, so `DDP` and `MeHMe` have
+/// no reading.
+///
 /// A symbol carries no count: `H4` is not a token, so `LiAlH4`, `H2O` and `CH3` have no chain
 /// reading, just as before. Counted labels are formulas, which
 /// [`MolecularFormula`](crate::reaction::MolecularFormula) reads; a chain of single bonds is
@@ -166,14 +170,21 @@ pub fn tokenize(config: &Config, label: &str) -> Option<Vec<String>> {
         return None;
     }
     let names = token_names(config);
+    let hydrogens: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| is_hydrogen_token(config, n))
+        .collect();
+    let hydrogens = &hydrogens;
     let bytes = label.as_bytes();
     // A name matching at `pos`. Compared as bytes: a name starts on a character boundary, so
-    // it can never match from inside a multi-byte character.
+    // it can never match from inside a multi-byte character. A hydrogen token has one bond to
+    // give, so it may start or end the chain but never stand inside it (`DDP` is no D–D–P).
     let matches = |pos: usize| {
-        names
-            .iter()
-            .copied()
-            .filter(move |n| bytes[pos..].starts_with(n.as_bytes()))
+        names.iter().copied().filter(move |n| {
+            bytes[pos..].starts_with(n.as_bytes())
+                && (pos == 0 || pos + n.len() == bytes.len() || !hydrogens.contains(n))
+        })
     };
 
     // readable[pos]: the rest of the label from `pos` splits into tokens.
@@ -216,6 +227,17 @@ fn token_names(config: &Config) -> Vec<&str> {
     names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     names.dedup();
     names
+}
+
+/// Whether the token `name` joins the chain through a hydrogen (`H`, `D`, `T`): the element
+/// symbol `H`, or a fragment whose attach atom is a hydrogen isotope. Such a token holds one
+/// bond, so it cannot be bonded to a token on each side.
+fn is_hydrogen_token(config: &Config, name: &str) -> bool {
+    let entry = match config.fragments.iter().find(|f| f.name == name) {
+        Some(def) => def.atoms.get(def.attach_idx).map(|a| a.element.as_str()),
+        None => Some(name),
+    };
+    matches!(entry, Some("H" | "D" | "T"))
 }
 
 /// Element symbols that may be a token: every element, except the symbols a label means as a
@@ -726,6 +748,27 @@ mod tests {
         assert_eq!(resolve_label(&cfg(), "OPr").unwrap().atoms.len(), 4, "O and three carbons");
         // `B` + `u` is no reading of `Bu`: it is the butyl fragment.
         assert_eq!(names("Bu"), ["Bu"]);
+    }
+
+    /// A hydrogen token (`H`, `D`) has one bond to give. Inside a chain it would need two, so
+    /// it may only start or end one: `DDP` is no D–D–P, `MeHMe` no Me–H–Me.
+    #[test]
+    fn a_hydrogen_token_never_stands_inside_a_chain() {
+        for label in ["DDP", "MeHMe", "MeDOMe", "PhDPh"] {
+            assert!(split(label).is_none(), "{label:?} must not tokenize");
+            assert!(
+                resolve_label(&cfg(), label).is_none(),
+                "{label:?} must not expand"
+            );
+        }
+        // At either end it is the hydrogen it always was.
+        assert_eq!(names("NaH"), ["Na", "H"]);
+        assert_eq!(names("LiAlH"), ["Li", "Al", "H"]);
+        assert_eq!(names("HCl"), ["H", "Cl"]);
+        assert_eq!(names("DCl"), ["D", "Cl"]);
+        assert_eq!(names("DD"), ["D", "D"]);
+        // The hydrogens of a fragment (`OH`, `NH2`) are not tokens of their own.
+        assert_eq!(names("MeOHMe"), ["Me", "OH", "Me"]);
     }
 
     /// A label that is a fragment name is still never split, element symbols or not.

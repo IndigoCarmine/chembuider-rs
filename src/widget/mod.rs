@@ -298,8 +298,15 @@ pub struct ChemStructEditor {
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
-    /// While rotating the selection (Alt+drag): the cursor angle from the last frame.
-    rotate_last_angle: Option<f32>,
+    /// While rotating the selection (Alt+drag, or a drag of the rotation handle).
+    pub(crate) rotate_drag: Option<interact::RotateDrag>,
+
+    /// The angle box, while it is open: the selection is turned by the angle typed into it
+    /// (see [`open_rotate_input`](Self::open_rotate_input)).
+    rotate_edit: Option<RotateEdit>,
+
+    /// The angle last entered in the angle box, offered again the next time it opens.
+    rotate_last_text: String,
 
     /// Screen rects of the atom labels painted last frame, for hit testing (wide labels
     /// like "CO2Et" should be clickable over their whole text, not just a small circle).
@@ -387,7 +394,9 @@ impl Default for ChemStructEditor {
             cleanup_job: None,
             cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
-            rotate_last_angle: None,
+            rotate_drag: None,
+            rotate_edit: None,
+            rotate_last_text: "90".to_string(),
             last_label_rects: std::collections::HashMap::new(),
             fit_requested: false,
             context_bond: None,
@@ -1232,6 +1241,170 @@ impl ChemStructEditor {
         self.text_edit = None;
         self.table_edit = None;
         self.object_drag = None;
+        self.rotate_edit = None;
+    }
+
+    /// Whether there is a selection to turn: two atoms or more (a single atom turned about
+    /// itself stays where it is).
+    pub fn can_rotate_selection(&self) -> bool {
+        self.selected_atoms.iter().filter(|id| self.molecule.atom_by_id(**id).is_some()).count() >= 2
+    }
+
+    /// Turn the selection (its atoms, and the arrows and texts selected with them) by
+    /// `degrees` about the centroid of its atoms, as one undo step. Positive is clockwise on
+    /// screen, the sign the rotation handle shows while it is dragged. Only positions change:
+    /// a wedge keeps its narrow end.
+    ///
+    /// Returns false, changing nothing, when there is nothing to turn
+    /// ([`can_rotate_selection`](Self::can_rotate_selection)) or the angle is no turn at all
+    /// (a multiple of 360°, or not a number).
+    pub fn rotate_selection_by(&mut self, degrees: f32) -> bool {
+        if !self.can_rotate_selection() || !degrees.is_finite() || degrees.rem_euclid(360.0) == 0.0 {
+            return false;
+        }
+        self.push_undo();
+        let pivot = interact::selection_centroid(self);
+        interact::rotate_selection(self, pivot, degrees.to_radians());
+        true
+    }
+
+    /// Whether the selection can be flipped ([`flip_selection`](Self::flip_selection)): two
+    /// atoms or more are selected, and exactly one bond leaves the selection.
+    pub fn can_flip_selection(&self) -> bool {
+        interact::flip_axis(self).is_some()
+    }
+
+    /// Flip the selection over the one bond that leaves it: every selected atom (and the
+    /// arrows and texts selected with them) is mirrored in the line through that bond's two
+    /// atoms, as one undo step. The bond's own atoms are on the line and stay, so the part
+    /// selected is laid over to the other side of the bond.
+    ///
+    /// Mirroring a drawing inverts what its wedges say, so the wedges are swapped to keep it
+    /// (as turning that part of the molecule half round about the bond does): solid and
+    /// hashed wedges that start (narrow end) on a selected atom change places, and so do bold
+    /// and plain hashed bonds between two selected atoms. A double bond inside the selection
+    /// keeps its E/Z; only when the bond flipped over is itself a double bond does its E/Z
+    /// change, which is then the point of flipping it.
+    ///
+    /// Returns false, changing nothing, unless
+    /// [`can_flip_selection`](Self::can_flip_selection).
+    pub fn flip_selection(&mut self) -> bool {
+        let Some((inside, outside)) = interact::flip_axis(self) else {
+            return false;
+        };
+        self.push_undo();
+        interact::flip_selection_over(self, inside, outside);
+        true
+    }
+
+    /// Open the angle box by the selection: a small field that takes an angle in degrees
+    /// (clockwise positive; a decimal is fine) and, on Enter, turns the selection by it
+    /// ([`rotate_selection_by`](Self::rotate_selection_by)). Escape, or a click elsewhere,
+    /// closes it without turning anything. Also opened by Ctrl+R and by a double-click on the
+    /// rotation handle; this is for a host's menu.
+    ///
+    /// Returns false, opening nothing, when there is nothing to turn.
+    pub fn open_rotate_input(&mut self) -> bool {
+        if !self.can_rotate_selection() {
+            return false;
+        }
+        self.rotate_edit = Some(RotateEdit { text: self.rotate_last_text.clone(), focus: true });
+        true
+    }
+
+    /// Whether the angle box is open.
+    pub fn is_rotate_input_open(&self) -> bool {
+        self.rotate_edit.is_some()
+    }
+
+    /// Show the angle box while it is open, and act on Enter and Escape. Returns whether the
+    /// selection was turned, and whether the box closed this frame.
+    fn show_rotate_edit(&mut self, ui: &mut egui::Ui, center: egui::Pos2, canvas_id: egui::Id) -> (bool, bool) {
+        let Some(mut edit) = self.rotate_edit.take() else {
+            return (false, false);
+        };
+        // The selection went (a host cleared it): nothing left to turn.
+        let Some(top) = interact::selection_top(self, center).filter(|_| self.can_rotate_selection()) else {
+            return (false, true);
+        };
+        let box_id = canvas_id.with("rotate_edit_box");
+        let opening = std::mem::take(&mut edit.focus);
+        // Beside the rotation handle.
+        let pos = top + egui::vec2(14.0, -(interact::ROTATE_HANDLE_GAP + 14.0));
+        let text = &mut edit.text;
+        let (response, sizing) = egui::Area::new(egui::Id::unique("rotate_edit_area"))
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Which way a positive angle turns, without a word to translate.
+                            let (mark, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            draw::clockwise_mark(ui.painter(), mark, ui.visuals().text_color());
+                            // Focus is asked for when the box opens and not again: asked for
+                            // on every frame it would be taken back from a click elsewhere,
+                            // and the box could not be clicked away. And it is asked for
+                            // *before* the box reads this frame's input, so digits typed in
+                            // the frame it opens in are not dropped. The offered angle is
+                            // selected, so typing replaces it.
+                            if opening {
+                                let mut state = egui::text_edit::TextEditState::default();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(text.chars().count()),
+                                )));
+                                state.store(ui.ctx(), box_id);
+                                ui.memory_mut(|m| m.request_focus(box_id));
+                            }
+                            let response = egui::TextEdit::singleline(text)
+                                .id(box_id)
+                                .desired_width(52.0)
+                                .show(ui)
+                                .response;
+                            ui.label("°");
+                            // egui lays a new `Area` out in an invisible sizing pass, where
+                            // the box lets go of the focus it was just given (see the label
+                            // editor): take it back.
+                            let sizing = ui.is_sizing_pass();
+                            if sizing {
+                                ui.memory_mut(|m| m.request_focus(box_id));
+                            }
+                            (response, sizing)
+                        })
+                        .inner
+                    })
+                    .inner
+            })
+            .inner;
+
+        let (enter, escape) =
+            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        if enter && !escape {
+            return match parse_angle(&edit.text) {
+                Some(degrees) => {
+                    // Hand the keyboard back to the canvas now: a box that just stops being
+                    // shown keeps its focus until egui reaps it, a frame later.
+                    response.surrender_focus();
+                    self.rotate_last_text = edit.text.trim().to_string();
+                    (self.rotate_selection_by(degrees), true)
+                }
+                None => {
+                    // Not an angle: Enter took the focus away, give it back and stay open.
+                    edit.focus = true;
+                    self.rotate_edit = Some(edit);
+                    (false, false)
+                }
+            };
+        }
+        // Escape, or the focus went elsewhere (a click on the canvas, a host's field): closed
+        // without turning anything.
+        let focused = ui.memory(|m| m.has_focus(box_id));
+        if escape || response.lost_focus() || !(focused || opening || sizing) {
+            response.surrender_focus();
+            return (false, true);
+        }
+        self.rotate_edit = Some(edit);
+        (false, false)
     }
 
     /// Delete everything selected, atoms, bonds and page objects, in one undo step. Returns
@@ -1595,6 +1768,49 @@ impl ChemStructEditor {
             }
         }
         best.map(|(id, _)| id)
+    }
+
+    /// Expand every atom label that is no element (`Ph`, `OMe`, `C12H25`, `MeOPh`) into the
+    /// atoms it stands for, as the `x` key does on one atom. Returns the labels that were left
+    /// as they are because they have no reading, in atom order.
+    ///
+    /// Not an undo step of its own: push one first if the user should be able to take it back.
+    pub fn expand_all_labels(&mut self) -> Vec<String> {
+        use crate::molecule::elements::element_of_label;
+        let labelled: Vec<(u32, String)> = self
+            .molecule
+            .atoms
+            .iter()
+            .filter(|a| element_of_label(&a.element).is_none())
+            .map(|a| (a.id, a.element.clone()))
+            .collect();
+        let mut unexpanded = Vec::new();
+        for (atom_id, label) in labelled {
+            if !interact::expand_label(self, atom_id) {
+                unexpanded.push(label);
+            }
+        }
+        unexpanded
+    }
+
+    /// The drawing as CDXML with every abbreviation expanded ([`expand_all_labels`] on a copy;
+    /// the editor's own drawing keeps its labels).
+    ///
+    /// [`molecule_to_cdxml`](crate::molecule::cdx::molecule_to_cdxml) writes a label such as
+    /// `Ph` or `C12H25` as a text node of no element, which ChemDraw shows as drawn but which a
+    /// reader that does not know the abbreviation takes for something else: RDKit's
+    /// `MolsFromCDXML` reads such a node as a single carbon, without a warning. Write this
+    /// instead when the CDXML is for such a reader. Labels with no reading stay labels.
+    ///
+    /// [`expand_all_labels`]: Self::expand_all_labels
+    pub fn to_cdxml_expanded(&self) -> String {
+        let mut copy = ChemStructEditor {
+            config: self.config.clone(),
+            molecule: self.molecule.clone(),
+            ..Default::default()
+        };
+        copy.expand_all_labels();
+        crate::molecule::cdx::molecule_to_cdxml(&copy.molecule)
     }
 
     pub fn bond_angles_from(&self, atom_id: u32) -> Vec<f32> {
@@ -2026,10 +2242,24 @@ impl ChemStructEditor {
         let text_input = self.label_edit.is_some()
             || self.text_edit.is_some()
             || self.table_edit.is_some()
+            || self.rotate_edit.is_some()
             || ui.ctx().egui_wants_keyboard_input();
         if !text_input && ui.input(|i| chord_pressed(i, egui::Key::Num0, |m| m.ctrl)) {
             self.request_fit();
         }
+        // Ctrl+R: the angle box, to turn the selection by a typed angle. It opens (below) in
+        // this same frame, which keeps the `r` from the tools' own keys.
+        if !text_input && ui.input(|i| chord_pressed(i, egui::Key::R, |m| m.ctrl && !m.shift && !m.alt)) {
+            self.open_rotate_input();
+        }
+        // Ctrl+Shift+F: flip the selection over the one bond that leaves it. The key is spent
+        // here, so that it is not also read by the tools.
+        let flip_chord = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
+            if modifiers.ctrl && modifiers.shift && !modifiers.alt);
+        let flipped = !text_input && ui.input(|i| i.events.iter().any(flip_chord)) && {
+            ui.ctx().input_mut(|i| i.events.retain(|e| !flip_chord(e)));
+            self.flip_selection()
+        };
 
         // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
         // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
@@ -2118,8 +2348,10 @@ impl ChemStructEditor {
         // Ctrl+Z: undo. Ctrl+Y or Ctrl+Shift+Z: redo.
         let (undo_pressed, redo_pressed) = self.take_undo_chord(ui);
         // The text box keeps Ctrl+Z / Ctrl+Y for its own typing.
-        let did_undo = undo_pressed && self.text_edit.is_none() && self.table_edit.is_none() && self.undo();
-        let did_redo = redo_pressed && self.text_edit.is_none() && self.table_edit.is_none() && self.redo();
+        // So does the angle box.
+        let own_undo = self.text_edit.is_some() || self.table_edit.is_some() || self.rotate_edit.is_some();
+        let did_undo = undo_pressed && !own_undo && self.undo();
+        let did_redo = redo_pressed && !own_undo && self.redo();
 
         // Copy/paste only act on the canvas when no text field has focus.
         let editing_text = ui.ctx().egui_wants_keyboard_input();
@@ -2310,11 +2542,18 @@ impl ChemStructEditor {
         let text_committed = self.show_text_edit(ui, center) | self.show_table_edit(ui);
         let text_editing = self.text_edit.is_some() || self.table_edit.is_some();
 
+        // ── Angle box (turn the selection by a typed angle) ──────────────────
+        // The canvas sits out every frame the box is open, and the one it closes in: the Enter,
+        // the Escape or the click that closed it is spent on closing it, and the keys typed
+        // into it (digits, Backspace, Delete) never reach the tools' shortcuts.
+        let (rotate_committed, rotate_closed) = self.show_rotate_edit(ui, center, response.id);
+        let rotate_editing = self.rotate_edit.is_some() || rotate_closed;
+
         // Suppress canvas key/mouse handling whenever a text field (our label editor or a
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let canvas_input = !(label_editing || label_focus_lost || text_editing || cleaning
+        let canvas_input = !(label_editing || label_focus_lost || text_editing || rotate_editing || cleaning
             || ui.ctx().egui_wants_keyboard_input());
         let tool_modified = if canvas_input {
             match self.tool.clone() {
@@ -2336,7 +2575,7 @@ impl ChemStructEditor {
         if canvas_input && ui.input(|i| i.pointer.middle_down()) {
             self.pan += ui.input(|i| i.pointer.delta());
         }
-        let modified = cleanup_toggle | label_confirmed | text_committed | tool_modified | cleaning | did_undo | did_redo;
+        let modified = cleanup_toggle | label_confirmed | text_committed | rotate_committed | flipped | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
         // crossing bonds, and labels paint the cached galleys. Keep the rects for next
@@ -2360,6 +2599,35 @@ impl ChemStructEditor {
 
         EditorResponse { response, modified }
     }
+}
+
+/// The angle box's state while it is open.
+#[derive(Debug, Clone, PartialEq)]
+struct RotateEdit {
+    /// What has been typed so far.
+    text: String,
+    /// The box has yet to be given the keyboard: when it opens, and after an Enter on
+    /// something that is not an angle.
+    focus: bool,
+}
+
+/// The angle typed into the angle box, in degrees: a number, with a decimal point or comma, a
+/// sign, and a `°` after it if the user likes. Full-width digits (an IME left on) count too.
+pub(crate) fn parse_angle(text: &str) -> Option<f32> {
+    let ascii: String = text
+        .trim()
+        .trim_end_matches('°')
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            ',' | '．' | '，' => '.',
+            '－' | '−' | 'ー' => '-',
+            '＋' => '+',
+            c => c,
+        })
+        .collect();
+    ascii.parse::<f32>().ok().filter(|degrees| degrees.is_finite())
 }
 
 /// Whether `key` went down this frame while the modifiers `with` accepts were held.
