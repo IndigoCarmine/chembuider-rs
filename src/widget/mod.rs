@@ -6,6 +6,8 @@ pub mod interact;
 #[cfg(test)]
 mod keyboard_solver;
 #[cfg(test)]
+mod frame_timing_tests;
+#[cfg(test)]
 mod keyboard_tests;
 #[cfg(test)]
 mod page_tests;
@@ -235,6 +237,19 @@ pub struct ChemStructEditor {
     /// While Some, keyboard input goes to the text field instead of shortcuts.
     pub label_edit: Option<(u32, String)>,
 
+    /// Keystrokes (key and text events) this frame could not take in their place, handed on to
+    /// the start of the next frame, ahead of anything typed since.
+    ///
+    /// A quick typist, or a slow frame, puts several keystrokes in one frame, and they must
+    /// come out as they would one per frame. Three cases cannot be handled within the frame:
+    /// - what follows the backtick that opens [`label_edit`](Self::label_edit) is the label's
+    ///   text (`` `Ph ``), but the editor only reads input from the next frame on;
+    /// - undo and redo act ahead of the tools' keys, so one with keys before it, or a second
+    ///   one, waits for the next frame together with everything after it;
+    /// - the canvas sits out the frame in which a click closes the label editor, so the keys
+    ///   after that click wait for the next one.
+    carried_keys: Vec<egui::Event>,
+
     /// Undo history (molecule snapshots, newest at back).
     pub undo_stack: VecDeque<crate::molecule::Molecule>,
 
@@ -264,6 +279,10 @@ pub struct ChemStructEditor {
     /// the cursor and retargeting the hotspot.
     pub pointer_active: bool,
 
+    /// Where the pointer was over the canvas (screen coordinates) at the end of the last frame:
+    /// where it still was when this frame's first events came in.
+    pointer_screen: Option<egui::Pos2>,
+
     /// Active background cleanup computation, if any (None when idle).
     pub cleanup_job: Option<crate::molecule::cleanup::CleanupJob>,
 
@@ -274,8 +293,15 @@ pub struct ChemStructEditor {
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
-    /// While rotating the selection (Alt+drag): the cursor angle from the last frame.
-    rotate_last_angle: Option<f32>,
+    /// While rotating the selection (Alt+drag, or a drag of the rotation handle).
+    pub(crate) rotate_drag: Option<interact::RotateDrag>,
+
+    /// The angle box, while it is open: the selection is turned by the angle typed into it
+    /// (see [`open_rotate_input`](Self::open_rotate_input)).
+    rotate_edit: Option<RotateEdit>,
+
+    /// The angle last entered in the angle box, offered again the next time it opens.
+    rotate_last_text: String,
 
     /// Screen rects of the atom labels painted last frame, for hit testing (wide labels
     /// like "CO2Et" should be clickable over their whole text, not just a small circle).
@@ -350,6 +376,7 @@ impl Default for ChemStructEditor {
             ring_repeat: None,
             config: Config::default(),
             label_edit: None,
+            carried_keys: Vec::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_targets: VecDeque::new(),
@@ -357,10 +384,13 @@ impl Default for ChemStructEditor {
             current_bond_stereo: BondStereo::None,
             last_mouse_mol: [0.0; 2],
             pointer_active: false,
+            pointer_screen: None,
             cleanup_job: None,
             cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
-            rotate_last_angle: None,
+            rotate_drag: None,
+            rotate_edit: None,
+            rotate_last_text: "90".to_string(),
             last_label_rects: std::collections::HashMap::new(),
             fit_requested: false,
             context_bond: None,
@@ -814,7 +844,7 @@ impl ChemStructEditor {
     /// the "ChemDraw Interchange Format" so the structure can be pasted into ChemDraw.
     #[cfg(windows)]
     fn copy_to_clipboard(&self, _ctx: &egui::Context, text: String) {
-        let emf = crate::molecule::image::molecule_to_emf(&self.molecule);
+        let emf = crate::molecule::image::molecule_to_emf_styled(&self.molecule, &self.config.style);
         let png = crate::molecule::image::molecule_to_png(&self.molecule);
         let dib = crate::molecule::image::molecule_to_dib(&self.molecule);
         let cdx = crate::molecule::cdx::molecule_to_cdx_bytes(&self.molecule);
@@ -1205,6 +1235,141 @@ impl ChemStructEditor {
         self.text_edit = None;
         self.table_edit = None;
         self.object_drag = None;
+        self.rotate_edit = None;
+    }
+
+    /// Whether there is a selection to turn: two atoms or more (a single atom turned about
+    /// itself stays where it is).
+    pub fn can_rotate_selection(&self) -> bool {
+        self.selected_atoms.iter().filter(|id| self.molecule.atom_by_id(**id).is_some()).count() >= 2
+    }
+
+    /// Turn the selection (its atoms, and the arrows and texts selected with them) by
+    /// `degrees` about the centroid of its atoms, as one undo step. Positive is clockwise on
+    /// screen, the sign the rotation handle shows while it is dragged. Only positions change:
+    /// a wedge keeps its narrow end.
+    ///
+    /// Returns false, changing nothing, when there is nothing to turn
+    /// ([`can_rotate_selection`](Self::can_rotate_selection)) or the angle is no turn at all
+    /// (a multiple of 360°, or not a number).
+    pub fn rotate_selection_by(&mut self, degrees: f32) -> bool {
+        if !self.can_rotate_selection() || !degrees.is_finite() || degrees.rem_euclid(360.0) == 0.0 {
+            return false;
+        }
+        self.push_undo();
+        let pivot = interact::selection_centroid(self);
+        interact::rotate_selection(self, pivot, degrees.to_radians());
+        true
+    }
+
+    /// Open the angle box by the selection: a small field that takes an angle in degrees
+    /// (clockwise positive; a decimal is fine) and, on Enter, turns the selection by it
+    /// ([`rotate_selection_by`](Self::rotate_selection_by)). Escape, or a click elsewhere,
+    /// closes it without turning anything. Also opened by Ctrl+R and by a double-click on the
+    /// rotation handle; this is for a host's menu.
+    ///
+    /// Returns false, opening nothing, when there is nothing to turn.
+    pub fn open_rotate_input(&mut self) -> bool {
+        if !self.can_rotate_selection() {
+            return false;
+        }
+        self.rotate_edit = Some(RotateEdit { text: self.rotate_last_text.clone(), focus: true });
+        true
+    }
+
+    /// Whether the angle box is open.
+    pub fn is_rotate_input_open(&self) -> bool {
+        self.rotate_edit.is_some()
+    }
+
+    /// Show the angle box while it is open, and act on Enter and Escape. Returns whether the
+    /// selection was turned, and whether the box closed this frame.
+    fn show_rotate_edit(&mut self, ui: &mut egui::Ui, center: egui::Pos2, canvas_id: egui::Id) -> (bool, bool) {
+        let Some(mut edit) = self.rotate_edit.take() else {
+            return (false, false);
+        };
+        // The selection went (a host cleared it): nothing left to turn.
+        let Some(top) = interact::selection_top(self, center).filter(|_| self.can_rotate_selection()) else {
+            return (false, true);
+        };
+        let box_id = canvas_id.with("rotate_edit_box");
+        let opening = std::mem::take(&mut edit.focus);
+        // Beside the rotation handle.
+        let pos = top + egui::vec2(14.0, -(interact::ROTATE_HANDLE_GAP + 14.0));
+        let text = &mut edit.text;
+        let (response, sizing) = egui::Area::new(egui::Id::unique("rotate_edit_area"))
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Which way a positive angle turns, without a word to translate.
+                            let (mark, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            draw::clockwise_mark(ui.painter(), mark, ui.visuals().text_color());
+                            // Focus is asked for when the box opens and not again: asked for
+                            // on every frame it would be taken back from a click elsewhere,
+                            // and the box could not be clicked away. And it is asked for
+                            // *before* the box reads this frame's input, so digits typed in
+                            // the frame it opens in are not dropped. The offered angle is
+                            // selected, so typing replaces it.
+                            if opening {
+                                let mut state = egui::text_edit::TextEditState::default();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(text.chars().count()),
+                                )));
+                                state.store(ui.ctx(), box_id);
+                                ui.memory_mut(|m| m.request_focus(box_id));
+                            }
+                            let response = egui::TextEdit::singleline(text)
+                                .id(box_id)
+                                .desired_width(52.0)
+                                .show(ui)
+                                .response;
+                            ui.label("°");
+                            // egui lays a new `Area` out in an invisible sizing pass, where
+                            // the box lets go of the focus it was just given (see the label
+                            // editor): take it back.
+                            let sizing = ui.is_sizing_pass();
+                            if sizing {
+                                ui.memory_mut(|m| m.request_focus(box_id));
+                            }
+                            (response, sizing)
+                        })
+                        .inner
+                    })
+                    .inner
+            })
+            .inner;
+
+        let (enter, escape) =
+            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        if enter && !escape {
+            return match parse_angle(&edit.text) {
+                Some(degrees) => {
+                    // Hand the keyboard back to the canvas now: a box that just stops being
+                    // shown keeps its focus until egui reaps it, a frame later.
+                    response.surrender_focus();
+                    self.rotate_last_text = edit.text.trim().to_string();
+                    (self.rotate_selection_by(degrees), true)
+                }
+                None => {
+                    // Not an angle: Enter took the focus away, give it back and stay open.
+                    edit.focus = true;
+                    self.rotate_edit = Some(edit);
+                    (false, false)
+                }
+            };
+        }
+        // Escape, or the focus went elsewhere (a click on the canvas, a host's field): closed
+        // without turning anything.
+        let focused = ui.memory(|m| m.has_focus(box_id));
+        if escape || response.lost_focus() || !(focused || opening || sizing) {
+            response.surrender_focus();
+            return (false, true);
+        }
+        self.rotate_edit = Some(edit);
+        (false, false)
     }
 
     /// Delete everything selected, atoms, bonds and page objects, in one undo step. Returns
@@ -1935,53 +2100,9 @@ impl ChemStructEditor {
         }
     }
 
-    /// Main entry point called from the app each frame. Returns true if molecule was modified.
-    ///
-    /// A host that wants the canvas [`Response`](egui::Response) — to attach a context menu,
-    /// say — calls [`show`](Self::show) instead.
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
-        self.show(ui).modified
-    }
-
-    /// [`ui`](Self::ui), also returning the canvas response.
-    pub fn show(&mut self, ui: &mut egui::Ui) -> EditorResponse {
-        // Named fonts in texts are drawn with the system's fonts.
-        fonts::install(ui.ctx());
-        let (rect, response) = ui.allocate_exact_size(
-            ui.available_size(),
-            egui::Sense::click_and_drag(),
-        );
-        let center = rect.center();
-        let painter = ui.painter_at(rect);
-
-        // Ctrl+0: fit the whole drawing to the canvas. Read here, ahead of the request below, so
-        // the fit lands in this very frame. Not while a text field (the label editor, or a host
-        // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
-        // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
-        let text_input = self.label_edit.is_some()
-            || self.text_edit.is_some()
-            || self.table_edit.is_some()
-            || ui.ctx().egui_wants_keyboard_input();
-        if !text_input && ui.input(|i| i.key_pressed(egui::Key::Num0) && i.modifiers.ctrl) {
-            self.request_fit();
-        }
-
-        // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
-        // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
-        if std::mem::take(&mut self.fit_requested) {
-            self.fit_with_layout(rect, FitOptions::default(), |job| painter.layout_job(job));
-        }
-
-        painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
-
-        // Update hover state and track mouse in mol coords.
-        //
-        // `hover_pos()` is None whenever no pointer is over the widget — which is every frame
-        // of keyboard-only use. Substituting a position for that absence (this used to be
-        // `unwrap_or(Pos2::ZERO)`) makes the editor behave as though the cursor were parked at
-        // the screen origin: if the canvas contains that point, it hovers whatever is drawn
-        // there and keys get routed to that atom instead of placing new ones.
-        let mouse_pos = response.hover_pos().filter(|p| rect.contains(*p));
+    /// Set the hover state (and the pointer tracking) for a pointer at `mouse_pos`, screen
+    /// coordinates over the canvas, or for no pointer.
+    pub(crate) fn hover_at(&mut self, mouse_pos: Option<egui::Pos2>, center: egui::Pos2) {
         self.pointer_active = mouse_pos.is_some();
         if let Some(mouse_pos) = mouse_pos {
             self.last_mouse_mol = self.screen_to_mol(mouse_pos, center);
@@ -2003,6 +2124,117 @@ impl ChemStructEditor {
             self.hovered_bond = None;
             self.hovered_object = None;
         }
+    }
+
+    /// This frame's undo (Ctrl+Z) or redo (Ctrl+Y, Ctrl+Shift+Z) chord, as (undo, redo).
+    ///
+    /// Undo and redo act ahead of the tools' keys, so they only keep their place among the
+    /// frame's keys when they come first. One with keys ahead of it waits for the next frame,
+    /// and so does a second one, each with every keystroke after it ([`carried_keys`]): a frame
+    /// holding `a Ctrl+Z` used to undo the step *before* the `a` and then draw the `a`, and one
+    /// holding `Ctrl+Z Ctrl+Z` undid once.
+    ///
+    /// [`carried_keys`]: Self::carried_keys
+    fn take_undo_chord(&mut self, ui: &egui::Ui) -> (bool, bool) {
+        let undo = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }
+            if modifiers.ctrl && !modifiers.shift);
+        let redo = |e: &egui::Event| matches!(e, egui::Event::Key { key: egui::Key::Y, pressed: true, modifiers, .. }
+            if modifiers.ctrl)
+            || matches!(e, egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }
+                if modifiers.ctrl && modifiers.shift);
+        let carried_before = self.carried_keys.len();
+        let chord = ui.ctx().input_mut(|i| {
+            let first_key = i.events.iter().position(|e| matches!(e, egui::Event::Key { pressed: true, .. }));
+            let mut chords = i.events.iter().enumerate()
+                .filter(|(_, e)| undo(e) || redo(e))
+                .map(|(k, _)| k);
+            let Some(first) = chords.next() else { return (false, false) };
+            let (now, wait_from) = if Some(first) == first_key {
+                (Some((undo(&i.events[first]), redo(&i.events[first]))), chords.next())
+            } else {
+                (None, Some(first))
+            };
+            if let Some(from) = wait_from {
+                let mut k = 0;
+                i.events.retain(|e| {
+                    let wait = k >= from && matches!(e, egui::Event::Key { .. } | egui::Event::Text(_));
+                    k += 1;
+                    if wait {
+                        self.carried_keys.push(e.clone());
+                    }
+                    !wait
+                });
+            }
+            now.unwrap_or((false, false))
+        });
+        if self.carried_keys.len() > carried_before {
+            ui.ctx().request_repaint();
+        }
+        chord
+    }
+
+    /// Main entry point called from the app each frame. Returns true if molecule was modified.
+    ///
+    /// A host that wants the canvas [`Response`](egui::Response) — to attach a context menu,
+    /// say — calls [`show`](Self::show) instead.
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+        self.show(ui).modified
+    }
+
+    /// [`ui`](Self::ui), also returning the canvas response.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> EditorResponse {
+        // Named fonts in texts are drawn with the system's fonts.
+        fonts::install(ui.ctx());
+        let (rect, response) = ui.allocate_exact_size(
+            ui.available_size(),
+            egui::Sense::click_and_drag(),
+        );
+        let center = rect.center();
+        let painter = ui.painter_at(rect);
+
+        // Keystrokes last frame handed on (see `carried_keys`) come first.
+        let carried = std::mem::take(&mut self.carried_keys);
+        if !carried.is_empty() {
+            ui.ctx().input_mut(|i| {
+                i.events.splice(0..0, carried);
+            });
+        }
+
+        // Ctrl+0: fit the whole drawing to the canvas. Read here, ahead of the request below, so
+        // the fit lands in this very frame. Not while a text field (the label editor, or a host
+        // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
+        // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
+        let text_input = self.label_edit.is_some()
+            || self.text_edit.is_some()
+            || self.table_edit.is_some()
+            || self.rotate_edit.is_some()
+            || ui.ctx().egui_wants_keyboard_input();
+        if !text_input && ui.input(|i| chord_pressed(i, egui::Key::Num0, |m| m.ctrl)) {
+            self.request_fit();
+        }
+        // Ctrl+R: the angle box, to turn the selection by a typed angle. It opens (below) in
+        // this same frame, which keeps the `r` from the tools' own keys.
+        if !text_input && ui.input(|i| chord_pressed(i, egui::Key::R, |m| m.ctrl && !m.shift && !m.alt)) {
+            self.open_rotate_input();
+        }
+
+        // A fit asked for by `request_fit`: this frame's canvas, laid out with the same fonts the
+        // draw pass below uses, and before hover/hit testing so the whole frame sees one view.
+        if std::mem::take(&mut self.fit_requested) {
+            self.fit_with_layout(rect, FitOptions::default(), |job| painter.layout_job(job));
+        }
+
+        painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+
+        // Update hover state and track mouse in mol coords.
+        //
+        // `hover_pos()` is None whenever no pointer is over the widget — which is every frame
+        // of keyboard-only use. Substituting a position for that absence (this used to be
+        // `unwrap_or(Pos2::ZERO)`) makes the editor behave as though the cursor were parked at
+        // the screen origin: if the canvas contains that point, it hovers whatever is drawn
+        // there and keys get routed to that atom instead of placing new ones.
+        let mouse_pos = response.hover_pos().filter(|p| rect.contains(*p));
+        self.hover_at(mouse_pos, center);
         // Selected objects that undo, redo or deletion removed are no longer selected.
         if !self.selected_objects.is_empty() {
             let mol = &self.molecule;
@@ -2059,7 +2291,7 @@ impl ChemStructEditor {
             (egui::Key::Num2, Tool::Bond),
             (egui::Key::Num3, Tool::Eraser),
         ] {
-            if ui.input(|i| i.key_pressed(key) && i.modifiers.ctrl) {
+            if ui.input(|i| chord_pressed(i, key, |m| m.ctrl)) {
                 self.tool = tool;
                 // Targets and in-flight gestures belong to the tool that was active.
                 self.hotspot_bond = None;
@@ -2071,14 +2303,12 @@ impl ChemStructEditor {
         }
 
         // Ctrl+Z: undo. Ctrl+Y or Ctrl+Shift+Z: redo.
-        let undo_pressed = ui.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift);
+        let (undo_pressed, redo_pressed) = self.take_undo_chord(ui);
         // The text box keeps Ctrl+Z / Ctrl+Y for its own typing.
-        let did_undo = undo_pressed && self.text_edit.is_none() && self.table_edit.is_none() && self.undo();
-        let redo_pressed = ui.input(|i| {
-            (i.key_pressed(egui::Key::Y) && i.modifiers.ctrl)
-                || (i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && i.modifiers.shift)
-        });
-        let did_redo = redo_pressed && self.text_edit.is_none() && self.table_edit.is_none() && self.redo();
+        // So does the angle box.
+        let own_undo = self.text_edit.is_some() || self.table_edit.is_some() || self.rotate_edit.is_some();
+        let did_undo = undo_pressed && !own_undo && self.undo();
+        let did_redo = redo_pressed && !own_undo && self.redo();
 
         // Copy/paste only act on the canvas when no text field has focus.
         let editing_text = ui.ctx().egui_wants_keyboard_input();
@@ -2120,8 +2350,8 @@ impl ChemStructEditor {
         // Ctrl+K: toggle background clean-up (start, or stop if already running).
         // Ctrl+Shift+K: clean up the reaction scheme around its arrows.
         let (cleanup_toggle, reaction_cleanup) = ui.input(|i| {
-            let k = i.key_pressed(egui::Key::K) && i.modifiers.ctrl;
-            (k && !i.modifiers.shift, k && i.modifiers.shift)
+            (chord_pressed(i, egui::Key::K, |m| m.ctrl && !m.shift),
+             chord_pressed(i, egui::Key::K, |m| m.ctrl && m.shift))
         });
         if cleanup_toggle {
             self.toggle_cleanup();
@@ -2141,6 +2371,7 @@ impl ChemStructEditor {
 
         // ── Label text-edit overlay ──────────────────────────────────────────
         let mut label_confirmed = false;
+        let mut label_focus_lost = false;
         // Extract what we need before the mutable borrow of label_edit
         // Font size scales with zoom so it tracks the panzoom transform (zoom == 1.0 = baseline).
         let label_size = self.config.style.label_size * self.zoom;
@@ -2152,32 +2383,51 @@ impl ChemStructEditor {
         if let (Some((edit_id, screen_pos)), Some((_, text))) =
             (label_state, self.label_edit.as_mut())
         {
+            let box_id = response.id.with("label_edit_box");
             let area_resp = egui::Area::new(egui::Id::unique("label_edit_area"))
                 .fixed_pos(screen_pos + egui::vec2(12.0, -12.0))
                 .show(ui.ctx(), |ui| {
-                    let mut output = egui::TextEdit::singleline(text)
-                        .desired_width(80.0)
-                        .font(egui::FontId::proportional(label_size))
-                        .show(ui);
-                    // Select the pre-filled element text (e.g. "C") on the first frame the box
-                    // is open, so typing replaces it outright instead of appending onto it —
-                    // `has_focus()` is false only on that first frame, before `request_focus()`
-                    // below takes effect.
-                    if !output.response.has_focus() {
-                        let range = egui::text::CCursorRange::two(
+                    // Focus the box *before* it reads this frame's input. Focus requested after
+                    // `TextEdit::show` only reaches the box the frame after, so whatever was typed
+                    // in the frame the box first appeared in — for a quick typist, the first
+                    // letter after the backtick — was silently dropped (`` `Si `` gave "i").
+                    //
+                    // Not focused yet means the box has just opened: select the pre-filled
+                    // element text (e.g. "C") as well, so typing replaces it outright instead of
+                    // appending onto it.
+                    if !ui.memory(|m| m.has_focus(box_id)) {
+                        let mut state = egui::text_edit::TextEditState::default();
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
                             egui::text::CCursor::new(0),
                             egui::text::CCursor::new(text.chars().count()),
-                        );
-                        output.state.cursor.set_char_range(Some(range));
-                        output.state.store(ui.ctx(), output.response.id);
+                        )));
+                        state.store(ui.ctx(), box_id);
+                        ui.memory_mut(|m| m.request_focus(box_id));
                     }
-                    output.response
+                    let response = egui::TextEdit::singleline(text)
+                        .id(box_id)
+                        .desired_width(80.0)
+                        .font(egui::FontId::proportional(label_size))
+                        .show(ui)
+                        .response;
+                    // The first time the box is ever shown, egui lays its `Area` out in an
+                    // invisible sizing pass, where the box lets go of focus again (after taking
+                    // this frame's typing). Without taking it back here, the next frame found
+                    // the box unfocused, took it for just opened and selected the typed text
+                    // for the next key to replace (`` `Ph `` gave "h").
+                    if ui.is_sizing_pass() {
+                        ui.memory_mut(|m| m.request_focus(box_id));
+                    }
+                    response
                 });
-            area_resp.inner.request_focus();
+            // Focus is asked for only when the box opens, above. Asking again on every frame
+            // took it straight back from a click elsewhere, so clicking away never committed the
+            // label (`lost_focus()` could not fire) and the box stayed open, swallowing every key.
 
             let enter  = ui.input(|i| i.key_pressed(egui::Key::Enter));
             let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            if enter || area_resp.inner.lost_focus() {
+            let lost_focus = area_resp.inner.lost_focus();
+            if enter || lost_focus {
                 let t = text.trim().to_string();
                 if !t.is_empty() {
                     if let Some(a) = self.molecule.atom_by_id_mut(edit_id) {
@@ -2187,6 +2437,11 @@ impl ChemStructEditor {
                 label_confirmed = true;
             }
             if escape { label_confirmed = true; }
+            // A click elsewhere that closes the box (focus lost other than by Enter or Escape) is
+            // spent closing it. Otherwise the same click also reached the canvas below, adding a
+            // stray atom where the user only meant to finish typing (or a bond off the atom just
+            // labelled, when that was clicked).
+            label_focus_lost = lost_focus && !enter && !escape;
 
             // Hand keyboard focus back to the canvas the moment the editor closes.
             //
@@ -2197,6 +2452,42 @@ impl ChemStructEditor {
             // — invisible at 60 Hz, perfectly reproducible in a scripted key sequence.
             if label_confirmed {
                 area_resp.inner.surrender_focus();
+                // The keys typed into the box are its own: only those after the Enter or Escape
+                // that closed it are left for the canvas shortcuts below. Otherwise a quick `h⏎`
+                // landing in one frame typed the `h` *and* fired the `h` shortcut on the atom just
+                // labelled, turning a fresh "Ph" into H.
+                //
+                // Closed by a click, the canvas sits this frame out (see `label_focus_lost`), so
+                // the keys after the click wait for the next frame (`carried_keys`) instead.
+                let mut after_click = Vec::new();
+                ui.ctx().input_mut(|i| {
+                    let closed_at = if label_focus_lost {
+                        // egui moves focus on the click, which completes on the release.
+                        i.events.iter().position(|e| matches!(e, egui::Event::PointerButton {
+                            pressed: false, ..
+                        }))
+                    } else {
+                        i.events.iter().position(|e| matches!(e, egui::Event::Key {
+                            key: egui::Key::Enter | egui::Key::Escape, pressed: true, ..
+                        }))
+                    };
+                    let end = closed_at.map_or(i.events.len(), |k| k + 1);
+                    let mut k = 0;
+                    i.events.retain(|e| {
+                        let typed = matches!(e, egui::Event::Key { .. } | egui::Event::Text(_));
+                        k += 1;
+                        if typed && k > end && label_focus_lost {
+                            after_click.push(e.clone());
+                            return false;
+                        }
+                        k > end || !typed
+                    });
+                });
+                if !after_click.is_empty() {
+                    // Ahead of any an undo chord handed on: those came later.
+                    self.carried_keys.splice(0..0, after_click);
+                    ui.ctx().request_repaint();
+                }
             }
         } else if self.label_edit.is_some() {
             label_confirmed = true; // atom no longer exists
@@ -2208,11 +2499,19 @@ impl ChemStructEditor {
         let text_committed = self.show_text_edit(ui, center) | self.show_table_edit(ui);
         let text_editing = self.text_edit.is_some() || self.table_edit.is_some();
 
+        // ── Angle box (turn the selection by a typed angle) ──────────────────
+        // The canvas sits out every frame the box is open, and the one it closes in: the Enter,
+        // the Escape or the click that closed it is spent on closing it, and the keys typed
+        // into it (digits, Backspace, Delete) never reach the tools' shortcuts.
+        let (rotate_committed, rotate_closed) = self.show_rotate_edit(ui, center, response.id);
+        let rotate_editing = self.rotate_edit.is_some() || rotate_closed;
+
         // Suppress canvas key/mouse handling whenever a text field (our label editor or a
         // toolbar field like the fragment-name input) has keyboard focus, so typed characters
         // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
         // positions (editing would fight the worker).
-        let canvas_input = !(label_editing || text_editing || cleaning || ui.ctx().egui_wants_keyboard_input());
+        let canvas_input = !(label_editing || label_focus_lost || text_editing || rotate_editing || cleaning
+            || ui.ctx().egui_wants_keyboard_input());
         let tool_modified = if canvas_input {
             match self.tool.clone() {
                 Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
@@ -2224,6 +2523,8 @@ impl ChemStructEditor {
         } else {
             false
         };
+        // Next frame's keys start out from here (see `interact::hover_at_key`).
+        self.pointer_screen = mouse_pos;
 
         // Middle-button drag pans the camera, whatever the tool. It runs after the tool
         // handler so the tool still sees this frame's pre-pan view, as the Bond tool did when
@@ -2231,7 +2532,7 @@ impl ChemStructEditor {
         if canvas_input && ui.input(|i| i.pointer.middle_down()) {
             self.pan += ui.input(|i| i.pointer.delta());
         }
-        let modified = cleanup_toggle | label_confirmed | text_committed | tool_modified | cleaning | did_undo | did_redo;
+        let modified = cleanup_toggle | label_confirmed | text_committed | rotate_committed | tool_modified | cleaning | did_undo | did_redo;
 
         // Lay all labels out first: bonds trim at the label rects, backgrounds mask
         // crossing bonds, and labels paint the cached galleys. Keep the rects for next
@@ -2255,6 +2556,52 @@ impl ChemStructEditor {
 
         EditorResponse { response, modified }
     }
+}
+
+/// The angle box's state while it is open.
+#[derive(Debug, Clone, PartialEq)]
+struct RotateEdit {
+    /// What has been typed so far.
+    text: String,
+    /// The box has yet to be given the keyboard: when it opens, and after an Enter on
+    /// something that is not an angle.
+    focus: bool,
+}
+
+/// The angle typed into the angle box, in degrees: a number, with a decimal point or comma, a
+/// sign, and a `°` after it if the user likes. Full-width digits (an IME left on) count too.
+pub(crate) fn parse_angle(text: &str) -> Option<f32> {
+    let ascii: String = text
+        .trim()
+        .trim_end_matches('°')
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            ',' | '．' | '，' => '.',
+            '－' | '−' | 'ー' => '-',
+            '＋' => '+',
+            c => c,
+        })
+        .collect();
+    ascii.parse::<f32>().ok().filter(|degrees| degrees.is_finite())
+}
+
+/// Whether `key` went down this frame while the modifiers `with` accepts were held.
+///
+/// Judged by the modifiers each key event carries, not by `InputState::modifiers`: that is the
+/// state at the *end* of the frame, so a quick Ctrl+Z whose Ctrl comes up in the same frame read
+/// as a plain `z` (and was dropped), and a plain key followed in the same frame by a Ctrl press
+/// read as a chord.
+pub(crate) fn chord_pressed(
+    i: &egui::InputState,
+    key: egui::Key,
+    with: impl Fn(egui::Modifiers) -> bool,
+) -> bool {
+    i.events.iter().any(|e| {
+        matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. }
+            if *k == key && with(*modifiers))
+    })
 }
 
 pub fn point_to_segment_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {

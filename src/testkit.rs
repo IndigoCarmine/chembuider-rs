@@ -205,12 +205,11 @@ pub(crate) const TEXT_PREFIX: &str = "text:";
 /// shortcut of its own, such as a bare P or Si — is unreachable from the harness, which reads
 /// as a missing product feature when it is really a missing test capability.
 ///
-/// **Two frames, and the empty one is load-bearing.** egui grants focus at the *start* of the
-/// frame after `request_focus()`, and `ChemStructEditor::ui` requests focus only after showing
-/// the `TextEdit` — so on the first frame the box exists it is not yet focused and silently
-/// drops anything typed. A real user never notices, because frames tick past at 60 Hz between
-/// one keystroke and the next; a one-chord-per-frame harness has to spend that frame on
-/// purpose.
+/// Two frames: an idle one, as a real user's typing has between keystrokes, then the text.
+/// (The idle frame used to be load-bearing: the label editor only took focus a frame after it
+/// appeared and dropped anything typed before. It no longer does — see
+/// `text_on_the_label_editors_first_frame_is_not_dropped` — and
+/// `widget::frame_timing_tests` drives typing with no idle frames at all.)
 pub(crate) fn text_frames(ctx: &egui::Context, editor: &mut ChemStructEditor, text: &str) {
     run_frame(ctx, CANVAS, editor, Vec::new());
     run_frame(ctx, CANVAS, editor, vec![egui::Event::Text(text.to_string())]);
@@ -637,24 +636,23 @@ mod tests {
         );
     }
 
-    /// The settling frame in [`text_frames`] is not padding. egui grants focus at the start of
-    /// the frame *after* `request_focus()`, so text sent on the frame the box first appears is
-    /// dropped — this asserts the harness spends that frame, by showing the naive one-frame
-    /// version fails where the real helper succeeds.
+    /// Text sent on the frame the label editor first appears must land in it.
+    ///
+    /// The editor used to request focus only after showing its `TextEdit`, which egui applies
+    /// from the next frame on, so this text was dropped — a user typing `` `Si `` quickly got
+    /// "i". The settling frame in [`text_frames`] was there to work round exactly that.
     #[test]
-    fn text_needs_the_frame_egui_spends_granting_focus() {
+    fn text_on_the_label_editors_first_frame_is_not_dropped() {
         let ctx = egui::Context::default();
         let mut editor = ChemStructEditor::default();
         for spec in ["c", "`"] {
             kbd_frame(&ctx, &mut editor, spec);
         }
-        // One frame only: the TextEdit exists but is not focused yet, so this is swallowed.
         run_frame(&ctx, CANVAS, &mut editor, vec![egui::Event::Text("Xx".to_string())]);
         assert_eq!(
             editor.label_edit.as_ref().map(|(_, t)| t.as_str()),
-            Some("C"),
-            "text on the editor's very first frame must land nowhere — if this starts passing, \
-             the settling frame in text_frames is no longer needed",
+            Some("Xx"),
+            "text on the editor's very first frame must replace the pre-filled element",
         );
     }
 

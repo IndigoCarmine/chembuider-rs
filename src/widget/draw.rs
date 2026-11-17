@@ -443,6 +443,29 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
         }
     }
 
+    // The selection's rotation handle (Select tool): a knob on a stem above the selection.
+    // During a rotation it turns with the selection, on a spoke from the pivot, with the angle
+    // turned so far beside it.
+    if let Some(handle) = super::interact::rotation_handle(editor, center) {
+        let blue = egui::Color32::from_rgb(80, 130, 255);
+        if let Some(rot) = &editor.rotate_drag {
+            let pivot = editor.mol_to_screen(rot.pivot, center);
+            painter.line_segment([pivot, handle], egui::Stroke::new(1.0, blue));
+            painter.circle_filled(pivot, 2.5, blue);
+            // Screen y points down, so a positive turn is clockwise on screen.
+            painter.text(
+                handle + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{:.0}°", rot.applied.to_degrees()),
+                egui::FontId::proportional(12.0),
+                blue,
+            );
+        } else if let Some(top) = super::interact::rotation_handle_anchor(editor, center) {
+            painter.line_segment([top - egui::vec2(0.0, 8.0), handle], egui::Stroke::new(1.0, blue));
+        }
+        painter.circle(handle, super::interact::ROTATE_HANDLE_RADIUS, egui::Color32::WHITE, egui::Stroke::new(1.5, blue));
+    }
+
     // Lasso
     if editor.lasso_path.len() > 1 {
         let pts: Vec<egui::Pos2> = editor.lasso_path.clone();
@@ -457,6 +480,25 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// A small clockwise arrow in `rect`: three quarters of a circle ending in an arrowhead. It
+/// stands before the angle box's field to say which way a positive angle turns.
+pub(crate) fn clockwise_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let (c, r) = (rect.center(), rect.width().min(rect.height()) * 0.36);
+    let stroke = egui::Stroke::new(1.3, color);
+    // Screen y points down, so a growing angle runs clockwise.
+    let at = |deg: f32| {
+        let a = deg.to_radians();
+        c + r * egui::vec2(a.cos(), a.sin())
+    };
+    let points: Vec<egui::Pos2> = (0..=18).map(|k| at(-240.0 + 15.0 * k as f32)).collect();
+    painter.add(egui::Shape::line(points, stroke));
+    let (tip, a) = (at(30.0), 30.0_f32.to_radians());
+    let along = egui::vec2(-a.sin(), a.cos());
+    let across = egui::vec2(a.cos(), a.sin());
+    painter.line_segment([tip, tip - 3.5 * along + 3.0 * across], stroke);
+    painter.line_segment([tip, tip - 3.5 * along - 3.0 * across], stroke);
+}
 
 /// Draw a dashed circle (used as the over-valence warning ring).
 fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32, stroke_width: f32) {

@@ -83,7 +83,7 @@ fragments (`Config::embedded()`). To load user shortcuts/fragments from disk ins
 
 | Tool | Actions |
 | --- | --- |
-| **Select** | Click / lasso-drag to select · double-click for the whole molecule · drag to move · `Alt`-drag to rotate · `Delete` to remove |
+| **Select** | Click / lasso-drag to select · double-click for the whole molecule · drag to move · drag the handle above the selection to rotate in 15° steps (`Shift`: freely), or `Alt`-drag to rotate · `Ctrl`+`R` (or double-click the handle) to type an angle · `Delete` to remove |
 | **Bond** | Click an atom to extend a chain · drag atom→atom to draw a bond · click a bond to cycle single/double/triple |
 | **Eraser** | Click an atom or bond to remove it |
 
