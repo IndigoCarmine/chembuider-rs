@@ -4,80 +4,72 @@
     {
       "element": "B",
       "pos": [
-        1.489517,
-        -0.17702939
-      ],
-      "charge": 0
-    },
-    {
-      "element": "O",
-      "pos": [
-        2.4461427,
-        0.82318455
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        3.9025733,
-        0.36451626
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        3.7084196,
-        -1.2690843
-      ],
-      "charge": 0
-    },
-    {
-      "element": "O",
-      "pos": [
-        2.1850543,
-        -1.3736032
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        5.2060657,
-        -1.3530838
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        3.717775,
-        -2.7690554
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        4.2632456,
-        1.8205092
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
-        5.378188,
-        0.09514332
-      ],
-      "charge": 0
-    },
-    {
-      "element": "C",
-      "pos": [
         0.0,
         0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        0.8817,
+        -1.2135
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.3083,
+        -0.75
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.3083,
+        0.75
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        0.8817,
+        1.2135
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.8948,
+        -2.1919
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.8,
+        -0.9068
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.8948,
+        2.1919
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.8,
+        0.9068
       ],
       "charge": 0
     }
@@ -109,30 +101,25 @@
       "order": "Single"
     },
     {
-      "begin": 3,
+      "begin": 2,
       "end": 5,
       "order": "Single"
     },
     {
-      "begin": 3,
+      "begin": 2,
       "end": 6,
       "order": "Single"
     },
     {
-      "begin": 2,
+      "begin": 3,
       "end": 7,
       "order": "Single"
     },
     {
-      "begin": 2,
+      "begin": 3,
       "end": 8,
-      "order": "Single"
-    },
-    {
-      "begin": 0,
-      "end": 9,
       "order": "Single"
     }
   ],
-  "attach_idx": 9
+  "attach_idx": 0
 }

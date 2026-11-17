@@ -1021,8 +1021,16 @@ fn handle_keys_bond_tool(
         if key == "x" || key == "X" {
             let target = editor.hovered_atom.or(editor.hotspot_atom);
             if let Some(atom_id) = target {
-                editor.push_undo();
-                if expand_label(editor, atom_id) { modified = true; }
+                // An undo step only for a label that expands; one with no reading is reported
+                // (`unexpanded_label`) unless it is a plain element, which has nothing to expand.
+                if label_reading(editor, atom_id).is_some() {
+                    editor.push_undo();
+                    if expand_label(editor, atom_id) { modified = true; }
+                } else if let Some(atom) = editor.molecule.atom_by_id(atom_id)
+                    && crate::molecule::elements::atomic_number(&atom.element).is_none()
+                {
+                    editor.unexpanded_label = Some(atom.element.clone());
+                }
                 continue;
             }
         }
@@ -2352,6 +2360,17 @@ pub(crate) fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
 // ExpandLabel
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// The fragment the label of `atom_id` expands into, read for the bonds the atom has
+/// ([`resolve_label_on`](crate::label_chain::resolve_label_on)); `None` when it has no reading.
+fn label_reading(
+    editor: &ChemStructEditor,
+    atom_id: u32,
+) -> Option<crate::molecule::fragment::Fragment> {
+    let atom = editor.molecule.atom_by_id(atom_id)?;
+    let bonds = editor.molecule.bond_order_sum(atom_id);
+    crate::label_chain::resolve_label_on(&editor.config, &atom.element, Some(bonds))
+}
+
 /// Replace an atom whose element text matches a known fragment name with the
 /// full fragment structure, preserving all bonds to the rest of the molecule.
 ///
@@ -2359,12 +2378,7 @@ pub(crate) fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
 /// [`label_chain`](crate::label_chain), which welds such a chain into one fragment so the
 /// insertion below is the same either way.
 pub(crate) fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool {
-    let element = match editor.molecule.atom_by_id(atom_id) {
-        Some(a) => a.element.clone(),
-        None    => return false,
-    };
-
-    let Some(frag) = crate::label_chain::resolve_label(&editor.config, &element) else { return false };
+    let Some(frag) = label_reading(editor, atom_id) else { return false };
 
     // Change attach atom's element to match fragment's root atom
     let root_elem   = frag.atoms[frag.attach_idx].element.clone();
@@ -2400,7 +2414,7 @@ pub(crate) fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool 
     }
 
     // Pick direction & flip, then insert the fragment in-place
-    let (angle, flip) = editor.best_fragment_placement(atom_id, &frag);
+    let (angle, flip) = label_placement(editor, atom_id, &frag);
     let new_ids = editor.molecule.insert_fragment(&frag, atom_id, angle, flip);
 
     // Same rule as the atom key that inserts a fragment: expanding "SiH3" onto a silicon that
@@ -2410,6 +2424,48 @@ pub(crate) fn expand_label(editor: &mut ChemStructEditor, atom_id: u32) -> bool 
     consume_group_h(editor, &touched);
 
     true
+}
+
+/// Where an expanded label's fragment goes: [`best_fragment_placement`], unless that lands one
+/// of its atoms on an atom already drawn — then the nearest turn (in steps of 30°, either
+/// way round, mirrored or not) that lands none.
+///
+/// `best_fragment_placement` lets a *ring* atom land on an existing one, because for a ring key
+/// that is ring fusion. A label is a substituent: its phenyl landing on the ring next to it
+/// (they share the 60° grid, so it does whenever the two are 60° apart) would silently merge
+/// the two rings and lose atoms.
+///
+/// [`best_fragment_placement`]: ChemStructEditor::best_fragment_placement
+fn label_placement(
+    editor: &ChemStructEditor,
+    atom_id: u32,
+    frag: &crate::molecule::fragment::Fragment,
+) -> (f32, bool) {
+    let mol = &editor.molecule;
+    let lands_on_an_atom = |angle: f32, flip: bool| {
+        mol.fragment_placement(frag, atom_id, angle, flip)
+            .into_iter()
+            .enumerate()
+            .any(|(i, pos)| {
+                i != frag.attach_idx
+                    && mol.find_atom_near(pos, crate::molecule::Molecule::SNAP_RADIUS).is_some()
+            })
+    };
+    let (angle, flip) = editor.best_fragment_placement(atom_id, frag);
+    if !lands_on_an_atom(angle, flip) {
+        return (angle, flip);
+    }
+    for step in 1..=6 {
+        for turn in [step as f32, -(step as f32)] {
+            let candidate = super::normalize_angle(angle + turn * std::f32::consts::FRAC_PI_6);
+            for mirrored in [flip, !flip] {
+                if !lands_on_an_atom(candidate, mirrored) {
+                    return (candidate, mirrored);
+                }
+            }
+        }
+    }
+    (angle, flip)
 }
 
 /// If `key` names an element, drop a bare atom of it at the cursor (`last_mouse_mol`).
