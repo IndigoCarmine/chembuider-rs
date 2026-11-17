@@ -1570,6 +1570,49 @@ impl ChemStructEditor {
         best.map(|(id, _)| id)
     }
 
+    /// Expand every atom label that is no element (`Ph`, `OMe`, `C12H25`, `MeOPh`) into the
+    /// atoms it stands for, as the `x` key does on one atom. Returns the labels that were left
+    /// as they are because they have no reading, in atom order.
+    ///
+    /// Not an undo step of its own: push one first if the user should be able to take it back.
+    pub fn expand_all_labels(&mut self) -> Vec<String> {
+        use crate::molecule::elements::element_of_label;
+        let labelled: Vec<(u32, String)> = self
+            .molecule
+            .atoms
+            .iter()
+            .filter(|a| element_of_label(&a.element).is_none())
+            .map(|a| (a.id, a.element.clone()))
+            .collect();
+        let mut unexpanded = Vec::new();
+        for (atom_id, label) in labelled {
+            if !interact::expand_label(self, atom_id) {
+                unexpanded.push(label);
+            }
+        }
+        unexpanded
+    }
+
+    /// The drawing as CDXML with every abbreviation expanded ([`expand_all_labels`] on a copy;
+    /// the editor's own drawing keeps its labels).
+    ///
+    /// [`molecule_to_cdxml`](crate::molecule::cdx::molecule_to_cdxml) writes a label such as
+    /// `Ph` or `C12H25` as a text node of no element, which ChemDraw shows as drawn but which a
+    /// reader that does not know the abbreviation takes for something else: RDKit's
+    /// `MolsFromCDXML` reads such a node as a single carbon, without a warning. Write this
+    /// instead when the CDXML is for such a reader. Labels with no reading stay labels.
+    ///
+    /// [`expand_all_labels`]: Self::expand_all_labels
+    pub fn to_cdxml_expanded(&self) -> String {
+        let mut copy = ChemStructEditor {
+            config: self.config.clone(),
+            molecule: self.molecule.clone(),
+            ..Default::default()
+        };
+        copy.expand_all_labels();
+        crate::molecule::cdx::molecule_to_cdxml(&copy.molecule)
+    }
+
     pub fn bond_angles_from(&self, atom_id: u32) -> Vec<f32> {
         let Some(src) = self.molecule.atom_by_id(atom_id) else {
             return vec![];
