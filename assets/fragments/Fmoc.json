@@ -1,0 +1,239 @@
+{
+  "name": "Fmoc",
+  "atoms": [
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        0.0,
+        -1.5
+      ],
+      "charge": 0
+    },
+    {
+      "element": "O",
+      "pos": [
+        1.299,
+        0.75
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.5981,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.8971,
+        0.75
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        5.2674,
+        0.1399
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        6.2711,
+        1.2546
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        5.5211,
+        2.5537
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.0539,
+        2.2418
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        5.731,
+        -1.2867
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        7.1982,
+        -1.5986
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        8.2019,
+        -0.4838
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        7.7383,
+        0.9427
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        5.9847,
+        3.9802
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.981,
+        5.095
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.5137,
+        4.7831
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.0502,
+        3.3565
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Double"
+    },
+    {
+      "begin": 0,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Single"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 4,
+      "end": 5,
+      "order": "Single"
+    },
+    {
+      "begin": 5,
+      "end": 6,
+      "order": "Single"
+    },
+    {
+      "begin": 6,
+      "end": 7,
+      "order": "Single"
+    },
+    {
+      "begin": 7,
+      "end": 8,
+      "order": "Single"
+    },
+    {
+      "begin": 8,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 5,
+      "end": 9,
+      "order": "Double"
+    },
+    {
+      "begin": 9,
+      "end": 10,
+      "order": "Single"
+    },
+    {
+      "begin": 10,
+      "end": 11,
+      "order": "Double"
+    },
+    {
+      "begin": 11,
+      "end": 12,
+      "order": "Single"
+    },
+    {
+      "begin": 12,
+      "end": 6,
+      "order": "Double"
+    },
+    {
+      "begin": 7,
+      "end": 13,
+      "order": "Double"
+    },
+    {
+      "begin": 13,
+      "end": 14,
+      "order": "Single"
+    },
+    {
+      "begin": 14,
+      "end": 15,
+      "order": "Double"
+    },
+    {
+      "begin": 15,
+      "end": 16,
+      "order": "Single"
+    },
+    {
+      "begin": 16,
+      "end": 8,
+      "order": "Double"
+    }
+  ],
+  "attach_idx": 0
+}

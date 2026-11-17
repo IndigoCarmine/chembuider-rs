@@ -1,0 +1,234 @@
+{
+  "name": "TBDPS",
+  "atoms": [
+    {
+      "element": "Si",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.5,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.25,
+        -1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.75,
+        -1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        4.5,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        3.75,
+        1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        2.25,
+        1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -1.5,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -2.25,
+        1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -3.75,
+        1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -4.5,
+        0.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -3.75,
+        -1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -2.25,
+        -1.299
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        1.5
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        0.0,
+        3.0
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        1.299,
+        2.25
+      ],
+      "charge": 0
+    },
+    {
+      "element": "C",
+      "pos": [
+        -1.299,
+        2.25
+      ],
+      "charge": 0
+    }
+  ],
+  "bonds": [
+    {
+      "begin": 0,
+      "end": 1,
+      "order": "Single"
+    },
+    {
+      "begin": 1,
+      "end": 2,
+      "order": "Single"
+    },
+    {
+      "begin": 2,
+      "end": 3,
+      "order": "Double"
+    },
+    {
+      "begin": 3,
+      "end": 4,
+      "order": "Single"
+    },
+    {
+      "begin": 4,
+      "end": 5,
+      "order": "Double"
+    },
+    {
+      "begin": 5,
+      "end": 6,
+      "order": "Single"
+    },
+    {
+      "begin": 6,
+      "end": 1,
+      "order": "Double"
+    },
+    {
+      "begin": 0,
+      "end": 7,
+      "order": "Single"
+    },
+    {
+      "begin": 7,
+      "end": 8,
+      "order": "Single"
+    },
+    {
+      "begin": 8,
+      "end": 9,
+      "order": "Double"
+    },
+    {
+      "begin": 9,
+      "end": 10,
+      "order": "Single"
+    },
+    {
+      "begin": 10,
+      "end": 11,
+      "order": "Double"
+    },
+    {
+      "begin": 11,
+      "end": 12,
+      "order": "Single"
+    },
+    {
+      "begin": 12,
+      "end": 7,
+      "order": "Double"
+    },
+    {
+      "begin": 0,
+      "end": 13,
+      "order": "Single"
+    },
+    {
+      "begin": 13,
+      "end": 14,
+      "order": "Single"
+    },
+    {
+      "begin": 13,
+      "end": 15,
+      "order": "Single"
+    },
+    {
+      "begin": 13,
+      "end": 16,
+      "order": "Single"
+    }
+  ],
+  "attach_idx": 0
+}
