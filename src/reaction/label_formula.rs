@@ -187,7 +187,7 @@ impl GroupTable {
             }
         }
         let longest = exact.keys().map(|spelling| spelling.chars().count()).max().unwrap_or(0);
-        let spelled = exact.keys().filter(|spelling| MolecularFormula::parse(spelling).is_some()).cloned().collect();
+        let spelled = exact.keys().filter(|spelling| spells_elements(spelling)).cloned().collect();
         Self { groups, exact, spelled, longest }
     }
 
@@ -205,6 +205,28 @@ impl GroupTable {
     fn token(&self, text: &str) -> Option<&FormulaGroup> {
         if self.spelled.contains(text) { None } else { self.exact(text) }
     }
+}
+
+/// Whether `spelling` reads, from end to end, as the element symbols a label holds (with
+/// counts): `COD` is C, O, D and `DBU` D, B, U; `IPr` is not, `Pr` being propyl in a label.
+fn spells_elements(spelling: &str) -> bool {
+    let chars: Vec<char> = spelling.chars().collect();
+    let mut readable = vec![false; chars.len() + 1];
+    readable[chars.len()] = true;
+    for pos in (0..chars.len()).rev() {
+        readable[pos] = (1..=2usize.min(chars.len() - pos)).any(|len| {
+            let symbol: String = chars[pos..pos + len].iter().collect();
+            let digits = chars[pos + len..].iter().take_while(|c| c.is_ascii_digit()).count();
+            is_element_token(&symbol) && readable[pos + len + digits]
+        });
+    }
+    !chars.is_empty() && readable[0]
+}
+
+/// Whether `symbol` is an element in a label: one with a weight, and not `Ar` (aryl) or `Pr`
+/// (propyl), which are abbreviations there — as the reading of a label for Expand has it.
+fn is_element_token(symbol: &str) -> bool {
+    atomic_weight(symbol).is_some() && !ABBREVIATION_SYMBOLS.contains(&symbol)
 }
 
 static GROUPS: RwLock<Option<Arc<GroupTable>>> = RwLock::new(None);
@@ -428,9 +450,7 @@ fn tokens_at(run: &[char], pos: usize, table: &GroupTable) -> Vec<Token> {
         if let Some(group) = table.token(&text) {
             tokens.push(Token { len, counts: group_counts(group) });
         }
-        // `Ar` (aryl) and `Pr` (propyl) are abbreviations in a label, never argon or
-        // praseodymium — as the reading of a label for Expand has it.
-        if len <= 2 && atomic_weight(&text).is_some() && !ABBREVIATION_SYMBOLS.contains(&text.as_str()) {
+        if len <= 2 && is_element_token(&text) {
             tokens.push(Token { len, counts: Counts::from([(text, 1)]) });
         }
     }
@@ -611,6 +631,7 @@ mod tests {
         // `iPr` and `IPr` differ only in case: each is itself.
         assert_eq!(read("Zn(iPr)2").as_deref(), Ok("C6H14Zn"));
         assert_eq!(read("Pd(IPr)Cl2").as_deref(), Ok("C27H36Cl2N2Pd"));
+        assert_eq!(read("IPrCuCl").as_deref(), Ok("C27H36ClCuN2"), "I and Pr are not its elements");
         assert_eq!(read("Ti(OiPr)4").as_deref(), Ok("C12H28O4Ti"));
     }
 
