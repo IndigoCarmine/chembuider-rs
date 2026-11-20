@@ -671,10 +671,11 @@ line (93.831,157.126) (100.327,160.874) stroke=2.250/#000000ff
 line (90.248,160.835) (98.910,165.832) stroke=2.250/#000000ff
 line (86.665,164.543) (97.493,170.790) stroke=2.250/#000000ff
 line (83.083,168.252) (96.075,175.748) stroke=2.250/#000000ff
-line (104.579,146.000) (97.367,133.500) stroke=6.000/#000000ff
+line (104.579,146.000) (95.060,129.500) stroke=6.000/#000000ff
 line (134.579,146.000) (136.078,148.599) stroke=2.250/#000000ff
 line (137.327,150.764) (138.827,153.363) stroke=2.250/#000000ff
 line (140.076,155.528) (141.575,158.127) stroke=2.250/#000000ff
+line (142.824,160.292) (144.098,162.500) stroke=2.250/#000000ff
 line (134.579,146.000) (138.273,145.965) stroke=2.250/#000000ff
 line (138.273,145.965) (140.352,144.999) stroke=2.250/#000000ff
 line (140.352,144.999) (140.148,142.715) stroke=2.250/#000000ff
@@ -693,12 +694,12 @@ line (143.806,121.001) (145.885,120.035) stroke=2.250/#000000ff
 line (145.885,120.035) (149.579,120.000) stroke=2.250/#000000ff
 line (89.579,169.500) (59.579,169.500) stroke=2.250/#000000ff
 line (89.579,174.500) (59.579,174.500) stroke=2.250/#000000ff
-line (59.579,172.000) (52.367,184.500) stroke=2.250/#000000ff
-line (55.248,169.501) (48.037,182.001) stroke=2.250/#000000ff
-line (63.910,174.499) (56.698,186.999) stroke=2.250/#000000ff
-rect (141.553,160.000)-(176.084,185.720) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (36.000,186.000)-(53.156,210.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (70.000,108.000)-(98.938,132.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (59.579,172.000) (50.060,188.500) stroke=2.250/#000000ff
+line (55.248,169.501) (45.729,186.001) stroke=2.250/#000000ff
+line (63.910,174.499) (54.391,190.999) stroke=2.250/#000000ff
+rect (142.553,164.000)-(175.365,182.720) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (37.000,190.000)-(53.000,206.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (71.000,112.000)-(98.000,128.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "HO" at=(72.000,110.000) sections=["HO":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "NH" at=(143.553,162.000) sections=["NH":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "2" at=(167.365,169.720) sections=["2":#000000ff@11.900] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
@@ -732,10 +733,11 @@ line (257.915,95.126) (264.411,98.874) stroke=2.250/#000000ff
 line (254.332,98.835) (262.994,103.832) stroke=2.250/#000000ff
 line (250.749,102.543) (261.576,108.790) stroke=2.250/#000000ff
 line (247.166,106.252) (260.159,113.748) stroke=2.250/#000000ff
-line (268.663,84.000) (261.451,71.500) stroke=6.000/#000000ff
+line (268.663,84.000) (259.144,67.500) stroke=6.000/#000000ff
 line (298.663,84.000) (300.162,86.599) stroke=2.250/#000000ff
 line (301.411,88.764) (302.910,91.363) stroke=2.250/#000000ff
 line (304.160,93.528) (305.659,96.127) stroke=2.250/#000000ff
+line (306.908,98.292) (308.182,100.500) stroke=2.250/#000000ff
 line (298.663,84.000) (302.356,83.965) stroke=2.250/#000000ff
 line (302.356,83.965) (304.436,82.999) stroke=2.250/#000000ff
 line (304.436,82.999) (304.231,80.715) stroke=2.250/#000000ff
@@ -754,12 +756,12 @@ line (307.890,59.001) (309.969,58.035) stroke=2.250/#000000ff
 line (309.969,58.035) (313.663,58.000) stroke=2.250/#000000ff
 line (253.663,107.500) (223.663,107.500) stroke=2.250/#000000ff
 line (253.663,112.500) (223.663,112.500) stroke=2.250/#000000ff
-line (223.663,110.000) (216.451,122.500) stroke=2.250/#000000ff
-line (219.332,107.501) (212.120,120.001) stroke=2.250/#000000ff
-line (227.994,112.499) (220.782,124.999) stroke=2.250/#000000ff
-rect (200.084,124.000)-(217.240,148.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (234.084,46.000)-(263.021,70.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
-rect (305.636,98.000)-(340.167,123.720) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (223.663,110.000) (214.144,126.500) stroke=2.250/#000000ff
+line (219.332,107.501) (209.813,124.001) stroke=2.250/#000000ff
+line (227.994,112.499) (218.474,128.999) stroke=2.250/#000000ff
+rect (201.084,128.000)-(217.084,144.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (235.084,50.000)-(262.084,66.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (306.636,102.000)-(339.449,120.720) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "HO" at=(236.084,48.000) sections=["HO":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "NH" at=(307.636,100.000) sections=["NH":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "2" at=(331.449,107.720) sections=["2":#000000ff@11.900] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
@@ -794,8 +796,8 @@ line (407.792,155.447) (386.792,155.447) stroke=2.250/#000000ff
 line (382.292,150.447) (367.292,176.428) stroke=2.250/#000000ff
 line (367.292,176.428) (382.292,202.409) stroke=2.250/#000000ff
 line (373.873,177.825) (384.373,196.012) stroke=2.250/#000000ff
-line (412.292,150.447) (419.498,137.966) stroke=2.250/#000000ff
-rect (418.713,112.466)-(447.651,136.466) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (412.292,150.447) (421.808,133.966) stroke=2.250/#000000ff
+rect (419.713,116.466)-(446.713,132.466) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "OH" at=(420.713,114.466) sections=["OH":#000000ff@17.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 "#;
 
@@ -824,8 +826,8 @@ line (161.625,93.641) (133.625,93.641) stroke=1.500/#000000ff
 line (127.625,90.141) (107.625,124.782) stroke=1.500/#000000ff
 line (107.625,124.782) (127.625,159.423) stroke=1.500/#000000ff
 line (113.656,128.228) (127.656,152.477) stroke=1.500/#000000ff
-line (167.625,90.141) (182.140,65.000) stroke=1.500/#000000ff
-rect (181.594,47.000)-(202.656,64.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (167.625,90.141) (183.872,62.000) stroke=1.500/#000000ff
+rect (181.594,50.000)-(201.594,61.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "OH" at=(182.594,48.000) sections=["OH":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 line (215.656,104.087) (306.656,104.087) stroke=1.500/#000000ff
 path closed=true fill=#000000ff stroke=0.000/#00000000 pts=[(311.656,104.087) (301.656,100.087) (301.656,108.087)] kind=Middle
@@ -843,9 +845,9 @@ line (380.406,93.641) (352.406,93.641) stroke=1.500/#000000ff
 line (346.406,90.141) (326.406,124.782) stroke=1.500/#000000ff
 line (326.406,124.782) (346.406,159.423) stroke=1.500/#000000ff
 line (332.437,128.228) (346.437,152.477) stroke=1.500/#000000ff
-line (386.406,90.141) (400.922,65.000) stroke=1.500/#000000ff
-line (413.438,55.500) (446.406,55.500) stroke=1.500/#000000ff
-rect (400.375,47.000)-(412.438,64.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (386.406,90.141) (402.654,62.000) stroke=1.500/#000000ff
+line (413.375,55.500) (446.406,55.500) stroke=1.500/#000000ff
+rect (400.375,50.000)-(412.375,61.000) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "O" at=(401.375,48.000) sections=["O":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "R" at=(38.000,186.173) sections=["R":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "e" at=(50.581,186.173) sections=["e":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
@@ -1006,7 +1008,7 @@ text "+" at=(133.500,117.782) sections=["+":#000000ff@17.000] families=[Proporti
 line (157.844,127.782) (177.479,127.782) stroke=1.500/#000000ff
 line (157.844,131.282) (177.479,131.282) stroke=1.500/#000000ff
 line (157.844,124.282) (177.479,124.282) stroke=1.500/#000000ff
-rect (178.479,119.282)-(190.542,136.282) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+rect (178.479,122.282)-(190.479,133.282) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 line (200.510,127.782) (199.727,132.726) stroke=1.500/#dc1e1eff
 line (197.455,137.187) (193.915,140.726) stroke=1.500/#dc1e1eff
 line (189.455,142.999) (184.510,143.782) stroke=1.500/#dc1e1eff
@@ -1039,8 +1041,8 @@ line (358.292,48.750) (338.292,83.391) stroke=1.500/#000000ff
 line (338.292,83.391) (358.292,118.032) stroke=1.500/#000000ff
 line (344.323,86.837) (358.323,111.086) stroke=1.500/#000000ff
 line (298.292,83.391) (338.292,83.391) stroke=1.500/#000000ff
-line (297.864,144.282) (334.252,144.282) stroke=1.500/#000000ff
-rect (335.252,135.782)-(340.470,152.782) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (297.864,144.282) (335.252,144.282) stroke=1.500/#000000ff
+rect (336.252,138.782)-(340.252,149.782) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "I" at=(336.252,136.782) sections=["I":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 line (467.792,183.119) (507.792,183.119) stroke=1.500/#000000ff
 line (507.792,183.119) (527.792,148.478) stroke=1.500/#000000ff
@@ -1051,8 +1053,8 @@ line (501.792,117.337) (473.792,117.337) stroke=1.500/#000000ff
 line (467.792,113.837) (447.792,148.478) stroke=1.500/#000000ff
 line (447.792,148.478) (467.792,183.119) stroke=1.500/#000000ff
 line (453.823,151.924) (467.823,176.172) stroke=1.500/#000000ff
-line (507.792,113.837) (522.307,88.696) stroke=1.500/#000000ff
-rect (521.761,70.696)-(542.823,87.696) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
+line (507.792,113.837) (524.039,85.696) stroke=1.500/#000000ff
+rect (521.761,73.696)-(541.761,84.696) fill=#ffffffff stroke=0.000/#00000000 corner=0/0/0/0 kind=Outside blur=0.000 round_px=None angle=0.000 brush=none
 text "OH" at=(522.761,71.696) sections=["OH":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 text "rt" at=(555.823,120.282) sections=["rt":#000000ff@13.000] families=[Proportional] override=none opacity=1.000 angle=0.000 fallback=#000000ff underline=0.000/#00000000
 "#;

@@ -78,13 +78,13 @@ impl App for FragmentEditorApp {
                 // ── Tools ──────────────────────────────────────────────────────
                 ui.label("Tool:");
                 if ui.selectable_label(self.editor.tool == Tool::Select, "⬚ Select").clicked() {
-                    self.editor.tool = Tool::Select;
+                    self.editor.set_tool(Tool::Select);
                 }
                 if ui.selectable_label(self.editor.tool == Tool::Bond, "✏ Bond").clicked() {
-                    self.editor.tool = Tool::Bond;
+                    self.editor.set_tool(Tool::Bond);
                 }
                 if ui.selectable_label(self.editor.tool == Tool::Eraser, "✖ Eraser").clicked() {
-                    self.editor.tool = Tool::Eraser;
+                    self.editor.set_tool(Tool::Eraser);
                 }
 
                 ui.separator();

@@ -747,6 +747,30 @@ impl RichGalley {
         out
     }
 
+    /// The rect (relative to this galley's top-left) the glyphs' ink covers: tighter than
+    /// [`size`](Self::size), which is the line box, room above the capitals and below the
+    /// baseline included. `None` when nothing is inked (blank text).
+    pub fn ink_rect(&self) -> Option<Rect> {
+        let mut rect: Option<Rect> = None;
+        for part in &self.parts {
+            for row in &part.galley.rows {
+                for glyph in &row.row.glyphs {
+                    let uv = &glyph.uv_rect;
+                    if uv.is_nothing() {
+                        continue;
+                    }
+                    let min = Pos2::ZERO + part.offset + row.pos.to_vec2() + glyph.pos.to_vec2() + uv.offset;
+                    let mut g = Rect::from_min_size(min, uv.size);
+                    if let Some(dx) = part.bold_offset {
+                        g.max.x += dx;
+                    }
+                    rect = Some(rect.map_or(g, |r| r.union(g)));
+                }
+            }
+        }
+        rect
+    }
+
     /// Bounding rect (relative to this galley's top-left) of a range of characters of the
     /// *flattened* text — the concatenation of every span's text, in order. Used to anchor
     /// a chemical label on its element symbol rather than the whole bounding box.

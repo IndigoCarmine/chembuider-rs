@@ -73,7 +73,13 @@ impl RenderTransform {
 /// the label's *element symbol* (not the bounding box) is centered on the atom position.
 pub struct SceneLabel {
     pub galley: RichGalley,
+    /// The galley's line box, where it is painted.
     pub rect: Rect,
+    /// What the letters themselves cover ([`RichGalley::ink_rect`]), inside `rect`: where bonds
+    /// to the atom stop and what the white background hides. The line box would also take the
+    /// room above the capitals and below the baseline, which along a steep bond between two
+    /// labels (an N–H at 60°) is the whole bond.
+    pub mask: Rect,
 }
 
 /// A stroked line segment (bond line, hash, dash, wavy segment).
@@ -186,7 +192,7 @@ pub struct ScenePolygon {
 
 /// Everything needed to draw a molecule, computed once and rendered by any backend. Draw order
 /// is back-to-front: [`ring_fills`](Self::ring_fills), then [`bonds`](Self::bonds), then the white
-/// label masks (each label rect expanded by [`label_bg_pad`](Self::label_bg_pad)), then labels.
+/// label masks (each label's [`mask`](SceneLabel::mask) expanded by [`label_bg_pad`](Self::label_bg_pad)), then labels.
 pub struct MoleculeScene {
     pub ring_fills: Vec<ScenePolygon>,
     pub bonds: Vec<SceneBond>,
@@ -329,7 +335,8 @@ pub fn build_labels(
             .unwrap_or_else(|| galley.size() * 0.5);
         let sp = xf.apply(atom.pos);
         let rect = Rect::from_min_size(sp - anchor, galley.size());
-        map.insert(atom.id, SceneLabel { galley, rect });
+        let mask = galley.ink_rect().map_or(rect, |ink| ink.translate(rect.min.to_vec2()));
+        map.insert(atom.id, SceneLabel { galley, rect, mask });
     }
     map
 }
@@ -700,7 +707,7 @@ pub fn build_bonds(
         let p1 = xf.apply(a.pos);
         let p2 = xf.apply(b.pos);
 
-        let trim_rect = |id: u32| labels.get(&id).map(|l| l.rect.expand(style.label_trim_pad * vs));
+        let trim_rect = |id: u32| labels.get(&id).map(|l| l.mask.expand(style.label_trim_pad * vs));
         let Some((tp1, tp2)) =
             trimmed_bond_endpoints(p1, p2, trim_rect(bond.begin), trim_rect(bond.end))
         else {
@@ -1112,6 +1119,48 @@ mod tests {
         let w = m.add_bond(c1, o, BondOrder::Single);
         m.bond_by_id_mut(w).unwrap().stereo = BondStereo::WedgeUp;
         m
+    }
+
+    /// A bond between two labels steeper than the labels are wide (an N–H at 60°) is drawn and
+    /// stays in view: the labels' line boxes overlap along it, so trimming at them left nothing
+    /// and the H looked unbonded. Bonds stop at the letters' ink instead, and the white
+    /// background behind a label covers no more than that, so it cannot hide what is left.
+    #[test]
+    fn a_steep_bond_between_two_labels_is_drawn() {
+        let mut m = Molecule::default();
+        let len = crate::widget::DEFAULT_BOND_LENGTH;
+        let n = m.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let h = m.add_atom("H".to_string(), [len * 0.5, -len * 0.866], 0);
+        let ring = [m.add_atom("C".to_string(), [len, 0.0], 0), m.add_atom("C".to_string(), [-len * 0.5, len * 0.866], 0)];
+        for c in ring {
+            m.add_bond(n, c, BondOrder::Single);
+        }
+        let nh = m.add_bond(n, h, BondOrder::Single);
+        let style = StyleConfig::default();
+        let mut fonts = fonts();
+        let mut view = fonts.with_pixels_per_point(1.0);
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let labels = build_labels(&m, &style, xf, |j| view.layout_job(j));
+        let (pn, ph) = (xf.apply(m.atom_by_id(n).unwrap().pos), xf.apply(m.atom_by_id(h).unwrap().pos));
+        let pad = style.label_trim_pad;
+        assert_eq!(
+            trimmed_bond_endpoints(pn, ph, Some(labels[&n].rect.expand(pad)), Some(labels[&h].rect.expand(pad))),
+            None,
+            "the line boxes swallow this bond (else the test shows nothing)"
+        );
+
+        let bonds = build_bonds(&m, &style, xf, &labels);
+        let drawn = bonds.iter().find(|b| b.bond_id == nh).expect("the N–H bond is drawn");
+        let background = |id: u32| labels[&id].mask.expand(style.label_bg_pad);
+        for id in [n, h] {
+            assert!(labels[&id].rect.contains_rect(labels[&id].mask), "the ink is inside the line box");
+        }
+        for stroke in &drawn.strokes {
+            assert!((stroke.b - stroke.a).length() >= 5.0, "a visible line");
+            for p in [stroke.a, stroke.b] {
+                assert!(!background(n).contains(p) && !background(h).contains(p), "no background hides it");
+            }
+        }
     }
 
     /// The whole point of `scene`: the on-screen editor and the image exporter get identical

@@ -98,7 +98,7 @@ fn dragging_with_the_arrow_tool_draws_a_snapped_arrow_as_one_undo_step() {
     assert_eq!(a[0].kind, ArrowKind::Reaction);
     assert!(close(a[0].tail, [0.0, 0.0]), "{:?}", a[0]);
     assert!(a[0].head[1].abs() < 1e-3 && (a[0].head[0] - (16.0f32 + 0.09).sqrt()).abs() < 1e-3, "{:?}", a[0]);
-    assert!(d.editor.object_drag.is_none());
+    assert!(d.editor.object_drag().is_none());
     assert_eq!(d.editor.undo_stack.len(), 1);
     assert!(d.editor.undo());
     assert!(d.editor.molecule.objects.is_empty());

@@ -1,7 +1,7 @@
 use super::{ChemStructEditor, DEFAULT_BOND_LENGTH};
 use crate::config::{AtomAction, BondAction, ResolvedAtomAction, SelectionAction};
 use crate::molecule::{ArrowKind, BondOrder, BondStereo, PageArrow, PageObject};
-use crate::molecule::page::{snap_direction, DEFAULT_ARROW_LENGTH};
+use crate::molecule::page::snap_direction;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Group-hydrogen bookkeeping
@@ -30,6 +30,19 @@ pub(crate) fn consume_group_h(editor: &mut ChemStructEditor, atoms: &[u32]) {
     }
 }
 
+/// Make room on `atom_id` for a bond about to be drawn out of it, taking off the group
+/// hydrogens it would leave no room for ([`Molecule::make_room_for_bond`]), so the new bond takes
+/// the place one of them held rather than going round it. Left on, the H of an N–H pushes the
+/// next bond out of the N off the outward direction, and is then removed anyway.
+///
+/// [`Molecule::make_room_for_bond`]: crate::molecule::Molecule::make_room_for_bond
+fn make_room_for_bond(editor: &mut ChemStructEditor, atom_id: u32) {
+    for h in editor.molecule.make_room_for_bond(atom_id) {
+        editor.selected_atoms.remove(&h);
+        if editor.hovered_atom == Some(h) { editor.hovered_atom = None; }
+    }
+}
+
 /// Cycle a bond's order (the mouse gesture for "make this a double bond"), consuming any
 /// group hydrogen the *increase* leaves no room for. A wrap back to single removes nothing.
 fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
@@ -53,7 +66,7 @@ fn cycle_bond_order(editor: &mut ChemStructEditor, bond_id: u32) {
 ///
 /// Anything else (no style chosen, or a double or triple bond) cycles the bond's order as
 /// before.
-fn retype_bond_with_tool(editor: &mut ChemStructEditor, bond_id: u32, narrow: Option<u32>) {
+pub(crate) fn retype_bond_with_tool(editor: &mut ChemStructEditor, bond_id: u32, narrow: Option<u32>) {
     let chosen = editor.current_bond_stereo.clone();
     let Some(bond) = editor.molecule.bond_by_id(bond_id) else {
         return;
@@ -76,7 +89,7 @@ fn retype_bond_with_tool(editor: &mut ChemStructEditor, bond_id: u32, narrow: Op
 }
 
 /// The atom of `bond_id` nearer to `pos` (molecule coordinates).
-fn nearer_bond_atom(editor: &ChemStructEditor, bond_id: u32, pos: [f32; 2]) -> Option<u32> {
+pub(crate) fn nearer_bond_atom(editor: &ChemStructEditor, bond_id: u32, pos: [f32; 2]) -> Option<u32> {
     let bond = editor.molecule.bond_by_id(bond_id)?;
     let dist = |id: u32| {
         editor.molecule.atom_by_id(id).map(|a| (a.pos[0] - pos[0]).powi(2) + (a.pos[1] - pos[1]).powi(2))
@@ -114,14 +127,16 @@ pub(crate) fn edit_bond_type(
 /// egui's `drag_started()` / `dragged()` / `drag_stopped()` fire for a drag by *any* button,
 /// but the middle button belongs to the camera (`ChemStructEditor::ui` pans with it), so the
 /// tools read their drags through this instead.
-struct PrimaryDrag {
-    started: bool,
-    dragged: bool,
-    stopped: bool,
+pub(crate) struct PrimaryDrag {
+    pub(crate) started: bool,
+    pub(crate) dragged: bool,
+    pub(crate) stopped: bool,
+    /// The drag stopped without the button coming up: egui aborted it (Escape).
+    pub(crate) aborted: bool,
 }
 
 impl PrimaryDrag {
-    fn of(response: &egui::Response, ui: &egui::Ui) -> Self {
+    pub(crate) fn of(response: &egui::Response, ui: &egui::Ui) -> Self {
         let (held, released) = ui.input(|i| {
             (i.pointer.button_down(egui::PointerButton::Primary),
              i.pointer.button_released(egui::PointerButton::Primary))
@@ -133,157 +148,120 @@ impl PrimaryDrag {
             // still held. `drag_stopped_by(Primary)` would only see the release, leaving the
             // gesture's state behind after an abort.
             stopped: response.drag_stopped() && (released || held),
+            aborted: response.drag_stopped() && held && !released,
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Public tool handlers
+// What the tools do (see `super::tools` for which tool does what)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn process_bond_tool(
-    editor: &mut ChemStructEditor,
-    response: &egui::Response,
-    center: egui::Pos2,
-    ui: &egui::Ui,
-) -> bool {
-    let mut modified = false;
-    let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
-    let drag = PrimaryDrag::of(response, ui);
-
-    // ── Drag tracking ────────────────────────────────────────────────────────
-    // Dragging *from an atom* always draws a bond, never moves it — the Bond tool's own
-    // gesture list is "drag atom→atom to draw a bond"; repositioning atoms via drag is the
-    // Select tool's job (`process_select_tool`), not this one.
-    //
-    // Dragging *from empty canvas* (no atom and no bond under the press) instead runs the same
-    // rubber-band selection the Select tool offers, so a user can marquee-select without
-    // leaving the Bond tool. A drag that begins on a bond keeps the Bond tool's old no-op.
-    if drag.started {
-        // `drag_started()` only fires once the pointer has moved past egui's drag threshold,
-        // so by now `mouse` (the *current* position) may already be well past the atom the
-        // drag actually started on. Hit-test at the press origin instead, or a fast drag off
-        // an atom silently does nothing (see `bond_tool_drag_from_atom_to_empty_space_creates_bonded_atom`).
-        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
-        // Prefer hit atom; fall back to currently hovered atom for slight-miss tolerance
-        editor.bond_start = editor.hit_test_atom(origin, center).or(editor.hovered_atom);
-        if editor.bond_start.is_some() {
-            editor.push_undo(); // snapshot before the drag adds a bond/atom
-            editor.preview_end_screen = Some(mouse);
-        } else if editor.hit_test_bond(origin, center).is_none() {
-            // Empty space: start a rubber-band selection instead of a bond. No undo snapshot —
-            // selection does not mutate the molecule.
-            lasso_begin(editor, origin);
-        }
+/// A bond out of atom `atom_id`, in the best free direction, to a new atom (or to one already
+/// there): what a click on an atom does with the Bond tool. Where that bond already exists, its
+/// order goes up instead. The new atom becomes the hotspot.
+pub(crate) fn grow_bond(editor: &mut ChemStructEditor, atom_id: u32, center: egui::Pos2) {
+    if editor.molecule.atom_by_id(atom_id).is_none() {
+        return;
     }
-
-    if drag.dragged {
-        if editor.bond_start.is_some() {
-            editor.preview_end_screen = Some(mouse);
-        } else if editor.drag_origin_screen.is_some() {
-            // Extend the rubber-band path; `draw_overlays` renders it, same as the Select tool.
-            editor.lasso_path.push(mouse);
-        }
+    let before = editor.molecule.clone();
+    make_room_for_bond(editor, atom_id);
+    let angle = editor.best_new_bond_angle(atom_id);
+    let Some(src) = editor.molecule.atom_by_id(atom_id) else { return };
+    let new_pos = [src.pos[0] + angle.cos() * DEFAULT_BOND_LENGTH, src.pos[1] + angle.sin() * DEFAULT_BOND_LENGTH];
+    let new_id = find_or_create_atom(editor, new_pos, center);
+    let existing = editor.molecule.bond_between(atom_id, new_id).map(|b| b.id);
+    if new_id == atom_id || existing.is_some() {
+        // No new bond after all: the hydrogens stay.
+        editor.molecule = before;
     }
-
-    if drag.stopped {
-        if editor.bond_start.is_none() && editor.drag_origin_screen.is_some() {
-            // Empty-space drag: commit the rubber-band selection and tear its state down.
-            lasso_select(editor, center);
-            editor.lasso_path.clear();
-            editor.drag_origin_screen = None;
-            editor.preview_end_screen = None;
+    if new_id != atom_id {
+        if let Some(existing) = existing {
+            cycle_bond_order(editor, existing);
         } else {
-            let start_id   = editor.bond_start.take();
-            let end_screen = editor.preview_end_screen.take();
-
-            if let (Some(src_id), Some(end)) = (start_id, end_screen) {
-                let target_id = editor.hit_test_atom(end, center)
-                    .or_else(|| {
-                        let mol_pos = editor.screen_to_mol(end, center);
-                        editor.molecule.find_atom_near(mol_pos, crate::molecule::Molecule::SNAP_RADIUS)
-                    })
-                    .unwrap_or_else(|| {
-                        let mol_pos = editor.screen_to_mol(end, center);
-                        editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0)
-                    });
-                if target_id != src_id {
-                    if let Some(existing) = editor.molecule.bond_between(src_id, target_id).map(|b| b.id) {
-                        retype_bond_with_tool(editor, existing, Some(src_id));
-                        modified = true;
-                    } else {
-                        let bid = editor.molecule.add_bond(src_id, target_id, editor.current_bond_order.clone());
-                        if bid != 0 {
-                            editor.molecule.press_leftovers.remove(&src_id);
-                            editor.molecule.press_leftovers.remove(&target_id);
-                            if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
-                                bond.stereo = editor.current_bond_stereo.clone();
-                            }
-                            consume_group_h(editor, &[src_id, target_id]);
-                        }
-                        modified = true;
-                    }
-                }
-            }
+            add_drawn_bond(editor, atom_id, new_id);
         }
     }
+    editor.hotspot_atom = Some(new_id);
+}
 
-    // ── Click ────────────────────────────────────────────────────────────────
-    if response.clicked() {
-        editor.push_undo();
-        if let Some(atom_id) = editor.hovered_atom {
-            let angle = editor.best_new_bond_angle(atom_id);
-            let new_pos = {
-                let src = editor.molecule.atom_by_id(atom_id).unwrap();
-                [src.pos[0] + angle.cos() * DEFAULT_BOND_LENGTH,
-                 src.pos[1] + angle.sin() * DEFAULT_BOND_LENGTH]
-            };
-            let new_id = find_or_create_atom(editor, new_pos, center);
-            if new_id != atom_id {
-                if let Some(existing) = editor.molecule.bond_between(atom_id, new_id).map(|b| b.id) {
-                    cycle_bond_order(editor, existing);
-                    modified = true;
-                } else {
-                    let bid = editor.molecule.add_bond(atom_id, new_id, editor.current_bond_order.clone());
-                    if bid != 0 {
-                        editor.molecule.press_leftovers.remove(&atom_id);
-                        editor.molecule.press_leftovers.remove(&new_id);
-                        if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
-                            bond.stereo = editor.current_bond_stereo.clone();
-                        }
-                        consume_group_h(editor, &[atom_id, new_id]);
-                    }
-                    modified = true;
-                }
-            }
-            editor.hotspot_atom = Some(new_id);
-        } else if let Some(bond_id) = editor.hovered_bond {
-            if editor.molecule.bond_by_id_mut(bond_id).is_some() {
-                // With a wedge (or another stereo style) chosen, a single bond becomes that
-                // style, its narrow end at the atom nearer the click.
-                let narrow = nearer_bond_atom(editor, bond_id, editor.screen_to_mol(mouse, center));
-                retype_bond_with_tool(editor, bond_id, narrow);
-                modified = true;
-            }
-        } else {
-            let mol_pos = editor.screen_to_mol(mouse, center);
-            let new_id = editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0);
-            editor.hotspot_atom = Some(new_id);
-            modified = true;
+/// A bond of the chosen order and style from `from` to `to`, as the Bond tool draws it.
+fn add_drawn_bond(editor: &mut ChemStructEditor, from: u32, to: u32) {
+    let bid = editor.molecule.add_bond(from, to, editor.current_bond_order.clone());
+    if bid != 0 {
+        editor.molecule.press_leftovers.remove(&from);
+        editor.molecule.press_leftovers.remove(&to);
+        if let Some(bond) = editor.molecule.bond_by_id_mut(bid) {
+            bond.stereo = editor.current_bond_stereo.clone();
         }
+        consume_group_h(editor, &[from, to]);
     }
+}
 
-    // ── Hover + Delete: remove the atom or bond under the cursor ─────────────
-    let delete_pressed =
-        ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-    if delete_pressed && delete_hovered(editor) {
-        modified = true;
+/// End a bond drawn by dragging from atom `from`: to the atom under `end` (screen), or near it,
+/// or else to a new atom there. A drag back onto `from` draws nothing; one onto an atom it is
+/// already bonded to retypes that bond (see [`retype_bond_with_tool`]).
+pub(crate) fn finish_bond(editor: &mut ChemStructEditor, from: u32, end: egui::Pos2, center: egui::Pos2) {
+    if editor.molecule.atom_by_id(from).is_none() {
+        return;
     }
+    let mol_pos = editor.screen_to_mol(end, center);
+    let target = editor
+        .hit_test_atom(end, center)
+        .or_else(|| editor.molecule.find_atom_near(mol_pos, crate::molecule::Molecule::SNAP_RADIUS))
+        .unwrap_or_else(|| editor.molecule.add_atom(editor.current_element.clone(), mol_pos, 0));
+    if target == from {
+        return;
+    }
+    if let Some(existing) = editor.molecule.bond_between(from, target).map(|b| b.id) {
+        retype_bond_with_tool(editor, existing, Some(from));
+    } else {
+        add_drawn_bond(editor, from, target);
+    }
+}
 
-    // ── Keyboard shortcuts ───────────────────────────────────────────────────
-    modified |= handle_keys_bond_tool(editor, response, center, ui);
-
-    modified
+/// Remove what `hit` is (the Eraser's click, Delete on what is pointed at). Returns whether
+/// something was removed.
+pub(crate) fn erase(editor: &mut ChemStructEditor, hit: super::tools::Hit) -> bool {
+    use super::tools::Hit;
+    match hit {
+        Hit::Atom(atom_id) => {
+            // Note a neighbour before the bonds disappear with the atom. Deleting the hotspot
+            // used to clear it outright, which is unrecoverable without a pointer: `Enter` and
+            // `g` both re-acquire a hotspot only from a *hovered* atom. Stepping to a former
+            // neighbour keeps the structure reachable.
+            let fallback = editor.molecule.neighbor_atom_ids(atom_id).into_iter().next();
+            editor.molecule.remove_atom(atom_id);
+            if editor.hotspot_atom == Some(atom_id) {
+                editor.hotspot_atom = fallback;
+            }
+            editor.selected_atoms.remove(&atom_id);
+            if editor.hovered_atom == Some(atom_id) {
+                editor.hovered_atom = None;
+            }
+            true
+        }
+        Hit::Bond(bond_id) => {
+            editor.molecule.remove_bond(bond_id);
+            editor.selected_bonds.remove(&bond_id);
+            if editor.hovered_bond == Some(bond_id) {
+                editor.hovered_bond = None;
+            }
+            if editor.hotspot_bond == Some(bond_id) {
+                editor.hotspot_bond = None;
+            }
+            true
+        }
+        Hit::Object(id) => {
+            editor.molecule.remove_object(id);
+            editor.selected_objects.remove(&id);
+            if editor.hovered_object == Some(id) {
+                editor.hovered_object = None;
+            }
+            true
+        }
+        Hit::Empty => false,
+    }
 }
 
 /// Delete the current atom or bond target.
@@ -296,66 +274,19 @@ pub fn process_bond_tool(
 /// The keyboard fallbacks are what make Delete work with no pointer at all.
 ///
 /// Returns true if something was removed.
-fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
-    enum Target { Atom(u32), Bond(u32), Object(u32) }
-
-    let target = editor.hovered_atom.map(Target::Atom)
-        .or_else(|| editor.hovered_object.map(Target::Object))
-        .or_else(|| editor.hovered_bond.map(Target::Bond))
-        .or_else(|| editor.hotspot_bond.map(Target::Bond))
-        .or_else(|| editor.hotspot_atom.map(Target::Atom));
-
-    match target {
-        Some(Target::Atom(atom_id)) => {
-            editor.push_undo();
-            // Note a neighbour before the bonds disappear with the atom. Deleting the hotspot
-            // used to clear it outright, which is unrecoverable without a pointer: `Enter` and
-            // `g` both re-acquire a hotspot only from a *hovered* atom. A keyboard user could
-            // therefore delete exactly once per structure and then had no way to keep editing.
-            // Stepping to a former neighbour keeps the structure reachable.
-            let fallback = editor.molecule.neighbor_atom_ids(atom_id).into_iter().next();
-            editor.molecule.remove_atom(atom_id);
-            if editor.hotspot_atom == Some(atom_id) { editor.hotspot_atom = fallback; }
-            editor.selected_atoms.remove(&atom_id);
-            editor.hovered_atom = None;
-            true
-        }
-        Some(Target::Bond(bond_id)) => {
-            editor.push_undo();
-            editor.molecule.remove_bond(bond_id);
-            editor.hovered_bond = None;
-            editor.hotspot_bond = None;
-            true
-        }
-        Some(Target::Object(id)) => {
-            editor.push_undo();
-            editor.molecule.remove_object(id);
-            editor.selected_objects.remove(&id);
-            editor.hovered_object = None;
-            true
-        }
-        None => false,
-    }
+pub(crate) fn delete_hovered(editor: &mut ChemStructEditor) -> bool {
+    use super::tools::Hit;
+    let target = editor.hovered_atom.map(Hit::Atom)
+        .or_else(|| editor.hovered_object.map(Hit::Object))
+        .or_else(|| editor.hovered_bond.map(Hit::Bond))
+        .or_else(|| editor.hotspot_bond.map(Hit::Bond))
+        .or_else(|| editor.hotspot_atom.map(Hit::Atom));
+    target.is_some_and(|hit| erase(editor, hit))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Rubber-band (lasso) selection — shared by the Select and Bond tools
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Begin a rubber-band selection at `origin`, the pointer's press origin: reset the
-/// in-progress path to start there and remember it as the drag origin.
-///
-/// The path starts at the press, not at the pointer when `drag_started()` fires: by then the
-/// pointer is past egui's drag threshold, possibly far past it after a fast first move, and
-/// the polygon would lose the stretch between the two.
-///
-/// Factored out so the Bond tool can start the exact same gesture the Select tool does when a
-/// drag begins over empty canvas (no atom and no bond under the press).
-fn lasso_begin(editor: &mut ChemStructEditor, origin: egui::Pos2) {
-    editor.lasso_path.clear();
-    editor.lasso_path.push(origin);
-    editor.drag_origin_screen = Some(origin);
-}
 
 /// Finish a rubber-band selection: replace the selection with every atom whose screen position
 /// falls inside the drawn polygon. A bond is taken through its atoms: one with both ends inside
@@ -365,17 +296,14 @@ fn lasso_begin(editor: &mut ChemStructEditor, origin: egui::Pos2) {
 /// polygon needs at least three vertices to bound an area, so a path too short to be a real
 /// lasso (a mere flick) selects nothing and leaves the selection untouched.
 ///
-/// Does not clear `lasso_path`/`drag_origin_screen`; the caller owns that teardown, since the
-/// Select tool clears them on every drag-stop regardless of which sub-gesture actually ran.
-fn lasso_select(editor: &mut ChemStructEditor, center: egui::Pos2) {
-    if editor.lasso_path.len() > 2 {
+pub(crate) fn lasso_select(editor: &mut ChemStructEditor, lasso: &[egui::Pos2], center: egui::Pos2) {
+    if lasso.len() > 2 {
         editor.selected_atoms.clear();
         editor.selected_bonds.clear();
         editor.selected_objects.clear();
-        let lasso = editor.lasso_path.clone();
         let hits: Vec<u32> = editor.molecule.atoms.iter().filter_map(|atom| {
             let sp = editor.mol_to_screen(atom.pos, center);
-            if is_point_in_polygon(sp, &lasso) { Some(atom.id) } else { None }
+            if is_point_in_polygon(sp, lasso) { Some(atom.id) } else { None }
         }).collect();
         editor.selected_atoms.extend(hits);
         // A page object is taken when it lies inside whole: both ends of an arrow, a text's
@@ -385,264 +313,92 @@ fn lasso_select(editor: &mut ChemStructEditor, center: egui::Pos2) {
                 let atoms: Vec<u32> = b.atoms.iter().copied().filter(|a| editor.molecule.atom_by_id(*a).is_some()).collect();
                 !atoms.is_empty() && atoms.iter().all(|a| editor.selected_atoms.contains(a))
             }
-            _ => o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), &lasso)),
+            _ => o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), lasso)),
         }).map(PageObject::id).collect();
         editor.selected_objects.extend(objects);
     }
 }
 
-pub fn process_select_tool(
-    editor: &mut ChemStructEditor,
-    response: &egui::Response,
+/// Begin turning the selection: by its handle (at `handle`, pressed at `origin`), which turns in
+/// steps, or by Alt+drag (the pointer now at `at`), which turns freely.
+pub(crate) fn start_rotation(
+    editor: &ChemStructEditor,
     center: egui::Pos2,
-    ui: &egui::Ui,
-) -> bool {
-    let mut modified = false;
-    let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
-    let drag = PrimaryDrag::of(response, ui);
-
-    // The rotation handle of the selection: a grab cursor over it, and a click on it is not a
-    // click on what lies under it (it must not toggle or clear the selection).
-    let handle = rotation_handle(editor, center);
-    let on_handle = |p: egui::Pos2| handle.is_some_and(|h| h.distance(p) <= ROTATE_HANDLE_HIT);
-    let rotating = editor.rotate_drag.is_some();
-    if rotating || ui.input(|i| i.pointer.hover_pos()).is_some_and(on_handle) {
-        ui.ctx().set_cursor_icon(if rotating { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    origin: egui::Pos2,
+    at: egui::Pos2,
+    handle: Option<egui::Pos2>,
+    by_handle: bool,
+) -> RotateDrag {
+    let pivot = selection_centroid(editor);
+    // The handle is grabbed where it was pressed; Alt+drag starts where the drag did.
+    let grab = editor.screen_to_mol(if by_handle { origin } else { at }, center);
+    let handle_at = handle.map_or(grab, |h| editor.screen_to_mol(h, center));
+    RotateDrag {
+        pivot,
+        last_angle: (grab[1] - pivot[1]).atan2(grab[0] - pivot[0]),
+        turned: 0.0,
+        applied: 0.0,
+        snap: by_handle,
+        handle_offset: [handle_at[0] - pivot[0], handle_at[1] - pivot[1]],
     }
-    let click_on_handle = (response.clicked() || response.double_clicked())
-        && response.interact_pointer_pos().is_some_and(on_handle);
-
-    // The flip button beside it: a click flips the selection over the bond that leaves it.
-    let flip_at = flip_button(editor, center);
-    let on_flip = |p: egui::Pos2| flip_at.is_some_and(|f| f.distance(p) <= ROTATE_HANDLE_HIT);
-    if !rotating && ui.input(|i| i.pointer.hover_pos()).is_some_and(on_flip) {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let click_on_flip = (response.clicked() || response.double_clicked())
-        && response.interact_pointer_pos().is_some_and(on_flip);
-
-    // Double-click an atom or bond → select that whole connected molecule.
-    if click_on_flip {
-        editor.lasso_path.clear();
-        modified |= editor.flip_selection();
-    } else if click_on_handle {
-        editor.lasso_path.clear();
-        // A double-click on the handle asks for the angle instead of a drag.
-        if response.double_clicked() {
-            editor.open_rotate_input();
-        }
-    } else if response.double_clicked() {
-        editor.lasso_path.clear();
-        let seed = editor.hovered_atom.or_else(|| {
-            editor.hovered_bond
-                .and_then(|bid| editor.molecule.bonds.iter().find(|b| b.id == bid))
-                .map(|b| b.begin)
-        });
-        if let Some(atom_id) = seed {
-            editor.selected_atoms = editor.molecule.connected_atoms(atom_id).into_iter().collect();
-            editor.selected_bonds.clear();
-        } else if let Some(id) = editor.hovered_object {
-            // Double-click a text (or a bracket, for its label) to edit it, a table's cell to
-            // enter its value.
-            if editor.molecule.object_by_id(id).is_some_and(|o| o.as_table().is_some()) {
-                // The release that completes a double-click may carry no interaction position.
-                let at = response
-                    .interact_pointer_pos()
-                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
-                    .unwrap_or(mouse);
-                if let Some(cell) = editor.table_cell_at(id, at) {
-                    modified |= editor.edit_table_cell(id, cell);
-                }
-            } else {
-                editor.edit_text(id);
-            }
-        }
-    } else if response.clicked() {
-        editor.lasso_path.clear();
-        if let Some(atom_id) = editor.hovered_atom {
-            if editor.selected_atoms.contains(&atom_id) {
-                editor.selected_atoms.remove(&atom_id);
-            } else {
-                editor.selected_atoms.insert(atom_id);
-            }
-        } else if let Some(id) = editor.hovered_object {
-            if !editor.selected_objects.remove(&id) {
-                editor.selected_objects.insert(id);
-            }
-        } else if let Some(bond_id) = editor.hovered_bond {
-            // A bond on its own (see `ChemStructEditor::selected_bonds`).
-            if !editor.selected_bonds.remove(&bond_id) {
-                editor.selected_bonds.insert(bond_id);
-            }
-        } else {
-            editor.selected_atoms.clear();
-            editor.selected_bonds.clear();
-            editor.selected_objects.clear();
-        }
-    }
-
-    if drag.started {
-        // As in the Bond tool, pick what the drag acts on at the press origin: by the time
-        // `drag_started()` fires the pointer may already have left the atom it was pressed on.
-        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
-        lasso_begin(editor, origin);
-        editor.object_drag = None;
-        // A drag of the rotation handle, or Alt+drag anywhere with a selection, rotates the
-        // selection around its centroid. The handle turns in 15° steps (Shift: freely), as an
-        // arrow's end does; Alt+drag is free.
-        let by_handle = on_handle(origin);
-        if by_handle || (ui.input(|i| i.modifiers.alt) && !editor.selected_atoms.is_empty()) {
-            editor.push_undo();
-            let pivot = selection_centroid(editor);
-            // The handle is grabbed where it was pressed; Alt+drag starts where the drag did.
-            let grab = editor.screen_to_mol(if by_handle { origin } else { mouse }, center);
-            let handle_at = handle.map_or(grab, |h| editor.screen_to_mol(h, center));
-            editor.rotate_drag = Some(RotateDrag {
-                pivot,
-                last_angle: (grab[1] - pivot[1]).atan2(grab[0] - pivot[0]),
-                turned: 0.0,
-                applied: 0.0,
-                snap: by_handle,
-                handle_offset: [handle_at[0] - pivot[0], handle_at[1] - pivot[1]],
-            });
-            editor.dragging_atom = None;
-        } else {
-            editor.rotate_drag = None;
-            editor.dragging_atom = None;
-            if let Some(end) = arrow_end_at(editor, origin, center) {
-                // An end of the lone selected arrow: drag that end.
-                editor.push_undo();
-                editor.object_drag = Some(end);
-            } else {
-                editor.dragging_atom = editor.hit_test_atom(origin, center);
-                if editor.dragging_atom.is_some() {
-                    // Snapshot once, before the first frame of movement, so the whole move is
-                    // one undo step (the Alt-rotation branch above does the same).
-                    editor.push_undo();
-                } else if let Some(id) = editor.hit_test_object(origin, center) {
-                    // A page object: move it, or the whole selection when it is part of it.
-                    editor.push_undo();
-                    editor.object_drag = Some(ObjectDrag::Move { with_selection: editor.selected_objects.contains(&id), id });
-                }
-            }
-        }
-    }
-
-    if drag.dragged {
-        if let Some(mut rot) = editor.rotate_drag.clone() {
-            // Rotate the selection by the change in cursor angle about its centroid.
-            let mp = editor.screen_to_mol(mouse, center);
-            let angle = (mp[1] - rot.pivot[1]).atan2(mp[0] - rot.pivot[0]);
-            let free = !rot.snap || ui.input(|i| i.modifiers.shift);
-            let delta = rot.advance(angle, free);
-            if delta != 0.0 {
-                rotate_selection(editor, rot.pivot, delta);
-                modified = true;
-            }
-            editor.rotate_drag = Some(rot);
-        } else if let Some(atom_id) = editor.dragging_atom {
-            let [dx, dy] = editor.view(center).screen_delta_to_mol(response.drag_delta());
-            let with_selection = editor.selected_atoms.contains(&atom_id);
-            let atoms_to_move: Vec<u32> = if with_selection {
-                editor.selected_atoms.iter().cloned().collect()
-            } else {
-                vec![atom_id]
-            };
-            for id in atoms_to_move {
-                if let Some(atom) = editor.molecule.atom_by_id_mut(id) {
-                    atom.pos[0] += dx;
-                    atom.pos[1] += dy;
-                }
-            }
-            if with_selection {
-                let moved = editor.selected_atoms.clone();
-                move_objects(editor, &editor.selected_objects.clone(), [dx, dy], &moved);
-            }
-            modified = true;
-        } else if let Some(drag) = editor.object_drag.clone() {
-            match drag {
-                ObjectDrag::Move { id, with_selection } => {
-                    let delta = editor.view(center).screen_delta_to_mol(response.drag_delta());
-                    if with_selection {
-                        let moved = editor.selected_atoms.clone();
-                        move_objects(editor, &editor.selected_objects.clone(), delta, &moved);
-                        let atoms: Vec<u32> = editor.selected_atoms.iter().copied().collect();
-                        move_atoms(editor, &atoms, delta);
-                    } else {
-                        move_objects(editor, &[id].into_iter().collect(), delta, &Default::default());
-                    }
-                }
-                ObjectDrag::ArrowEnd { id, head } => {
-                    let free = ui.input(|i| i.modifiers.shift);
-                    let to = editor.screen_to_mol(mouse, center);
-                    if let Some(PageObject::Arrow(a)) = editor.molecule.object_by_id_mut(id) {
-                        let (fixed, moving) = if head { (a.tail, &mut a.head) } else { (a.head, &mut a.tail) };
-                        *moving = if free { to } else { snap_direction(fixed, to, 15.0) };
-                    }
-                }
-                ObjectDrag::NewArrow { .. } => {}
-            }
-            modified = true;
-        } else {
-            editor.lasso_path.push(mouse);
-        }
-    }
-
-    if drag.stopped {
-        if editor.rotate_drag.take().is_some() {
-            // rotation finished
-        } else if editor.dragging_atom.is_some() {
-            editor.dragging_atom = None;
-        } else if editor.object_drag.take().is_some() {
-            // move finished
-        } else {
-            lasso_select(editor, center);
-        }
-        editor.lasso_path.clear();
-        editor.drag_origin_screen = None;
-    }
-
-    // ── Keyboard ─────────────────────────────────────────────────────────────
-    // Delete/Backspace: remove the selection, or fall back to the hovered atom/bond.
-    let delete_pressed =
-        ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-    if delete_pressed {
-        if editor.delete_selection() {
-            modified = true;
-        } else if delete_hovered(editor) {
-            modified = true;
-        }
-    }
-
-    modified |= handle_keys_select_tool(editor, ui);
-
-    modified
 }
 
-pub fn process_eraser_tool(
+/// Turn the selection as the pointer, now at `to` (molecule coordinates), has turned about the
+/// pivot. Shift turns freely where the handle would step.
+pub(crate) fn drag_rotation(editor: &mut ChemStructEditor, rot: &mut RotateDrag, to: [f32; 2], shift: bool) {
+    let angle = (to[1] - rot.pivot[1]).atan2(to[0] - rot.pivot[0]);
+    let delta = rot.advance(angle, !rot.snap || shift);
+    if delta != 0.0 {
+        rotate_selection(editor, rot.pivot, delta);
+    }
+}
+
+/// Move atom `atom_id` by `delta` (molecule coordinates), with the whole selection (page
+/// objects too) when it is part of it.
+pub(crate) fn drag_atom(editor: &mut ChemStructEditor, atom_id: u32, delta: [f32; 2]) {
+    if editor.selected_atoms.contains(&atom_id) {
+        let atoms: Vec<u32> = editor.selected_atoms.iter().copied().collect();
+        move_atoms(editor, &atoms, delta);
+        let moved = editor.selected_atoms.clone();
+        move_objects(editor, &editor.selected_objects.clone(), delta, &moved);
+    } else {
+        move_atoms(editor, &[atom_id], delta);
+    }
+}
+
+/// Go on with page-object drag `drag`: the pointer moved by `delta` and is now at `to` (both
+/// molecule coordinates). Shift lets an arrow point any way. The drag as it now stands.
+pub(crate) fn drag_object(
     editor: &mut ChemStructEditor,
-    response: &egui::Response,
-    _center: egui::Pos2,
-) -> bool {
-    let mut modified = false;
-    if response.clicked() {
-        if let Some(atom_id) = editor.hovered_atom {
-            editor.push_undo();
-            editor.molecule.remove_atom(atom_id);
-            modified = true;
-        } else if let Some(id) = editor.hovered_object {
-            editor.push_undo();
-            editor.molecule.remove_object(id);
-            editor.selected_objects.remove(&id);
-            editor.hovered_object = None;
-            modified = true;
-        } else if let Some(bond_id) = editor.hovered_bond {
-            editor.push_undo();
-            editor.molecule.remove_bond(bond_id);
-            modified = true;
+    drag: ObjectDrag,
+    delta: [f32; 2],
+    to: [f32; 2],
+    shift: bool,
+) -> ObjectDrag {
+    match drag {
+        ObjectDrag::Move { id, with_selection } => {
+            if with_selection {
+                let moved = editor.selected_atoms.clone();
+                move_objects(editor, &editor.selected_objects.clone(), delta, &moved);
+                let atoms: Vec<u32> = editor.selected_atoms.iter().copied().collect();
+                move_atoms(editor, &atoms, delta);
+            } else {
+                move_objects(editor, &[id].into_iter().collect(), delta, &Default::default());
+            }
+            drag
+        }
+        ObjectDrag::ArrowEnd { id, head } => {
+            if let Some(PageObject::Arrow(a)) = editor.molecule.object_by_id_mut(id) {
+                let (fixed, moving) = if head { (a.tail, &mut a.head) } else { (a.head, &mut a.tail) };
+                *moving = if shift { to } else { snap_direction(fixed, to, 15.0) };
+            }
+            drag
+        }
+        ObjectDrag::NewArrow { tail, kind, .. } => {
+            let head = if shift { to } else { snap_direction(tail, to, 15.0) };
+            ObjectDrag::NewArrow { tail, head, kind }
         }
     }
-    modified
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -713,15 +469,12 @@ pub(crate) const ROTATE_SNAP_DEG: f32 = 15.0;
 pub(crate) const ROTATE_HANDLE_GAP: f32 = 26.0;
 /// The radius the rotation handle is drawn with, and the one it is grabbed within (pixels).
 pub(crate) const ROTATE_HANDLE_RADIUS: f32 = 5.0;
-const ROTATE_HANDLE_HIT: f32 = 9.0;
+pub(crate) const ROTATE_HANDLE_HIT: f32 = 9.0;
 
 /// The top-centre of the selected atoms' bounding box on screen, which the rotation handle
-/// stands over. `None` unless the Select tool has two atoms or more selected: turning a single
+/// stands over, whatever the tool. `None` unless two atoms or more are selected: turning a single
 /// atom about itself moves nothing.
 pub(crate) fn rotation_handle_anchor(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
-    if editor.tool != crate::Tool::Select {
-        return None;
-    }
     selection_top(editor, center)
 }
 
@@ -744,10 +497,10 @@ pub(crate) fn selection_top(editor: &ChemStructEditor, center: egui::Pos2) -> Op
 /// rotation, wherever it has been turned to. `None` when there is no handle (see
 /// [`rotation_handle_anchor`]), and while the selection is being moved or a lasso drawn.
 pub(crate) fn rotation_handle(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
-    if let Some(rot) = &editor.rotate_drag {
+    if let Some(rot) = editor.rotate_drag() {
         return Some(editor.mol_to_screen(rot.handle_pos(), center));
     }
-    if editor.dragging_atom.is_some() || editor.object_drag.is_some() || editor.drag_origin_screen.is_some() {
+    if editor.gesture().is_some() {
         return None;
     }
     rotation_handle_anchor(editor, center).map(|top| top - egui::vec2(0.0, ROTATE_HANDLE_GAP))
@@ -756,7 +509,7 @@ pub(crate) fn rotation_handle(editor: &ChemStructEditor, center: egui::Pos2) -> 
 /// Where the flip button is on screen: left of the rotation handle, while the handle is shown
 /// at rest and one bond leaves the selection ([`flip_axis`]). `None` otherwise.
 pub(crate) fn flip_button(editor: &ChemStructEditor, center: egui::Pos2) -> Option<egui::Pos2> {
-    if editor.rotate_drag.is_some() {
+    if editor.rotate_drag().is_some() {
         return None;
     }
     let handle = rotation_handle(editor, center)?;
@@ -850,7 +603,7 @@ pub(crate) fn lone_selected_arrow(editor: &ChemStructEditor) -> Option<&PageArro
 }
 
 /// The end of the lone selected arrow under screen point `screen`, if any.
-fn arrow_end_at(editor: &ChemStructEditor, screen: egui::Pos2, center: egui::Pos2) -> Option<ObjectDrag> {
+pub(crate) fn arrow_end_at(editor: &ChemStructEditor, screen: egui::Pos2, center: egui::Pos2) -> Option<ObjectDrag> {
     let a = lone_selected_arrow(editor)?;
     let near = |p: [f32; 2]| editor.mol_to_screen(p, center).distance(screen) <= super::NODE_HIT_RADIUS_PX * 0.7;
     if near(a.head) {
@@ -887,218 +640,38 @@ fn move_objects(
     }
 }
 
-/// The Arrow tool: drag from tail to head to draw an arrow of `kind` (its direction snaps to
-/// 15° steps unless Shift is held), or click to place one of the default length pointing
-/// right. Delete removes what is under the pointer, as in the Bond tool.
-pub fn process_arrow_tool(
-    editor: &mut ChemStructEditor,
-    response: &egui::Response,
-    center: egui::Pos2,
-    ui: &egui::Ui,
-    kind: ArrowKind,
-) -> bool {
-    let mut modified = false;
-    let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
-    let drag = PrimaryDrag::of(response, ui);
-    if drag.started {
-        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(mouse);
-        let tail = editor.screen_to_mol(origin, center);
-        editor.object_drag = Some(ObjectDrag::NewArrow { tail, head: tail, kind });
+/// End an arrow drawn by dragging from `tail` to `head`. A drag too short to give it a direction
+/// draws nothing.
+pub(crate) fn finish_arrow(editor: &mut ChemStructEditor, tail: [f32; 2], head: [f32; 2], kind: ArrowKind) {
+    let (dx, dy) = (head[0] - tail[0], head[1] - tail[1]);
+    if (dx * dx + dy * dy).sqrt() >= DEFAULT_BOND_LENGTH * 0.25 {
+        editor.molecule.add_arrow(tail, head, kind);
     }
-    if drag.dragged {
-        let free = ui.input(|i| i.modifiers.shift);
-        let to = editor.screen_to_mol(mouse, center);
-        if let Some(ObjectDrag::NewArrow { tail, head, .. }) = &mut editor.object_drag {
-            *head = if free { to } else { snap_direction(*tail, to, 15.0) };
-        }
-    }
-    if drag.stopped {
-        if let Some(ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag.take() {
-            let (dx, dy) = (head[0] - tail[0], head[1] - tail[1]);
-            // A drag too short to give the arrow a direction draws nothing.
-            if (dx * dx + dy * dy).sqrt() >= DEFAULT_BOND_LENGTH * 0.25 {
-                editor.push_undo();
-                editor.molecule.add_arrow(tail, head, kind);
-                modified = true;
-            }
-        }
-    }
-    if response.clicked() {
-        let tail = editor.screen_to_mol(mouse, center);
-        editor.push_undo();
-        editor.molecule.add_arrow(tail, [tail[0] + DEFAULT_ARROW_LENGTH, tail[1]], kind);
-        modified = true;
-    }
-    let delete_pressed =
-        ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-    if delete_pressed && delete_hovered(editor) {
-        modified = true;
-    }
-    modified
-}
-
-/// The Text tool: a click on a text opens it for editing; a click anywhere else opens a new,
-/// empty text there (the click is on its first line, at its left end). Typing goes to the text
-/// box ([`ChemStructEditor::text_edit`]) until it is committed.
-pub fn process_text_tool(
-    editor: &mut ChemStructEditor,
-    response: &egui::Response,
-    center: egui::Pos2,
-    _ui: &egui::Ui,
-) -> bool {
-    if response.clicked() {
-        let mouse = response.interact_pointer_pos().unwrap_or(egui::Pos2::ZERO);
-        let on_text = editor
-            .hit_test_object(mouse, center)
-            .filter(|id| editor.molecule.object_by_id(*id).is_some_and(|o| o.as_text().is_some()));
-        match on_text {
-            Some(id) => {
-                editor.edit_text(id);
-            }
-            None => {
-                // The click marks the middle of the first line's capital letters, so the
-                // baseline sits a little below it.
-                let size = editor.config.style.label_size / super::SCALE_FACTOR;
-                let at = editor.screen_to_mol(mouse, center);
-                editor.text_edit = Some(super::TextEditState::new([at[0], at[1] + size * 0.35]));
-            }
-        }
-    }
-    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Key handling (Bond tool)
+// Keys
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn handle_keys_bond_tool(
-    editor: &mut ChemStructEditor,
-    response: &egui::Response,
-    center: egui::Pos2,
-    ui: &egui::Ui,
-) -> bool {
-    let mut modified = false;
-    // The hover `ChemStructEditor::show` worked out, where the pointer ended the frame.
-    let end_hover = Hover::of(editor);
-    let end_pointer = response.hover_pos().filter(|p| response.rect.contains(*p));
-
-    // Every key is taken in the order it was pressed, arrows included: a frame holding
-    // `ArrowLeft a` (a quick typist, or a slow frame) must aim the `a` where the arrow went,
-    // exactly as when the two keys arrive in frames of their own.
-    for PressedKey { key, shift, ctrl, alt, repeat: held, index } in &pressed_keys(ui) {
-        if let Some((dx, dy)) = arrow_direction(key) {
-            // A press like any other, it ends a ring repeat (see `take_ring_repeat`).
-            if !(*ctrl || *alt) {
-                editor.ring_repeat = None;
-            }
-            walk_keyboard_target(editor, dx, dy, *shift);
-            continue;
-        }
-        if *held || *ctrl || *alt { continue; }
-        hover_at_key(editor, ui, response, center, *index, end_pointer, end_hover);
-        let target = editor.keyboard_target();
-        let repeat = take_ring_repeat(editor, key);
-
-        // Hotspot / navigation keys
-        match key.as_str() {
-            "Enter" => {
-                if let Some(id) = editor.hovered_atom { editor.hotspot_atom = Some(id); }
-                continue;
-            }
-            "Space" | "Tab" => {
-                editor.hotspot_atom = None;
-                editor.hotspot_bond = None;
-                continue;
-            }
-            "g" | "G" => {
-                if let Some(id) = editor.hovered_atom { editor.hotspot_atom = Some(id); }
-                continue;
-            }
-            _ => {}
-        }
-
-        // ExpandLabel: x / X key — expands a label-named atom (e.g. "Bor") into its fragment
-        if key == "x" || key == "X" {
-            let target = editor.hovered_atom.or(editor.hotspot_atom);
-            if let Some(atom_id) = target {
-                // An undo step only for a label that expands; one with no reading is reported
-                // (`unexpanded_label`) unless it is a plain element, which has nothing to expand.
-                if label_reading(editor, atom_id).is_some() {
-                    editor.push_undo();
-                    if expand_label(editor, atom_id) { modified = true; }
-                } else if let Some(atom) = editor.molecule.atom_by_id(atom_id)
-                    && crate::molecule::elements::atomic_number(&atom.element).is_none()
-                {
-                    editor.unexpanded_label = Some(atom.element.clone());
-                }
-                continue;
-            }
-        }
-
-        // Open label-edit mode: backtick key
-        if key == "`" {
-            let target = editor.hovered_atom.or(editor.hotspot_atom);
-            if let Some(atom_id) = target {
-                let current = editor.molecule.atom_by_id(atom_id)
-                    .map(|a| a.element.clone())
-                    .unwrap_or_default();
-                editor.label_edit = Some((atom_id, current));
-                // Whatever follows the backtick in this frame is the label's text, not more
-                // shortcuts: `` `Ph `` in one frame used to fire `P` (benzene) and `h` here.
-                // The editor first reads input next frame, so it gets them then.
-                // (Ahead of any keystrokes an undo chord already handed on: they came later.)
-                let mut carry = keystrokes_after(ui, *index);
-                carry.append(&mut editor.carried_keys);
-                editor.carried_keys = carry;
-                if !editor.carried_keys.is_empty() {
-                    ui.ctx().request_repaint();
-                }
-                break;
-            }
-        }
-
-        // Target resolution, in priority order:
-        //  1. hovering an atom → act on it (change element / attach fragment)
-        //  2. else, a key that names an element → drop that atom at the cursor, ahead of any
-        //     stale hotspot (so O/N/S place a new atom rather than editing the hotspot)
-        //  3. else, a hovered bond, or a keyboard-selected bond → bond key (either beats a
-        //     stale atom hotspot so e.g. fusing a ring/fragment targets the bond, not the atom)
-        //  4. else, a hotspot → build from it (chains, rings, fused fragments)
-        //
-        // A ring with nowhere to go changes nothing, and must not become a step that undo spends
-        // a press on, or wipe the redo history; so the snapshot waits for the outcome.
-        if let Some(atom_id) = editor.hovered_atom {
-            modified |= press_on_atom(editor, atom_id, key, target, Aim::User);
-        } else if place_element_at_cursor(editor, key) {
-            modified = true;
-        } else if let Some(bond_id) = editor.hovered_bond.or(editor.hotspot_bond) {
-            let before = (editor.molecule.clone(), target);
-            let outcome = dispatch_bond_key(editor, bond_id, key);
-            if outcome != KeyOutcome::Nothing {
-                push_undo_of(editor, before);
-                modified = true;
-            }
-            // The mouse aims for itself, so only the keyboard's own target moves on.
-            if let (KeyOutcome::RingDrawn(ring), None) = (outcome, editor.hovered_bond)
-                && let Some(next) = next_bond_round_ring(editor, &ring, key)
-            {
-                editor.hotspot_bond = Some(next);
-            }
-        } else if let Some(atom_id) = repeat {
-            modified |= press_on_atom(editor, atom_id, key, target, Aim::Repeat);
-        } else if let Some(atom_id) = editor.hotspot_atom {
-            modified |= press_on_atom(editor, atom_id, key, target, Aim::User);
-        }
+/// Open the label box on atom `atom_id`, the backtick having been pressed at event `index`.
+pub(crate) fn open_label_edit(editor: &mut ChemStructEditor, ui: &egui::Ui, atom_id: u32, index: usize) {
+    let current = editor.molecule.atom_by_id(atom_id).map(|a| a.element.clone()).unwrap_or_default();
+    editor.label_edit = Some((atom_id, current));
+    // Whatever follows the backtick in this frame is the label's text, not more shortcuts:
+    // `` `Ph `` in one frame used to fire `P` (benzene) and `h`. The box first reads input next
+    // frame, so it gets them then (ahead of any keystrokes an undo chord already handed on:
+    // they came later).
+    let mut carry = keystrokes_after(ui, index);
+    carry.append(&mut editor.carried_keys);
+    editor.carried_keys = carry;
+    if !editor.carried_keys.is_empty() {
+        ui.ctx().request_repaint();
     }
-    // The frame ends with the pointer where it ended up, for drawing and its own gestures.
-    end_hover.restore(editor);
-
-    modified
 }
 
 /// The hover state [`ChemStructEditor::show`] sets each frame.
 #[derive(Clone, Copy)]
-struct Hover {
+pub(crate) struct Hover {
     atom: Option<u32>,
     bond: Option<u32>,
     object: Option<u32>,
@@ -1108,7 +681,7 @@ struct Hover {
 }
 
 impl Hover {
-    fn of(editor: &ChemStructEditor) -> Self {
+    pub(crate) fn of(editor: &ChemStructEditor) -> Self {
         Self {
             atom: editor.hovered_atom,
             bond: editor.hovered_bond,
@@ -1117,7 +690,7 @@ impl Hover {
         }
     }
 
-    fn restore(self, editor: &mut ChemStructEditor) {
+    pub(crate) fn restore(self, editor: &mut ChemStructEditor) {
         editor.hovered_atom = self.atom;
         editor.hovered_bond = self.bond;
         editor.hovered_object = self.object;
@@ -1135,7 +708,7 @@ impl Hover {
 /// sweeping to the next — acted where the pointer arrived instead: on the next atom, or, past
 /// the atoms, on the keyboard hotspot. Likewise a key pressed just before the pointer left the
 /// canvas. `end_pointer` and `end_hover` are where the frame ends and the hover there.
-fn hover_at_key(
+pub(crate) fn hover_at_key(
     editor: &mut ChemStructEditor,
     ui: &egui::Ui,
     response: &egui::Response,
@@ -1163,7 +736,7 @@ fn hover_at_key(
 }
 
 /// The direction an arrow key walks in, if `key` is one.
-fn arrow_direction(key: &str) -> Option<(f32, f32)> {
+pub(crate) fn arrow_direction(key: &str) -> Option<(f32, f32)> {
     match key {
         "ArrowRight" => Some((1.0, 0.0)),
         "ArrowLeft" => Some((-1.0, 0.0)),
@@ -1173,7 +746,7 @@ fn arrow_direction(key: &str) -> Option<(f32, f32)> {
     }
 }
 
-/// Arrow key navigation (Bond tool), auto-repeat included.
+/// Arrow key navigation, auto-repeat included.
 ///
 /// Plain arrow walks the hotspot atom to the neighbour in that direction. Shift+arrow
 /// instead targets the *bond* to that neighbour: bond actions (order, stereo, ring and
@@ -1184,7 +757,7 @@ fn arrow_direction(key: &str) -> Option<(f32, f32)> {
 /// at the *end* of the frame, so a Shift released in the arrow's frame made Shift+arrow walk
 /// the atom instead, and a Shift pressed for the next key (`ArrowLeft E`) made a plain arrow
 /// target a bond.
-fn walk_keyboard_target(editor: &mut ChemStructEditor, dx: f32, dy: f32, shift: bool) {
+pub(crate) fn walk_keyboard_target(editor: &mut ChemStructEditor, dx: f32, dy: f32, shift: bool) {
     match editor.hotspot_atom {
         Some(src_id) => {
             if let Some(next) = navigate_direction(&editor.molecule, src_id, dx, dy) {
@@ -1212,7 +785,7 @@ fn walk_keyboard_target(editor: &mut ChemStructEditor, dx: f32, dy: f32, shift: 
 
 /// Press `key` on atom `atom_id` as one undo step, if it changes anything, with `target` as where
 /// undo goes back to aiming. Returns whether it did.
-fn press_on_atom(
+pub(crate) fn press_on_atom(
     editor: &mut ChemStructEditor,
     atom_id: u32,
     key: &str,
@@ -1249,7 +822,7 @@ fn push_undo_of(
 /// a sheet: the first free bond in that sense is the one against what is already there, so the
 /// rings wind round the first one in a spiral with no gaps, where the bond opposite would give a
 /// ribbon one ring wide.
-fn next_bond_round_ring(editor: &mut ChemStructEditor, ring: &[u32], key: &str) -> Option<u32> {
+pub(crate) fn next_bond_round_ring(editor: &mut ChemStructEditor, ring: &[u32], key: &str) -> Option<u32> {
     let positions: Vec<[f32; 2]> = ring
         .iter()
         .filter_map(|&id| editor.molecule.atom_by_id(id).map(|a| a.pos))
@@ -1332,104 +905,13 @@ fn aim_ring_repeat(editor: &mut ChemStructEditor, outcome: KeyOutcome, key: &str
 /// The atom this press of `key` is the repeat of a ring press on, if it is one. Any press but a
 /// chord ends the repeat, so an arrow or another key finds the hotspot as the ring left it, and
 /// Ctrl+Z does not spend the repeat it has just put back.
-fn take_ring_repeat(editor: &mut ChemStructEditor, key: &str) -> Option<u32> {
+pub(crate) fn take_ring_repeat(editor: &mut ChemStructEditor, key: &str) -> Option<u32> {
     editor
         .ring_repeat
         .take()
         .filter(|r| r.key == key && editor.hotspot_atom == Some(r.from))
         .map(|r| r.atom)
         .filter(|&id| editor.molecule.atom_by_id(id).is_some())
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Key handling (Select tool)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn handle_keys_select_tool(editor: &mut ChemStructEditor, ui: &egui::Ui) -> bool {
-    let mut modified = false;
-    let keys = pressed_key_strings(ui);
-
-    for (key, _shift, ctrl, alt) in &keys {
-        let repeat = if *ctrl || *alt {
-            None
-        } else {
-            take_ring_repeat(editor, key)
-        };
-
-        // Hotspot keys
-        match key.as_str() {
-            "Enter" => {
-                if let Some(id) = editor.hovered_atom { editor.hotspot_atom = Some(id); }
-                continue;
-            }
-            "Space" | "Tab" => {
-                editor.hotspot_atom = None;
-                editor.hotspot_bond = None;
-                continue;
-            }
-            "g" | "G" => {
-                // Fall back to the hotspot: this is the only key that grows the selection,
-                // so requiring a hovered atom left selection (and therefore Delete, move and
-                // rotate) completely unreachable without a pointer.
-                if let Some(id) = editor.hovered_atom.or(editor.hotspot_atom) {
-                    editor.hotspot_atom = Some(id);
-                    editor.selected_atoms.insert(id);
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        if !ctrl && !alt {
-            let atom_target = editor.hovered_atom.or(repeat).or(editor.hotspot_atom);
-            let aim = if editor.hovered_atom.is_none() && repeat.is_some() {
-                Aim::Repeat
-            } else {
-                Aim::User
-            };
-            if let Some(atom_id) = atom_target {
-                let outcome = dispatch_atom_key(editor, atom_id, key, aim);
-                modified |= outcome != KeyOutcome::Nothing;
-                aim_ring_repeat(editor, outcome, key);
-            }
-        }
-
-        // Selection arrow operations (Ctrl/Alt/Shift+arrows)
-        if *ctrl || *alt || *_shift {
-            let actions: Vec<SelectionAction> = editor.config.selection_shortcuts.iter()
-                .filter(|s| {
-                    s.key == *key
-                    && s.ctrl  == *ctrl
-                    && s.alt   == *alt
-                    && s.shift == *_shift
-                })
-                .map(|s| s.action.clone())
-                .collect();
-            for action in actions {
-                apply_selection_action(editor, &action);
-                modified = true;
-            }
-        }
-    }
-
-    // Hotspot arrow navigation (no modifier)
-    if let Some(src_id) = editor.hotspot_atom {
-        let dir = ui.input(|i| {
-            let no_mod = !i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt;
-            if no_mod && i.key_pressed(egui::Key::ArrowRight) { Some((1.0_f32,  0.0_f32)) }
-            else if no_mod && i.key_pressed(egui::Key::ArrowLeft)  { Some((-1.0,  0.0)) }
-            else if no_mod && i.key_pressed(egui::Key::ArrowUp)    { Some((0.0, -1.0)) }
-            else if no_mod && i.key_pressed(egui::Key::ArrowDown)  { Some((0.0,  1.0)) }
-            else { None }
-        });
-        if let Some((dx, dy)) = dir {
-            if let Some(next) = navigate_direction(&editor.molecule, src_id, dx, dy) {
-                editor.hotspot_atom = Some(next);
-            }
-        }
-    }
-
-    modified
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1458,7 +940,7 @@ fn dispatch_atom_key(
 
 /// How a press came to be on the atom it is on.
 #[derive(Clone, Copy, PartialEq)]
-enum Aim {
+pub(crate) enum Aim {
     /// The user pointed at it, with the mouse or the arrows.
     User,
     /// It is the same ring key again, going on from where the last ring left off. That can be a
@@ -1468,7 +950,7 @@ enum Aim {
 
 /// What a key did to the atom or bond it was pressed on.
 #[derive(PartialEq)]
-enum KeyOutcome {
+pub(crate) enum KeyOutcome {
     /// Nothing changed: no such key, or no room for what it draws.
     Nothing,
     /// The target was edited, or something with no ring through it was drawn on it.
@@ -1478,7 +960,7 @@ enum KeyOutcome {
     RingDrawn(Vec<u32>),
 }
 
-fn dispatch_bond_key(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> KeyOutcome {
+pub(crate) fn dispatch_bond_key(editor: &mut ChemStructEditor, bond_id: u32, key: &str) -> KeyOutcome {
     let actions: Vec<BondAction> = editor.config.bond_shortcuts.iter()
         .filter(|s| s.key == key && !s.ctrl && !s.alt)
         .map(|s| s.action.clone())
@@ -1554,6 +1036,8 @@ fn apply_atom_action(
                     }
                 }
 
+                // The fragment's first bond takes the place of a hydrogen it displaces.
+                make_room_for_bond(editor, atom_id);
                 // Detect best orientation: angle + flip to keep ring bulk away from existing bonds
                 let (angle, flip) = editor.best_fragment_placement(atom_id, &frag);
                 let on_ring = crate::molecule::fragment::ring_membership(&frag);
@@ -1645,7 +1129,7 @@ fn apply_bond_action(
     }
 }
 
-fn apply_selection_action(editor: &mut ChemStructEditor, action: &SelectionAction) {
+pub(crate) fn apply_selection_action(editor: &mut ChemStructEditor, action: &SelectionAction) {
     const STEP: f32 = DEFAULT_BOND_LENGTH;
     const ROTATE_DEG: f32 = std::f32::consts::PI / 12.0; // 15°
 
@@ -1672,6 +1156,7 @@ fn extend_chain(editor: &mut ChemStructEditor, from_atom_id: u32, n: usize) {
     let snap = crate::molecule::Molecule::SNAP_RADIUS;
     let mut current = from_atom_id;
     for _ in 0..n {
+        make_room_for_bond(editor, current);
         let angle = editor.best_new_bond_angle(current);
         let new_pos = {
             let src = editor.molecule.atom_by_id(current).unwrap();
@@ -2240,31 +1725,22 @@ fn rotate_atoms(editor: &mut ChemStructEditor, ids: &[u32], angle: f32) {
 // Key-string helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Returns (key_str, shift, ctrl, alt) for each key pressed this frame (no repeat).
-fn pressed_key_strings(ui: &egui::Ui) -> Vec<(String, bool, bool, bool)> {
-    pressed_keys(ui)
-        .into_iter()
-        .filter(|k| !k.repeat)
-        .map(|k| (k.key, k.shift, k.ctrl, k.alt))
-        .collect()
-}
-
 /// A key pressed this frame, in the order the presses came.
-struct PressedKey {
+pub(crate) struct PressedKey {
     /// As [`key_to_str`] names it.
-    key: String,
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
+    pub(crate) key: String,
+    pub(crate) shift: bool,
+    pub(crate) ctrl: bool,
+    pub(crate) alt: bool,
     /// An auto-repeat of a key held down.
-    repeat: bool,
+    pub(crate) repeat: bool,
     /// Where the press sits in this frame's `InputState::events`.
-    index: usize,
+    pub(crate) index: usize,
 }
 
 /// Every key pressed this frame that [`key_to_str`] names, auto-repeats included, each with
 /// the modifiers held *at that press* (not the frame's final modifier state).
-fn pressed_keys(ui: &egui::Ui) -> Vec<PressedKey> {
+pub(crate) fn pressed_keys(ui: &egui::Ui) -> Vec<PressedKey> {
     ui.input(|i| {
         i.events.iter().enumerate().filter_map(|(index, event)| match event {
             egui::Event::Key { key, pressed: true, modifiers, repeat, .. } => Some(PressedKey {
@@ -2347,6 +1823,9 @@ pub(crate) fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
         Enter  => "Enter",
         Space  => "Space",
         Tab    => "Tab",
+        Delete    => "Delete",
+        Backspace => "Backspace",
+        Escape    => "Escape",
         _ => return None,
     };
     Some(s.to_string())
@@ -2362,7 +1841,7 @@ pub(crate) fn key_to_str(key: egui::Key, shift: bool) -> Option<String> {
 
 /// The fragment the label of `atom_id` expands into, read for the bonds the atom has
 /// ([`resolve_label_on`](crate::label_chain::resolve_label_on)); `None` when it has no reading.
-fn label_reading(
+pub(crate) fn label_reading(
     editor: &ChemStructEditor,
     atom_id: u32,
 ) -> Option<crate::molecule::fragment::Fragment> {
@@ -2486,7 +1965,7 @@ fn label_placement(
 /// alcohol) and made most structures unbuildable. Deferring to the hotspot instead lets
 /// `dispatch_atom_key` retarget that atom, which is how a heteroatom joins the structure.
 /// Space/Tab drops the hotspot when a separate component really is wanted.
-fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
+pub(crate) fn place_element_at_cursor(editor: &mut ChemStructEditor, key: &str) -> bool {
     if !editor.pointer_active && editor.hotspot_atom.is_some() {
         return false;
     }
@@ -2525,7 +2004,7 @@ mod tests {
 
     /// Regression test: dragging from an existing atom out into empty space (Bond tool)
     /// should draw a bond to a newly created atom at the drop point, not silently do
-    /// nothing (see the `process_bond_tool` drag_stopped handler).
+    /// nothing (see `finish_bond`).
     #[test]
     fn bond_tool_drag_from_atom_to_empty_space_creates_bonded_atom() {
         let ctx = egui::Context::default();
@@ -2866,7 +2345,7 @@ mod tests {
         assert!(rotation_handle(&editor, MID).is_none(), "a single atom has nothing to turn");
         editor.selected_atoms.insert(b);
         editor.tool = crate::Tool::Bond;
-        assert!(rotation_handle(&editor, MID).is_none(), "the handle belongs to the Select tool");
+        assert!(rotation_handle(&editor, MID).is_some(), "the handle is there whatever the tool");
         let _ = a;
     }
 
@@ -2893,7 +2372,7 @@ mod tests {
         assert_eq!((bond.begin, bond.end), (a, b), "the wedge keeps its narrow end on the same atom");
         assert_eq!(bond.stereo, BondStereo::WedgeUp);
         assert_eq!(editor.selected_atoms, [a, b].into_iter().collect(), "the selection is kept");
-        assert!(editor.rotate_drag.is_none(), "the rotation ends with the drag");
+        assert!(editor.rotate_drag().is_none(), "the rotation ends with the drag");
 
         assert_eq!(editor.undo_stack.len(), 1, "one rotation pushes exactly one undo snapshot");
         assert!(editor.undo(), "the rotation is undoable");
