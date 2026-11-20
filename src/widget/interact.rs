@@ -2002,6 +2002,27 @@ mod tests {
     use crate::config::{AtomAction, AtomShortcut};
     use crate::testkit::run_frame;
 
+    /// The aryl groups whose arms are themselves labels (TDP: three OC12H25; TTP: three TEG)
+    /// expand onto a methyl: the ring is drawn, the arms stay labels, and the arms count as the
+    /// atoms they stand for.
+    #[test]
+    fn aryl_groups_with_labelled_arms_expand() {
+        use crate::reaction::MolecularFormula;
+        for (name, arm, formula) in [("TDP", "OC12H25", "C43H80O3"), ("TTP", "TEG", "C28H50O12")] {
+            let mut editor = ChemStructEditor::default();
+            let c = editor.molecule.add_atom("C".into(), [0.0, 0.0], 0);
+            let g = editor.molecule.add_atom(name.into(), [1.5, 0.0], 0);
+            editor.molecule.add_bond(c, g, BondOrder::Single);
+            assert!(expand_label(&mut editor, g), "{name} expands");
+            let arms = editor.molecule.atoms.iter().filter(|a| a.element == arm).count();
+            let carbons = editor.molecule.atoms.iter().filter(|a| a.element == "C").count();
+            assert_eq!((arms, carbons), (3, 7), "{name}: a ring of six on the methyl, three {arm} arms");
+            let after = MolecularFormula::of(&editor.molecule);
+            assert!(after.unknown_elements().is_empty(), "{name}: every arm is understood: {:?}", after.unknown_elements());
+            assert_eq!(after.plain(), formula, "{name} on a methyl");
+        }
+    }
+
     /// Regression test: dragging from an existing atom out into empty space (Bond tool)
     /// should draw a bond to a newly created atom at the drop point, not silently do
     /// nothing (see `finish_bond`).
