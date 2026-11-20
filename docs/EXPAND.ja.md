@@ -84,9 +84,11 @@ Expand する経路でも同じ結果になります。
 | `TBS` | *tert*-ブチルジメチルシリル基（Si(CH₃)₂C(CH₃)₃）。Si が接続点 | `assets/fragments/TBS.json`（組み込み） |
 | `BPin` | ピナコールボロン酸エステル（4,4,5,5-テトラメチル-1,3,2-ジオキサボロラン）。B が接続点 | `assets/fragments/BPin.json`（組み込み） |
 | `NO2` | ニトロ基（N⁺(=O)(O⁻) の電荷分離表記）。N が接続点 | `assets/fragments/NO2.json`（組み込み） |
-| `Benz` | ベンジル系置換基（–CH₂–C₆H₅、末端の CH₂ が接続点）。8 原子中 7 原子が新規追加 | `fragments/Benz.json`（ユーザー追加） |
+| `Benz` | ベンジル基（–CH₂–C₆H₅）。CH₂ が接続点で、ラベルの原子がそのまま CH₂ になる | `assets/fragments/Benz.json`（組み込み） |
 | `Ts` | トシル基（*p*-トルエンスルホニル、CH₃–C₆H₄–SO₂–）。S が接続点 | `assets/fragments/Ts.json`（組み込み） |
-| `TEG` | トリエチレングリコール鎖（–O–CH₂CH₂–O–CH₂CH₂–O–CH₂CH₂–O–CH₃ 相当）。末端 CH₂ が接続点 | `fragments/TEG.json`（ユーザー追加） |
+| `TEG` | トリエチレングリコール鎖（–O–CH₂CH₂–O–CH₂CH₂–O–CH₂CH₂–O–CH₃）。先頭の O が接続点 | `assets/fragments/TEG.json`（組み込み） |
+| `TDP` | 3,4,5-トリス(ドデシルオキシ)フェニル基。3 本の腕は `OC12H25` ラベルのまま置かれる。ipso 炭素が接続点 | `assets/fragments/TDP.json`（組み込み） |
+| `TTP` | 3,4,5-トリス(TEG)フェニル基。3 本の腕は `TEG` ラベルのまま置かれる（`TEG` をさらに展開できる）。ipso 炭素が接続点 | `assets/fragments/TTP.json`（組み込み） |
 | `C2H5` | エチル鎖（炭素 2 個） | `fragments/C2H5.json`（ユーザー追加） |
 | `C3H7` | *n*-プロピル鎖（炭素 3 個） | `fragments/C3H7.json`（ユーザー追加） |
 | `C4H9` | *n*-ブチル鎖（炭素 4 個） | `fragments/C4H9.json`（ユーザー追加） |
