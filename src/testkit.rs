@@ -88,12 +88,9 @@ pub(crate) fn run_frame_with_modifiers(
 /// A `Ctrl+` or `Alt+` prefix suppresses the implied shift on an uppercase letter, so
 /// `Ctrl+Z` is undo and `Ctrl+Shift+Z` is redo — matching conventional notation.
 ///
-/// Note `Delete` / `Backspace` / `Escape` are accepted here but deliberately have no
-/// `key_to_str` mapping in the widget; they reach handlers only via `Input::key_pressed`.
-///
 /// Returns a **press followed by a release**. The release is not optional: egui marks a
-/// press as `repeat: true` when the key is already down, and `pressed_key_strings` drops
-/// repeats — so a held key makes the second and later frames of `c 1 1 1` silently no-op.
+/// press as `repeat: true` when the key is already down, and the canvas drops repeats (but
+/// for the arrows) — so a held key makes the second and later frames of `c 1 1 1` silently no-op.
 pub(crate) fn chord(spec: &str) -> (Vec<egui::Event>, egui::Modifiers) {
     let mut ctrl = false;
     let mut alt = false;
@@ -222,9 +219,9 @@ pub(crate) fn text_frames(ctx: &egui::Context, editor: &mut ChemStructEditor, te
 /// resurrects the phantom-cursor behaviour, every keyboard test fails loudly instead of
 /// silently testing the mouse path.
 ///
-/// One chord per frame is required, not stylistic: `pressed_key_strings` filters on
-/// `repeat: false`, and the arrow-key handlers use `Input::key_pressed`, which is
-/// edge-triggered per frame. (A `text:` token spends two frames; see [`text_frames`].)
+/// One chord per frame is required, not stylistic: the canvas drops key presses marked
+/// `repeat: true`, which egui marks a press of a key still down. (A `text:` token spends two
+/// frames; see [`text_frames`].)
 pub(crate) fn kbd_frame(ctx: &egui::Context, editor: &mut ChemStructEditor, spec: &str) {
     match spec.strip_prefix(TEXT_PREFIX) {
         Some(text) => text_frames(ctx, editor, text),
@@ -606,7 +603,7 @@ mod tests {
     /// A chord must be delivered on *every* frame, including when the same key repeats.
     ///
     /// egui stamps `repeat: true` on a press whose key is still down, and
-    /// `pressed_key_strings` drops repeats — so without the release event in [`chord`], the
+    /// the canvas drops repeats — so without the release event in [`chord`], the
     /// second `o` here is silently swallowed and the test reads as "the app cannot place two
     /// oxygens", which is false. Any golden sequence with a doubled key depends on this.
     #[test]

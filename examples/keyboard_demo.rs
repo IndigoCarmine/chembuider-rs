@@ -114,7 +114,7 @@ struct Chord {
 /// Undo、`Ctrl+Shift+Z` は Redo という慣用表記どおりに読める。
 ///
 /// 返すのは**押下と離上の 2 イベント**で、離上は省略できない。egui は押しっぱなしのキーの
-/// 押下に `repeat: true` を立て、`pressed_key_strings` は repeat を捨てるので、離上を送らない
+/// 押下に `repeat: true` を立て、キャンバスは repeat を捨てるので、離上を送らない
 /// と `c 1 1 1` の 2 個目以降が黙って無視される。
 ///
 /// `testkit::chord` と違い、未知のトークンでは panic せずエラーを返す。ゴールデン列は
@@ -441,8 +441,7 @@ impl Replay {
     /// このフレームに 1 コードぶんの入力を egui へ流し込む。
     ///
     /// **1 フレームに 1 コードまで**というのは様式ではなく必須の制約。egui は押しっぱなしの
-    /// キーの押下に `repeat: true` を立て、ウィジェット側の `pressed_key_strings` は repeat を
-    /// 捨てる。矢印キーのハンドラも `Input::key_pressed` のフレーム単位のエッジを見ている。
+    /// キーの押下に `repeat: true` を立て、キャンバスは（矢印キー以外の）repeat を捨てる。
     /// 同じフレームに 2 個詰め込むと、片方が黙って無かったことになる。
     fn emit(&mut self, ctx: &egui::Context) -> Emitted {
         let token = self.tokens[self.idx].clone();

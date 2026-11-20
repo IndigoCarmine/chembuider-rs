@@ -109,15 +109,15 @@ impl App for EditorApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Tool:");
                 if ui.selectable_label(self.editor.tool == Tool::Select, "⬚ Select").clicked() {
-                    self.editor.tool = Tool::Select;
+                    self.editor.set_tool(Tool::Select);
                     self.status = tool_status(Tool::Select);
                 }
                 if ui.selectable_label(self.editor.tool == Tool::Bond, "✏ Bond").clicked() {
-                    self.editor.tool = Tool::Bond;
+                    self.editor.set_tool(Tool::Bond);
                     self.status = tool_status(Tool::Bond);
                 }
                 if ui.selectable_label(self.editor.tool == Tool::Eraser, "✖ Eraser").clicked() {
-                    self.editor.tool = Tool::Eraser;
+                    self.editor.set_tool(Tool::Eraser);
                     self.status = tool_status(Tool::Eraser);
                 }
                 for (tool, label) in [
@@ -126,7 +126,7 @@ impl App for EditorApp {
                     (Tool::Text, "T Text"),
                 ] {
                     if ui.selectable_label(self.editor.tool == tool, label).clicked() {
-                        self.editor.tool = tool.clone();
+                        self.editor.set_tool(tool.clone());
                         self.status = tool_status(tool);
                     }
                 }

@@ -18,6 +18,7 @@ mod appearance_tests;
 pub mod rich_text;
 pub mod scene;
 pub mod text_format;
+pub(crate) mod tools;
 pub mod view;
 
 #[cfg(test)]
@@ -202,19 +203,12 @@ pub struct ChemStructEditor {
     /// covered through them without being listed here.
     pub selected_bonds: HashSet<u32>,
 
-    pub dragging_atom: Option<u32>,
-    pub drag_start_mol: Option<[f32; 2]>,
-
-    pub bond_start: Option<u32>,
-    pub preview_end_screen: Option<egui::Pos2>,
+    /// The drag in progress (drawing a bond, a lasso, moving or turning things): see
+    /// [`tools::Gesture`].
+    gesture: Option<tools::ActiveGesture>,
 
     pub hovered_atom: Option<u32>,
     pub hovered_bond: Option<u32>,
-
-    pub lasso_path: Vec<egui::Pos2>,
-
-    // Track drag origin to distinguish click vs drag
-    pub drag_origin_screen: Option<egui::Pos2>,
 
     /// The "active" atom for keyboard navigation (hotspot).
     pub hotspot_atom: Option<u32>,
@@ -298,9 +292,6 @@ pub struct ChemStructEditor {
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
-    /// While rotating the selection (Alt+drag, or a drag of the rotation handle).
-    pub(crate) rotate_drag: Option<interact::RotateDrag>,
-
     /// The angle box, while it is open: the selection is turned by the angle typed into it
     /// (see [`open_rotate_input`](Self::open_rotate_input)).
     rotate_edit: Option<RotateEdit>,
@@ -329,9 +320,6 @@ pub struct ChemStructEditor {
 
     /// The page text being typed, while the text box is open. Keyboard input goes to it.
     pub text_edit: Option<TextEditState>,
-
-    /// A drag on page objects in progress (drawing an arrow, moving objects, an arrow's end).
-    pub(crate) object_drag: Option<interact::ObjectDrag>,
 
     /// A reaction-table cell being typed into, while its box is open.
     pub table_edit: Option<TableCellEdit>,
@@ -368,14 +356,9 @@ impl Default for ChemStructEditor {
             pan: egui::Vec2::ZERO,
             selected_atoms: HashSet::new(),
             selected_bonds: HashSet::new(),
-            dragging_atom: None,
-            drag_start_mol: None,
-            bond_start: None,
-            preview_end_screen: None,
+            gesture: None,
             hovered_atom: None,
             hovered_bond: None,
-            lasso_path: Vec::new(),
-            drag_origin_screen: None,
             hotspot_atom: None,
             hotspot_bond: None,
             ring_repeat: None,
@@ -394,7 +377,6 @@ impl Default for ChemStructEditor {
             cleanup_job: None,
             cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
-            rotate_drag: None,
             rotate_edit: None,
             rotate_last_text: "90".to_string(),
             last_label_rects: std::collections::HashMap::new(),
@@ -403,7 +385,6 @@ impl Default for ChemStructEditor {
             selected_objects: HashSet::new(),
             hovered_object: None,
             text_edit: None,
-            object_drag: None,
             table_edit: None,
             last_object_rects: std::collections::HashMap::new(),
             last_table_cells: std::collections::HashMap::new(),
@@ -415,7 +396,7 @@ impl Default for ChemStructEditor {
 
 /// Where the keyboard is aiming: [`hotspot_atom`](ChemStructEditor::hotspot_atom) and
 /// [`hotspot_bond`](ChemStructEditor::hotspot_bond).
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct KeyboardTarget {
     atom: Option<u32>,
     bond: Option<u32>,
@@ -424,7 +405,7 @@ pub(crate) struct KeyboardTarget {
 
 /// Where pressing a ring key again goes on from: the hotspot the ring left, or if that has no room
 /// another atom of the ring.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct RingRepeat {
     /// The key that drew the ring.
     pub(crate) key: String,
@@ -1240,7 +1221,7 @@ impl ChemStructEditor {
         self.label_edit = None;
         self.text_edit = None;
         self.table_edit = None;
-        self.object_drag = None;
+        self.gesture = None;
         self.rotate_edit = None;
     }
 
@@ -2239,11 +2220,14 @@ impl ChemStructEditor {
         // the fit lands in this very frame. Not while a text field (the label editor, or a host
         // field such as the fragment-name input) takes the keyboard. The atom and bond drawing
         // shortcuts skip Ctrl-modified keys, so this never also fires the plain `0` shortcut.
+        // A text field of the host's (only a text field: a focused button does not type) has the
+        // keyboard.
+        let host_typing = ui.ctx().text_edit_focused();
         let text_input = self.label_edit.is_some()
             || self.text_edit.is_some()
             || self.table_edit.is_some()
             || self.rotate_edit.is_some()
-            || ui.ctx().egui_wants_keyboard_input();
+            || host_typing;
         if !text_input && ui.input(|i| chord_pressed(i, egui::Key::Num0, |m| m.ctrl)) {
             self.request_fit();
         }
@@ -2326,22 +2310,15 @@ impl ChemStructEditor {
             }
         }
 
-        // Ctrl+1/2/3: switch tool. Handled here, above the tool dispatch, because the Bond
-        // tool discards every Ctrl-modified key and there was otherwise no way to leave a
-        // tool without clicking the toolbar.
+        // Ctrl+1/2/3: switch tool. Handled here, above the tool dispatch, which takes no
+        // Ctrl-modified key but the selection shortcuts.
         for (key, tool) in [
             (egui::Key::Num1, Tool::Select),
             (egui::Key::Num2, Tool::Bond),
             (egui::Key::Num3, Tool::Eraser),
         ] {
             if ui.input(|i| chord_pressed(i, key, |m| m.ctrl)) {
-                self.tool = tool;
-                // Targets and in-flight gestures belong to the tool that was active.
-                self.hotspot_bond = None;
-                self.bond_start = None;
-                self.lasso_path.clear();
-                self.drag_origin_screen = None;
-                self.preview_end_screen = None;
+                self.set_tool(tool);
             }
         }
 
@@ -2354,7 +2331,7 @@ impl ChemStructEditor {
         let did_redo = redo_pressed && !own_undo && self.redo();
 
         // Copy/paste only act on the canvas when no text field has focus.
-        let editing_text = ui.ctx().egui_wants_keyboard_input();
+        let editing_text = text_input;
 
         // Copy (Ctrl/Cmd+C): egui converts the shortcut into Event::Copy/Cut — `key_pressed(C)`
         // does NOT fire — so we listen for those events (with a raw-key fallback). On Windows
@@ -2549,30 +2526,27 @@ impl ChemStructEditor {
         let (rotate_committed, rotate_closed) = self.show_rotate_edit(ui, center, response.id);
         let rotate_editing = self.rotate_edit.is_some() || rotate_closed;
 
-        // Suppress canvas key/mouse handling whenever a text field (our label editor or a
-        // toolbar field like the fragment-name input) has keyboard focus, so typed characters
-        // don't leak into atom/bond shortcuts; also while a background cleanup is rewriting
-        // positions (editing would fight the worker).
-        let canvas_input = !(label_editing || label_focus_lost || text_editing || rotate_editing || cleaning
-            || ui.ctx().egui_wants_keyboard_input());
-        let tool_modified = if canvas_input {
-            match self.tool.clone() {
-                Tool::Bond   => interact::process_bond_tool(self, &response, center, ui),
-                Tool::Select => interact::process_select_tool(self, &response, center, ui),
-                Tool::Eraser => interact::process_eraser_tool(self, &response, center),
-                Tool::Arrow(kind) => interact::process_arrow_tool(self, &response, center, ui, kind),
-                Tool::Text => interact::process_text_tool(self, &response, center, ui),
-            }
-        } else {
-            false
-        };
+        // What the canvas takes this frame (see `tools` for the rules):
+        // - the pointer, unless one of the editor's own boxes is open or closed this frame (the
+        //   click that closes one is spent on that), or a cleanup is rewriting the positions
+        //   (editing would fight the worker). A host's text field does not stop it: a click on
+        //   the canvas takes the keyboard from it.
+        // - the keys, unless any text field has the keyboard (typing must not leak into the
+        //   shortcuts), or a cleanup runs.
+        let own_box = label_editing || label_focus_lost || text_editing || rotate_editing;
+        let pointer_input = !(own_box || cleaning);
+        let key_input = !(own_box || cleaning || ui.ctx().text_edit_focused());
+        if cleaning && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Progress);
+        }
+        let tool_modified = tools::dispatch(self, &response, center, ui, pointer_input, key_input);
         // Next frame's keys start out from here (see `interact::hover_at_key`).
         self.pointer_screen = mouse_pos;
 
         // Middle-button drag pans the camera, whatever the tool. It runs after the tool
         // handler so the tool still sees this frame's pre-pan view, as the Bond tool did when
         // the pan lived inside it.
-        if canvas_input && ui.input(|i| i.pointer.middle_down()) {
+        if pointer_input && ui.input(|i| i.pointer.middle_down()) {
             self.pan += ui.input(|i| i.pointer.delta());
         }
         let modified = cleanup_toggle | label_confirmed | text_committed | rotate_committed | flipped | tool_modified | cleaning | did_undo | did_redo;
@@ -3213,9 +3187,10 @@ mod view_tests {
         assert_middle_drag_pans(ChemStructEditor { tool: Tool::Eraser, ..Default::default() });
     }
 
-    /// A focused text field keeps the canvas from reacting to input, the camera included.
+    /// A focused field of the host's does not stop the pointer: the camera still pans (only
+    /// the keys stay with the field).
     #[test]
-    fn middle_drag_does_not_pan_while_a_text_field_has_focus() {
+    fn middle_drag_pans_while_a_host_field_has_focus() {
         for tool in [Tool::Bond, Tool::Select, Tool::Eraser] {
             let ctx = egui::Context::default();
             let mut editor = ChemStructEditor { tool: tool.clone(), ..Default::default() };
@@ -3244,7 +3219,7 @@ mod view_tests {
             }]);
             let pan_start = editor.pan;
             frame(&mut editor, vec![egui::Event::PointerMoved(p1)]);
-            assert_eq!(editor.pan, pan_start, "{tool:?}: no pan while a text field has focus");
+            assert_ne!(editor.pan, pan_start, "{tool:?}: the middle drag pans");
         }
     }
 
@@ -3363,7 +3338,7 @@ mod view_tests {
         // The path is closed, so the pan ends where it began; check it moved along the way.
         let mut panned = false;
         middle_drag_along(&mut editor, &path, |e| {
-            assert!(e.lasso_path.is_empty(), "no lasso path during a middle drag");
+            assert!(e.lasso_path().is_empty(), "no lasso path during a middle drag");
             panned |= e.pan != pan_start;
         });
 
@@ -3389,13 +3364,12 @@ mod view_tests {
         for p in [p0 + egui::vec2(40.0, -40.0), p0 + egui::vec2(80.0, -60.0)] {
             run_frame(&ctx, screen_rect, &mut editor, vec![egui::Event::PointerMoved(p)]);
         }
-        assert!(!editor.lasso_path.is_empty(), "the primary drag draws a lasso");
-        assert!(editor.drag_origin_screen.is_some());
+        assert!(!editor.lasso_path().is_empty(), "the primary drag draws a lasso");
 
         let (events, modifiers) = crate::testkit::chord("Escape");
         crate::testkit::run_frame_with_modifiers(&ctx, screen_rect, &mut editor, events, modifiers);
-        assert!(editor.lasso_path.is_empty(), "the aborted lasso is cleared");
-        assert!(editor.drag_origin_screen.is_none(), "the aborted lasso is torn down");
+        assert!(editor.lasso_path().is_empty(), "the aborted lasso is cleared");
+        assert!(editor.gesture().is_none(), "the aborted lasso is torn down");
     }
 
     #[test]
@@ -3407,7 +3381,7 @@ mod view_tests {
 
         let path = [MID, MID + egui::vec2(80.0, 40.0), MID + egui::vec2(150.0, 90.0)];
         middle_drag_along(&mut editor, &path, |e| {
-            assert!(e.bond_start.is_none(), "no bond preview during a middle drag");
+            assert!(e.bond_preview().is_none(), "no bond preview during a middle drag");
         });
 
         assert_eq!(editor.molecule.atoms.len(), 1, "no atom added");

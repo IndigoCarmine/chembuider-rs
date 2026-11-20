@@ -827,9 +827,33 @@ impl Molecule {
     ///
     /// Returns the ids removed.
     pub fn consume_excess_group_h(&mut self, atom_id: u32) -> Vec<u32> {
+        let removed = self.excess_group_h(atom_id, 0);
+        for &h in &removed {
+            self.remove_atom(h);
+        }
+        removed
+    }
+
+    /// Make room on `atom_id` for one more single bond: drop the group hydrogens that bond
+    /// would leave no room for, as [`consume_excess_group_h`](Self::consume_excess_group_h)
+    /// would once it is there. Done *before* the bond is drawn, the place a hydrogen held is
+    /// free for it: the H of an N–H stands exactly where the next bond out of the N belongs.
+    ///
+    /// Returns the ids removed.
+    pub fn make_room_for_bond(&mut self, atom_id: u32) -> Vec<u32> {
+        let removed = self.excess_group_h(atom_id, 1);
+        for &h in &removed {
+            self.remove_atom(h);
+        }
+        removed
+    }
+
+    /// The group hydrogens [`consume_excess_group_h`](Self::consume_excess_group_h) takes off
+    /// `atom_id` once its bonds carry `added` more valence than now, in the order it takes them.
+    fn excess_group_h(&self, atom_id: u32, added: i16) -> Vec<u32> {
         let Some(atom) = self.atom_by_id(atom_id) else { return Vec::new() };
         let Some(limit) = charged_max_valence(&atom.element, atom.charge) else { return Vec::new() };
-        let mut sum = self.bond_order_sum(atom_id);
+        let mut sum = self.bond_order_sum(atom_id) + added;
         if sum <= limit {
             return Vec::new();
         }
@@ -845,16 +869,15 @@ impl Molecule {
             .collect();
         candidates.sort_by_key(|&(h, _)| std::cmp::Reverse(h));
 
-        let mut removed = Vec::new();
+        let mut excess = Vec::new();
         for (h, contribution) in candidates {
             if sum <= limit {
                 break;
             }
-            self.remove_atom(h);
             sum -= contribution;
-            removed.push(h);
+            excess.push(h);
         }
-        removed
+        excess
     }
 
     /// Snap radius for merging overlapping atoms (molecular units).

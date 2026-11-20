@@ -1399,7 +1399,7 @@ impl ReactionEditor {
         if delete
             && self.keyboard
             && self.edit.is_none()
-            && !ui.ctx().egui_wants_keyboard_input()
+            && !ui.ctx().text_edit_focused()
             && pointer_here
         {
             self.delete_selected(reaction);

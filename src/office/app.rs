@@ -327,7 +327,7 @@ impl OfficeApp {
         ui.horizontal_wrapped(|ui| {
             for (tool, label) in [(Tool::Select, select), (Tool::Bond, bond), (Tool::Eraser, eraser)] {
                 if ui.selectable_label(ed.tool == tool, label).clicked() {
-                    ed.tool = tool;
+                    ed.set_tool(tool);
                 }
             }
             ui.separator();

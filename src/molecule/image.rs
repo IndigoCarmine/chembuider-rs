@@ -242,7 +242,7 @@ fn push_label_mask_svg(s: &mut String, scene: &MoleculeScene, bounds: egui::Rect
             r#"<defs><mask id="labels" maskUnits="userSpaceOnUse" x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}"><rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" fill="white"/>"#
         ));
         for label in scene.labels.values() {
-            let r = label.rect.expand(scene.label_bg_pad);
+            let r = label.mask.expand(scene.label_bg_pad);
             s.push_str(&format!(
                 r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="black"/>"#,
                 r.min.x, r.min.y, r.width(), r.height()
@@ -763,7 +763,7 @@ pub fn molecule_to_emf_styled(mol: &Molecule, style: &StyleConfig) -> Option<isi
 
         // Ring fills and bonds are cut away under each label (rather than covered with white),
         // so the background stays transparent there: the rects the canvas paints white.
-        let cuts: Vec<egui::Rect> = scene.labels.values().map(|l| l.rect.expand(scene.label_bg_pad)).collect();
+        let cuts: Vec<egui::Rect> = scene.labels.values().map(|l| l.mask.expand(scene.label_bg_pad)).collect();
         // Ring fills (backmost): filled polygons, no outline.
         for poly in scene.ring_fills.iter().filter(|p| p.rgba[3] > 0) {
             polygon(&poly.points, over_white(poly.rgba), &cuts);
@@ -871,7 +871,7 @@ mod tests {
         let mut elements: Vec<&str> = svg.split('<').collect();
         elements.sort_unstable();
         let fnv = elements.concat().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-        assert_eq!((svg.len(), fnv), (2394, 15025168934221154562), "{svg}");
+        assert_eq!((svg.len(), fnv), (2393, 7414704120391190974), "{svg}");
     }
 
     #[test]

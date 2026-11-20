@@ -432,7 +432,7 @@ impl ReactionApp {
                     .selectable_label(self.canvas.tool == tool, label)
                     .clicked()
                 {
-                    self.canvas.tool = tool;
+                    self.canvas.set_tool(tool);
                 }
             }
             if ui.button("🗑 Clear").clicked() {
@@ -714,7 +714,7 @@ impl ReactionApp {
                     self.canvas.push_undo();
                     self.canvas.molecule = mol;
                     self.canvas.selected_atoms.clear();
-                    self.canvas.tool = Tool::Select;
+                    self.canvas.set_tool(Tool::Select);
                     // Link this slot to the canvas: every edit now flows back into it (and the
                     // table, for a main-line structure) automatically, no Replace click needed.
                     self.linked_structure = Some(target);

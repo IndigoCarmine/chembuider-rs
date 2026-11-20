@@ -105,7 +105,7 @@ pub fn draw_shadows_under_labels(
     ring_fills: bool,
 ) {
     let pad = editor.config.style.label_bg_pad * editor.zoom;
-    let backgrounds: Vec<egui::Rect> = labels.values().map(|l| l.rect.expand(pad)).collect();
+    let backgrounds: Vec<egui::Rect> = labels.values().map(|l| l.mask.expand(pad)).collect();
     if !backgrounds.is_empty() {
         paint_shadows(editor, painter, center, labels, ring_fills, &backgrounds);
     }
@@ -266,7 +266,7 @@ pub fn draw_bonds(
 
 // ─── Layer 1: atom label backgrounds ─────────────────────────────────────────
 
-/// White rectangles behind labels: incident bonds are already trimmed at the label rect,
+/// White rectangles behind labels: incident bonds are already trimmed at the label's mask,
 /// so this only masks NON-incident bonds that happen to cross behind the text.
 pub fn draw_atom_backgrounds(
     editor: &ChemStructEditor,
@@ -276,7 +276,7 @@ pub fn draw_atom_backgrounds(
 ) {
     let pad = editor.config.style.label_bg_pad * editor.zoom;
     for layout in labels.values() {
-        painter.rect_filled(layout.rect.expand(pad), 0.0, egui::Color32::WHITE);
+        painter.rect_filled(layout.mask.expand(pad), 0.0, egui::Color32::WHITE);
     }
 }
 
@@ -413,7 +413,7 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
         }
     }
     // The arrow being drawn with the Arrow tool.
-    if let Some(super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag {
+    if let Some(&super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag() {
         let preview = PageObject::Arrow(crate::molecule::PageArrow { id: 0, tail, head, kind, source: None });
         let obj = scene::build_object(&preview, &editor.molecule, style, xf, |job| painter.layout_job(job));
         paint(&obj, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
@@ -433,7 +433,7 @@ pub struct PageObjectRects {
 
 pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center: egui::Pos2) {
     // Bond preview line
-    if let (Some(src_id), Some(end)) = (editor.bond_start, editor.preview_end_screen) {
+    if let Some((src_id, end)) = editor.bond_preview() {
         if let Some(src) = editor.molecule.atom_by_id(src_id) {
             let sp = editor.mol_to_screen(src.pos, center);
             painter.line_segment(
@@ -443,12 +443,12 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
         }
     }
 
-    // The selection's rotation handle (Select tool): a knob on a stem above the selection.
+    // The selection's rotation handle: a knob on a stem above the selection.
     // During a rotation it turns with the selection, on a spoke from the pivot, with the angle
     // turned so far beside it.
     if let Some(handle) = super::interact::rotation_handle(editor, center) {
         let blue = egui::Color32::from_rgb(80, 130, 255);
-        if let Some(rot) = &editor.rotate_drag {
+        if let Some(rot) = editor.rotate_drag() {
             let pivot = editor.mol_to_screen(rot.pivot, center);
             painter.line_segment([pivot, handle], egui::Stroke::new(1.0, blue));
             painter.circle_filled(pivot, 2.5, blue);
@@ -488,8 +488,8 @@ pub fn draw_overlays(editor: &ChemStructEditor, painter: &egui::Painter, center:
     }
 
     // Lasso
-    if editor.lasso_path.len() > 1 {
-        let pts: Vec<egui::Pos2> = editor.lasso_path.clone();
+    if editor.lasso_path().len() > 1 {
+        let pts: Vec<egui::Pos2> = editor.lasso_path().to_vec();
         painter.add(egui::Shape::Path(egui::epaint::PathShape {
             points: pts,
             // Must be closed: epaint panics when filling an open path.
