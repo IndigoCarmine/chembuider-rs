@@ -34,6 +34,14 @@ struct RelaxParams {
     angle_amp_max: f32,
 }
 
+// A dative bond (an arrow from a ligand's donor atom to a metal) is an order of magnitude
+// weaker than the ligands' own bonds, in its spring and in the bends it takes part in, so the
+// ligands keep their shape and the arrows give way instead. The dative bonds of one
+// structure pull towards a common length, their mean; that length pulls towards the standard
+// bond length another order of magnitude more weakly still, so the ligands' room decides it.
+const DATIVE_WEAKER: f32 = 0.1;
+const DATIVE_ANCHOR: f32 = 0.1;
+
 // Maximum per-atom speed: prevents velocity runaway when initial forces are large.
 // With dt_max=0.1, this limits per-step displacement to V_MAX*dt_max = 0.5 units/step.
 const V_MAX: f32 = 5.0;
@@ -252,6 +260,8 @@ pub struct CleanupState {
     bonds: Vec<(u32, u32)>,         // cached from mol (immutable during relaxation)
     adj: HashMap<u32, Vec<u32>>,    // cached adjacency list
     bonded: HashSet<(u32, u32)>,    // both orderings, for O(1) repulsion filter
+    // The dative bonds, and the parts of the structure they join.
+    dative: Dative,
     // sp-hybridized centers that want linear (180°) geometry: a degree-2 atom with a
     // triple bond, or the central atom of two cumulated double bonds (allene).
     linear_atoms: HashSet<u32>,
@@ -318,21 +328,35 @@ impl CleanupState {
         }
 
         let linear_atoms = linear_centers(mol);
+        let dative = Dative::of(mol, &atom_ids);
+        if selection.is_none() {
+            dative.spread(&mut pos, &bonds);
+        }
 
-        let mut cycles = find_simple_cycles(&adj, &atom_ids);
+        // The ring rescue permutes rings into regular polygons: the rings of the ligands, not
+        // the chelate rings their dative bonds close through a metal.
+        let any_cycle = !find_simple_cycles(&adj, &atom_ids).is_empty();
+        let mut cycles = if dative.is_empty() {
+            find_simple_cycles(&adj, &atom_ids)
+        } else {
+            find_simple_cycles(&dative.covalent_adj(&adj), &atom_ids)
+        };
         let has_rings;
         let movable: Vec<u32>;
         let free_groups;
         match selection {
             None => {
-                has_rings = !cycles.is_empty();
+                has_rings = any_cycle;
                 movable = atom_ids.clone();
                 free_groups = None;
             }
             Some(sel) => {
                 // Friction damps the oscillation of any ring a moving atom sits in; the ring
                 // rescue only permutes rings whose atoms may all move.
-                has_rings = cycles.iter().any(|ring| ring.iter().any(|id| sel.contains(id)));
+                has_rings = any_cycle
+                    && find_simple_cycles(&adj, &atom_ids)
+                        .iter()
+                        .any(|ring| ring.iter().any(|id| sel.contains(id)));
                 cycles.retain(|ring| ring.iter().all(|id| sel.contains(id)));
                 movable = atom_ids.iter().copied().filter(|id| sel.contains(id)).collect();
                 free_groups = Some(free_groups_of(&adj, &movable, sel, &pos));
@@ -341,12 +365,15 @@ impl CleanupState {
         }
 
         // Pre-compute initial forces so the first VV half-kick uses real forces, not zeros.
-        compute_forces(&pos, &bonds, &adj, &atom_ids, &bonded, &linear_atoms, &PARAMS, &mut forces);
+        compute_forces(
+            &pos, &bonds, &adj, &atom_ids, &bonded, &linear_atoms, &dative, &PARAMS, &mut forces,
+        );
 
         let ref_pos: Vec<[f32; 2]> = movable.iter().map(|id| pos[id]).collect();
 
         CleanupState {
             pos, vel, atom_ids, movable, free_groups, forces, bonds, adj, bonded,
+            dative,
             linear_atoms,
             cycles,
             dt: PARAMS.dt_init,
@@ -392,7 +419,7 @@ impl CleanupState {
         self.steps_since_ref = 0;
         compute_forces(
             &self.pos, &self.bonds, &self.adj, &self.atom_ids,
-            &self.bonded, &self.linear_atoms, &PARAMS, &mut self.forces,
+            &self.bonded, &self.linear_atoms, &self.dative, &PARAMS, &mut self.forces,
         );
     }
 
@@ -464,7 +491,7 @@ impl CleanupState {
             // 3. Compute forces at the new positions (overwrites self.forces).
             compute_forces(
                 &self.pos, &self.bonds, &self.adj, &self.atom_ids,
-                &self.bonded, &self.linear_atoms, p, &mut self.forces,
+                &self.bonded, &self.linear_atoms, &self.dative, p, &mut self.forces,
             );
 
             // 4. Second half-kick — velocity is now the full VV velocity at the new position.
@@ -1062,7 +1089,9 @@ fn linear_centers(mol: &Molecule) -> HashSet<u32> {
     let mut triples: HashMap<u32, u32> = HashMap::new();
     let mut doubles: HashMap<u32, u32> = HashMap::new();
     let mut degree: HashMap<u32, u32> = HashMap::new();
-    for b in &mol.bonds {
+    // A dative bond is left out: an alkyne carbon bound to a metal stays straight among its
+    // own bonds (the weak bend places the arrow, see `Dative::linear`).
+    for b in mol.bonds.iter().filter(|b| b.stereo != crate::molecule::BondStereo::Dative) {
         for id in [b.begin, b.end] {
             *degree.entry(id).or_insert(0) += 1;
             match b.order {
@@ -1084,6 +1113,7 @@ fn linear_centers(mol: &Molecule) -> HashSet<u32> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_forces(
     pos: &HashMap<u32, [f32; 2]>,
     bonds: &[(u32, u32)],
@@ -1091,6 +1121,7 @@ fn compute_forces(
     atom_ids: &[u32],
     bonded: &HashSet<(u32, u32)>,
     linear_atoms: &HashSet<u32>,
+    dative: &Dative,
     p: &RelaxParams,
     forces: &mut HashMap<u32, [f32; 2]>,
 ) {
@@ -1098,14 +1129,37 @@ fn compute_forces(
         *f = [0.0, 0.0];
     }
 
+    let length = |a: u32, b: u32| {
+        let (pa, pb) = (pos[&a], pos[&b]);
+        ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2)).sqrt()
+    };
+    // Each structure's dative bonds pull towards their mean length (see DATIVE_WEAKER). The
+    // mean moving with them adds nothing to the force: the deviations from a mean sum to
+    // zero, so this is the gradient of Σ ½k(d − mean)² + ½k'·n·(mean − L)².
+    let mut dative_mean: HashMap<usize, f32> = HashMap::new();
+    for group in &dative.groups {
+        let mean = group.iter().map(|&i| length(bonds[i].0, bonds[i].1)).sum::<f32>()
+            / group.len() as f32;
+        for &i in group {
+            dative_mean.insert(i, mean);
+        }
+    }
+
     // Bond stretching: soft potential — harmonic near L, constant-force cap beyond bond_cap
-    for &(begin, end) in bonds {
+    for (i, &(begin, end)) in bonds.iter().enumerate() {
         let pi = pos[&begin];
         let pj = pos[&end];
         let dx = pj[0] - pi[0];
         let dy = pj[1] - pi[1];
         let d = (dx * dx + dy * dy).sqrt().max(0.001);
-        let mag = p.k_bond * (d - L).clamp(-p.bond_cap, p.bond_cap);
+        let mag = match dative_mean.get(&i) {
+            Some(&mean) => {
+                let k = p.k_bond * DATIVE_WEAKER;
+                k * (d - mean).clamp(-p.bond_cap, p.bond_cap)
+                    + k * DATIVE_ANCHOR * (mean - L).clamp(-p.bond_cap, p.bond_cap)
+            }
+            None => p.k_bond * (d - L).clamp(-p.bond_cap, p.bond_cap),
+        };
         let fx = mag * dx / d;
         let fy = mag * dy / d;
         {
@@ -1120,113 +1174,37 @@ fn compute_forces(
         }
     }
 
-    // Angle bending: tangential forces on consecutive neighbor pairs sorted by angle.
-    // degree 2: small gap → 120°, large (reflex) gap → 240°
-    // degree 3: all gaps → 120°
-    // degree ≥4: equal spacing 360°/n
+    // Angle bending (see `bend`). An atom with dative bonds is bent twice: at full strength
+    // among its other bonds, as if the dative ones were not there (a pyridine nitrogen keeps
+    // its ring angle, a metal's ordinary ligands their spread), and an order of magnitude
+    // more weakly at the gaps next to a dative bond, among all its bonds (the arrow leaves a
+    // donor along its lone pair; a metal's arrows spread evenly).
     for &c_id in atom_ids {
         let neighbors = &adj[&c_id];
-        let n = neighbors.len();
-        if n < 2 {
+        let linear = linear_atoms.contains(&c_id);
+        if !neighbors.iter().any(|&n| dative.pairs.contains(&(c_id, n))) {
+            bend(c_id, neighbors, linear, |_, _| 1.0, pos, p, forces);
             continue;
         }
-
-        let cp = pos[&c_id];
-        let mut sorted: Vec<(u32, f32)> = neighbors
+        let own: Vec<u32> = neighbors
             .iter()
-            .map(|&nid| {
-                let np = pos[&nid];
-                (nid, (np[1] - cp[1]).atan2(np[0] - cp[0]))
-            })
+            .copied()
+            .filter(|&n| !dative.pairs.contains(&(c_id, n)))
             .collect();
-        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-        for i in 0..n {
-            let (id_a, ang_a) = sorted[i];
-            let (id_b, ang_b) = sorted[(i + 1) % n];
-
-            let mut gap = ang_b - ang_a;
-            if gap <= 0.0 {
-                gap += std::f32::consts::TAU;
-            }
-
-            let theta0 = if n == 2 && linear_atoms.contains(&c_id) {
-                // sp center (triple bond / allene): both gaps want 180°.
-                std::f32::consts::PI
-            } else if n == 2 {
-                if gap < std::f32::consts::PI {
-                    std::f32::consts::TAU / 3.0
-                } else {
-                    std::f32::consts::TAU * 2.0 / 3.0
-                }
-            } else if n == 3 {
-                std::f32::consts::TAU / 3.0
+        bend(c_id, &own, linear, |_, _| 1.0, pos, p, forces);
+        let at_arrow = |a: u32, b: u32| {
+            if dative.pairs.contains(&(c_id, a)) || dative.pairs.contains(&(c_id, b)) {
+                DATIVE_WEAKER
             } else {
-                std::f32::consts::TAU / n as f32
-            };
-
-            let err = gap - theta0;
-            let na = pos[&id_a];
-            let nb = pos[&id_b];
-            let ra = ((na[0] - cp[0]).powi(2) + (na[1] - cp[1]).powi(2))
-                .sqrt()
-                .max(0.001);
-            let rb = ((nb[0] - cp[0]).powi(2) + (nb[1] - cp[1]).powi(2))
-                .sqrt()
-                .max(0.001);
-            let ta = [-(na[1] - cp[1]) / ra, (na[0] - cp[0]) / ra];
-            let tb = [-(nb[1] - cp[1]) / rb, (nb[0] - cp[0]) / rb];
-
-            // The bend acts as a torque τ = -∂E/∂gap = -k·err on the a–c–b wedge.  A torque
-            // is converted to a tangential force by dividing by the moment arm: |f| = τ/r.
-            // That 1/r is what makes the pair's torques about the centre cancel exactly
-            // (r_a·τ/r_a - r_b·τ/r_b = 0).  Applying the same |f| to both neighbours instead
-            // (the previous code) leaves a residual torque ∝ τ·(r_a - r_b), i.e. a
-            // non-conservative field that pumps angular momentum in forever: the molecule
-            // reaches its relaxed shape and then spins, so a motion-based convergence test
-            // never fires.  With the 1/r factor the angle term is exactly -∇E for
-            // E = Σ ½·(k_angle·L)·(gap-θ0)², hence torque-free by rotational invariance.
-            //
-            // The constant L only sets the scale (it cancels in the torque balance): it keeps
-            // the force magnitude at the equilibrium bond length identical to before, so the
-            // tuned k_angle/k_bond balance is unchanged for normal geometry.
-            //
-            // angle_amp_max bounds the 1/r blow-up for a neighbour collapsing onto the centre.
-            // The bound must rescale *both* magnitudes by the same factor: the torques cancel
-            // only while r_a·|f_a| = r_b·|f_b|, so flooring the two arms individually (or
-            // clipping just the larger force) would reintroduce exactly the spurious torque
-            // that the 1/r exists to remove.  A common positive rescale keeps the force
-            // parallel to the true gradient, so it still descends the energy — the same
-            // trust-region trick bond_cap / rep_cap already use.
-            let f = p.k_angle * err * L;
-            let mut fa_mag = f / ra;
-            let mut fb_mag = f / rb;
-            let amp = L / ra.min(rb);
-            if amp > p.angle_amp_max {
-                let s = p.angle_amp_max / amp;
-                fa_mag *= s;
-                fb_mag *= s;
+                0.0
             }
-            {
-                let fa = forces.get_mut(&id_a).unwrap();
-                fa[0] += fa_mag * ta[0];
-                fa[1] += fa_mag * ta[1];
-            }
-            {
-                let fb = forces.get_mut(&id_b).unwrap();
-                fb[0] -= fb_mag * tb[0];
-                fb[1] -= fb_mag * tb[1];
-            }
-            // Reaction on center atom: Newton's 3rd law — ensures zero net force
-            {
-                let fc = forces.get_mut(&c_id).unwrap();
-                fc[0] += fb_mag * tb[0] - fa_mag * ta[0];
-                fc[1] += fb_mag * tb[1] - fa_mag * ta[1];
-            }
-        }
+        };
+        bend(c_id, neighbors, dative.linear.contains(&c_id), at_arrow, pos, p, forces);
     }
 
-    // Non-bonded repulsion: soft 1/r² within half a bond length
+    // Non-bonded repulsion: soft 1/r² within half a bond length. The parts of a complex (its
+    // ligands, its metal) keep a whole bond length apart, so that a ligand the weak arrows
+    // let move is pushed off the others instead of being drawn across them.
     for i in 0..atom_ids.len() {
         for j in (i + 1)..atom_ids.len() {
             let id_i = atom_ids[i];
@@ -1240,7 +1218,8 @@ fn compute_forces(
             let dy = pj[1] - pi[1];
             let d2 = (dx * dx + dy * dy).max(0.0001);
             let d = d2.sqrt();
-            if d >= L * 0.5 {
+            let reach = if dative.apart(id_i, id_j) { L } else { L * 0.5 };
+            if d >= reach {
                 continue;
             }
             let mag = (p.k_rep / d2).min(p.rep_cap);
@@ -1258,6 +1237,314 @@ fn compute_forces(
             }
         }
     }
+}
+
+/// The bend term at `c_id` over `neighbors`: tangential forces on consecutive neighbour pairs
+/// sorted by angle, each gap scaled by `weight` of its two neighbours (0 skips it).
+/// degree 2: small gap → 120°, large (reflex) gap → 240° (180° both for a `linear` sp centre)
+/// degree 3: all gaps → 120°
+/// degree ≥4: equal spacing 360°/n
+fn bend(
+    c_id: u32,
+    neighbors: &[u32],
+    linear: bool,
+    weight: impl Fn(u32, u32) -> f32,
+    pos: &HashMap<u32, [f32; 2]>,
+    p: &RelaxParams,
+    forces: &mut HashMap<u32, [f32; 2]>,
+) {
+    let n = neighbors.len();
+    if n < 2 {
+        return;
+    }
+
+    let cp = pos[&c_id];
+    let mut sorted: Vec<(u32, f32)> = neighbors
+        .iter()
+        .map(|&nid| {
+            let np = pos[&nid];
+            (nid, (np[1] - cp[1]).atan2(np[0] - cp[0]))
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    for i in 0..n {
+        let (id_a, ang_a) = sorted[i];
+        let (id_b, ang_b) = sorted[(i + 1) % n];
+        let w = weight(id_a, id_b);
+        if w == 0.0 {
+            continue;
+        }
+
+        let mut gap = ang_b - ang_a;
+        if gap <= 0.0 {
+            gap += std::f32::consts::TAU;
+        }
+
+        let theta0 = if n == 2 && linear {
+            // sp center (triple bond / allene): both gaps want 180°.
+            std::f32::consts::PI
+        } else if n == 2 {
+            if gap < std::f32::consts::PI {
+                std::f32::consts::TAU / 3.0
+            } else {
+                std::f32::consts::TAU * 2.0 / 3.0
+            }
+        } else if n == 3 {
+            std::f32::consts::TAU / 3.0
+        } else {
+            std::f32::consts::TAU / n as f32
+        };
+
+        let err = gap - theta0;
+        let na = pos[&id_a];
+        let nb = pos[&id_b];
+        let ra = ((na[0] - cp[0]).powi(2) + (na[1] - cp[1]).powi(2))
+            .sqrt()
+            .max(0.001);
+        let rb = ((nb[0] - cp[0]).powi(2) + (nb[1] - cp[1]).powi(2))
+            .sqrt()
+            .max(0.001);
+        let ta = [-(na[1] - cp[1]) / ra, (na[0] - cp[0]) / ra];
+        let tb = [-(nb[1] - cp[1]) / rb, (nb[0] - cp[0]) / rb];
+
+        // The bend acts as a torque τ = -∂E/∂gap = -k·err on the a–c–b wedge.  A torque
+        // is converted to a tangential force by dividing by the moment arm: |f| = τ/r.
+        // That 1/r is what makes the pair's torques about the centre cancel exactly
+        // (r_a·τ/r_a - r_b·τ/r_b = 0).  Applying the same |f| to both neighbours instead
+        // (the previous code) leaves a residual torque ∝ τ·(r_a - r_b), i.e. a
+        // non-conservative field that pumps angular momentum in forever: the molecule
+        // reaches its relaxed shape and then spins, so a motion-based convergence test
+        // never fires.  With the 1/r factor the angle term is exactly -∇E for
+        // E = Σ ½·(k_angle·L)·(gap-θ0)², hence torque-free by rotational invariance.
+        //
+        // The constant L only sets the scale (it cancels in the torque balance): it keeps
+        // the force magnitude at the equilibrium bond length identical to before, so the
+        // tuned k_angle/k_bond balance is unchanged for normal geometry.
+        //
+        // angle_amp_max bounds the 1/r blow-up for a neighbour collapsing onto the centre.
+        // The bound must rescale *both* magnitudes by the same factor: the torques cancel
+        // only while r_a·|f_a| = r_b·|f_b|, so flooring the two arms individually (or
+        // clipping just the larger force) would reintroduce exactly the spurious torque
+        // that the 1/r exists to remove.  A common positive rescale keeps the force
+        // parallel to the true gradient, so it still descends the energy — the same
+        // trust-region trick bond_cap / rep_cap already use.
+        let f = w * p.k_angle * err * L;
+        let mut fa_mag = f / ra;
+        let mut fb_mag = f / rb;
+        let amp = L / ra.min(rb);
+        if amp > p.angle_amp_max {
+            let s = p.angle_amp_max / amp;
+            fa_mag *= s;
+            fb_mag *= s;
+        }
+        {
+            let fa = forces.get_mut(&id_a).unwrap();
+            fa[0] += fa_mag * ta[0];
+            fa[1] += fa_mag * ta[1];
+        }
+        {
+            let fb = forces.get_mut(&id_b).unwrap();
+            fb[0] -= fb_mag * tb[0];
+            fb[1] -= fb_mag * tb[1];
+        }
+        // Reaction on center atom: Newton's 3rd law — ensures zero net force
+        {
+            let fc = forces.get_mut(&c_id).unwrap();
+            fc[0] += fb_mag * tb[0] - fa_mag * ta[0];
+            fc[1] += fb_mag * tb[1] - fa_mag * ta[1];
+        }
+    }
+}
+
+/// The dative bonds of a molecule (arrows from a ligand's donor atom to a metal) and the
+/// parts of its structures they join, for the clean-up to treat apart (see `DATIVE_WEAKER`).
+#[derive(Default)]
+struct Dative {
+    /// Both orderings of each dative bond's two atoms.
+    pairs: HashSet<(u32, u32)>,
+    /// The dative bonds of each structure, as indices into the bonds: held equally long.
+    groups: Vec<Vec<usize>>,
+    /// Per atom of a structure with a dative bond: its structure, and its part (the atoms
+    /// joined to it by other bonds). Two parts of one structure keep a bond length apart.
+    part: HashMap<u32, (usize, usize)>,
+    /// sp centres counting their dative bond (a nitrile's or a carbonyl ligand's donor),
+    /// whose two bonds want 180° in the weak bend.
+    linear: HashSet<u32>,
+    /// The acceptors of the dative bonds (the metals).
+    acceptors: HashSet<u32>,
+}
+
+/// How far `Dative::spread` moves the ligands out per try, and how many tries it makes.
+const SPREAD_FACTOR: f32 = 1.25;
+const SPREAD_TRIES: usize = 12;
+
+impl Dative {
+    fn of(mol: &Molecule, atom_ids: &[u32]) -> Self {
+        use crate::molecule::{BondOrder, BondStereo};
+        let is = |b: &crate::molecule::Bond| b.stereo == BondStereo::Dative;
+        if !mol.bonds.iter().any(is) {
+            return Self::default();
+        }
+        let index: HashMap<u32, usize> =
+            atom_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        let ends = |b: &crate::molecule::Bond| (index[&b.begin], index[&b.end]);
+        let structure = components(atom_ids.len(), mol.bonds.iter().map(ends));
+        let part = components(atom_ids.len(), mol.bonds.iter().filter(|b| !is(b)).map(ends));
+        let mut by_structure: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut pairs = HashSet::new();
+        for (i, b) in mol.bonds.iter().enumerate().filter(|(_, b)| is(b)) {
+            by_structure.entry(structure[index[&b.begin]]).or_default().push(i);
+            pairs.insert((b.begin, b.end));
+            pairs.insert((b.end, b.begin));
+        }
+        let part = atom_ids
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| by_structure.contains_key(&structure[i]))
+            .map(|(i, &id)| (id, (structure[i], part[i])))
+            .collect();
+        let mut groups: Vec<Vec<usize>> = by_structure.into_values().collect();
+        groups.sort();
+        // Degree with the dative bonds, multiple bonds without.
+        let mut degree: HashMap<u32, usize> = HashMap::new();
+        let mut multiple: HashMap<u32, (usize, usize)> = HashMap::new();
+        for b in &mol.bonds {
+            for id in [b.begin, b.end] {
+                *degree.entry(id).or_default() += 1;
+                let m = multiple.entry(id).or_default();
+                match b.order {
+                    BondOrder::Triple if !is(b) => m.0 += 1,
+                    BondOrder::Double if !is(b) => m.1 += 1,
+                    _ => {}
+                }
+            }
+        }
+        let linear = degree
+            .iter()
+            .filter(|&(id, &d)| {
+                let (triples, doubles) = multiple[id];
+                d == 2 && (triples >= 1 || doubles >= 2)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        let acceptors = mol.bonds.iter().filter(|b| is(b)).map(|b| b.end).collect();
+        Dative { pairs, groups, part, linear, acceptors }
+    }
+
+    /// Before a whole clean-up: move the ligands of each complex out from its metals, each
+    /// as it is drawn, until no bond of one part crosses a bond of another (or an arrow). The
+    /// relaxation cannot pull a ligand drawn across another back out through it; once apart,
+    /// the parts keep a bond length from each other (see `compute_forces`) as the weak arrows
+    /// draw them back in. A complex drawn without crossings is left as it is.
+    fn spread(&self, pos: &mut HashMap<u32, [f32; 2]>, bonds: &[(u32, u32)]) {
+        if self.is_empty() {
+            return;
+        }
+        // Each part away from the metals, with the centre it moves out from.
+        let mut parts: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
+        for (&id, &key) in &self.part {
+            parts.entry(key).or_default().push(id);
+        }
+        let mut centre: HashMap<usize, ([f32; 2], usize)> = HashMap::new();
+        for &a in &self.acceptors {
+            let Some(&(s, _)) = self.part.get(&a) else { continue };
+            let c = centre.entry(s).or_insert(([0.0, 0.0], 0));
+            c.0[0] += pos[&a][0];
+            c.0[1] += pos[&a][1];
+            c.1 += 1;
+        }
+        let ligands: Vec<(Vec<u32>, [f32; 2])> = parts
+            .into_iter()
+            .filter(|(_, ids)| !ids.iter().any(|id| self.acceptors.contains(id)))
+            .filter_map(|((s, _), ids)| {
+                let &(sum, n) = centre.get(&s)?;
+                Some((ids, [sum[0] / n as f32, sum[1] / n as f32]))
+            })
+            .collect();
+        for _ in 0..SPREAD_TRIES {
+            if !self.parts_cross(pos, bonds) {
+                return;
+            }
+            for (ids, c) in &ligands {
+                let n = ids.len() as f32;
+                let (sx, sy) = ids.iter().fold((0.0, 0.0), |(x, y), id| (x + pos[id][0], y + pos[id][1]));
+                let shift = [
+                    (sx / n - c[0]) * (SPREAD_FACTOR - 1.0),
+                    (sy / n - c[1]) * (SPREAD_FACTOR - 1.0),
+                ];
+                for id in ids {
+                    let p = pos.get_mut(id).unwrap();
+                    p[0] += shift[0];
+                    p[1] += shift[1];
+                }
+            }
+        }
+    }
+
+    /// Whether a bond of one part of a complex crosses a bond of another part, or an arrow
+    /// crosses any bond.
+    fn parts_cross(&self, pos: &HashMap<u32, [f32; 2]>, bonds: &[(u32, u32)]) -> bool {
+        let part_of = |&(a, b): &(u32, u32)| {
+            if self.pairs.contains(&(a, b)) {
+                None
+            } else {
+                self.part.get(&a).copied()
+            }
+        };
+        let in_complex: Vec<(&(u32, u32), Option<(usize, usize)>)> = bonds
+            .iter()
+            .filter(|(a, _)| self.part.contains_key(a))
+            .map(|b| (b, part_of(b)))
+            .collect();
+        in_complex.iter().enumerate().any(|(k, &(&(a, b), pa))| {
+            in_complex[k + 1..].iter().any(|&(&(c, d), pc)| {
+                let shared = a == c || a == d || b == c || b == d;
+                let apart = pa.is_none() || pc.is_none() || pa != pc;
+                !shared && apart && segments_cross(pos[&a], pos[&b], pos[&c], pos[&d])
+            })
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// `adj` without the dative bonds.
+    fn covalent_adj(&self, adj: &HashMap<u32, Vec<u32>>) -> HashMap<u32, Vec<u32>> {
+        adj.iter()
+            .map(|(&a, ns)| {
+                (a, ns.iter().copied().filter(|&b| !self.pairs.contains(&(a, b))).collect())
+            })
+            .collect()
+    }
+
+    /// Whether `a` and `b` are in different parts of one complex.
+    fn apart(&self, a: u32, b: u32) -> bool {
+        match (self.part.get(&a), self.part.get(&b)) {
+            (Some(&(sa, pa)), Some(&(sb, pb))) => sa == sb && pa != pb,
+            _ => false,
+        }
+    }
+}
+
+/// The connected component of each of `n` nodes joined by `edges`, numbered by a member.
+fn components(n: usize, edges: impl Iterator<Item = (usize, usize)>) -> Vec<usize> {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    for (a, b) in edges {
+        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    (0..n).map(|i| root(&mut parent, i)).collect()
 }
 
 /// Move the atoms `ids` together so their centroid is at `target`.  (Subtracting a zero
