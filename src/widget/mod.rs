@@ -2451,7 +2451,8 @@ impl ChemStructEditor {
                 let t = text.trim().to_string();
                 if !t.is_empty() {
                     if let Some(a) = self.molecule.atom_by_id_mut(edit_id) {
-                        a.element = t;
+                        // Counts typed as plain digits (`CH2OH`) are subscripts, as in a formula.
+                        a.element = crate::molecule::depict::subscript_counts(&t);
                     }
                 }
                 label_confirmed = true;

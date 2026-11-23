@@ -442,6 +442,20 @@ fn label_editing_accepts_a_two_letter_element() {
     );
 }
 
+/// Digits typed into a label count what is before them, so they are subscripts, as in a
+/// formula: `CH2OH` is kept as `CH_2OH`. Digits already in markup are left as typed.
+#[test]
+fn digits_typed_into_a_label_are_subscripts() {
+    for (typed, kept) in [("CH2OH", "CH_2OH"), ("C12H25", "C_{12}H_{25}"), ("SO_4^{2-}", "SO_4^{2-}")] {
+        let e = type_keys(&format!("c 1 ` text:{typed} Enter"));
+        assert!(
+            e.molecule.atoms.iter().any(|a| a.element == kept),
+            "{typed}: got {:?}",
+            e.molecule.atoms.iter().map(|a| &a.element).collect::<Vec<_>>(),
+        );
+    }
+}
+
 /// Ctrl+1/2/3 switch tools; without this the keyboard cannot leave the Bond tool.
 #[test]
 fn tool_switching_is_reachable_by_keyboard() {

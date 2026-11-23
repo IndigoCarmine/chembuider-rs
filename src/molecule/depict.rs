@@ -294,3 +294,151 @@ pub(crate) fn displayed_h_count(mol: &impl AtomLookup, atom_id: u32) -> u8 {
     (effective - bond_sum_heavy).max(0) as u8
 }
 
+
+/// A label as typed into the label box, its counts made subscripts as in a formula: a run of
+/// digits after a letter or a closing bracket (`CH2OH`, `C6H5`, `(CH3)3`, `Ph3P`, `R1`) is
+/// written as one, `_2` or `_{12}`. Digits the markup already places are left as they are: in a
+/// script (`SO_4^{2-}`) or escaped to stay on the baseline (`R\1`). So are digits that count
+/// nothing, leading the label or after a sign or a space (`13C`, `2,4-DNP`). Anything else
+/// is kept as typed, so a label already in markup comes back unchanged.
+pub fn subscript_counts(typed: &str) -> String {
+    let chars: Vec<char> = typed.chars().collect();
+    // The index of the `}` closing the group whose `{` is at `open`, escapes skipped.
+    let closing = |open: usize| {
+        let mut depth = 0usize;
+        let mut k = open;
+        while k < chars.len() {
+            match chars[k] {
+                '\\' => k += 1,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k);
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        None
+    };
+    let mut out = String::with_capacity(typed.len() + 4);
+    // Whether a digit here counts what comes before it.
+    let mut counts = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                out.extend(chars.get(i..(i + 2).min(chars.len())).unwrap_or_default());
+                i += 2;
+                counts = false;
+                continue;
+            }
+            // A script, copied as it is: one character, or a braced group.
+            '_' | '^' if i + 1 < chars.len() => {
+                let end = if chars[i + 1] == '{' {
+                    closing(i + 1)
+                } else {
+                    Some(i + 1)
+                };
+                if let Some(end) = end {
+                    out.extend(&chars[i..=end]);
+                    i = end + 1;
+                    counts = false;
+                    continue;
+                }
+                counts = false;
+            }
+            // A font group's head (`{@Symbol:`), copied as it is; its text goes on below.
+            '{' if chars.get(i + 1) == Some(&'@') => {
+                let mut k = i + 2;
+                while k < chars.len() && chars[k] != ':' {
+                    k += if chars[k] == '\\' { 2 } else { 1 };
+                }
+                if k < chars.len() {
+                    out.extend(&chars[i..=k]);
+                    i = k + 1;
+                    counts = false;
+                    continue;
+                }
+                counts = false;
+            }
+            '0'..='9' if counts => {
+                let run: String = chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                i += run.len();
+                if run.len() == 1 {
+                    out.push('_');
+                    out.push_str(&run);
+                } else {
+                    out.push_str(&format!("_{{{run}}}"));
+                }
+                counts = false;
+                continue;
+            }
+            // Bold and italic markers change no count.
+            '*' | '/' => {}
+            c => counts = c.is_alphabetic() || matches!(c, ')' | ']'),
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subscript_counts;
+
+    #[test]
+    fn typed_counts_become_subscripts() {
+        for (typed, markup) in [
+            ("CH3", "CH_3"),
+            ("CH2OH", "CH_2OH"),
+            ("CO2Et", "CO_2Et"),
+            ("C12H25", "C_{12}H_{25}"),
+            ("N(CH3)2", "N(CH_3)_2"),
+            ("Ph3P", "Ph_3P"),
+            ("R1", "R_1"),
+            ("**Boc2**N", "**Boc_2**N"),
+            ("//t//Bu3Sn", "//t//Bu_3Sn"),
+            ("{@Arial,12:C6H5}", "{@Arial,12:C_6H_5}"),
+        ] {
+            assert_eq!(subscript_counts(typed), markup, "{typed}");
+        }
+    }
+
+    #[test]
+    fn digits_the_markup_places_or_that_count_nothing_stay() {
+        for typed in [
+            "C",
+            "Ph",
+            "CO_2Et",
+            "C_{12}H_{25}",
+            "SO_4^{2-}",
+            "NH_4^+",
+            "R\\1",
+            "13C",
+            "2,4-DNP",
+            "Fe^{3+}",
+            "a_",
+            "x^{2",
+            "{@Arial",
+            "",
+        ] {
+            assert_eq!(subscript_counts(typed), typed, "{typed}");
+        }
+    }
+
+    #[test]
+    fn subscript_counts_is_idempotent() {
+        for typed in ["CH3", "C12H25", "N(CH3)2", "R\\12", "SO4^{2-}"] {
+            let once = subscript_counts(typed);
+            assert_eq!(subscript_counts(&once), once, "{typed}");
+        }
+    }
+}
