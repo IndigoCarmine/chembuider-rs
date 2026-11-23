@@ -240,7 +240,7 @@ pub(crate) fn folded_h(mol: &impl AtomLookup, atom_id: u32) -> bool {
         let n = if nb.begin == other { nb.end } else { nb.begin };
         match mol.atom_by_id(n) {
             Some(a) if a.element == "H" && a.group_h => (n < atom_id) as i16,
-            _ => nb.order.valence(),
+            _ => nb.valence(),
         }
     }).sum();
     used < valence
@@ -289,7 +289,7 @@ pub(crate) fn displayed_h_count(mol: &impl AtomLookup, atom_id: u32) -> u8 {
             let other = if b.begin == atom_id { b.end } else { b.begin };
             !folded_h(mol, other)
         })
-        .map(|b| b.order.valence())
+        .map(|b| b.valence())
         .sum();
     (effective - bond_sum_heavy).max(0) as u8
 }

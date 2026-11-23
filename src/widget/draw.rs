@@ -702,6 +702,76 @@ mod tests {
         (m, x, hs)
     }
 
+    /// `donor → acceptor` as a dative bond (an arrow from the donor) in `m`.
+    fn dative(m: &mut Molecule, donor: u32, acceptor: u32) {
+        let id = m.add_bond(donor, acceptor, BondOrder::Single);
+        m.bonds.iter_mut().find(|b| b.id == id).unwrap().stereo =
+            crate::molecule::BondStereo::Dative;
+    }
+
+    /// A dative bond takes no valence from either end: a ligand's donor atom keeps its bonds
+    /// and hydrogens, unflagged, and so does an acceptor with a valence of its own. The
+    /// formula and the SMILES agree with the labels; the SMILES writes the complex as its
+    /// separate components, having no dative bond.
+    #[test]
+    fn a_dative_bond_takes_no_valence() {
+        use crate::molecule::smiles::to_smiles;
+        use crate::reaction::formula::MolecularFormula;
+
+        // [Fe(NH3)]2+: the ammine nitrogen keeps its three hydrogens.
+        let mut m = Molecule::default();
+        let fe = m.add_atom("Fe".to_string(), [0.0, 0.0], 2);
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 0);
+        dative(&mut m, n, fe);
+        assert_eq!(label(&m, n), "NH3");
+        assert!(!is_valence_invalid(&m, n));
+        assert_eq!(m.bond_order_sum(n), 0);
+        assert_eq!(MolecularFormula::of(&m).plain(), "FeH3N");
+        assert_eq!(to_smiles(&m), "N.[Fe+2]");
+
+        // Pyridine on a metal: the nitrogen's two ring bonds and its double bond are all it
+        // has; the dative bond is no fourth one.
+        let mut m = Molecule::default();
+        let fe = m.add_atom("Fe".to_string(), [0.0, 3.0], 2);
+        let ring: Vec<u32> = (0..6)
+            .map(|i| {
+                let a = (i as f32) * std::f32::consts::FRAC_PI_3;
+                let el = if i == 0 { "N" } else { "C" };
+                m.add_atom(el.to_string(), [1.5 * a.sin(), 1.5 * a.cos()], 0)
+            })
+            .collect();
+        for i in 0..6 {
+            let order = if i % 2 == 0 { BondOrder::Double } else { BondOrder::Single };
+            m.add_bond(ring[i], ring[(i + 1) % 6], order);
+        }
+        dative(&mut m, ring[0], fe);
+        assert_eq!(label(&m, ring[0]), "N");
+        assert!(!is_valence_invalid(&m, ring[0]), "the pyridine nitrogen is not over-bonded");
+        assert_eq!(MolecularFormula::of(&m).plain(), "C5H5FeN");
+        assert_eq!(to_smiles(&m), "C1=CC=CC=N1.[Fe+2]");
+
+        // H3N→BH3: the acceptor keeps its hydrogens too.
+        let mut m = Molecule::default();
+        let n = m.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("B".to_string(), [1.5, 0.0], 0);
+        dative(&mut m, n, b);
+        let h = |m: &Molecule, id| crate::molecule::depict::displayed_h_count(m, id);
+        assert_eq!((h(&m, n), h(&m, b)), (3, 3));
+        assert!(!is_valence_invalid(&m, b));
+        assert_eq!(MolecularFormula::of(&m).plain(), "BH6N");
+
+        // An ordinary fourth bond on a neutral nitrogen is still flagged.
+        let mut m = Molecule::default();
+        let fe = m.add_atom("Fe".to_string(), [0.0, 0.0], 0);
+        let n = m.add_atom("N".to_string(), [1.5, 0.0], 0);
+        m.add_bond(n, fe, BondOrder::Single);
+        for i in 0..3 {
+            let c = m.add_atom("C".to_string(), [2.5, i as f32], 0);
+            m.add_bond(n, c, BondOrder::Single);
+        }
+        assert!(is_valence_invalid(&m, n));
+    }
+
     /// The warning ring and the label agree on what a charge does: a bond the label has room
     /// for is never flagged, and one it has no room for always is. Otherwise the ring would
     /// appear on an atom whose hydrogens are all folded out of sight (a borate), or a

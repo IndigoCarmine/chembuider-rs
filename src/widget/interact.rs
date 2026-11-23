@@ -165,7 +165,11 @@ pub(crate) fn grow_bond(editor: &mut ChemStructEditor, atom_id: u32, center: egu
         return;
     }
     let before = editor.molecule.clone();
-    make_room_for_bond(editor, atom_id);
+    // A dative bond takes none of the donor's valence (`Bond::valence`): an ammine keeps its
+    // hydrogens.
+    if editor.current_bond_stereo != BondStereo::Dative {
+        make_room_for_bond(editor, atom_id);
+    }
     let angle = editor.best_new_bond_angle(atom_id);
     let Some(src) = editor.molecule.atom_by_id(atom_id) else { return };
     let new_pos = [src.pos[0] + angle.cos() * DEFAULT_BOND_LENGTH, src.pos[1] + angle.sin() * DEFAULT_BOND_LENGTH];
@@ -3173,6 +3177,57 @@ mod tests {
         let after = editor.molecule.bond_by_id(bond).unwrap();
         assert_eq!(after.stereo, BondStereo::WedgeDown, "another wedge replaces it");
         assert_eq!((after.begin, after.end), (b, a), "from the atom nearer the click");
+    }
+
+    /// The dative bond tool: a drag from a ligand's nitrogen to a metal draws an arrow from
+    /// the nitrogen; a click on it turns it round, like a wedge.
+    #[test]
+    fn dative_tool_drag_draws_an_arrow_from_the_donor() {
+        let mut editor = ChemStructEditor {
+            tool: crate::Tool::Bond,
+            current_bond_stereo: BondStereo::Dative,
+            ..Default::default()
+        };
+        let n = editor.molecule.add_atom("N".to_string(), [0.0, 0.0], 0);
+        let fe = editor.molecule.add_atom("Fe".to_string(), [3.0, 0.0], 2);
+        let from = editor.mol_to_screen([0.0, 0.0], MID);
+        let to = editor.mol_to_screen([3.0, 0.0], MID);
+        let mid = egui::pos2((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+        primary_drag_along(&mut editor, &[from, mid, to], Default::default());
+        assert_eq!(editor.molecule.bonds.len(), 1);
+        let bond = editor.molecule.bonds[0].clone();
+        assert_eq!((bond.order, bond.stereo), (BondOrder::Single, BondStereo::Dative));
+        assert_eq!((bond.begin, bond.end), (n, fe), "from the nitrogen to the iron");
+
+        let at = along_bond(&editor, n, fe, 0.35);
+        click_at(&mut editor, at);
+        let bond = editor.molecule.bond_by_id(bond.id).unwrap();
+        assert_eq!((bond.begin, bond.end), (fe, n), "a click turns it round");
+    }
+
+    /// Clicking an ammine's nitrogen with the dative tool grows an arrow and leaves its three
+    /// hydrogens: unlike a single bond, the arrow takes none of the nitrogen's valence.
+    #[test]
+    fn dative_tool_click_keeps_the_donors_hydrogens() {
+        for (stereo, left) in [(BondStereo::Dative, 3), (BondStereo::None, 2)] {
+            let mut editor = ChemStructEditor {
+                tool: crate::Tool::Bond,
+                current_bond_stereo: stereo.clone(),
+                ..Default::default()
+            };
+            let n = editor.molecule.add_atom("N".to_string(), [0.0, 0.0], 0);
+            for k in 0..3 {
+                let a = (120.0 * k as f32 + 90.0).to_radians();
+                let h = editor.molecule.add_atom("H".to_string(), [a.cos(), a.sin()], 0);
+                editor.molecule.atom_by_id_mut(h).unwrap().group_h = true;
+                editor.molecule.add_bond(n, h, BondOrder::Single);
+            }
+            let at = editor.mol_to_screen([0.0, 0.0], MID);
+            click_at(&mut editor, at);
+            let hydrogens = editor.molecule.atoms.iter().filter(|a| a.element == "H").count();
+            assert_eq!(hydrogens, left, "{stereo:?}");
+            assert_eq!(editor.molecule.bonds_for_atom(n).len(), left + 1, "{stereo:?}: grown");
+        }
     }
 
     /// A style without a direction (bold) replaces a single bond the same way, keeps the

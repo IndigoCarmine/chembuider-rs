@@ -294,6 +294,13 @@ impl Skeleton {
         let mut bonds = Vec::new();
         let mut adj = vec![Vec::new(); kept.len()];
         for b in &mol.bonds {
+            // A dative bond is not written: SMILES has no such bond, and a plain one would
+            // read as a fourth bond on a pyridine nitrogen. The metal and its ligands are
+            // written as the separate components they are without it (`[Fe+2].n1…`), each
+            // atom with the hydrogens it has ([`Bond::valence`](super::Bond::valence)).
+            if b.stereo == super::BondStereo::Dative {
+                continue;
+            }
             // A bond onto a folded hydrogen is now part of an atom's hydrogen count, and one
             // referencing a missing atom is malformed; both are simply not written.
             let (Some(&i), Some(&j)) = (index_of.get(&b.begin), index_of.get(&b.end)) else {
