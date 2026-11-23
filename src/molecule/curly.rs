@@ -144,7 +144,7 @@ pub const MAX_CURLY_ANGLE: f32 = 300.0;
 /// The most an arc may lean ([`CurlyArrow::skew`]).
 pub const MAX_CURLY_SKEW: f32 = 0.8;
 /// Where on a bond a tail stands: this share of the bond's length from its `side` atom.
-pub const BOND_TAIL_AT: f32 = 0.35;
+pub const BOND_TAIL_AT: f32 = 0.4;
 
 // Clearances, in molecule units (a bond is 1.5). An atom's label is about 0.75 high and 0.7
 // wide per letter (10 pt beside a 14.4 pt bond), so a shown label needs more room than a bare
@@ -157,7 +157,7 @@ const DOTS_BARE: f32 = 0.26;
 const TAIL_BARE: f32 = 0.44;
 /// How far short of an atom's centre a head stops.
 const HEAD_GAP_LABELLED: f32 = 0.55;
-const HEAD_GAP_BARE: f32 = 0.24;
+const HEAD_GAP_BARE: f32 = 0.34;
 /// How far a tail on a bond is lifted off its line, and how far short of a bond's (or a gap's)
 /// middle a head stops.
 const BOND_TAIL_LIFT: f32 = 0.1;
