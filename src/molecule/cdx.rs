@@ -50,6 +50,10 @@ const PROP_BOND_DISPLAY: u16 = 0x0601;
 const PROP_BOND_DOUBLE_POSITION: u16 = 0x0603;
 const PROP_BOND_BEGIN: u16 = 0x0604;
 const PROP_BOND_END: u16 = 0x0605;
+/// kCDXProp_LineWidth (CDXML `LineWidth`): a line width in CDX coordinates (1/65536 pt). The
+/// document's is the width of every line that names none; a fragment's, or a bond's own,
+/// overrides it.
+const PROP_LINE_WIDTH: u16 = 0x0807;
 
 /// kCDXBondOrder_Dative: a dative bond is an order of its own in CDX.
 const ORDER_DATIVE: i16 = 0x1000;
@@ -523,6 +527,9 @@ pub(crate) fn fragments_mapped(
                 b.set(PROP_BOND_DOUBLE_POSITION, position.to_le_bytes().to_vec());
             }
             cdx_colors::set_foreground(&mut b, bond.color, colors);
+            if let Some(width) = bond.width {
+                b.set(PROP_LINE_WIDTH, coordinate(width).to_le_bytes().to_vec());
+            }
             frag.children.push(b);
         }
         if let Some(shadow) = shadow {
@@ -813,6 +820,7 @@ fn read_fragment_mapped(
             if let Some(last) = mol.bonds.last_mut() {
                 last.double_position = double_position;
                 last.color = cdx_colors::foreground(bond, colors);
+                last.width = line_width(bond);
             }
             bonded.extend([a, b]);
         }
@@ -927,10 +935,47 @@ pub fn cdxml_of_document(doc: &CdxObject) -> String {
 }
 
 /// The structures of a document object tree; see [`read_cdx`].
+/// A width in points as a CDX coordinate (1/65536 pt).
+fn coordinate(points: f32) -> i32 {
+    (points as f64 * 65536.0).round() as i32
+}
+
+/// The width of `bond`'s lines, its own `LineWidth` or the one it inherits (see
+/// [`inherit_line_widths`]), in points: `None` for the default
+/// ([`Bond::DEFAULT_WIDTH`](super::Bond::DEFAULT_WIDTH)), the width of a bond that names none.
+fn line_width(bond: &CdxObject) -> Option<f32> {
+    let range = super::Bond::WIDTH_RANGE;
+    let points = bond.prop_int(PROP_LINE_WIDTH)? as f32 / 65536.0;
+    // ChemDraw writes 0.6 pt as 0x9999, a hair under it.
+    ((points - super::Bond::DEFAULT_WIDTH).abs() > 0.005).then(|| points.clamp(*range.start(), *range.end()))
+}
+
+/// Give every bond in `obj` that names no `LineWidth` of its own the one it is drawn in: that of
+/// the nearest object around it that names one (its fragment, a page, the document), `inherited`
+/// above `obj`.
+fn inherit_line_widths(obj: &mut CdxObject, inherited: Option<Vec<u8>>) {
+    let own = obj.prop(PROP_LINE_WIDTH).map(<[u8]>::to_vec);
+    if obj.tag == OBJ_BOND {
+        if let (None, Some(width)) = (own, inherited) {
+            obj.set(PROP_LINE_WIDTH, width);
+        }
+        return;
+    }
+    let here = own.or(inherited);
+    for child in &mut obj.children {
+        inherit_line_widths(child, here.clone());
+    }
+}
+
 fn read_document(doc: &CdxObject) -> Option<CdxImport> {
     if doc.tag != OBJ_DOCUMENT {
         return None;
     }
+    // The line widths a document's bonds inherit, put onto the bonds: a structure drawn in a
+    // ChemDraw document of 1 pt lines keeps them.
+    let mut doc = doc.clone();
+    inherit_line_widths(&mut doc, None);
+    let doc = &doc;
     let pages = || doc.children.iter().filter(|c| c.tag == OBJ_PAGE);
     let (mut atoms, mut bonds) = (0, 0);
     for page in pages() {
