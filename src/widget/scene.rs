@@ -774,9 +774,36 @@ pub fn build_bonds(
             BondStereo::HollowWedge => push_wedge_hollow(&mut strokes, tp1, tp2, style.wedge_width * vs, width),
             BondStereo::Dative => push_dative(&mut strokes, &mut fills, tp1, tp2, style.wedge_width * vs, width),
         }
+        // Lines wider than the style's show a notch where two of them meet at an atom, their
+        // square ends crossing; a disc as wide as the line on each end at an atom rounds the
+        // join. Lines of the style's own width are drawn as before.
+        if bond.line_scale() > 1.0 {
+            round_line_ends(&strokes, [p1, p2], &mut fills);
+        }
         out.push(SceneBond { bond_id: bond.id, strokes, fills, color: bond.color });
     }
     out
+}
+
+/// A disc as wide as the line on each end of `strokes` that lies on one of the `atoms` (an end
+/// trimmed at a label lies on none), into `fills`.
+fn round_line_ends(strokes: &[SceneStroke], atoms: [Pos2; 2], fills: &mut Vec<Vec<Pos2>>) {
+    const SIDES: usize = 16;
+    for s in strokes {
+        for end in [s.a, s.b] {
+            if atoms.iter().any(|p| (end - *p).length() < 1e-3) {
+                let r = s.width * 0.5;
+                fills.push(
+                    (0..SIDES)
+                        .map(|k| {
+                            let a = k as f32 * std::f32::consts::TAU / SIDES as f32;
+                            end + r * Vec2::new(a.cos(), a.sin())
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
 }
 
 // ─── Geometry helpers (backend-neutral; shared by all renderers) ───────────────
@@ -1259,6 +1286,24 @@ mod tests {
         let bonds = build_bonds(&m, &style, xf, &HashMap::new());
         assert!(bonds[0].strokes.iter().all(|s| (s.width - style.bond_width * 2.0).abs() < 1e-4));
         assert_eq!(bonds[1].fills, narrow, "a wedge is drawn as before");
+    }
+
+    /// A wide line's ends at its atoms are rounded (a disc each), so two wide lines join
+    /// without a notch; an end at a label, and a line of the style's width, have none.
+    #[test]
+    fn a_wide_line_has_round_ends_at_its_atoms() {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let ab = m.add_bond(a, b, BondOrder::Single);
+        let style = StyleConfig::default();
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        assert!(build_bonds(&m, &style, xf, &HashMap::new())[0].fills.is_empty());
+        m.bond_by_id_mut(ab).unwrap().width = Some(1.5);
+        let fills = build_bonds(&m, &style, xf, &HashMap::new())[0].fills.clone();
+        assert_eq!(fills.len(), 2);
+        let r = style.bond_width * 2.5 * 0.5;
+        assert!(fills[0].iter().all(|p| (p.to_vec2().length() - r).abs() < 1e-3), "centred on the atom");
     }
 
     /// Vinyl (R–CH=CH₂): the inner line of the offset double bond is shortened only at the end
