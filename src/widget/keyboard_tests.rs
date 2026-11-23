@@ -446,12 +446,31 @@ fn label_editing_accepts_a_two_letter_element() {
 /// formula: `CH2OH` is kept as `CH_2OH`. Digits already in markup are left as typed.
 #[test]
 fn digits_typed_into_a_label_are_subscripts() {
-    for (typed, kept) in [("CH2OH", "CH_2OH"), ("C12H25", "C_{12}H_{25}"), ("SO_4^{2-}", "SO_4^{2-}")] {
+    for (typed, kept) in [
+        ("CH2OH", "CH_2OH"),
+        ("C12H25", "C_{12}H_{25}"),
+        ("SO_4^{2-}", "SO_4^{2-}"),
+        ("NH4+", "NH_4^+"),
+    ] {
         let e = type_keys(&format!("c 1 ` text:{typed} Enter"));
         assert!(
             e.molecule.atoms.iter().any(|a| a.element == kept),
             "{typed}: got {:?}",
             e.molecule.atoms.iter().map(|a| &a.element).collect::<Vec<_>>(),
+        );
+    }
+}
+
+/// A lone ion typed into a label is the element with that charge: `Fe2+` is iron(II), drawn
+/// Fe²⁺, not a label Fe₂+ with a count.
+#[test]
+fn an_ion_typed_into_a_label_is_a_charged_element() {
+    for (typed, element, charge) in [("Fe2+", "Fe", 2), ("Fe+3", "Fe", 3), ("Cl-", "Cl", -1)] {
+        let e = type_keys(&format!("c 1 ` text:{typed} Enter"));
+        assert!(
+            e.molecule.atoms.iter().any(|a| a.element == element && a.charge == charge),
+            "{typed}: got {:?}",
+            e.molecule.atoms.iter().map(|a| (&a.element, a.charge)).collect::<Vec<_>>(),
         );
     }
 }

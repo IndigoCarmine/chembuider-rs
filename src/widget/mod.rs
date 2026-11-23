@@ -2451,8 +2451,17 @@ impl ChemStructEditor {
                 let t = text.trim().to_string();
                 if !t.is_empty() {
                     if let Some(a) = self.molecule.atom_by_id_mut(edit_id) {
-                        // Counts typed as plain digits (`CH2OH`) are subscripts, as in a formula.
-                        a.element = crate::molecule::depict::subscript_counts(&t);
+                        use crate::molecule::depict::{subscript_counts, typed_ion};
+                        if let Some((element, charge)) = typed_ion(&t) {
+                            // A lone ion (`Fe2+`) is the element with that charge, which the
+                            // label then shows as a superscript (Fe²⁺), not a count (Fe₂+).
+                            a.element = element;
+                            a.charge = charge;
+                        } else {
+                            // Counts typed as plain digits (`CH2OH`) are subscripts, as in a
+                            // formula, and a charge at the end a superscript.
+                            a.element = subscript_counts(&t);
+                        }
                     }
                 }
                 label_confirmed = true;

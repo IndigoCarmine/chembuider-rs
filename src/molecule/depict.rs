@@ -299,8 +299,10 @@ pub(crate) fn displayed_h_count(mol: &impl AtomLookup, atom_id: u32) -> u8 {
 /// digits after a letter or a closing bracket (`CH2OH`, `C6H5`, `(CH3)3`, `Ph3P`, `R1`) is
 /// written as one, `_2` or `_{12}`. Digits the markup already places are left as they are: in a
 /// script (`SO_4^{2-}`) or escaped to stay on the baseline (`R\1`). So are digits that count
-/// nothing, leading the label or after a sign or a space (`13C`, `2,4-DNP`). Anything else
-/// is kept as typed, so a label already in markup comes back unchanged.
+/// nothing, leading the label or after a sign or a space (`13C`, `2,4-DNP`). A charge at the
+/// end is a superscript (`NH4+` → `NH_4^+`). Anything else is kept as typed, so a label already
+/// in markup comes back unchanged. A lone ion (`Fe2+`) is no label but an atom with a charge:
+/// see [`typed_ion`].
 pub fn subscript_counts(typed: &str) -> String {
     let chars: Vec<char> = typed.chars().collect();
     // The index of the `}` closing the group whose `{` is at `open`, escapes skipped.
@@ -380,6 +382,17 @@ pub fn subscript_counts(typed: &str) -> String {
                 counts = false;
                 continue;
             }
+            // A charge ending the label: `NH4+`, `SO4--`.
+            '+' | '-' if i > 0 && chars[i..].iter().all(|c| matches!(c, '+' | '-')) => {
+                let signs: String = chars[i..].iter().collect();
+                if signs.len() == 1 {
+                    out.push('^');
+                    out.push_str(&signs);
+                } else {
+                    out.push_str(&format!("^{{{signs}}}"));
+                }
+                break;
+            }
             // Bold and italic markers change no count.
             '*' | '/' => {}
             c => counts = c.is_alphabetic() || matches!(c, ')' | ']'),
@@ -388,6 +401,48 @@ pub fn subscript_counts(typed: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// The element and the charge of a lone ion typed into the label box: an element symbol and a
+/// charge, as it is written (`Fe2+`, `Fe^{2+}`, `Cu+`, `Cl-`, `O2-`) or with the sign first
+/// (`Fe+2`), or as repeated signs (`Fe++`). `None` for anything else: a label (`NH4+`, `Ph`),
+/// a group label read as an element symbol (`Ac`), or an element with no charge (`Fe`).
+pub fn typed_ion(typed: &str) -> Option<(String, i8)> {
+    let plain: String = typed.chars().filter(|c| !matches!(c, '^' | '{' | '}')).collect();
+    let symbol_len = plain
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| !c.is_ascii_lowercase())
+        .map_or(plain.len(), |(k, _)| k);
+    let (symbol, charge) = plain.split_at(symbol_len);
+    if !symbol.starts_with(|c: char| c.is_ascii_uppercase()) || super::elements::element_of_label(symbol).is_none() {
+        return None;
+    }
+    let sign = |c: char| match c {
+        '+' => Some(1i8),
+        '-' => Some(-1),
+        _ => None,
+    };
+    let digits = |d: &str| -> Option<i8> {
+        if d.is_empty() {
+            Some(1)
+        } else {
+            d.parse::<i8>().ok().filter(|n| (1..=8).contains(n))
+        }
+    };
+    let first = charge.chars().next()?;
+    let last = charge.chars().last()?;
+    let value = if charge.chars().all(|c| c == first) && sign(first).is_some() {
+        // `Fe++`, `O--`.
+        sign(first)? * i8::try_from(charge.len()).ok().filter(|n| *n <= 8)?
+    } else if let Some(s) = sign(last) {
+        // `Fe2+`.
+        s * digits(&charge[..charge.len() - 1])?
+    } else {
+        // `Fe+2`.
+        sign(first)? * digits(&charge[1..])?
+    };
+    Some((symbol.to_string(), value))
 }
 
 #[cfg(test)]
@@ -404,6 +459,9 @@ mod tests {
             ("N(CH3)2", "N(CH_3)_2"),
             ("Ph3P", "Ph_3P"),
             ("R1", "R_1"),
+            ("NH4+", "NH_4^+"),
+            ("SO4--", "SO_4^{--}"),
+            ("Me3N+", "Me_3N^+"),
             ("**Boc2**N", "**Boc_2**N"),
             ("//t//Bu3Sn", "//t//Bu_3Sn"),
             ("{@Arial,12:C6H5}", "{@Arial,12:C_6H_5}"),
@@ -431,6 +489,27 @@ mod tests {
             "",
         ] {
             assert_eq!(subscript_counts(typed), typed, "{typed}");
+        }
+    }
+
+    #[test]
+    fn a_lone_ion_is_an_element_with_a_charge() {
+        use super::typed_ion;
+        for (typed, ion) in [
+            ("Fe2+", ("Fe", 2)),
+            ("Fe3+", ("Fe", 3)),
+            ("Fe^{2+}", ("Fe", 2)),
+            ("Fe+2", ("Fe", 2)),
+            ("Fe++", ("Fe", 2)),
+            ("Cu+", ("Cu", 1)),
+            ("Cl-", ("Cl", -1)),
+            ("O2-", ("O", -2)),
+            ("N+", ("N", 1)),
+        ] {
+            assert_eq!(typed_ion(typed), Some((ion.0.to_string(), ion.1)), "{typed}");
+        }
+        for typed in ["Fe", "Fe2", "NH4+", "Ph+", "Ac+", "Fe2+3", "Fe+-", "Fe9+", "fe2+", "+", "", "Fe2+x"] {
+            assert_eq!(typed_ion(typed), None, "{typed}");
         }
     }
 
