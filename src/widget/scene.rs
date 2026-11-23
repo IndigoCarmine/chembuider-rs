@@ -694,10 +694,10 @@ pub fn build_bonds(
     labels: &HashMap<u32, SceneLabel>,
 ) -> Vec<SceneBond> {
     let vs = xf.visual_scale;
-    let width = style.bond_width * vs;
     let index = MolIndex::new(mol);
     let mut out = Vec::new();
     for bond in &mol.bonds {
+        let width = style.bond_width * vs * bond.line_scale();
         if folded_h(&index, bond.begin) || folded_h(&index, bond.end) {
             continue;
         }
@@ -1236,6 +1236,29 @@ mod tests {
         assert!((strokes[0].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[1].a.y.abs() - expected).abs() < 1e-3);
         assert!((strokes[0].width - style.bond_width * 2.0).abs() < 1e-4);
+    }
+
+    /// A bond's own line width ([`Bond::width`](crate::molecule::Bond::width)) scales its lines
+    /// against the style's, ChemDraw's 0.6 pt: 1.2 pt is twice as wide. A wedge keeps its size.
+    #[test]
+    fn a_bonds_width_scales_its_lines() {
+        let mut m = Molecule::default();
+        let a = m.add_atom("C".to_string(), [0.0, 0.0], 0);
+        let b = m.add_atom("C".to_string(), [1.0, 0.0], 0);
+        let c = m.add_atom("C".to_string(), [2.0, 0.5], 0);
+        let ab = m.add_bond(a, b, BondOrder::Double);
+        let bc = m.add_bond(b, c, BondOrder::Single);
+        let style = StyleConfig::default();
+        let xf = RenderTransform { coord_scale: SCALE_FACTOR, offset: Vec2::ZERO, visual_scale: 1.0 };
+        let wedge = |m: &Molecule| build_bonds(m, &style, xf, &HashMap::new())[1].fills.clone();
+        m.bond_by_id_mut(bc).unwrap().stereo = BondStereo::WedgeUp;
+        let narrow = wedge(&m);
+        for id in [ab, bc] {
+            m.bond_by_id_mut(id).unwrap().width = Some(1.2);
+        }
+        let bonds = build_bonds(&m, &style, xf, &HashMap::new());
+        assert!(bonds[0].strokes.iter().all(|s| (s.width - style.bond_width * 2.0).abs() < 1e-4));
+        assert_eq!(bonds[1].fills, narrow, "a wedge is drawn as before");
     }
 
     /// Vinyl (R–CH=CH₂): the inner line of the offset double bond is shortened only at the end

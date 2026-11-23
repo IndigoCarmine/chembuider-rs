@@ -70,6 +70,9 @@ struct ClipBond {
     /// The line colour ([`Bond::color`](crate::molecule::Bond::color)), as for [`ClipAtom::color`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     color: Option<[u8; 4]>,
+    /// The line width ([`Bond::width`](crate::molecule::Bond::width)), as for the colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    width: Option<f32>,
 }
 
 /// A ring fill on the clipboard: atom *indices* (positions within `ClipMol::atoms`, not ids,
@@ -630,6 +633,29 @@ impl ChemStructEditor {
         true
     }
 
+    /// Give the selected bonds — as [`set_selected_bond_color`](Self::set_selected_bond_color)
+    /// picks them — lines `width` points wide (`None` is the style's width), as one undo step. A
+    /// width is kept within [`Bond::WIDTH_RANGE`](crate::molecule::Bond::WIDTH_RANGE). Returns
+    /// false when no selected bond changes.
+    pub fn set_selected_bond_width(&mut self, width: Option<f32>) -> bool {
+        let range = crate::molecule::Bond::WIDTH_RANGE;
+        let width = width.map(|w| w.clamp(*range.start(), *range.end()));
+        let selected = |b: &crate::molecule::Bond| {
+            self.selected_bonds.contains(&b.id)
+                || (self.selected_atoms.contains(&b.begin) && self.selected_atoms.contains(&b.end))
+        };
+        let ids: Vec<u32> =
+            self.molecule.bonds.iter().filter(|b| selected(b) && b.width != width).map(|b| b.id).collect();
+        if ids.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        for b in self.molecule.bonds.iter_mut().filter(|b| ids.contains(&b.id)) {
+            b.width = width;
+        }
+        true
+    }
+
     /// Give the labels of the selected atoms and the selected texts the text colour `color`
     /// (straight RGBA; `None` is the style's colour), as one undo step. Bonds keep their own
     /// colour. Returns false when nothing selected changes.
@@ -804,6 +830,7 @@ impl ChemStructEditor {
                 stereo: b.stereo.clone(),
                 double_position: b.double_position,
                 color: b.color,
+                width: b.width,
             })
         }).collect();
 
@@ -894,6 +921,7 @@ impl ChemStructEditor {
                         bond.stereo = b.stereo.clone();
                         bond.double_position = b.double_position;
                         bond.color = b.color;
+                        bond.width = b.width;
                     }
                 }
             }
@@ -954,6 +982,7 @@ impl ChemStructEditor {
                         bond.stereo = b.stereo.clone();
                         bond.double_position = b.double_position;
                         bond.color = b.color;
+                        bond.width = b.width;
                     }
                 }
             }

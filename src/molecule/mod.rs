@@ -257,9 +257,25 @@ pub struct Bond {
     /// style's colour, as before colours existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 4]>,
+    /// The width of the bond's lines in points, ChemDraw's `LineWidth`; `None` draws them in
+    /// the style's width, [`Bond::DEFAULT_WIDTH`] in a document. A wedge's wide end and a bold
+    /// bond keep their own widths, as in ChemDraw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f32>,
 }
 
 impl Bond {
+    /// The line width, in points, that a bond with no [`width`](Self::width) of its own is
+    /// drawn in: ChemDraw's (ACS) document style, which the default style draws in.
+    pub const DEFAULT_WIDTH: f32 = 0.6;
+    /// The narrowest and the widest line a bond is given ([`Self::width`]): ChemDraw's limits.
+    pub const WIDTH_RANGE: std::ops::RangeInclusive<f32> = 0.1..=10.0;
+
+    /// How many times as wide as the style's lines this bond's lines are drawn.
+    pub fn line_scale(&self) -> f32 {
+        self.width.map_or(1.0, |w| w / Self::DEFAULT_WIDTH)
+    }
+
     /// What this bond takes of each of its two atoms' valence: its order's, except for a
     /// dative bond, which takes none. The donor gives a lone pair it does not bond with
     /// otherwise, and the acceptor (a metal, or the boron of H₃N→BH₃) takes it into an empty
@@ -423,7 +439,16 @@ impl Molecule {
     /// [`add_bond`](Self::add_bond)'s search through every bond would make reading quadratic).
     fn push_bond(&mut self, begin: u32, end: u32, order: BondOrder, stereo: BondStereo) -> u32 {
         let id = self.alloc_id();
-        self.bonds.push(Bond { id, begin, end, order, stereo, double_position: DoublePosition::Auto, color: None });
+        self.bonds.push(Bond {
+            id,
+            begin,
+            end,
+            order,
+            stereo,
+            double_position: DoublePosition::Auto,
+            color: None,
+            width: None,
+        });
         id
     }
 
