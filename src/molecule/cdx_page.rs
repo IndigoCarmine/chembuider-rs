@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::cdx::{self, OBJ_GROUP, OBJ_TEXT, PROP_2D_POSITION, PROP_BOUNDING_BOX, PROP_TEXT, PROP_UTF8_TEXT, PT, SCALE};
 use super::cdx_bracket::{self, OBJ_BRACKETED_GROUP};
+use super::cdx_curly;
 use super::cdx_codec::CdxObject;
 use super::cdx_colors::{self, ColorTable};
 use super::cdx_fonts::{self, FontTable};
@@ -87,6 +88,8 @@ fn hundredths(v: f32) -> u16 {
 pub(crate) struct Converted {
     pub object: PageObject,
     pub ids: Vec<u32>,
+    /// What may tie a curly arrow to the atoms read with it ([`cdx_curly::link`]).
+    pub links: Option<cdx_curly::Links>,
 }
 
 /// Every page-level object of `page` (looking inside groups), in document order.
@@ -224,13 +227,19 @@ pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable, colors: &ColorTa
     let mut out = Vec::new();
     for obj in objects {
         match obj.tag {
+            OBJ_ARROW if cdx_curly::is_curly_arrow(obj) => {
+                let Some((arrow, links)) = cdx_curly::read_arrow(obj) else { continue };
+                let mut ids = vec![obj.id];
+                ids.extend(graphic_of.get(&obj.id));
+                out.push(Converted { object: PageObject::Curly(arrow), ids, links: Some(links) });
+            }
             OBJ_ARROW => {
                 let Some(&kind) = arrows.get(&obj.id) else { continue };
                 let (Some(head), Some(tail)) = (point_3d(obj, PROP_HEAD_3D), point_3d(obj, PROP_TAIL_3D)) else { continue };
                 let mut ids = vec![obj.id];
                 ids.extend(graphic_of.get(&obj.id));
                 let arrow = PageArrow { id: 0, tail: mol_point(tail), head: mol_point(head), kind, source: Some(obj.id) };
-                out.push(Converted { object: PageObject::Arrow(arrow), ids });
+                out.push(Converted { object: PageObject::Arrow(arrow), ids, links: None });
             }
             OBJ_GRAPHIC => {
                 // A graphic superseded by an arrow object is that arrow (taken with it, or left
@@ -238,19 +247,25 @@ pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable, colors: &ColorTa
                 if superseded_by(obj).is_some_and(|a| all_ids.contains(&a)) {
                     continue;
                 }
+                if cdx_curly::is_curly_graphic(obj) {
+                    if let Some(arrow) = cdx_curly::read_graphic(obj) {
+                        out.push(Converted { object: PageObject::Curly(arrow), ids: vec![obj.id], links: Some(Default::default()) });
+                    }
+                    continue;
+                }
                 let Some(kind) = graphic_kind(obj) else { continue };
                 let Some((head, tail)) = graphic_ends(obj) else { continue };
                 let arrow = PageArrow { id: 0, tail: mol_point(tail), head: mol_point(head), kind, source: Some(obj.id) };
-                out.push(Converted { object: PageObject::Arrow(arrow), ids: vec![obj.id] });
+                out.push(Converted { object: PageObject::Arrow(arrow), ids: vec![obj.id], links: None });
             }
             OBJ_TEXT => {
                 if let Some(text) = read_text(obj, fonts, &colors.inside(page)) {
-                    out.push(Converted { object: PageObject::Text(text), ids: vec![obj.id] });
+                    out.push(Converted { object: PageObject::Text(text), ids: vec![obj.id], links: None });
                 }
             }
             OBJ_STOICHIOMETRY_GRID => {
                 if let Some(table) = cdx_table::read_grid(obj) {
-                    out.push(Converted { object: PageObject::Table(table), ids: vec![obj.id] });
+                    out.push(Converted { object: PageObject::Table(table), ids: vec![obj.id], links: None });
                 }
             }
             OBJ_BRACKETED_GROUP => {
@@ -260,7 +275,7 @@ pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable, colors: &ColorTa
                     if let Some((bracket, drawn)) = cdx_bracket::read_group(group, &graphics) {
                         let mut ids = vec![group.id];
                         ids.extend(drawn);
-                        out.push(Converted { object: PageObject::Bracket(bracket), ids });
+                        out.push(Converted { object: PageObject::Bracket(bracket), ids, links: None });
                     }
                 }
             }
@@ -543,13 +558,14 @@ fn same_point(a: (f64, f64), b: (f64, f64)) -> bool {
 
 /// The ChemDraw objects for `mol`'s page objects, moved by `shift` (CDX units), with new ids
 /// from `next`. An object whose source is in `owned` is written as its original objects with
-/// what changed rewritten; any other is written new. `fragment_of` is the fragment each atom
-/// was written in (a table names the fragments of its columns). Texts name their fonts in
+/// what changed rewritten; any other is written new. `ids` are what the atoms and bonds were
+/// written as: a table names the fragments of its columns, a curly arrow the nodes and bonds
+/// its ends are on. Texts name their fonts in
 /// `fonts`, the document's font table, which gains the fonts it lacked, and their colours in
 /// `colors`, its colour table, likewise.
 pub(crate) fn write_objects(
     mol: &Molecule,
-    fragment_of: &HashMap<u32, u32>,
+    ids: &cdx::WrittenIds,
     owned: &mut Owned,
     shift: (f64, f64),
     next: &mut u32,
@@ -597,22 +613,26 @@ pub(crate) fn write_objects(
                         cdx_table::translate_grid(grid, (at.0 - was.0, at.1 - was.1));
                     }
                     let entries: Vec<_> = t.reactants.iter().chain(&t.products).collect();
-                    cdx_table::relink_grid(grid, &entries, fragment_of);
+                    cdx_table::relink_grid(grid, &entries, &ids.fragment_of);
                     out.extend(cdx_objects);
                 } else {
-                    out.push(cdx_table::grid_object(cdx_objects[0].id, t, mol, at, fragment_of, next));
+                    out.push(cdx_table::grid_object(cdx_objects[0].id, t, mol, at, &ids.fragment_of, next));
                 }
             }
             (PageObject::Arrow(a), _) => out.extend(new_arrow(a, shift, next)),
             (PageObject::Table(t), _) => {
                 *next += 1;
                 let id = *next;
-                out.push(cdx_table::grid_object(id, t, mol, cdx_point(t.pos, shift), fragment_of, next));
+                out.push(cdx_table::grid_object(id, t, mol, cdx_point(t.pos, shift), &ids.fragment_of, next));
             }
             (PageObject::Text(t), _) => {
                 if !t.is_blank() {
                     out.push(new_text(t, shift, next, fonts, colors));
                 }
+            }
+            (PageObject::Curly(c), original) => {
+                let original = original.and_then(|(read, objects)| matches!(read, PageObject::Curly(_)).then_some(objects));
+                out.extend(cdx_curly::write(mol, c, original, ids, shift, next));
             }
             // Written with the fragments they enclose (`cdx_bracket::write_brackets`); what
             // reading took for it goes back to `owned` for that.
@@ -811,6 +831,9 @@ mod tests {
                     assert_eq!((&x.text, x.align), (&y.text, y.align));
                     assert!((x.pos[0] - y.pos[0]).abs() < 1e-3 && (x.pos[1] - y.pos[1]).abs() < 1e-3, "{x:?} vs {y:?}");
                 }
+                (PageObject::Curly(x), PageObject::Curly(y)) => {
+                    assert!((x.angle - y.angle).abs() < 0.05 && x.kind == y.kind, "{x:?} vs {y:?}");
+                }
                 (PageObject::Bracket(x), PageObject::Bracket(y)) => {
                     assert_eq!((x.usage, &x.label, x.atoms.len()), (y.usage, &y.label, y.atoms.len()), "{x:?} vs {y:?}");
                 }
@@ -856,8 +879,9 @@ mod tests {
         assert_eq!(arrows(&read_cdx(&bytes).unwrap().molecule).len(), 1);
     }
 
-    /// Arrows the editor cannot draw (a curved one, a hollow retrosynthetic head, a resonance
-    /// arrow) stay ChemDraw's: counted as other objects and written back unchanged.
+    /// Arrows the editor cannot draw (a hollow retrosynthetic head, a resonance arrow) stay
+    /// ChemDraw's: counted as other objects and written back unchanged. A curved arrow is the
+    /// editor's now: a curly arrow, written back as one.
     #[test]
     fn arrows_the_editor_cannot_draw_are_left_alone() {
         let mut doc = cdx_codec::parse(&molecule_to_cdx_document(&drawn())).unwrap();
@@ -878,11 +902,17 @@ mod tests {
         let bytes = cdx_codec::write(&doc);
         let import = read_cdx(&bytes).unwrap();
         assert_eq!(arrows(&import.molecule).len(), 2, "only the two drawn ones");
-        assert_eq!(import.other_objects, 3);
+        let curly: Vec<_> = import.molecule.curly_arrows().collect();
+        assert_eq!(curly.len(), 1);
+        assert_eq!((curly[0].angle, curly[0].source), (90.0, Some(900)));
+        assert_eq!(import.other_objects, 2);
         let saved = cdx_codec::parse(&merge_into_cdx(&bytes, &import.molecule)).unwrap();
-        for o in [curved, hollow, resonance] {
+        for o in [hollow, resonance] {
             assert_eq!(find(&saved, o.id, o.tag), Some(o));
         }
+        // The curved arrow keeps its id, rewritten as a curly arrow.
+        let again = find(&saved, 900, OBJ_ARROW).expect("the curved arrow is kept");
+        assert_eq!(again.prop_int(PROP_ANGULAR_SIZE), Some(900));
     }
 
     /// The ChemDraw 25 reaction with one more text, made after the CDX specification (no

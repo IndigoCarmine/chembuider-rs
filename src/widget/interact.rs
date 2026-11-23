@@ -1,6 +1,6 @@
 use super::{ChemStructEditor, DEFAULT_BOND_LENGTH};
 use crate::config::{AtomAction, BondAction, ResolvedAtomAction, SelectionAction};
-use crate::molecule::{ArrowKind, BondOrder, BondStereo, PageArrow, PageObject};
+use crate::molecule::{ArrowKind, BondOrder, BondStereo, CurlyArrow, CurlyEnd, CurlyKind, PageArrow, PageObject};
 use crate::molecule::page::snap_direction;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -311,11 +311,16 @@ pub(crate) fn lasso_select(editor: &mut ChemStructEditor, lasso: &[egui::Pos2], 
         }).collect();
         editor.selected_atoms.extend(hits);
         // A page object is taken when it lies inside whole: both ends of an arrow, a text's
-        // anchor, all the atoms of a bracket.
+        // anchor, all the atoms of a bracket, the atoms and free ends of a curly arrow.
         let objects: Vec<u32> = editor.molecule.objects.iter().filter(|o| match o {
             PageObject::Bracket(b) => {
                 let atoms: Vec<u32> = b.atoms.iter().copied().filter(|a| editor.molecule.atom_by_id(*a).is_some()).collect();
                 !atoms.is_empty() && atoms.iter().all(|a| editor.selected_atoms.contains(a))
+            }
+            // A curly arrow with its atoms, and its free ends inside.
+            PageObject::Curly(c) => {
+                c.atoms(&editor.molecule).iter().all(|a| editor.selected_atoms.contains(a))
+                    && o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), lasso))
             }
             _ => o.key_points().iter().all(|p| is_point_in_polygon(editor.mol_to_screen(*p, center), lasso)),
         }).map(PageObject::id).collect();
@@ -402,6 +407,12 @@ pub(crate) fn drag_object(
             let head = if shift { to } else { snap_direction(tail, to, 15.0) };
             ObjectDrag::NewArrow { tail, head, kind }
         }
+        ObjectDrag::CurlyBend { id } => {
+            bend_curly(editor, id, to, shift);
+            drag
+        }
+        // Its head is found on the screen, where the atoms are hit (`curly_target`).
+        ObjectDrag::NewCurly(_) => drag,
     }
 }
 
@@ -419,6 +430,119 @@ pub(crate) enum ObjectDrag {
     Move { id: u32, with_selection: bool },
     /// Dragging one end of arrow `id` (its head, or its tail).
     ArrowEnd { id: u32, head: bool },
+    /// The Curly arrow tool drawing a new curly arrow.
+    NewCurly(CurlyDrag),
+    /// Bending curly arrow `id` by the handle in its middle.
+    CurlyBend { id: u32 },
+}
+
+/// A curly arrow being drawn: from what the drag was pressed on, to what the pointer is over.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CurlyDrag {
+    pub tail: CurlyEnd,
+    pub head: CurlyEnd,
+    pub kind: CurlyKind,
+}
+
+impl CurlyDrag {
+    /// The arrow as it would be drawn now, bending away from the structure.
+    pub(crate) fn arrow(&self, mol: &crate::molecule::Molecule) -> CurlyArrow {
+        let angle = crate::molecule::curly::default_angle(mol, &self.tail, &self.head);
+        CurlyArrow::new(self.tail, self.head, angle, self.kind)
+    }
+}
+
+/// The atom an end gives its electrons from: a lone pair's atom, the side atom of a bond.
+fn source_atom(end: &CurlyEnd) -> Option<u32> {
+    match *end {
+        CurlyEnd::Atom(a) | CurlyEnd::Bond { side: a, .. } => Some(a),
+        CurlyEnd::Between(..) | CurlyEnd::Point(_) => None,
+    }
+}
+
+/// What the head of a curly arrow from `tail` stands on with the pointer at screen point `at`:
+/// the atom under it (with `between`, the gap between that atom and the tail's, where a bond is
+/// to form), else the bond under it, else the free point. An arrow does not end where it starts.
+pub(crate) fn curly_target(editor: &ChemStructEditor, tail: &CurlyEnd, at: egui::Pos2, center: egui::Pos2, between: bool) -> CurlyEnd {
+    let to = editor.screen_to_mol(at, center);
+    if let Some(atom) = editor.hit_test_atom(at, center) {
+        if *tail == CurlyEnd::Atom(atom) {
+            return CurlyEnd::Point(to);
+        }
+        return match source_atom(tail) {
+            Some(s) if between && s != atom => CurlyEnd::Between(s, atom),
+            _ => CurlyEnd::Atom(atom),
+        };
+    }
+    if let Some(bond) = editor.hit_test_bond(at, center)
+        && !matches!(*tail, CurlyEnd::Bond { bond: b, .. } if b == bond)
+        && let Some(side) = nearer_bond_atom(editor, bond, to)
+    {
+        return CurlyEnd::Bond { bond, side };
+    }
+    CurlyEnd::Point(to)
+}
+
+/// End a curly arrow drawn by dragging: add it, bending away from the structure, and leave it
+/// the selection, so its handle is there to bend it. One between free points too close to give
+/// it a direction, or one that cannot be placed, draws nothing.
+pub(crate) fn finish_curly(editor: &mut ChemStructEditor, drag: &CurlyDrag) {
+    if let (CurlyEnd::Point(a), CurlyEnd::Point(b)) = (drag.tail, drag.head)
+        && ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt() < DEFAULT_BOND_LENGTH * 0.25
+    {
+        return;
+    }
+    let arrow = drag.arrow(&editor.molecule);
+    if crate::molecule::curly::geometry(&editor.molecule, &arrow).is_none() {
+        return;
+    }
+    let id = editor.molecule.add_curly_arrow(arrow);
+    editor.selected_atoms.clear();
+    editor.selected_bonds.clear();
+    editor.selected_objects = [id].into_iter().collect();
+}
+
+/// The curly arrow that is the whole selection, whose handle can then be dragged.
+pub(crate) fn lone_selected_curly(editor: &ChemStructEditor) -> Option<&CurlyArrow> {
+    if editor.selected_objects.len() != 1 || !editor.selected_atoms.is_empty() {
+        return None;
+    }
+    let id = *editor.selected_objects.iter().next()?;
+    editor.molecule.object_by_id(id)?.as_curly()
+}
+
+/// Where the handle that bends the lone selected curly arrow is, in molecule coordinates.
+pub(crate) fn curly_handle(editor: &ChemStructEditor) -> Option<[f32; 2]> {
+    let c = lone_selected_curly(editor)?;
+    crate::molecule::curly::geometry(&editor.molecule, c).map(|p| p.middle())
+}
+
+/// The bend of the lone selected curly arrow, when its handle is under screen point `screen`.
+pub(crate) fn curly_handle_at(editor: &ChemStructEditor, screen: egui::Pos2, center: egui::Pos2) -> Option<ObjectDrag> {
+    let handle = curly_handle(editor)?;
+    let id = lone_selected_curly(editor)?.id;
+    (editor.mol_to_screen(handle, center).distance(screen) <= super::NODE_HIT_RADIUS_PX * 0.7).then_some(ObjectDrag::CurlyBend { id })
+}
+
+/// Bend curly arrow `id` so its middle passes through `to` (molecule coordinates); with
+/// `symmetric`, keep it a plain arc, only the depth of its bend following the pointer.
+///
+/// The ends move as the arrow bends (a lone pair's tail leaves its atom along the arc), so the
+/// arc through `to` is found again from where they then are, a few times over, going half way
+/// each time (all the way would swing to and fro about the answer): enough to bring the handle
+/// under the pointer.
+fn bend_curly(editor: &mut ChemStructEditor, id: u32, to: [f32; 2], symmetric: bool) {
+    for step in 0..24 {
+        let Some(PageObject::Curly(c)) = editor.molecule.object_by_id(id) else { return };
+        let Some(path) = crate::molecule::curly::geometry(&editor.molecule, c) else { return };
+        let Some((angle, skew)) = crate::molecule::curly::bend_through(path.tail, path.head, to) else { return };
+        let skew = if symmetric { 0.0 } else { skew };
+        let k = if step == 0 { 1.0 } else { 0.5 };
+        if let Some(PageObject::Curly(c)) = editor.molecule.object_by_id_mut(id) {
+            c.angle += (angle - c.angle) * k;
+            c.skew += (skew - c.skew) * k;
+        }
+    }
 }
 
 /// A rotation of the selection in progress (Select tool): Alt+drag, or a drag of the rotation

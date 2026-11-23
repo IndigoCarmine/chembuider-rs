@@ -8,9 +8,9 @@
 //!
 //! | input | default | overridden by |
 //! |---|---|---|
-//! | click | toggle what is under the pointer in the selection; on empty canvas, clear it | Bond (draw), Eraser (erase), Arrow (place), Text (type) |
+//! | click | toggle what is under the pointer in the selection; on empty canvas, clear it | Bond (draw), Eraser (erase), Arrow (place), Text (type), Curly arrow (flip one) |
 //! | double-click | an atom or bond: select its molecule; a text or table cell: edit it | Bond, Eraser, Arrow (a second click) |
-//! | drag | from an atom, object or arrow end: move it; from empty canvas: lasso | Bond (from an atom: draw a bond), Arrow (draw an arrow) |
+//! | drag | from an atom, object, arrow end or a curly arrow's handle: move it (bend the arrow); from empty canvas: lasso | Bond (from an atom: draw a bond), Arrow (draw an arrow), Curly arrow (draw one) |
 //! | keys | the drawing shortcuts, Delete, Escape, arrows | — |
 //!
 //! Some things belong to no tool and are not overridable: the selection's rotation handle and
@@ -34,6 +34,7 @@
 
 mod arrow;
 mod bond;
+mod curly;
 pub(crate) mod default;
 mod eraser;
 mod text;
@@ -138,6 +139,7 @@ impl Tool {
             Tool::Eraser => &eraser::Eraser,
             Tool::Arrow(_) => &arrow::Arrow,
             Tool::Text => &text::Text,
+            Tool::CurlyArrow(_) => &curly::Curly,
         }
     }
 }
@@ -170,7 +172,7 @@ impl Gesture {
             self,
             Gesture::MoveAtom { .. }
                 | Gesture::Rotate(_)
-                | Gesture::Object(ObjectDrag::Move { .. } | ObjectDrag::ArrowEnd { .. })
+                | Gesture::Object(ObjectDrag::Move { .. } | ObjectDrag::ArrowEnd { .. } | ObjectDrag::CurlyBend { .. })
         )
     }
 }
@@ -427,6 +429,12 @@ fn drag_on(editor: &mut ChemStructEditor, cx: &Cx, at: egui::Pos2) {
             }
         }
         Gesture::MoveAtom { atom } => interact::drag_atom(editor, atom, delta),
+        Gesture::Object(ObjectDrag::NewCurly(mut drawing)) => {
+            drawing.head = interact::curly_target(editor, &drawing.tail, at, cx.center, shift);
+            if let Some(Gesture::Object(ObjectDrag::NewCurly(d))) = editor.gesture_mut() {
+                *d = drawing;
+            }
+        }
         Gesture::Object(drag) => {
             let drag = interact::drag_object(editor, drag, delta, editor.screen_to_mol(at, cx.center), shift);
             if let Some(Gesture::Object(d)) = editor.gesture_mut() {
@@ -448,6 +456,7 @@ fn finish(editor: &mut ChemStructEditor, cx: &Cx, gesture: Gesture) {
         Gesture::DrawBond { from, end } => interact::finish_bond(editor, from, end, cx.center),
         Gesture::Lasso { path } => interact::lasso_select(editor, &path, cx.center),
         Gesture::Object(ObjectDrag::NewArrow { tail, head, kind }) => interact::finish_arrow(editor, tail, head, kind),
+        Gesture::Object(ObjectDrag::NewCurly(drag)) => interact::finish_curly(editor, &drag),
         Gesture::MoveAtom { .. } | Gesture::Object(_) | Gesture::Rotate(_) => {}
     }
 }

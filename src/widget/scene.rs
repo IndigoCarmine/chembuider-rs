@@ -24,7 +24,7 @@ use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::config::StyleConfig;
 use crate::molecule::lookup::{AtomLookup, MolIndex};
-use crate::molecule::{ArrowKind, BondOrder, Bracket, BondStereo, DoublePosition, Molecule, PageObject, PageText, ReactionTable, TextAlign};
+use crate::molecule::{ArrowKind, BondOrder, Bracket, BondStereo, CurlyArrow, CurlyKind, DoublePosition, Molecule, PageObject, PageText, ReactionTable, TextAlign};
 use crate::reaction::edit::CellRef;
 use crate::widget::rich_text::{RichText, SpanStyle};
 
@@ -42,6 +42,19 @@ pub const ARROW_HEAD_CENTER: f32 = 19.69;
 pub const ARROW_HEAD_HALF_WIDTH: f32 = 5.63;
 /// Distance between the two shafts of an equilibrium arrow, in line widths.
 pub const ARROW_SHAFT_SPACING: f32 = 6.0;
+/// A curly arrow's head, in line widths, as [`ARROW_HEAD_LENGTH`] and its fellows size a
+/// reaction arrow's: smaller, as a mechanism's arrows are drawn among the atoms, but still
+/// notched, and wide enough to read at a glance.
+pub const CURLY_HEAD_LENGTH: f32 = 11.0;
+/// See [`CURLY_HEAD_LENGTH`].
+pub const CURLY_HEAD_CENTER: f32 = 9.0;
+/// See [`CURLY_HEAD_LENGTH`].
+pub const CURLY_HEAD_HALF_WIDTH: f32 = 3.6;
+/// The radius of a lone pair's dot, and the distance between the two dots' centres, in line
+/// widths.
+pub const LONE_PAIR_DOT_RADIUS: f32 = 1.6;
+/// See [`LONE_PAIR_DOT_RADIUS`].
+pub const LONE_PAIR_DOT_SPACING: f32 = 5.5;
 /// Baseline-to-baseline distance of a page text's lines, in font sizes.
 pub const TEXT_LINE_HEIGHT: f32 = 1.2;
 
@@ -389,7 +402,104 @@ pub fn build_object(
         }
         PageObject::Table(t) => build_table(t, mol, style, xf, layout).object,
         PageObject::Bracket(b) => build_bracket(b, mol, style, xf, layout),
+        PageObject::Curly(c) => build_curly(c, mol, style, xf),
     }
+}
+
+/// A curly arrow ([`crate::molecule::curly`]): its curved shaft, its head (whole, or half on the
+/// outer side for a fish-hook) turned along the curve's last stretch, and the dots of the lone
+/// pair it starts from. Lines are as wide as bonds and the head is sized in line widths, as for
+/// a reaction arrow. An arrow that cannot be placed (an atom it names is gone) draws nothing.
+pub fn build_curly(c: &CurlyArrow, mol: &Molecule, style: &StyleConfig, xf: RenderTransform) -> SceneObject {
+    let width = style.bond_width * xf.visual_scale;
+    let Some(path) = crate::molecule::curly::geometry(mol, c) else {
+        return SceneObject { object_id: c.id, strokes: Vec::new(), fills: Vec::new(), texts: Vec::new(), rect: Rect::NOTHING };
+    };
+    let points: Vec<Pos2> = path.points.iter().map(|p| xf.apply(*p)).collect();
+    let (strokes, mut fills) = curly_primitives(&points, c.kind, c.angle, width);
+    if let Some((middle, across)) = path.dots {
+        let m = xf.apply(middle);
+        let across = Vec2::new(across[0], across[1]) * (LONE_PAIR_DOT_SPACING * width * 0.5);
+        for centre in [m + across, m - across] {
+            fills.push(dot(centre, LONE_PAIR_DOT_RADIUS * width));
+        }
+    }
+    let mut rect = Rect::NOTHING;
+    points.iter().chain(fills.iter().flatten()).for_each(|p| rect.extend_with(*p));
+    SceneObject { object_id: c.id, strokes, fills, texts: Vec::new(), rect: rect.expand(width * 0.5) }
+}
+
+/// A filled round dot: a 12-sided polygon, round enough at the size of a lone pair's dot.
+fn dot(centre: Pos2, radius: f32) -> Vec<Pos2> {
+    (0..12)
+        .map(|k| {
+            let a = k as f32 * std::f32::consts::TAU / 12.0;
+            centre + Vec2::new(a.cos(), a.sin()) * radius
+        })
+        .collect()
+}
+
+/// The shaft and head of a curly arrow along `points` (pixels, tail to tip), lines `width` wide.
+/// `angle` is the arrow's ([`CurlyArrow::angle`]): its sign says which side of the curve is the
+/// outer one, where a fish-hook's half head goes. The head is turned along the chord of the
+/// curve's last head-length, so it sits on the curve, and the shaft stops at its notch. A head
+/// never takes more than half the curve.
+pub fn curly_primitives(points: &[Pos2], kind: CurlyKind, angle: f32, width: f32) -> (Vec<SceneStroke>, Vec<Vec<Pos2>>) {
+    let mut strokes = Vec::new();
+    let mut fills = Vec::new();
+    let total: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+    if points.len() < 2 || total < 1e-3 {
+        return (strokes, fills);
+    }
+    let scale = (total * 0.5 / (CURLY_HEAD_LENGTH * width)).min(1.0);
+    let head_len = CURLY_HEAD_LENGTH * width * scale;
+    let center = CURLY_HEAD_CENTER * width * scale;
+    let half = CURLY_HEAD_HALF_WIDTH * width * scale;
+    // The point `back` along the curve from the tip.
+    let at_from_tip = |back: f32| -> (Pos2, usize) {
+        let mut left = back;
+        for k in (1..points.len()).rev() {
+            let step = points[k - 1].distance(points[k]);
+            if step >= left && step > 0.0 {
+                return (points[k] + (points[k - 1] - points[k]) * (left / step), k);
+            }
+            left -= step;
+        }
+        (points[0], 1)
+    };
+    let tip = *points.last().expect("two points at least");
+    let (back, _) = at_from_tip(head_len);
+    let along = tip - back;
+    if along.length() < 1e-4 {
+        return (strokes, fills);
+    }
+    let dir = along / along.length();
+    let notch = tip - dir * center;
+    let base = tip - dir * head_len;
+    // The shaft: the curve up to the notch's distance from the tip, then on to the notch.
+    let (end, k) = at_from_tip(center);
+    let mut shaft: Vec<Pos2> = points[..k].to_vec();
+    shaft.push(end);
+    shaft.push(notch);
+    for w in shaft.windows(2) {
+        if w[0].distance(w[1]) > 1e-4 {
+            strokes.push(SceneStroke { a: w[0], b: w[1], width });
+        }
+    }
+    // Left of the direction of travel, on a y-down screen.
+    let left = Vec2::new(dir.y, -dir.x);
+    match kind {
+        CurlyKind::Pair => {
+            fills.push(vec![tip, base + left * half, notch]);
+            fills.push(vec![tip, notch, base - left * half]);
+        }
+        CurlyKind::Single => {
+            // A positive angle bends the arc out to the right: its outer side is the right.
+            let outer = if angle > 0.0 { -left } else { left };
+            fills.push(vec![tip, base + outer * half, notch]);
+        }
+    }
+    (strokes, fills)
 }
 
 /// Size of a bracket's label relative to the atom labels (ChemDraw: 7.5 pt beside 10 pt).

@@ -412,6 +412,15 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
             painter.circle(sp, 4.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
         }
     }
+    // The handle that bends a lone selected curly arrow, in its middle.
+    if let Some(handle) = super::interact::curly_handle(editor) {
+        painter.circle(xf.apply(handle), 4.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
+    }
+    // The curly arrow being drawn with the Curly arrow tool, bending as it will.
+    if let Some(super::interact::ObjectDrag::NewCurly(drawing)) = editor.object_drag() {
+        let preview = scene::build_curly(&drawing.arrow(&editor.molecule), &editor.molecule, style, xf);
+        paint(&preview, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
+    }
     // The arrow being drawn with the Arrow tool.
     if let Some(&super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag() {
         let preview = PageObject::Arrow(crate::molecule::PageArrow { id: 0, tail, head, kind, source: None });

@@ -66,8 +66,8 @@ pub(crate) fn edit_object(editor: &mut ChemStructEditor, id: u32, at: egui::Pos2
     }
 }
 
-/// A drag moves what it was pressed on (an end of the lone selected arrow, an atom, a page
-/// object), and draws a rubber band from anywhere else.
+/// A drag moves what it was pressed on (an end of the lone selected arrow, the handle of the lone
+/// selected curly arrow, an atom, a page object), and draws a rubber band from anywhere else.
 pub(crate) fn on_drag_start(
     editor: &mut ChemStructEditor,
     cx: &Cx,
@@ -77,6 +77,9 @@ pub(crate) fn on_drag_start(
 ) -> Option<Gesture> {
     if let Some(end) = interact::arrow_end_at(editor, origin, cx.center) {
         return Some(Gesture::Object(end));
+    }
+    if let Some(bend) = interact::curly_handle_at(editor, origin, cx.center) {
+        return Some(Gesture::Object(bend));
     }
     Some(match hit {
         Hit::Atom(atom) => Gesture::MoveAtom { atom },
