@@ -72,7 +72,7 @@ impl Molecule {
                 let other = if b.begin == id { b.end } else { b.begin };
                 !self.atom_by_id(other).is_some_and(|a| a.group_h)
             })
-            .map(|b| b.order.valence())
+            .map(|b| b.valence())
             .sum();
         Some(sum - limit)
     }

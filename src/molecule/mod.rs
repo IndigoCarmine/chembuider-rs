@@ -259,6 +259,21 @@ pub struct Bond {
     pub color: Option<[u8; 4]>,
 }
 
+impl Bond {
+    /// What this bond takes of each of its two atoms' valence: its order's, except for a
+    /// dative bond, which takes none. The donor gives a lone pair it does not bond with
+    /// otherwise, and the acceptor (a metal, or the boron of H₃N→BH₃) takes it into an empty
+    /// orbital: the pyridine nitrogen of a complex keeps its three bonds, an ammine ligand its
+    /// three hydrogens, a borane its three.
+    pub fn valence(&self) -> i16 {
+        if self.stereo == BondStereo::Dative {
+            0
+        } else {
+            self.order.valence()
+        }
+    }
+}
+
 /// A drop shadow cast by one structure (a connected set of atoms, [`Molecule::structures`]):
 /// its ring fills, bonds and atom labels (not the arrows and texts on the page), drawn behind
 /// everything else. Each structure has its own, kept on its atoms ([`Atom::shadow`]).
@@ -623,7 +638,7 @@ impl Molecule {
 
     /// Total bond order carried by `atom_id`.
     pub fn bond_order_sum(&self, atom_id: u32) -> i16 {
-        self.bonds_for_atom(atom_id).iter().map(|b| b.order.valence()).sum()
+        self.bonds_for_atom(atom_id).iter().map(|b| b.valence()).sum()
     }
 
     // ─── Rings ────────────────────────────────────────────────────────────────
@@ -861,7 +876,7 @@ impl Molecule {
         let mut candidates: Vec<(u32, i16)> = self
             .bonds_for_atom(atom_id)
             .iter()
-            .map(|b| (if b.begin == atom_id { b.end } else { b.begin }, b.order.valence()))
+            .map(|b| (if b.begin == atom_id { b.end } else { b.begin }, b.valence()))
             .filter(|&(other, _)| {
                 self.atom_by_id(other).is_some_and(|a| a.element == "H" && a.group_h)
                     && self.bonds_for_atom(other).len() == 1
