@@ -123,6 +123,10 @@ struct ClipCurly {
     kind: crate::molecule::CurlyKind,
     #[serde(default)]
     dots: bool,
+    /// The free shape ([`CurlyArrow::path`](crate::molecule::CurlyArrow::path)): relative to the
+    /// ends, so it pastes as it was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path: Vec<[f32; 2]>,
 }
 
 /// A self-contained copy of a sub-structure (atoms + the bonds among them), used for
@@ -163,8 +167,11 @@ pub enum Tool {
     /// electrons; the tail stands on the side of the atom nearer the press), drag to the atom or
     /// bond the electrons go to, and release. Shift at the release on an atom points the head
     /// between that atom and the one the electrons come from: the bond being made. The new arrow
-    /// is left selected, with a handle at its middle that bends it; a click on an arrow flips
-    /// which side it bends to.
+    /// is left selected, with its handles: the middle of the arc bends it; two Bézier control
+    /// points give it any shape (an S, a long U); a double-click on the curve adds a knot for a
+    /// path of several pieces (a double-click on a knot takes it out, on a control point makes
+    /// the arrow a plain arc again); the ends can be dragged onto another atom or bond. A click
+    /// on an arrow selects it.
     CurlyArrow(crate::molecule::CurlyKind),
 }
 
@@ -866,7 +873,15 @@ impl ChemStructEditor {
                         CurlyEnd::Point(p) => ClipCurlyEnd::Point(p),
                     })
                 };
-                Some(ClipCurly { tail: end(&c.tail)?, head: end(&c.head)?, angle: c.angle, skew: c.skew, kind: c.kind, dots: c.dots })
+                Some(ClipCurly {
+                    tail: end(&c.tail)?,
+                    head: end(&c.head)?,
+                    angle: c.angle,
+                    skew: c.skew,
+                    kind: c.kind,
+                    dots: c.dots,
+                    path: c.path.clone(),
+                })
             })
             .collect();
         if ids.is_empty() && texts.is_empty() && curly.is_empty() {
@@ -1022,7 +1037,12 @@ impl ChemStructEditor {
                 })
             };
             if let (Some(tail), Some(head)) = (end(&c.tail), end(&c.head)) {
-                let arrow = crate::molecule::CurlyArrow { skew: c.skew, dots: c.dots, ..crate::molecule::CurlyArrow::new(tail, head, c.angle, c.kind) };
+                let arrow = crate::molecule::CurlyArrow {
+                    skew: c.skew,
+                    dots: c.dots,
+                    path: c.path.clone(),
+                    ..crate::molecule::CurlyArrow::new(tail, head, c.angle, c.kind)
+                };
                 new_objects.push(self.molecule.add_curly_arrow(arrow));
             }
         }
@@ -1659,13 +1679,21 @@ impl ChemStructEditor {
     }
 
     /// Set how far the selected curly arrows turn, in degrees (the sign kept: each still bends
-    /// to its side), and make them plain arcs. One undo step; false when that changes nothing.
+    /// to its side), and make them plain arcs (a free shape is let go). One undo step; false when
+    /// that changes nothing.
     pub fn set_selected_curly_angle(&mut self, degrees: f32) -> bool {
         let degrees = crate::molecule::curly::clamp_angle(degrees.abs());
         self.change_selected_curly(|c| {
             c.angle = if c.angle < 0.0 { -degrees } else { degrees };
             c.skew = 0.0;
+            c.path.clear();
         })
+    }
+
+    /// Make the selected curly arrows plain arcs again, letting go of any free shape they were
+    /// given. One undo step; false when none had one.
+    pub fn reset_selected_curly_shapes(&mut self) -> bool {
+        self.change_selected_curly(|c| c.path.clear())
     }
 
     /// Close the text box, keeping what was typed: a new text is added, an edited one changed,

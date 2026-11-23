@@ -1,7 +1,7 @@
 //! The Curly arrow tool: a drag from an atom (a lone pair) or a bond (its electrons) to the atom
 //! or bond the electrons go to draws an electron-pushing arrow ([`crate::molecule::curly`]); a
-//! click on a curly arrow flips the side it bends to. The handle in the middle of the selected
-//! arrow bends it, here as with every tool. Everything else is the default.
+//! click on a curly arrow makes it the selection, showing its handles (which shape it, here as
+//! with every tool). Everything else is the default.
 
 use super::{default, Cx, Gesture, Hit, ToolBehavior};
 use crate::molecule::{CurlyEnd, CurlyKind, PageObject};
@@ -18,29 +18,22 @@ fn kind(editor: &ChemStructEditor) -> CurlyKind {
     }
 }
 
-/// Flip curly arrow `id` when `hit` is one; whether it was.
-fn flip(editor: &mut ChemStructEditor, hit: Hit) -> bool {
+/// Make curly arrow `id` the selection when `hit` is one; whether it was.
+fn select(editor: &mut ChemStructEditor, hit: Hit) -> bool {
     let Hit::Object(id) = hit else { return false };
-    match editor.molecule.object_by_id_mut(id) {
-        Some(PageObject::Curly(c)) => {
-            c.flip();
-            true
-        }
-        _ => false,
+    if !matches!(editor.molecule.object_by_id(id), Some(PageObject::Curly(_))) {
+        return false;
     }
+    editor.selected_atoms.clear();
+    editor.selected_bonds.clear();
+    editor.selected_objects = [id].into_iter().collect();
+    true
 }
 
 impl ToolBehavior for Curly {
     fn on_click(&self, editor: &mut ChemStructEditor, cx: &Cx, at: egui::Pos2, hit: Hit) {
-        if !flip(editor, hit) {
+        if !select(editor, hit) {
             default::on_click(editor, cx, at, hit);
-        }
-    }
-
-    /// Quick clicks on an arrow flip it each time.
-    fn on_double_click(&self, editor: &mut ChemStructEditor, cx: &Cx, at: egui::Pos2, hit: Hit) {
-        if !flip(editor, hit) {
-            default::on_double_click(editor, cx, at, hit);
         }
     }
 

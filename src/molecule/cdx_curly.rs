@@ -24,6 +24,23 @@
 //! </arrow>
 //! ```
 //!
+//! **A free shape** (an S, a long U or L round other atoms: [`CurlyArrow::path`]) is no arc, so
+//! it is written as ChemDraw's Bézier `curve` instead (`CurvePoints`: each knot as control-in,
+//! knot, control-out), drawn as this editor draws it, cut back at the ends, with the same
+//! arrowheads (`ArrowheadHead`, `ArrowheadType`) and the same tag, whose value then carries the
+//! path in the frame of its anchors:
+//!
+//! ```text
+//! <curve id="30" CurvePoints="..." FillType="None" ArrowheadHead="Full" ArrowheadType="Solid" ...>
+//!   <objecttag ... Name="ChemBuilder/CurlyArrow" Value="v=2 tail=bond:9:4 head=atom:12 ...
+//!     path=0.2,0.9;0.4,0;0.5,-0.2;0.6,-0.4;0.9,-0.8"/>
+//! </curve>
+//! ```
+//!
+//! A ChemDraw curve with a head at its end and none at its start is read back as a curly arrow
+//! of that shape. A ChemDraw curve has no `ArrowSource` / `ArrowTarget`, so without the tag its
+//! ends are tied only where they clearly stand.
+//!
 //! Reading takes an arrow with the tag back exactly as it was written — provided the tag still
 //! describes the arrow: ChemDraw keeps a persistent tag, but if the arrow or its atoms were moved
 //! there, or ChemDraw gave the objects new ids, the ends the tag names are no longer where the
@@ -43,6 +60,7 @@ use crate::widget::scene::{CURLY_HEAD_CENTER, CURLY_HEAD_HALF_WIDTH, CURLY_HEAD_
 
 pub(crate) const OBJ_GRAPHIC: u16 = 0x8007;
 pub(crate) const OBJ_ARROW: u16 = 0x8021;
+pub(crate) const OBJ_CURVE: u16 = 0x8008;
 
 const PROP_SUPERSEDED_BY: u16 = 0x0013;
 const PROP_HEAD_3D: u16 = 0x0207;
@@ -66,6 +84,9 @@ const PROP_FILL_TYPE: u16 = 0x0A37;
 const PROP_DIPOLE: u16 = 0x0A3A;
 const PROP_NO_GO: u16 = 0x0A3B;
 const PROP_ARROW_SOURCE: u16 = 0x0A3E;
+const PROP_CURVE_TYPE: u16 = 0x0A08;
+const PROP_CURVE_POINTS: u16 = 0x0A23;
+const PROP_CLOSED: u16 = 0x0A39;
 const PROP_ARROW_TARGET: u16 = 0x0A3F;
 
 const GRAPHIC_ARC: i16 = 2;
@@ -80,8 +101,15 @@ const FILL_NONE: i16 = 1;
 
 /// The name of the object tag that holds what ChemDraw cannot say about a curly arrow.
 pub(crate) const CURLY_TAG: &str = "ChemBuilder/CurlyArrow";
-/// The version of the tag's value this writes; a reader takes this one and earlier ones.
-const TAG_VERSION: u32 = 1;
+/// The version of the tag's value this writes; a reader takes this one and earlier ones. 1: the
+/// ends, angle, skew, kind and dots; 2: and the free shape (`path`).
+const TAG_VERSION: u32 = 2;
+/// kCDXCurveType: closed, and the arrowheads an older curve has at its start (whole or half).
+const CURVE_CLOSED: i16 = 0x0001;
+const CURVE_ARROWS_AT_START: i16 = 0x0010 | 0x0040;
+/// kCDXCurveType: an arrowhead at the end, whole or half (an older curve's head).
+const CURVE_ARROW_AT_END: i16 = 0x0008;
+const CURVE_HALF_ARROW_AT_END: i16 = 0x0020;
 /// How far an end the tag names may lie from the arrow's `Tail3D` / `Head3D` (molecule units, a
 /// bond is 1.5) for the tag to be trusted: rounding, not an edit.
 const TAG_TOLERANCE: f32 = 0.12;
@@ -138,6 +166,56 @@ pub(crate) fn is_curly_graphic(g: &CdxObject) -> bool {
         && g.prop_i16(PROP_GRAPHIC_TYPE) == Some(GRAPHIC_ARC)
         && matches!(g.prop_i16(PROP_ARROW_TYPE), Some(ARROW_TYPE_HALF_HEAD | ARROW_TYPE_FULL_HEAD))
         && cdx::bounding_box(g).is_some()
+}
+
+/// Whether a ChemDraw `curve` is a curved arrow this editor draws as a curly arrow: open, with a
+/// head at its end (whole or half) and none at its start, and points enough for one piece.
+pub(crate) fn is_curly_curve(c: &CdxObject) -> bool {
+    if c.tag != OBJ_CURVE || cdx_appearance::is_ring_fill(c) {
+        return false;
+    }
+    let curve_type = c.prop_i16(PROP_CURVE_TYPE).unwrap_or(0);
+    let head = matches!(c.prop_i16(PROP_ARROWHEAD_HEAD), Some(HEAD_FULL | HEAD_HALF_LEFT | HEAD_HALF_RIGHT))
+        || curve_type & (CURVE_ARROW_AT_END | CURVE_HALF_ARROW_AT_END) != 0;
+    head && curve_type & (CURVE_CLOSED | CURVE_ARROWS_AT_START) == 0
+        && !c.prop(PROP_CLOSED).is_some_and(|v| v.first().is_some_and(|&b| b != 0))
+        && matches!(c.prop_i16(PROP_ARROWHEAD_TAIL), None | Some(0 | HEAD_NONE))
+        && !c.prop_i16(PROP_ARROWHEAD_TYPE).is_some_and(|t| t != 0 && t != ARROWHEAD_SOLID)
+        && curve_knots(c).is_some_and(|k| k.len() >= 2)
+}
+
+/// A curve's knots, each as (control in, knot, control out), in molecule units.
+fn curve_knots(c: &CdxObject) -> Option<Vec<[[f32; 2]; 3]>> {
+    let v = c.prop(PROP_CURVE_POINTS)?;
+    let n = u16::from_le_bytes([*v.first()?, *v.get(1)?]) as usize;
+    if n < 3 || !n.is_multiple_of(3) {
+        return None;
+    }
+    let int = |at: usize| v.get(at..at + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64 / SCALE);
+    // A CDX 2D point is y, then x.
+    let point = |k: usize| Some([int(2 + k * 8 + 4)? as f32, int(2 + k * 8)? as f32]);
+    (0..n / 3).map(|k| Some([point(3 * k)?, point(3 * k + 1)?, point(3 * k + 2)?])).collect()
+}
+
+/// A ChemDraw `curve` arrow as a curly arrow of its shape with free ends where it starts and
+/// ends, and what may tie those ends to atoms (only its tag: a curve has no source or target).
+pub(crate) fn read_curve(c: &CdxObject) -> Option<(CurlyArrow, Links)> {
+    let knots = curve_knots(c)?;
+    let pieces: Vec<[[f32; 2]; 4]> = knots.windows(2).map(|w| [w[0][1], w[0][2], w[1][0], w[1][1]]).collect();
+    let (tail, head) = (pieces[0][0], pieces[pieces.len() - 1][3]);
+    let path = curly::path_of(tail, head, &pieces)?;
+    let curve_type = c.prop_i16(PROP_CURVE_TYPE).unwrap_or(0);
+    let kind = match c.prop_i16(PROP_ARROWHEAD_HEAD) {
+        Some(HEAD_FULL) => CurlyKind::Pair,
+        Some(_) => CurlyKind::Single,
+        None if curve_type & CURVE_HALF_ARROW_AT_END != 0 => CurlyKind::Single,
+        None => CurlyKind::Pair,
+    };
+    let mut arrow = CurlyArrow::new(CurlyEnd::Point(tail), CurlyEnd::Point(head), curly::DEFAULT_CURLY_ANGLE, kind);
+    arrow.path = path;
+    arrow.source = Some(c.id);
+    let tag = cdx_appearance::tag_named(c, CURLY_TAG).and_then(cdx_appearance::tag_text).filter(|t| !t.is_empty());
+    Some((arrow, Links { tag, source: None, target: None }))
 }
 
 /// What reading a curly arrow found that ties it to the drawing, applied by [`link`] once the
@@ -243,8 +321,8 @@ fn tag_end(mol: &Molecule, ids: &ReadIds, text: &str) -> Option<CurlyEnd> {
     })
 }
 
-/// `arrow` (with free ends, as read) as the tag says it was written: its ends, angle, skew, kind
-/// and dots. `None` when the tag does not read, is of a later version, or no longer describes
+/// `arrow` (with free ends, as read) as the tag says it was written: its ends, angle, skew, kind,
+/// dots and free shape. `None` when the tag does not read, is of a later version, or no longer describes
 /// the arrow (its ends are not where the file draws them).
 fn from_tag(mol: &Molecule, ids: &ReadIds, arrow: &CurlyArrow, tag: &str) -> Option<CurlyArrow> {
     let fields: HashMap<&str, &str> = tag.split_whitespace().filter_map(|f| f.split_once('=')).collect();
@@ -271,6 +349,19 @@ fn from_tag(mol: &Molecule, ids: &ReadIds, arrow: &CurlyArrow, tag: &str) -> Opt
         Some(_) => return None,
     };
     out.dots = fields.get("dots").is_some_and(|d| *d == "1");
+    out.path = match fields.get("path") {
+        Some(text) => text
+            .split(';')
+            .map(|p| {
+                let (s, t) = p.split_once(',')?;
+                Some([s.parse::<f32>().ok().filter(|v| v.is_finite())?, t.parse::<f32>().ok().filter(|v| v.is_finite())?])
+            })
+            .collect::<Option<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    if !out.path.is_empty() && !out.is_shaped() {
+        return None;
+    }
     // Still the arrow the file draws?
     let path = curly::geometry(mol, &out)?;
     let (CurlyEnd::Point(tail), CurlyEnd::Point(head)) = (arrow.tail, arrow.head) else { return None };
@@ -304,12 +395,21 @@ pub(crate) fn link(arrow: &mut CurlyArrow, links: &Links, mol: &Molecule, ids: &
             .or_else(|| curly::end_near(mol, at, is_tail))
             .unwrap_or(CurlyEnd::Point(at))
     };
+    let drawn = curly::pieces(mol, arrow);
+    let read = arrow.clone();
     arrow.tail = tie(links.source, tail, true);
     arrow.head = tie(links.target, head, false);
     // A tail and a head on one atom is no arrow to redraw: keep it as ChemDraw drew it.
     if arrow.tail == arrow.head || (matches!(arrow.tail, CurlyEnd::Atom(a) if arrow.head == CurlyEnd::Atom(a))) {
-        arrow.tail = CurlyEnd::Point(tail);
-        arrow.head = CurlyEnd::Point(head);
+        *arrow = read;
+        return;
+    }
+    // A free shape keeps its control points where the file has them, now between the anchors
+    // of the ends it is tied to.
+    if let (Some(pieces), Some((at, ah))) = (drawn, curly::anchors(mol, arrow))
+        && let Some(path) = curly::path_of(at, ah, &pieces)
+    {
+        arrow.path = path;
     }
 }
 
@@ -339,7 +439,7 @@ fn native_id(end: &CurlyEnd, ids: &WrittenIds) -> Option<u32> {
 /// The tag's value for `arrow`.
 fn tag_value(arrow: &CurlyArrow, ids: &WrittenIds) -> String {
     let end = |e: &CurlyEnd| end_text(e, ids).unwrap_or_else(|| "free".to_string());
-    format!(
+    let mut value = format!(
         "v={TAG_VERSION} tail={} head={} angle={} skew={} kind={} dots={}",
         end(&arrow.tail),
         end(&arrow.head),
@@ -350,12 +450,18 @@ fn tag_value(arrow: &CurlyArrow, ids: &WrittenIds) -> String {
             CurlyKind::Single => "single",
         },
         u8::from(arrow.dots),
-    )
+    );
+    if arrow.is_shaped() {
+        let points: Vec<String> = arrow.path.iter().map(|p| format!("{},{}", p[0], p[1])).collect();
+        value.push_str(&format!(" path={}", points.join(";")));
+    }
+    value
 }
 
 /// The arc ChemDraw draws for `arrow`: its tail, head and centre (CDX units), its radius and the
 /// angle written. `None` when the arrow cannot be placed.
 struct Arc {
+    path: curly::CurlyPath,
     tail: (f64, f64),
     head: (f64, f64),
     center: (f64, f64),
@@ -387,16 +493,16 @@ fn arc_of(mol: &Molecule, arrow: &CurlyArrow, shift: (f64, f64)) -> Option<Arc> 
             to_cdx(p, shift)
         })
         .collect();
-    Some(Arc { tail, head, center, radius, angle, points })
+    Some(Arc { path, tail, head, center, radius, angle, points })
 }
 
-fn head_value(arrow: &CurlyArrow, angle: f32) -> i16 {
+/// `ArrowheadHead` for `arrow` drawn along `path`: a fish-hook's barb on the outer side of its
+/// last turn, as the editor draws it ([`curly::barb_left`]).
+fn head_value(arrow: &CurlyArrow, path: &curly::CurlyPath) -> i16 {
     match arrow.kind {
         CurlyKind::Pair => HEAD_FULL,
-        // The barb on the outer side of the arc: the right of the way it goes when it bends
-        // right (a positive angle).
-        CurlyKind::Single if angle > 0.0 => HEAD_HALF_RIGHT,
-        CurlyKind::Single => HEAD_HALF_LEFT,
+        CurlyKind::Single if curly::barb_left(arrow, path) => HEAD_HALF_LEFT,
+        CurlyKind::Single => HEAD_HALF_RIGHT,
     }
 }
 
@@ -419,7 +525,7 @@ fn set_curly(a: &mut CdxObject, g: Option<&mut CdxObject>, arrow: &CurlyArrow, a
     let [l, t, r, bt] = b.expect("an arc has points");
     a.set(PROP_BOUNDING_BOX, cdx::rect([l - pad, t - pad, r + pad, bt + pad]));
     a.set(PROP_FILL_TYPE, i16_bytes(FILL_NONE));
-    a.set(PROP_ARROWHEAD_HEAD, i16_bytes(head_value(arrow, arc.angle)));
+    a.set(PROP_ARROWHEAD_HEAD, i16_bytes(head_value(arrow, &arc.path)));
     a.props.retain(|(t, _)| *t != PROP_ARROWHEAD_TAIL && *t != PROP_ARROW_SHAFT_SPACING);
     a.set(PROP_ARROWHEAD_TYPE, i16_bytes(ARROWHEAD_SOLID));
     a.set(PROP_HEAD_SIZE, i16_bytes(hundredths(CURLY_HEAD_LENGTH)));
@@ -454,9 +560,55 @@ fn set_curly(a: &mut CdxObject, g: Option<&mut CdxObject>, arrow: &CurlyArrow, a
     }
 }
 
+/// Set everything this editor says about a curly arrow with a free shape on `c` (a new `curve`
+/// or the one it was read from): the curve as it is drawn, cut back at the ends, moved by
+/// `shift`, its head, and the tag. False when the arrow cannot be placed.
+fn set_curve(c: &mut CdxObject, mol: &Molecule, arrow: &CurlyArrow, ids: &WrittenIds, shift: (f64, f64), next: &mut u32) -> bool {
+    let (Some(pieces), Some(path)) = (curly::drawn_pieces(mol, arrow), curly::geometry(mol, arrow)) else { return false };
+    // Each knot as (control in, knot, control out); the ends' outer controls are the ends.
+    let mut knots: Vec<[[f32; 2]; 3]> = vec![[pieces[0][0], pieces[0][0], pieces[0][1]]];
+    for (i, b) in pieces.iter().enumerate() {
+        let out = pieces.get(i + 1).map_or(b[3], |n| n[1]);
+        knots.push([b[2], b[3], out]);
+    }
+    let mut points = ((knots.len() * 3) as u16).to_le_bytes().to_vec();
+    let mut bbox: Option<[f64; 4]> = None;
+    for k in &knots {
+        for p in k {
+            let (x, y) = to_cdx(*p, shift);
+            points.extend(cdx::point(x, y));
+        }
+    }
+    for p in &path.points {
+        let (x, y) = to_cdx(*p, shift);
+        bbox = Some(cdx::union(bbox, [x, y, x, y]));
+    }
+    let line = 0.6 * PT;
+    let pad = line / 2.0 + CURLY_HEAD_HALF_WIDTH as f64 * line;
+    let [l, t, r, bt] = bbox.expect("a curve has points");
+    c.set(PROP_BOUNDING_BOX, cdx::rect([l - pad, t - pad, r + pad, bt + pad]));
+    c.set(PROP_CURVE_POINTS, points);
+    // An open curve: what made the one read closed or headed at its start is dropped.
+    if let Some(t) = c.prop_i16(PROP_CURVE_TYPE) {
+        c.set(PROP_CURVE_TYPE, i16_bytes(t & !(CURVE_CLOSED | CURVE_ARROWS_AT_START | CURVE_ARROW_AT_END | CURVE_HALF_ARROW_AT_END)));
+    }
+    c.props.retain(|(t, _)| *t != PROP_CLOSED && *t != PROP_ARROWHEAD_TAIL);
+    c.set(PROP_FILL_TYPE, i16_bytes(FILL_NONE));
+    c.set(PROP_ARROWHEAD_HEAD, i16_bytes(head_value(arrow, &path)));
+    c.set(PROP_ARROWHEAD_TYPE, i16_bytes(ARROWHEAD_SOLID));
+    c.set(PROP_HEAD_SIZE, i16_bytes(hundredths(CURLY_HEAD_LENGTH)));
+    c.set(PROP_ARROWHEAD_CENTER_SIZE, i16_bytes(hundredths(CURLY_HEAD_CENTER)));
+    c.set(PROP_ARROWHEAD_WIDTH, i16_bytes(hundredths(CURLY_HEAD_HALF_WIDTH)));
+    c.children.retain(|o| !cdx_appearance::is_tag_named(o, CURLY_TAG));
+    *next += 1;
+    c.children.push(cdx_appearance::object_tag(*next, CURLY_TAG, Some(&tag_value(arrow, ids))));
+    true
+}
+
 /// The ChemDraw objects for `arrow` on `mol`, moved by `shift`: the objects it was read from
-/// (`original`, rewritten), or a new arc graphic and the `arrow` superseding it, with new ids
-/// from `next`. Nothing when the arrow cannot be placed.
+/// (`original`, rewritten), or new ones with new ids from `next` — an arc graphic and the
+/// `arrow` superseding it for an arc, a `curve` for a free shape. An arrow whose shape changed
+/// kind since it was read is written new. Nothing when the arrow cannot be placed.
 pub(crate) fn write(
     mol: &Molecule,
     arrow: &CurlyArrow,
@@ -465,8 +617,22 @@ pub(crate) fn write(
     shift: (f64, f64),
     next: &mut u32,
 ) -> Vec<CdxObject> {
+    let original = original.unwrap_or_default();
+    let read_as_curve = original.iter().any(|o| o.tag == OBJ_CURVE);
+    if arrow.is_shaped() {
+        let mut c = match original.into_iter().find(|o| o.tag == OBJ_CURVE) {
+            Some(c) => c,
+            None => {
+                *next += 1;
+                let mut c = CdxObject::new(OBJ_CURVE, *next);
+                c.set(PROP_BOUNDING_BOX, Vec::new()); // first, as ChemDraw orders it; set below
+                c
+            }
+        };
+        return if set_curve(&mut c, mol, arrow, ids, shift, next) { vec![c] } else { Vec::new() };
+    }
     let Some(arc) = arc_of(mol, arrow, shift) else { return Vec::new() };
-    let mut objects = original.unwrap_or_default();
+    let mut objects = if read_as_curve { Vec::new() } else { original };
     if !objects.iter().any(|o| o.tag == OBJ_ARROW) {
         // Read from a lone graphic, or new: a new arrow object, and a graphic for it.
         if !objects.iter().any(|o| o.tag == OBJ_GRAPHIC) {
@@ -538,7 +704,15 @@ mod tests {
         };
         for (x, y) in xs.iter().zip(ys) {
             assert_eq!((end(a, &x.tail), end(a, &x.head)), (end(b, &y.tail), end(b, &y.head)), "{x:?} vs {y:?}");
-            assert!((x.angle - y.angle).abs() < 0.05 && (x.skew - y.skew).abs() < 1e-4, "{x:?} vs {y:?}");
+            if x.is_shaped() {
+                assert_eq!(x.path.len(), y.path.len(), "{x:?} vs {y:?}");
+                for (p, q) in x.path.iter().zip(&y.path) {
+                    assert!((p[0] - q[0]).abs() < 1e-3 && (p[1] - q[1]).abs() < 1e-3, "{x:?} vs {y:?}");
+                }
+            } else {
+                assert!(!y.is_shaped(), "{y:?}");
+                assert!((x.angle - y.angle).abs() < 0.05 && (x.skew - y.skew).abs() < 1e-4, "{x:?} vs {y:?}");
+            }
             assert_eq!((x.kind, x.dots), (y.kind, y.dots));
         }
     }
@@ -574,7 +748,7 @@ mod tests {
             "ArrowSource=",
             "ArrowTarget=",
             "Name=\"ChemBuilder/CurlyArrow\"",
-            "v=1 tail=atom:",
+            "v=2 tail=atom:",
             "head=between:",
             "tail=bond:",
         ] {
@@ -662,4 +836,135 @@ mod tests {
         assert_eq!(again.other_objects, 0);
         let _ = PageObject::Curly(a[0].clone());
     }
+
+    /// The user's sketch: a ketone C=O, an H up and to the right, a methoxide down and to the
+    /// right; an S from the C=O bond (O's side) to the H, and a two-piece route from the
+    /// methoxide's lone pair round the bottom into the carbon from below.
+    fn shaped() -> (Molecule, Vec<CurlyArrow>) {
+        let mut m = Molecule::default();
+        let c = m.add_atom("C".into(), [9.0, 9.0], 0);
+        let o = m.add_atom("O".into(), [9.0, 7.5], 0);
+        let me1 = m.add_atom("C".into(), [7.7, 9.75], 0);
+        let me2 = m.add_atom("C".into(), [10.3, 9.75], 0);
+        let h = m.add_atom("H".into(), [11.4, 6.6], 0);
+        let nu = m.add_atom("O".into(), [12.5, 10.8], -1);
+        let co = m.add_bond(c, o, BondOrder::Double);
+        m.add_bond(c, me1, BondOrder::Single);
+        m.add_bond(c, me2, BondOrder::Single);
+        let s = CurlyArrow { path: vec![[0.3, 0.6], [0.6, -0.6]], ..CurlyArrow::new(CurlyEnd::Bond { bond: co, side: o }, CurlyEnd::Atom(h), 90.0, CurlyKind::Pair) };
+        let route = CurlyArrow {
+            path: vec![[0.1, 0.4], [0.4, 0.8], [0.6, 0.6], [0.8, 0.4], [1.1, 0.2]],
+            ..CurlyArrow::new(CurlyEnd::Atom(nu), CurlyEnd::Atom(c), 90.0, CurlyKind::Pair)
+        };
+        let hook = CurlyArrow { path: vec![[0.2, -0.5], [0.8, -0.5]], ..CurlyArrow::new(CurlyEnd::Atom(o), CurlyEnd::Between(o, h), 90.0, CurlyKind::Single) };
+        let arrows = vec![s, route, hook];
+        for a in &arrows {
+            m.add_curly_arrow(a.clone());
+        }
+        (m, arrows)
+    }
+
+    #[test]
+    fn shaped_arrows_are_chemdraw_curves_and_come_back_exactly() {
+        let (m, arrows) = shaped();
+        let xml = molecule_to_cdxml(&m);
+        let read = cdx_file_rs::cdxml::parse_cdxml_with_warnings(&xml).unwrap();
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        assert_eq!(xml.matches("<curve").count(), 3, "{xml}");
+        assert!(!xml.contains("<arrow"), "no arc for a free shape: {xml}");
+        for needle in ["CurvePoints=", "ArrowheadHead=\"Full\"", "ArrowheadType=\"Solid\"", "v=2 tail=bond:", "path=0.3,0.6;0.6,-0.6"] {
+            assert!(xml.contains(needle), "{needle}: {xml}");
+        }
+        assert!(xml.contains("ArrowheadHead=\"HalfLeft\"") || xml.contains("ArrowheadHead=\"HalfRight\""), "{xml}");
+        let from_cdx = read_cdx(&molecule_to_cdx_document(&m)).unwrap();
+        same_arrows(&m, &arrows, &from_cdx.molecule, &curlies(&from_cdx.molecule));
+        assert_eq!(from_cdx.other_objects, 0);
+        let from_xml = read_cdxml(&xml).unwrap();
+        same_arrows(&m, &arrows, &from_xml.molecule, &curlies(&from_xml.molecule));
+        // Saved into the document it came from, each curve keeps its id.
+        let bytes = molecule_to_cdx_document(&m);
+        let ids: Vec<Option<u32>> = curlies(&from_cdx.molecule).iter().map(|c| c.source).collect();
+        let again = read_cdx(&merge_into_cdx(&bytes, &from_cdx.molecule)).unwrap();
+        same_arrows(&m, &arrows, &again.molecule, &curlies(&again.molecule));
+        assert_eq!(curlies(&again.molecule).iter().map(|c| c.source).collect::<Vec<_>>(), ids);
+        assert_eq!(again.other_objects, 0);
+    }
+
+    #[test]
+    fn the_curve_is_drawn_where_the_editor_draws_it() {
+        let (m, arrows) = shaped();
+        let doc = cdx_codec::parse(&molecule_to_cdx_document(&m)).unwrap();
+        let curve = doc.children[0].children.iter().find(|o| o.tag == OBJ_CURVE).unwrap();
+        let knots = curve_knots(curve).unwrap();
+        let drawn = curly::geometry(&m, &m.curly_arrows().next().unwrap().clone()).unwrap();
+        // The document may be shifted onto the page; compare the shape, not the place.
+        let shift = [knots[0][1][0] - drawn.tail[0], knots[0][1][1] - drawn.tail[1]];
+        let end = knots[knots.len() - 1][1];
+        assert!((end[0] - shift[0] - drawn.head[0]).abs() < 0.02 && (end[1] - shift[1] - drawn.head[1]).abs() < 0.02, "{end:?} {shift:?} {drawn:?}");
+        let _ = arrows;
+    }
+
+    #[test]
+    fn without_the_tag_a_curve_keeps_its_shape_and_is_tied_where_clear() {
+        let (m, _) = shaped();
+        let mut doc = cdx_codec::parse(&molecule_to_cdx_document(&m)).unwrap();
+        strip_tags(&mut doc);
+        let read = read_cdx(&cdx_codec::write(&doc)).unwrap().molecule;
+        let a = curlies(&read);
+        assert_eq!(a.len(), 3);
+        assert!(a.iter().all(|c| c.is_shaped()));
+        // Each is drawn as the file has it, whatever it was tied to.
+        let (written, back) = (curly::geometry(&m, &curlies(&m)[1]).unwrap(), curly::geometry(&read, &a[1]).unwrap());
+        let shift = [back.points[0][0] - written.points[0][0], back.points[0][1] - written.points[0][1]];
+        for p in [0.25f32, 0.5, 0.75] {
+            let q = written.points[(p * (written.points.len() - 1) as f32) as usize];
+            let nearest = back.points.iter().map(|b| ((b[0] - q[0] - shift[0]).powi(2) + (b[1] - q[1] - shift[1]).powi(2)).sqrt()).fold(f32::INFINITY, f32::min);
+            assert!(nearest < 0.25, "{p}: {nearest}");
+        }
+    }
+
+    #[test]
+    fn a_version_1_tag_still_reads() {
+        let (m, arrows) = mechanism();
+        let xml = molecule_to_cdxml(&m).replace("v=2 ", "v=1 ");
+        let read = read_cdxml(&xml).unwrap();
+        same_arrows(&m, &arrows, &read.molecule, &curlies(&read.molecule));
+        // A later version than this reader knows is not trusted.
+        let read = read_cdxml(&molecule_to_cdxml(&m).replace("v=2 ", "v=9 ")).unwrap();
+        assert_eq!(curlies(&read.molecule)[1].skew, 0.0, "the skew only the tag carries is gone");
+    }
+
+    #[test]
+    fn a_chemdraw_bezier_arrow_reads_as_a_shaped_curly_arrow() {
+        // A curved arrow drawn with ChemDraw's freehand-curve tool: one piece from the lower
+        // right up over to a bromine atom, as CDXML writes it (each knot as control in, knot,
+        // control out), and a fish-hook on a closed curve, which is not an arrow.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
+<CDXML><page id="1">
+<fragment id="2"><n id="3" p="100 100" Element="35"/><n id="4" p="114.4 100"/><b id="5" B="3" E="4"/></fragment>
+<curve id="10" CurvePoints="140 130 140 130 150 100 120 80 104 94 104 94" FillType="None" ArrowheadHead="Full" ArrowheadType="Solid"/>
+<curve id="11" CurvePoints="60 60 60 60 70 50 80 60 80 70 80 70" ArrowheadHead="HalfLeft" ArrowheadType="Solid"/>
+<curve id="12" CurveType="1" CurvePoints="10 10 10 10 20 10 20 20 20 20 10 20" ArrowheadHead="Full"/>
+</page></CDXML>"#;
+        let import = read_cdxml(xml).unwrap();
+        let a = curlies(&import.molecule);
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(import.other_objects, 1, "the closed curve stays a shape");
+        assert!(a[0].is_shaped() && a[0].kind == CurlyKind::Pair);
+        // Its head is next to the bromine: tied to it.
+        let CurlyEnd::Atom(br) = a[0].head else { panic!("{:?}", a[0]) };
+        assert_eq!(import.molecule.atom_by_id(br).unwrap().element, "Br");
+        assert!(matches!(a[0].tail, CurlyEnd::Point(_)));
+        assert_eq!(a[1].kind, CurlyKind::Single);
+        // Drawn through the file's control points: its middle is where the file's curve's is.
+        let path = curly::geometry(&import.molecule, &a[1]).unwrap();
+        let mid = bezier_point_pt([[60.0, 60.0], [70.0, 50.0], [80.0, 60.0], [80.0, 70.0]], 0.5);
+        let m = path.points[path.points.len() / 2];
+        assert!((m[0] * 9.6 - mid[0]).abs() < 0.5 && (m[1] * 9.6 - mid[1]).abs() < 0.5, "{m:?} {mid:?}");
+    }
+
+    fn bezier_point_pt(b: [[f32; 2]; 4], t: f32) -> [f32; 2] {
+        curly::bezier_point(&b, t)
+    }
+
 }

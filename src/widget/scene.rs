@@ -416,7 +416,7 @@ pub fn build_curly(c: &CurlyArrow, mol: &Molecule, style: &StyleConfig, xf: Rend
         return SceneObject { object_id: c.id, strokes: Vec::new(), fills: Vec::new(), texts: Vec::new(), rect: Rect::NOTHING };
     };
     let points: Vec<Pos2> = path.points.iter().map(|p| xf.apply(*p)).collect();
-    let (strokes, mut fills) = curly_primitives(&points, c.kind, c.angle, width);
+    let (strokes, mut fills) = curly_primitives(&points, c.kind, crate::molecule::curly::barb_left(c, &path), width);
     if let Some((middle, across)) = path.dots {
         let m = xf.apply(middle);
         let across = Vec2::new(across[0], across[1]) * (LONE_PAIR_DOT_SPACING * width * 0.5);
@@ -440,11 +440,12 @@ fn dot(centre: Pos2, radius: f32) -> Vec<Pos2> {
 }
 
 /// The shaft and head of a curly arrow along `points` (pixels, tail to tip), lines `width` wide.
-/// `angle` is the arrow's ([`CurlyArrow::angle`]): its sign says which side of the curve is the
-/// outer one, where a fish-hook's half head goes. The head is turned along the chord of the
-/// curve's last head-length, so it sits on the curve, and the shaft stops at its notch. A head
+/// A fish-hook's half head goes on the left of the way the curve ends when `barb_left`, else on
+/// its right ([`barb_left`](crate::molecule::curly::barb_left) picks the outer side). The head
+/// points the way the curve's last stretch runs (the chord of its last half head-length, close
+/// to the tangent at the tip yet still on the curve), and the shaft stops at its notch. A head
 /// never takes more than half the curve.
-pub fn curly_primitives(points: &[Pos2], kind: CurlyKind, angle: f32, width: f32) -> (Vec<SceneStroke>, Vec<Vec<Pos2>>) {
+pub fn curly_primitives(points: &[Pos2], kind: CurlyKind, barb_left: bool, width: f32) -> (Vec<SceneStroke>, Vec<Vec<Pos2>>) {
     let mut strokes = Vec::new();
     let mut fills = Vec::new();
     let total: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
@@ -468,7 +469,7 @@ pub fn curly_primitives(points: &[Pos2], kind: CurlyKind, angle: f32, width: f32
         (points[0], 1)
     };
     let tip = *points.last().expect("two points at least");
-    let (back, _) = at_from_tip(head_len);
+    let (back, _) = at_from_tip(head_len * 0.5);
     let along = tip - back;
     if along.length() < 1e-4 {
         return (strokes, fills);
@@ -494,8 +495,7 @@ pub fn curly_primitives(points: &[Pos2], kind: CurlyKind, angle: f32, width: f32
             fills.push(vec![tip, notch, base - left * half]);
         }
         CurlyKind::Single => {
-            // A positive angle bends the arc out to the right: its outer side is the right.
-            let outer = if angle > 0.0 { -left } else { left };
+            let outer = if barb_left { left } else { -left };
             fills.push(vec![tip, base + outer * half, notch]);
         }
     }

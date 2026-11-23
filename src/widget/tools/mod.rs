@@ -8,9 +8,9 @@
 //!
 //! | input | default | overridden by |
 //! |---|---|---|
-//! | click | toggle what is under the pointer in the selection; on empty canvas, clear it | Bond (draw), Eraser (erase), Arrow (place), Text (type), Curly arrow (flip one) |
+//! | click | toggle what is under the pointer in the selection; on empty canvas, clear it | Bond (draw), Eraser (erase), Arrow (place), Text (type), Curly arrow (select one) |
 //! | double-click | an atom or bond: select its molecule; a text or table cell: edit it | Bond, Eraser, Arrow (a second click) |
-//! | drag | from an atom, object, arrow end or a curly arrow's handle: move it (bend the arrow); from empty canvas: lasso | Bond (from an atom: draw a bond), Arrow (draw an arrow), Curly arrow (draw one) |
+//! | drag | from an atom, object, arrow end or a curly arrow's handle: move it (reshape or re-point the arrow); from empty canvas: lasso | Bond (from an atom: draw a bond), Arrow (draw an arrow), Curly arrow (draw one) |
 //! | keys | the drawing shortcuts, Delete, Escape, arrows | — |
 //!
 //! Some things belong to no tool and are not overridable: the selection's rotation handle and
@@ -172,7 +172,13 @@ impl Gesture {
             self,
             Gesture::MoveAtom { .. }
                 | Gesture::Rotate(_)
-                | Gesture::Object(ObjectDrag::Move { .. } | ObjectDrag::ArrowEnd { .. } | ObjectDrag::CurlyBend { .. })
+                | Gesture::Object(
+                    ObjectDrag::Move { .. }
+                        | ObjectDrag::ArrowEnd { .. }
+                        | ObjectDrag::CurlyBend { .. }
+                        | ObjectDrag::CurlyPoint { .. }
+                        | ObjectDrag::CurlyRepoint { .. }
+                )
         )
     }
 }
@@ -351,6 +357,15 @@ fn pointer_input(editor: &mut ChemStructEditor, cx: &Cx, tool: &dyn ToolBehavior
             if response.double_clicked() {
                 editor.open_rotate_input();
             }
+        } else if interact::curly_handle_at(editor, at, cx.center).is_some()
+            || (response.double_clicked() && is_curly_at(editor, at, cx.center))
+        {
+            // A curly arrow's handles are dragged, not clicked: a click on one keeps the
+            // selection, and a double-click there, or on a curly arrow's curve, shapes it.
+            if response.double_clicked() {
+                let (_, shaped) = as_one_step(editor, |editor| interact::curly_double_click(editor, at, cx.center));
+                changed |= shaped;
+            }
         } else {
             let hit = editor.hit_at(at, cx.center);
             let ((), click_changed) = as_one_step(editor, |editor| {
@@ -412,6 +427,11 @@ fn pointer_input(editor: &mut ChemStructEditor, cx: &Cx, tool: &dyn ToolBehavior
     (aborted, changed)
 }
 
+/// Whether a curly arrow is what is under screen point `at`.
+fn is_curly_at(editor: &ChemStructEditor, at: egui::Pos2, center: egui::Pos2) -> bool {
+    matches!(editor.hit_at(at, center), Hit::Object(id) if editor.molecule.object_by_id(id).is_some_and(|o| o.as_curly().is_some()))
+}
+
 /// The pointer moved to `at` during the drag.
 fn drag_on(editor: &mut ChemStructEditor, cx: &Cx, at: egui::Pos2) {
     let delta = editor.view(cx.center).screen_delta_to_mol(cx.response.drag_delta());
@@ -457,6 +477,9 @@ fn finish(editor: &mut ChemStructEditor, cx: &Cx, gesture: Gesture) {
         Gesture::Lasso { path } => interact::lasso_select(editor, &path, cx.center),
         Gesture::Object(ObjectDrag::NewArrow { tail, head, kind }) => interact::finish_arrow(editor, tail, head, kind),
         Gesture::Object(ObjectDrag::NewCurly(drag)) => interact::finish_curly(editor, &drag),
+        Gesture::Object(ObjectDrag::CurlyRepoint { id, head, at }) => {
+            interact::finish_curly_repoint(editor, id, head, at, cx.center, cx.shift())
+        }
         Gesture::MoveAtom { .. } | Gesture::Object(_) | Gesture::Rotate(_) => {}
     }
 }

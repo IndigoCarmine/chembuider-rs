@@ -227,6 +227,10 @@ pub(crate) fn convert_page(page: &CdxObject, fonts: &FontTable, colors: &ColorTa
     let mut out = Vec::new();
     for obj in objects {
         match obj.tag {
+            cdx_curly::OBJ_CURVE if cdx_curly::is_curly_curve(obj) => {
+                let Some((arrow, links)) = cdx_curly::read_curve(obj) else { continue };
+                out.push(Converted { object: PageObject::Curly(arrow), ids: vec![obj.id], links: Some(links) });
+            }
             OBJ_ARROW if cdx_curly::is_curly_arrow(obj) => {
                 let Some((arrow, links)) = cdx_curly::read_arrow(obj) else { continue };
                 let mut ids = vec![obj.id];
