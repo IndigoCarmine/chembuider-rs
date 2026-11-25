@@ -1,10 +1,10 @@
-//! The Curly arrow tool and how curly arrows are bent, flipped, moved with their atoms, deleted,
-//! copied, saved and drawn, driven through whole headless frames.
+//! The Curly arrow tool, and how curly arrows are drawn from their roles, reshaped by hand,
+//! re-pointed, moved with their atoms, deleted, copied, saved and drawn, driven through whole
+//! headless frames.
 
 use super::*;
-use crate::molecule::curly::{self, CurlyPath};
+use crate::molecule::curly::{self, CurlyCase, CurlyPath};
 use crate::molecule::{CurlyArrow, CurlyEnd, CurlyKind};
-use crate::testkit::run_frame_with_modifiers;
 
 /// The 640x480 test screen; its center is molecule (0, 0) at the default view, 50 px a unit.
 const SCREEN: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(640.0, 480.0));
@@ -19,37 +19,59 @@ const SHIFT: egui::Modifiers = egui::Modifiers { shift: true, ..egui::Modifiers:
 struct Driver {
     ctx: egui::Context,
     editor: ChemStructEditor,
+    /// The frames' clock, so that egui tells a double-click from two clicks a while apart.
+    time: f64,
 }
 
-/// The atoms of the drawing: a carbonyl carbon C bonded to O above it (a double bond) and to a
-/// methyl carbon Me, and a hydroxide oxygen Nu off to the right.
+/// The user's sketch: acetone's C=O (O above C) with its methyls, an H up and to the right of
+/// O, and a methoxide O⁻ (Nu) down and to the right.
 struct Atoms {
     c: u32,
     o: u32,
     me: u32,
+    h: u32,
     nu: u32,
     co: u32,
 }
+
+/// Where the sketch's atoms are (molecule units).
+const C: [f32; 2] = [0.0, 0.0];
+const O: [f32; 2] = [0.0, -1.5];
+const H: [f32; 2] = [2.0, -2.8];
+const NU: [f32; 2] = [3.2, 2.2];
+/// On the C=O bond, nearer O (outside O's label), and nearer C.
+const ON_CO_NEAR_O: [f32; 2] = [0.0, -0.8];
+const ON_CO_NEAR_C: [f32; 2] = [0.0, -0.4];
 
 impl Driver {
     fn new(kind: CurlyKind) -> (Self, Atoms) {
         let mut editor = ChemStructEditor { tool: Tool::CurlyArrow(kind), ..Default::default() };
         let m = &mut editor.molecule;
-        let c = m.add_atom("C".into(), [0.0, 0.0], 0);
-        let o = m.add_atom("O".into(), [0.0, -1.5], 0);
+        let c = m.add_atom("C".into(), C, 0);
+        let o = m.add_atom("O".into(), O, 0);
         let me = m.add_atom("C".into(), [-1.3, 0.75], 0);
-        let nu = m.add_atom("O".into(), [3.0, -0.5], -1);
+        let me2 = m.add_atom("C".into(), [1.3, 0.75], 0);
         let co = m.add_bond(c, o, BondOrder::Double);
         m.add_bond(c, me, BondOrder::Single);
-        let d = Driver { ctx: egui::Context::default(), editor };
-        let mut d = d;
+        m.add_bond(c, me2, BondOrder::Single);
+        let h = m.add_atom("H".into(), H, 0);
+        let nu = m.add_atom("O".into(), NU, -1);
+        let nu_me = m.add_atom("C".into(), [4.5, 1.45], 0);
+        m.add_bond(nu, nu_me, BondOrder::Single);
+        let mut d = Driver { ctx: egui::Context::default(), editor, time: 0.0 };
         // A first frame lays the labels out, for hit testing.
         d.frame_with(Vec::new(), Default::default());
-        (d, Atoms { c, o, me, nu, co })
+        (d, Atoms { c, o, me, h, nu, co })
     }
 
     fn frame_with(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
-        run_frame_with_modifiers(&self.ctx, SCREEN, &mut self.editor, events, modifiers);
+        self.time += 1.0 / 60.0;
+        let events = std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect();
+        let raw = egui::RawInput { screen_rect: Some(SCREEN), events, focused: true, time: Some(self.time), ..Default::default() };
+        let editor = &mut self.editor;
+        let _ = crate::testkit::run_ui(&self.ctx, raw, |ui| {
+            editor.ui(ui);
+        });
     }
 
     fn button(pos: egui::Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
@@ -60,6 +82,16 @@ impl Driver {
         self.frame_with(vec![egui::Event::PointerMoved(p)], Default::default());
         self.frame_with(vec![Self::button(p, true, Default::default())], Default::default());
         self.frame_with(vec![Self::button(p, false, Default::default())], Default::default());
+    }
+
+    fn double_click(&mut self, p: egui::Pos2) {
+        // Well after any click before it.
+        self.time += 1.0;
+        self.frame_with(vec![egui::Event::PointerMoved(p)], Default::default());
+        for _ in 0..2 {
+            self.frame_with(vec![Self::button(p, true, Default::default())], Default::default());
+            self.frame_with(vec![Self::button(p, false, Default::default())], Default::default());
+        }
     }
 
     fn drag(&mut self, from: egui::Pos2, to: egui::Pos2, modifiers: egui::Modifiers) {
@@ -79,176 +111,265 @@ impl Driver {
     fn path(&self, c: &CurlyArrow) -> CurlyPath {
         curly::geometry(&self.editor.molecule, c).expect("placed")
     }
+
+    fn handles(&self) -> curly::CurlyHandles {
+        crate::widget::interact::curly_handles(&self.editor).expect("a lone selected curly arrow").1
+    }
 }
 
 #[test]
-fn a_drag_from_a_lone_pair_to_an_atom_draws_one_undoable_arrow_left_selected() {
+fn the_sketch_drawn_with_the_tool_records_its_roles_and_is_laid_out_as_an_s() {
     let (mut d, a) = Driver::new(CurlyKind::Pair);
-    d.drag(at([3.0, -0.5]), at([0.0, 0.0]), Default::default());
-    let arrows = d.curly();
-    assert_eq!(arrows.len(), 1);
-    let c = &arrows[0];
-    assert_eq!((c.tail, c.head, c.kind), (CurlyEnd::Atom(a.nu), CurlyEnd::Atom(a.c), CurlyKind::Pair));
-    assert!(c.dots, "a lone pair shows its dots");
-    assert!((c.angle.abs() - curly::DEFAULT_CURLY_ANGLE).abs() < 1e-3);
-    assert_eq!(d.editor.selected_objects, [c.id].into_iter().collect(), "left selected, its handle showing");
+    // Pressed on C=O nearer O, released on H.
+    d.drag(at(ON_CO_NEAR_O), at(H), Default::default());
+    let c = d.curly()[0].clone();
+    assert_eq!((c.from, c.to), (CurlyEnd::Bond { bond: a.co, onto: a.o }, CurlyEnd::Atom(a.h)));
+    assert!(!c.is_shaped() && !c.flip, "drawn automatically");
+    assert_eq!(c.case(&d.editor.molecule), CurlyCase::BondViaAtomToPartner);
+    assert_eq!(d.editor.selected_curly_description().as_deref(), Some("C=O → (O) → H"));
+    // The S: off the bond's middle, past O on its right, into H along O···H.
+    let path = d.path(&c);
+    assert!(path.pieces.len() == 2 && path.arc.is_none());
+    assert!(path.points.iter().any(|p| (p[1] - O[1]).abs() < 0.3 && p[0] > O[0] + 0.5));
+    // One undo step.
     assert_eq!(d.editor.undo_stack.len(), 1);
     assert!(d.editor.undo());
     assert!(d.curly().is_empty());
     assert!(d.editor.redo());
-    assert_eq!(d.curly().len(), 1);
+    // It follows the H: dragged further out with the Select tool, the S is laid out anew.
+    d.editor.set_tool(Tool::Select);
+    d.editor.selected_objects.clear();
+    d.drag(at(H), at([3.0, -3.3]), Default::default());
+    let moved = d.path(&d.curly()[0]);
+    assert!(moved.head[0] > path.head[0] + 0.5, "{:?} {:?}", path.head, moved.head);
+    assert!(moved.points.iter().any(|p| (p[1] - O[1]).abs() < 0.3 && p[0] > O[0] + 0.5), "still round O");
 }
 
 #[test]
-fn a_drag_from_a_bond_keeps_the_tail_on_the_side_pressed() {
-    for (press, side) in [([0.0, -0.78], 1), ([0.0, -0.4], 0)] {
+fn a_lone_pair_drag_gives_a_lone_pair_to_atom_arrow_with_its_dots() {
+    let (mut d, a) = Driver::new(CurlyKind::Pair);
+    d.drag(at(NU), at(C), Default::default());
+    let c = d.curly()[0].clone();
+    assert_eq!((c.from, c.to, c.kind), (CurlyEnd::Atom(a.nu), CurlyEnd::Atom(a.c), CurlyKind::Pair));
+    assert!(c.dots);
+    assert_eq!(c.case(&d.editor.molecule), CurlyCase::LonePairToAtom);
+    assert_eq!(d.editor.selected_objects, [c.id].into_iter().collect(), "left selected, its handles showing");
+    assert!(d.path(&c).dots.is_some());
+}
+
+#[test]
+fn a_bond_drag_takes_onto_from_the_half_pressed() {
+    for (press, onto) in [(ON_CO_NEAR_O, 1), (ON_CO_NEAR_C, 0)] {
         let (mut d, a) = Driver::new(CurlyKind::Pair);
-        let side = [a.c, a.o][side];
-        d.drag(at(press), at([3.0, -0.5]), Default::default());
+        let onto = [a.c, a.o][onto];
+        d.drag(at(press), at(NU), Default::default());
         let c = &d.curly()[0];
-        assert_eq!(c.tail, CurlyEnd::Bond { bond: a.co, side }, "pressed at {press:?}");
-        assert_eq!(c.head, CurlyEnd::Atom(a.nu));
+        assert_eq!(c.from, CurlyEnd::Bond { bond: a.co, onto }, "pressed at {press:?}");
+        assert_eq!(c.to, CurlyEnd::Atom(a.nu));
         assert!(!c.dots);
     }
 }
 
 #[test]
-fn shift_at_the_release_points_between_the_atoms_and_a_bond_can_be_the_head() {
+fn shift_points_between_the_atoms_and_a_bond_can_be_the_target() {
     let (mut d, a) = Driver::new(CurlyKind::Pair);
-    d.drag(at([3.0, -0.5]), at([0.0, 0.0]), SHIFT);
-    assert_eq!(d.curly()[0].head, CurlyEnd::Between(a.nu, a.c));
-    // From the oxygen's lone pair into the C–Me bond.
-    d.drag(at([0.0, -1.5]), at([-0.65, 0.375]), Default::default());
+    d.drag(at(NU), at(C), SHIFT);
+    assert_eq!(d.curly()[0].to, CurlyEnd::Between(a.nu, a.c));
+    // From O's lone pair into the C–Me bond.
+    d.drag(at(O), at([-0.65, 0.375]), Default::default());
     let c = &d.curly()[1];
-    assert!(matches!(c.head, CurlyEnd::Bond { bond, .. } if d.editor.molecule.bond_by_id(bond).unwrap().order == BondOrder::Single));
+    assert!(matches!(c.to, CurlyEnd::Bond { bond, .. } if d.editor.molecule.bond_by_id(bond).unwrap().order == BondOrder::Single));
+    let _ = a.me;
 }
 
 #[test]
-fn a_drag_ending_on_its_own_atom_or_nowhere_much_draws_nothing_attached() {
+fn a_drag_too_short_draws_nothing_and_one_to_empty_space_a_free_end() {
     let (mut d, a) = Driver::new(CurlyKind::Single);
-    d.drag(at([5.0, 3.0]), at([5.1, 3.0]), Default::default());
+    d.drag(at([5.0, -3.0]), at([5.1, -3.0]), Default::default());
     assert!(d.curly().is_empty(), "too short to point anywhere");
-    // To empty canvas: a free head.
-    d.drag(at([3.0, -0.5]), at([5.0, 2.0]), Default::default());
+    d.drag(at(NU), at([5.0, -3.0]), Default::default());
     let c = &d.curly()[0];
-    assert_eq!((c.tail, c.kind), (CurlyEnd::Atom(a.nu), CurlyKind::Single));
-    assert!(matches!(c.head, CurlyEnd::Point(p) if (p[0] - 5.0).abs() < 0.05 && (p[1] - 2.0).abs() < 0.05));
+    assert_eq!((c.from, c.kind), (CurlyEnd::Atom(a.nu), CurlyKind::Single));
+    assert!(matches!(c.to, CurlyEnd::Point(p) if (p[0] - 5.0).abs() < 0.05 && (p[1] + 3.0).abs() < 0.05));
 }
 
 #[test]
-fn the_handle_bends_the_arc_and_a_click_selects_it() {
+fn dragging_a_control_point_shapes_it_by_hand_until_it_is_reset() {
     let (mut d, _) = Driver::new(CurlyKind::Pair);
-    d.drag(at([3.0, -0.5]), at([0.0, 0.0]), Default::default());
-    let before = d.curly()[0].clone();
-    let path = d.path(&before);
-    // Drag the handle across the chord, farther out on the other side.
-    let mid = [(path.tail[0] + path.head[0]) / 2.0, (path.tail[1] + path.head[1]) / 2.0];
-    let out = [path.middle()[0] - mid[0], path.middle()[1] - mid[1]];
-    let to = [mid[0] - out[0] * 1.5, mid[1] - out[1] * 1.5];
-    d.drag(at(path.middle()), at(to), Default::default());
-    let bent = d.curly()[0].clone();
-    assert!(bent.angle.signum() != before.angle.signum(), "{} → {}", before.angle, bent.angle);
-    let handle = d.path(&bent).middle();
-    assert!((handle[0] - to[0]).hypot(handle[1] - to[1]) < 0.05, "the handle follows the pointer: {handle:?} {to:?}");
-    assert_eq!(d.editor.undo_stack.len(), 2, "one undo step for the bend");
-    // With Shift it stays a plain arc, only its depth following the pointer.
-    let path = d.path(&bent);
-    let deeper = [path.middle()[0] * 1.1, path.middle()[1] * 1.1];
-    d.drag(at(path.middle()), at(deeper), SHIFT);
-    assert_eq!(d.curly()[0].skew, 0.0, "{:?}", d.curly()[0]);
-    // Without Shift it leans toward where it is pulled.
-    let path = d.path(&d.curly()[0]);
-    let toward_head = [path.middle()[0] + (path.head[0] - path.tail[0]) * 0.2, path.middle()[1] + (path.head[1] - path.tail[1]) * 0.2];
-    d.drag(at(path.middle()), at(toward_head), Default::default());
-    assert!(d.curly()[0].skew > 0.2, "{:?}", d.curly()[0]);
-    // A click with the tool selects it alone; the menu's flip turns it over, one undo step.
-    let leaning = d.curly()[0].clone();
-    let p = d.path(&leaning).points[12];
+    d.drag(at(NU), at(C), Default::default());
+    let auto = d.curly()[0].clone();
+    let auto_path = d.path(&auto);
+    let steps = d.editor.undo_stack.len();
+    let c1 = d.handles().controls[0].1;
+    d.drag(at(c1), at([2.0, 3.2]), Default::default());
+    let shaped = d.curly()[0].clone();
+    assert!(shaped.is_shaped());
+    assert_eq!(d.editor.undo_stack.len(), steps + 1, "one undo step");
+    let moved = d.handles().controls[0].1;
+    assert!((moved[0] - 2.0).abs() < 0.05 && (moved[1] - 3.2).abs() < 0.05, "{moved:?}");
+    // The hand-set shape follows the atoms.
+    let before = d.path(&shaped);
+    let nu = d.editor.molecule.atoms.iter().position(|x| x.pos == NU).unwrap();
+    d.editor.molecule.atoms[nu].pos = [NU[0] + 1.0, NU[1]];
+    let after = d.path(&d.curly()[0]);
+    assert!(after.tail[0] > before.tail[0] + 0.8);
+    d.editor.molecule.atoms[nu].pos = NU;
+    // Undo, redo; then back to automatic, one undo step.
+    assert!(d.editor.undo() && !d.curly()[0].is_shaped());
+    assert!(d.editor.redo() && d.curly()[0].is_shaped());
+    d.editor.selected_objects = [shaped.id].into_iter().collect();
+    assert!(d.editor.reset_selected_curly_shapes());
+    assert!(!d.curly()[0].is_shaped());
+    assert_eq!(d.path(&d.curly()[0]), auto_path);
+    assert!(d.editor.undo() && d.curly()[0].is_shaped());
+    // A double-click on a control point gives the automatic shape back too.
+    d.editor.selected_objects = [shaped.id].into_iter().collect();
+    let c1 = d.handles().controls[0].1;
+    d.double_click(at(c1));
+    assert!(!d.curly()[0].is_shaped());
+}
+
+#[test]
+fn a_routed_arrow_gets_knots_by_double_clicks() {
+    let (mut d, _) = Driver::new(CurlyKind::Pair);
+    d.drag(at(NU), at(C), Default::default());
+    // A double-click on the curve adds a knot; the shape does not change.
+    let arrow = d.curly()[0].clone();
+    let before = d.path(&arrow);
+    let steps = d.editor.undo_stack.len();
+    let on = before.points[before.points.len() / 3];
+    d.double_click(at(on));
+    let knotted = d.curly()[0].clone();
+    assert_eq!(knotted.path.len(), 5, "{knotted:?}");
+    assert_eq!(d.editor.undo_stack.len(), steps + 1);
+    // Route it round the bottom: the knot below and left of the carbon.
+    let knot = d.handles().knots[0].1;
+    d.drag(at(knot), at([0.3, 2.6]), Default::default());
+    let routed = d.path(&d.curly()[0]);
+    assert!(routed.points.iter().any(|p| p[1] > 2.3), "{routed:?}");
+    // A double-click on the knot takes it out again.
+    let knot = d.handles().knots[0].1;
+    d.double_click(at(knot));
+    assert_eq!(d.curly()[0].path.len(), 2);
+}
+
+#[test]
+fn dragging_an_end_changes_the_roles_and_keeps_it_automatic() {
+    let (mut d, a) = Driver::new(CurlyKind::Pair);
+    d.drag(at(NU), at(C), Default::default());
+    // The target onto the H.
+    let head = d.handles().head;
+    let steps = d.editor.undo_stack.len();
+    d.drag(at(head), at(H), Default::default());
+    assert_eq!(d.curly()[0].to, CurlyEnd::Atom(a.h));
+    assert_eq!(d.editor.undo_stack.len(), steps + 1, "one undo step");
+    // The source onto the C=O bond, near O: its electrons, onto O; the sketch's arrow.
+    let tail = d.handles().tail;
+    d.drag(at(tail), at(ON_CO_NEAR_O), Default::default());
+    let c = d.curly()[0].clone();
+    assert_eq!(c.from, CurlyEnd::Bond { bond: a.co, onto: a.o });
+    assert!(!c.dots && !c.is_shaped());
+    assert_eq!(c.case(&d.editor.molecule), CurlyCase::BondViaAtomToPartner);
+    // The target off into empty space: a free end there.
+    let head = d.handles().head;
+    d.drag(at(head), at([4.0, -2.0]), Default::default());
+    assert!(matches!(d.curly()[0].to, CurlyEnd::Point(p) if (p[0] - 4.0).abs() < 0.05 && (p[1] + 2.0).abs() < 0.05));
+    // Onto an atom with Shift: the gap between it and the source's atom (O).
+    let head = d.handles().head;
+    d.drag(at(head), at(NU), SHIFT);
+    assert_eq!(d.curly()[0].to, CurlyEnd::Between(a.o, a.nu));
+    assert!(d.editor.undo());
+    assert!(matches!(d.curly()[0].to, CurlyEnd::Point(_)));
+}
+
+#[test]
+fn a_click_selects_and_flip_turns_the_layout_to_the_other_side() {
+    let (mut d, _) = Driver::new(CurlyKind::Pair);
+    d.drag(at(NU), at(C), Default::default());
+    let c = d.curly()[0].clone();
+    let p = d.path(&c).points[16];
     d.editor.selected_objects.clear();
     d.click(at(p));
-    assert_eq!(d.editor.selected_objects, [leaning.id].into_iter().collect());
-    assert_eq!(d.curly()[0].angle, leaning.angle);
-    assert!(d.editor.flip_selected_curly_arrows());
-    assert_eq!(d.curly()[0].angle, -leaning.angle);
-    assert!(d.editor.undo());
-    assert_eq!(d.curly()[0].angle, leaning.angle);
-}
-
-#[test]
-fn the_arrow_follows_moved_atoms() {
-    let (mut d, a) = Driver::new(CurlyKind::Pair);
-    d.drag(at([0.0, -0.4]), at([3.0, -0.5]), Default::default());
-    let c = d.curly()[0].clone();
+    assert_eq!(d.editor.selected_objects, [c.id].into_iter().collect());
     let before = d.path(&c);
-    // Move the hydroxide with the Select tool.
-    d.editor.set_tool(Tool::Select);
-    d.editor.selected_objects.clear();
-    d.drag(at([3.0, -0.5]), at([3.0, 1.5]), Default::default());
-    assert!((d.editor.molecule.atom_by_id(a.nu).unwrap().pos[1] - 1.5).abs() < 1e-3);
-    let after = d.path(&d.curly()[0]);
-    let nu = d.editor.molecule.atom_by_id(a.nu).unwrap().pos;
-    let gap = (after.head[0] - nu[0]).hypot(after.head[1] - nu[1]);
-    assert!(gap > 0.45 && gap < 0.75, "stops short of the oxygen's label: {gap} {after:?}");
-    assert!((after.tail[0] - before.tail[0]).abs() < 0.2, "the tail stays on its bond");
-    // Turning the whole drawing turns the arrow with it.
-    d.editor.selected_atoms = d.editor.molecule.atoms.iter().map(|a| a.id).collect();
-    d.editor.selected_objects = [c.id].into_iter().collect();
-    assert!(d.editor.rotate_selection_by(180.0));
-    let turned = d.curly()[0].clone();
-    assert_eq!((turned.tail, turned.head, turned.angle), (c.tail, c.head, c.angle), "only its atoms moved");
+    assert!(d.editor.flip_selected_curly_arrows());
+    let flipped = d.curly()[0].clone();
+    assert!(flipped.flip && !flipped.is_shaped());
+    let after = d.path(&flipped);
+    let side = |p: &CurlyPath| {
+        let chord = [p.head[0] - p.tail[0], p.head[1] - p.tail[1]];
+        let m = p.middle();
+        (chord[0] * (m[1] - p.tail[1]) - chord[1] * (m[0] - p.tail[0])).signum()
+    };
+    assert_ne!(side(&before), side(&after));
+    assert!(d.editor.undo());
+    assert!(!d.curly()[0].flip);
 }
 
 #[test]
 fn deleting_atoms_frees_or_takes_the_arrows_on_them() {
-    let (mut d, a) = Driver::new(CurlyKind::Pair);
-    d.drag(at([3.0, -0.5]), at([0.0, 0.0]), Default::default());
+    let (mut d, _) = Driver::new(CurlyKind::Pair);
+    d.drag(at(NU), at(C), Default::default());
     let drawn = d.path(&d.curly()[0]);
-    // The eraser on the hydroxide: the tail stays where it was drawn, free.
+    // The eraser on the methoxide: the source stays where it was drawn, free.
     d.editor.set_tool(Tool::Eraser);
-    d.click(at([3.0, -0.5]));
+    d.click(at(NU));
     let c = d.curly()[0].clone();
-    assert!(matches!(c.tail, CurlyEnd::Point(p) if (p[0] - drawn.tail[0]).abs() < 1e-3), "{c:?}");
+    assert!(matches!(c.from, CurlyEnd::Point(p) if (p[0] - drawn.tail[0]).abs() < 1e-3), "{c:?}");
     assert!(d.editor.undo());
     // Deleting the whole selection takes the arrows standing on it.
-    d.editor.selected_atoms = [a.c, a.o, a.me, a.nu].into_iter().collect();
+    d.editor.selected_atoms = d.editor.molecule.atoms.iter().map(|x| x.id).collect();
     d.editor.selected_objects.clear();
     assert!(d.editor.delete_selection());
     assert!(d.curly().is_empty());
 }
 
 #[test]
-fn copy_and_paste_keep_the_arrows_on_the_pasted_atoms() {
+fn copy_paste_and_json_keep_the_roles_and_the_shape() {
     let (mut d, a) = Driver::new(CurlyKind::Single);
-    d.drag(at([0.0, -0.78]), at([3.0, -0.5]), Default::default());
-    d.editor.selected_atoms = [a.c, a.o, a.me, a.nu].into_iter().collect();
+    d.drag(at(ON_CO_NEAR_O), at(H), Default::default());
+    assert!(d.editor.flip_selected_curly_arrows());
+    d.drag(at(NU), at(C), Default::default());
+    let c1 = d.handles().controls[0].1;
+    d.drag(at(c1), at([2.0, 3.2]), Default::default());
+    let json = serde_json::to_string(&d.editor.molecule).unwrap();
+    assert!(json.contains("\"from\"") && json.contains("\"onto\"") && json.contains("\"path\""), "{json}");
+    assert_eq!(serde_json::from_str::<crate::molecule::Molecule>(&json).unwrap(), d.editor.molecule);
+    d.editor.selected_atoms = d.editor.molecule.atoms.iter().map(|x| x.id).collect();
     d.editor.selected_objects.clear();
     let text = d.editor.copy_to_string().unwrap();
     assert!(d.editor.paste_from_string(&text));
     let arrows = d.curly();
-    assert_eq!(arrows.len(), 2);
-    let pasted = &arrows[1];
-    let CurlyEnd::Bond { bond, side } = pasted.tail else { panic!("{pasted:?}") };
-    assert!(!d.editor.molecule.atom_by_id(side).is_none() && side != a.o && side != a.c);
-    assert_eq!(d.editor.molecule.atom_by_id(side).unwrap().element, "O");
-    assert!(d.editor.molecule.bond_by_id(bond).is_some());
-    assert_eq!((pasted.kind, pasted.angle), (arrows[0].kind, arrows[0].angle));
-    assert!(d.editor.selected_objects.contains(&pasted.id));
+    assert_eq!(arrows.len(), 4);
+    let (s, pasted) = (&arrows[0], &arrows[2]);
+    let CurlyEnd::Bond { bond, onto } = pasted.from else { panic!("{pasted:?}") };
+    assert!(bond != a.co && onto != a.o);
+    assert_eq!(d.editor.molecule.atom_by_id(onto).unwrap().element, "O");
+    assert_eq!((pasted.kind, pasted.flip), (s.kind, s.flip));
+    assert_eq!(arrows[3].path, arrows[1].path, "the hand-set shape too");
+    // Pasted a bond length right and down, it is drawn so.
+    let (x, y) = (d.path(s), d.path(pasted));
+    for (p, q) in x.points.iter().zip(&y.points) {
+        assert!((q[0] - p[0] - DEFAULT_BOND_LENGTH).abs() < 1e-3 && (q[1] - p[1] - DEFAULT_BOND_LENGTH).abs() < 1e-3);
+    }
 }
 
 #[test]
-fn curly_arrows_save_as_json() {
+fn turning_the_drawing_keeps_the_roles() {
     let (mut d, _) = Driver::new(CurlyKind::Pair);
-    d.drag(at([3.0, -0.5]), at([0.0, 0.0]), SHIFT);
-    let json = serde_json::to_string(&d.editor.molecule).unwrap();
-    assert!(json.contains("\"Curly\""), "{json}");
-    let back: crate::molecule::Molecule = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, d.editor.molecule);
+    d.drag(at(ON_CO_NEAR_O), at(H), Default::default());
+    let c = d.curly()[0].clone();
+    d.editor.selected_atoms = d.editor.molecule.atoms.iter().map(|x| x.id).collect();
+    d.editor.selected_objects = [c.id].into_iter().collect();
+    assert!(d.editor.rotate_selection_by(180.0));
+    let turned = d.curly()[0].clone();
+    assert_eq!((turned.from, turned.to, turned.flip), (c.from, c.to, c.flip), "only its atoms moved");
 }
 
 #[test]
 fn the_scene_draws_a_curve_a_head_and_the_lone_pair() {
     let (mut d, a) = Driver::new(CurlyKind::Pair);
-    d.drag(at([3.0, -0.5]), at([0.0, 0.0]), Default::default());
+    d.drag(at(NU), at(C), Default::default());
     let style = d.editor.config.style.clone();
     let xf = scene::RenderTransform { coord_scale: SCALE_FACTOR, offset: egui::vec2(320.0, 240.0), visual_scale: 1.0 };
     let c = d.curly()[0].clone();
@@ -260,8 +381,8 @@ fn the_scene_draws_a_curve_a_head_and_the_lone_pair() {
     assert!(obj.fills[0][0].distance(xf.apply(path.head)) < 1e-3, "the head's tip is at the end of the curve");
     let nu = xf.apply(d.editor.molecule.atom_by_id(a.nu).unwrap().pos);
     let dot = obj.fills[2].iter().fold(egui::Vec2::ZERO, |s, p| s + p.to_vec2()) / 12.0;
-    assert!((dot.to_pos2().distance(nu) - 0.52 * SCALE_FACTOR).abs() < 4.0, "beside the oxygen");
-    // A fish-hook has half a head, on the outer side of the arc.
+    assert!(dot.to_pos2().distance(nu) < 0.8 * SCALE_FACTOR, "beside the oxygen");
+    // A fish-hook has half a head, on the outer side of the curve's last turn.
     let hook = CurlyArrow { kind: CurlyKind::Single, dots: false, ..c.clone() };
     let obj = scene::build_curly(&hook, &d.editor.molecule, &style, xf);
     assert_eq!(obj.fills.len(), 1);
@@ -269,171 +390,33 @@ fn the_scene_draws_a_curve_a_head_and_the_lone_pair() {
     let chord_mid = (xf.apply(path.tail).to_vec2() + xf.apply(path.head).to_vec2()) * 0.5;
     let apex = xf.apply(path.middle()).to_vec2();
     let out = (apex - chord_mid).normalized();
-    let head = xf.apply(path.head).to_vec2();
-    assert!((barb.to_vec2() - head).dot(out) > 0.0, "the barb points out of the arc");
-    // Drawn in the editor: the arrow is hit on its curve.
-    let center = egui::pos2(320.0, 240.0);
-    assert_eq!(d.editor.hit_test_object(xf.apply(path.points[20]), center), Some(c.id));
+    assert!((barb.to_vec2() - xf.apply(path.head).to_vec2()).dot(out) > 0.0, "the barb points out of the arc");
+    // In the editor the arrow is hit on its curve.
+    assert_eq!(d.editor.hit_test_object(xf.apply(path.points[20]), egui::pos2(320.0, 240.0)), Some(c.id));
 }
 
-// ─── Free shapes and re-pointing ──────────────────────────────────────────────
-
-/// The user's two arrows: a ketone C=O (O above C), an H up and to the right, and a methoxide
-/// O⁻ below and to the right. Atoms: (c, o, h, nu), and the C=O bond.
-fn sketch() -> (Driver, [u32; 4], u32) {
-    let (mut d, a) = Driver::new(CurlyKind::Pair);
-    let h = d.editor.molecule.add_atom("H".into(), [2.4, -2.4], 0);
-    d.editor.molecule.atom_by_id_mut(a.nu).unwrap().pos = [3.5, 1.8];
-    d.frame_with(Vec::new(), Default::default());
-    (d, [a.c, a.o, h, a.nu], a.co)
-}
-
-fn handle_of(d: &Driver, find: impl Fn(&crate::molecule::curly::CurlyHandles) -> [f32; 2]) -> [f32; 2] {
-    let (_, h) = crate::widget::interact::curly_handles(&d.editor).expect("a lone selected curly arrow");
-    find(&h)
-}
-
+/// A click whose press this editor never saw — pressed on a dialog or a menu, or on another
+/// document's canvas in the same place, before this one was shown — does nothing to it: an
+/// opened drawing is neither selected nor changed by the click that opened it.
 #[test]
-fn an_s_shaped_arrow_is_two_control_drags_each_undoable() {
-    let (mut d, [_, o, h, _], co) = sketch();
-    // From the C=O bond, on the O side, to the H.
-    d.drag(at([0.0, -0.78]), at([2.4, -2.4]), Default::default());
-    let c = d.curly()[0].clone();
-    assert_eq!((c.tail, c.head), (CurlyEnd::Bond { bond: co, side: o }, CurlyEnd::Atom(h)));
-    let steps = d.editor.undo_stack.len();
-    // The first control point down and right, the second up and left: an S.
-    let c1 = handle_of(&d, |h| h.controls[0].1);
-    d.drag(at(c1), at([1.6, 0.3]), Default::default());
-    let c2 = handle_of(&d, |h| h.controls[1].1);
-    d.drag(at(c2), at([0.4, -2.6]), Default::default());
-    let s = d.curly()[0].clone();
-    assert!(s.is_shaped() && s.path.len() == 2, "{s:?}");
-    assert_eq!(d.editor.undo_stack.len(), steps + 2, "one undo step per drag");
-    // It runs right and down, turns back up and left, then reaches the H: its points cross the
-    // line between its ends.
-    let path = d.path(&s);
-    let (p, q) = (path.tail, path.head);
-    let side = |x: [f32; 2]| ((q[0] - p[0]) * (x[1] - p[1]) - (q[1] - p[1]) * (x[0] - p[0])).signum();
-    let sides: Vec<f32> = path.points.iter().step_by(6).skip(1).map(|x| side(*x)).collect();
-    assert!(sides.contains(&1.0) && sides.contains(&-1.0), "an S crosses its chord: {sides:?}");
-    // The handle went where it was dragged.
-    let moved = handle_of(&d, |h| h.controls[1].1);
-    assert!((moved[0] - 0.4).abs() < 0.05 && (moved[1] + 2.6).abs() < 0.05, "{moved:?}");
-    assert!(d.editor.undo());
-    assert!(d.curly()[0].is_shaped(), "one drag back: still shaped by the first");
-    assert!(d.editor.undo());
-    assert!(!d.curly()[0].is_shaped(), "two back: the arc it was drawn as");
-    assert!(d.editor.redo() && d.editor.redo());
-    assert_eq!(d.curly()[0], s);
-    // The S follows its atoms: everything moved by (1, 1) moves the curve by the same.
-    let all: Vec<u32> = d.editor.molecule.atoms.iter().map(|a| a.id).collect();
-    for id in all {
-        let a = d.editor.molecule.atom_by_id_mut(id).unwrap();
-        a.pos = [a.pos[0] + 1.0, a.pos[1] + 1.0];
-    }
-    let shifted = d.path(&d.curly()[0]);
-    for (x, y) in path.points.iter().zip(&shifted.points) {
-        assert!((y[0] - x[0] - 1.0).abs() < 1e-3 && (y[1] - x[1] - 1.0).abs() < 1e-3);
-    }
-}
-
-#[test]
-fn a_routed_arrow_gets_knots_by_double_clicks_and_follows_its_atoms() {
-    let (mut d, [c, _, _, nu], _) = sketch();
-    // From the methoxide's lone pair to the carbonyl carbon.
-    d.drag(at([3.5, 1.8]), at([0.0, 0.0]), Default::default());
-    let arrow = d.curly()[0].clone();
-    assert_eq!((arrow.tail, arrow.head), (CurlyEnd::Atom(nu), CurlyEnd::Atom(c)));
-    // A double-click on the curve adds a knot; the shape does not change.
-    let mid = d.path(&arrow).middle();
-    let steps = d.editor.undo_stack.len();
-    d.frame_with(vec![egui::Event::PointerMoved(at(mid))], Default::default());
-    for _ in 0..2 {
-        d.frame_with(vec![Driver::button(at(mid), true, Default::default())], Default::default());
-        d.frame_with(vec![Driver::button(at(mid), false, Default::default())], Default::default());
-    }
-    let knotted = d.curly()[0].clone();
-    assert_eq!(knotted.path.len(), 5, "{knotted:?}");
-    assert_eq!(d.editor.undo_stack.len(), steps + 1);
-    // Route it: the knot down to the bottom left, below the carbon.
-    let knot = handle_of(&d, |h| h.knots[0].1);
-    d.drag(at(knot), at([0.2, 2.6]), Default::default());
-    let first_control = handle_of(&d, |h| h.controls[0].1);
-    d.drag(at(first_control), at([2.0, 2.6]), Default::default());
-    let last_control = handle_of(&d, |h| h.controls[3].1);
-    d.drag(at(last_control), at([0.0, 1.6]), Default::default());
-    let routed = d.curly()[0].clone();
-    let path = d.path(&routed);
-    // It runs along the bottom and comes up into the carbon from below.
-    assert!(path.points.iter().any(|p| p[1] > 2.0), "{path:?}");
-    let n = path.points.len();
-    let into = [path.points[n - 1][0] - path.points[n - 4][0], path.points[n - 1][1] - path.points[n - 4][1]];
-    assert!(into[1] < 0.0 && into[1].abs() > into[0].abs(), "the head points up: {into:?}");
-    // Moving the methoxide stretches the route with it; the carbon end stays.
-    d.editor.molecule.atom_by_id_mut(nu).unwrap().pos[0] += 1.0;
-    let moved = d.path(&d.curly()[0]);
-    assert!((moved.head[0] - path.head[0]).abs() < 0.05 && (moved.head[1] - path.head[1]).abs() < 0.05);
-    assert!(moved.tail[0] > path.tail[0] + 0.8);
-    // A double-click on the knot takes it out again.
-    let knot = handle_of(&d, |h| h.knots[0].1);
-    d.frame_with(vec![egui::Event::PointerMoved(at(knot))], Default::default());
-    for _ in 0..2 {
-        d.frame_with(vec![Driver::button(at(knot), true, Default::default())], Default::default());
-        d.frame_with(vec![Driver::button(at(knot), false, Default::default())], Default::default());
-    }
-    assert_eq!(d.curly()[0].path.len(), 2);
-}
-
-#[test]
-fn an_end_dragged_onto_something_else_stands_on_it() {
-    let (mut d, [c, o, h, nu], co) = sketch();
-    d.drag(at([3.5, 1.8]), at([0.0, 0.0]), Default::default());
-    let id = d.curly()[0].id;
-    // The head onto the H.
-    let head = handle_of(&d, |h| h.head);
-    let steps = d.editor.undo_stack.len();
-    d.drag(at(head), at([2.4, -2.4]), Default::default());
-    assert_eq!(d.curly()[0].head, CurlyEnd::Atom(h));
-    assert_eq!(d.editor.undo_stack.len(), steps + 1, "one undo step");
-    // The tail onto the C=O bond, near O: its electrons, kept on O's side.
-    let tail = handle_of(&d, |h| h.tail);
-    d.drag(at(tail), at([0.0, -0.78]), Default::default());
-    let a = d.curly()[0].clone();
-    assert_eq!(a.tail, CurlyEnd::Bond { bond: co, side: o });
-    assert!(!a.dots, "no lone pair on a bond");
-    // The head off into empty space: a free end there.
-    let head = handle_of(&d, |h| h.head);
-    d.drag(at(head), at([4.0, -2.0]), Default::default());
-    assert!(matches!(d.curly()[0].head, CurlyEnd::Point(p) if (p[0] - 4.0).abs() < 0.05 && (p[1] + 2.0).abs() < 0.05));
-    // Back onto an atom with Shift: between it and the tail's atom.
-    let head = handle_of(&d, |h| h.head);
-    d.drag(at(head), at([0.0, 0.0]), SHIFT);
-    assert_eq!(d.curly()[0].head, CurlyEnd::Between(o, c));
-    assert!(d.editor.undo());
-    assert!(matches!(d.curly()[0].head, CurlyEnd::Point(_)));
-    let _ = (id, nu);
-}
-
-#[test]
-fn shaped_arrows_copy_paste_and_save_with_their_shape() {
-    let (mut d, [c, o, h, nu], _) = sketch();
-    d.drag(at([0.0, -0.78]), at([2.4, -2.4]), Default::default());
-    let c1 = handle_of(&d, |h| h.controls[0].1);
-    d.drag(at(c1), at([1.6, 0.3]), Default::default());
-    let shaped = d.curly()[0].clone();
-    assert!(shaped.is_shaped());
-    let json = serde_json::to_string(&d.editor.molecule).unwrap();
-    assert!(json.contains("\"path\""), "{json}");
-    assert_eq!(serde_json::from_str::<crate::molecule::Molecule>(&json).unwrap(), d.editor.molecule);
-    d.editor.selected_atoms = [c, o, h, nu].into_iter().chain([d.editor.molecule.atoms[2].id]).collect();
+fn a_click_pressed_before_the_editor_was_shown_is_not_its_own() {
+    let (mut d, _) = Driver::new(CurlyKind::Pair);
+    d.drag(at(NU), at(C), Default::default());
+    let opened = d.editor.molecule.clone();
+    let p = at(d.path(&d.curly()[0]).points[16]);
+    // The press goes to another editor shown in the same place.
+    let mut other = ChemStructEditor { tool: Tool::CurlyArrow(CurlyKind::Pair), ..Default::default() };
+    std::mem::swap(&mut d.editor, &mut other);
+    d.time += 1.0;
+    d.frame_with(vec![egui::Event::PointerMoved(p)], Default::default());
+    d.frame_with(vec![Driver::button(p, true, Default::default())], Default::default());
+    // The drawing is shown, and the button comes up over its arrow.
+    std::mem::swap(&mut d.editor, &mut other);
     d.editor.selected_objects.clear();
-    let text = d.editor.copy_to_string().unwrap();
-    assert!(d.editor.paste_from_string(&text));
-    let pasted = d.curly()[1].clone();
-    assert_eq!(pasted.path, shaped.path);
-    // Pasted a bond length right and down, it is drawn so.
-    let (x, y) = (d.path(&shaped), d.path(&pasted));
-    for (p, q) in x.points.iter().zip(&y.points) {
-        assert!((q[0] - p[0] - DEFAULT_BOND_LENGTH).abs() < 1e-3 && (q[1] - p[1] - DEFAULT_BOND_LENGTH).abs() < 1e-3);
-    }
+    d.frame_with(vec![Driver::button(p, false, Default::default())], Default::default());
+    assert!(d.editor.selected_objects.is_empty(), "nothing selected");
+    assert_eq!(d.editor.molecule, opened, "nothing changed");
+    // Its own clicks still work.
+    d.click(p);
+    assert_eq!(d.editor.selected_objects.len(), 1);
 }

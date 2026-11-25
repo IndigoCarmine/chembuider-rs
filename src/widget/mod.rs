@@ -105,7 +105,12 @@ struct ClipText {
 #[derive(Serialize, Deserialize)]
 enum ClipCurlyEnd {
     Atom(usize),
-    Bond { begin: usize, end: usize, side: usize },
+    Bond {
+        begin: usize,
+        end: usize,
+        #[serde(alias = "side")]
+        onto: usize,
+    },
     Between(usize, usize),
     Point([f32; 2]),
 }
@@ -114,11 +119,12 @@ enum ClipCurlyEnd {
 /// ends tied to the copied atoms.
 #[derive(Serialize, Deserialize)]
 struct ClipCurly {
-    tail: ClipCurlyEnd,
-    head: ClipCurlyEnd,
-    angle: f32,
+    #[serde(alias = "tail")]
+    from: ClipCurlyEnd,
+    #[serde(alias = "head")]
+    to: ClipCurlyEnd,
     #[serde(default)]
-    skew: f32,
+    flip: bool,
     #[serde(default)]
     kind: crate::molecule::CurlyKind,
     #[serde(default)]
@@ -167,11 +173,13 @@ pub enum Tool {
     /// electrons; the tail stands on the side of the atom nearer the press), drag to the atom or
     /// bond the electrons go to, and release. Shift at the release on an atom points the head
     /// between that atom and the one the electrons come from: the bond being made. The new arrow
-    /// is left selected, with its handles: the middle of the arc bends it; two Bézier control
-    /// points give it any shape (an S, a long U); a double-click on the curve adds a knot for a
-    /// path of several pieces (a double-click on a knot takes it out, on a control point makes
-    /// the arrow a plain arc again); the ends can be dragged onto another atom or bond. A click
-    /// on an arrow selects it.
+    /// is left selected. Its meaning — the source (a lone pair, or a bond with the atom its
+    /// electrons move onto: the one nearer the press), and the target — is what is stored; the
+    /// arrow is drawn from it automatically ([`crate::molecule::curly::layout`]). Its handles
+    /// reshape it by hand: the Bézier control points give it any shape, a double-click on the
+    /// curve adds a knot (on a knot takes it out, on a control point gives the automatic shape
+    /// back), and the ends can be dragged onto another atom, bond or empty space, which changes
+    /// its roles. A click on an arrow selects it.
     CurlyArrow(crate::molecule::CurlyKind),
 }
 
@@ -341,6 +349,12 @@ pub struct ChemStructEditor {
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
+    /// Whether this editor saw the press of the pointer button now down (or just released) on
+    /// its canvas. A click or a drag whose press it never saw — one that began on a dialog or a
+    /// menu before this editor was shown, or on another document's canvas in the same place —
+    /// is not its to act on.
+    pub(crate) press_seen: bool,
+
     /// The angle box, while it is open: the selection is turned by the angle typed into it
     /// (see [`open_rotate_input`](Self::open_rotate_input)).
     rotate_edit: Option<RotateEdit>,
@@ -426,6 +440,7 @@ impl Default for ChemStructEditor {
             cleanup_job: None,
             cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
+            press_seen: false,
             rotate_edit: None,
             rotate_last_text: "90".to_string(),
             last_label_rects: std::collections::HashMap::new(),
@@ -865,19 +880,18 @@ impl ChemStructEditor {
                     use crate::molecule::CurlyEnd;
                     Some(match *e {
                         CurlyEnd::Atom(a) => ClipCurlyEnd::Atom(index[&a]),
-                        CurlyEnd::Bond { bond, side } => {
+                        CurlyEnd::Bond { bond, onto } => {
                             let b = self.molecule.bond_by_id(bond)?;
-                            ClipCurlyEnd::Bond { begin: index[&b.begin], end: index[&b.end], side: *index.get(&side)? }
+                            ClipCurlyEnd::Bond { begin: index[&b.begin], end: index[&b.end], onto: *index.get(&onto)? }
                         }
                         CurlyEnd::Between(a, b) => ClipCurlyEnd::Between(index[&a], index[&b]),
                         CurlyEnd::Point(p) => ClipCurlyEnd::Point(p),
                     })
                 };
                 Some(ClipCurly {
-                    tail: end(&c.tail)?,
-                    head: end(&c.head)?,
-                    angle: c.angle,
-                    skew: c.skew,
+                    from: end(&c.from)?,
+                    to: end(&c.to)?,
+                    flip: c.flip,
                     kind: c.kind,
                     dots: c.dots,
                     path: c.path.clone(),
@@ -1028,20 +1042,20 @@ impl ChemStructEditor {
                 let atom = |i: usize| new_ids.get(i).copied();
                 Some(match *e {
                     ClipCurlyEnd::Atom(i) => CurlyEnd::Atom(atom(i)?),
-                    ClipCurlyEnd::Bond { begin, end, side } => CurlyEnd::Bond {
+                    ClipCurlyEnd::Bond { begin, end, onto } => CurlyEnd::Bond {
                         bond: self.molecule.bond_between(atom(begin)?, atom(end)?)?.id,
-                        side: atom(side)?,
+                        onto: atom(onto)?,
                     },
                     ClipCurlyEnd::Between(a, b) => CurlyEnd::Between(atom(a)?, atom(b)?),
                     ClipCurlyEnd::Point(p) => CurlyEnd::Point([p[0] + OFFSET[0], p[1] + OFFSET[1]]),
                 })
             };
-            if let (Some(tail), Some(head)) = (end(&c.tail), end(&c.head)) {
+            if let (Some(from), Some(to)) = (end(&c.from), end(&c.to)) {
                 let arrow = crate::molecule::CurlyArrow {
-                    skew: c.skew,
+                    flip: c.flip,
                     dots: c.dots,
                     path: c.path.clone(),
-                    ..crate::molecule::CurlyArrow::new(tail, head, c.angle, c.kind)
+                    ..crate::molecule::CurlyArrow::new(from, to, c.kind)
                 };
                 new_objects.push(self.molecule.add_curly_arrow(arrow));
             }
@@ -1539,7 +1553,7 @@ impl ChemStructEditor {
                     crate::molecule::CurlyEnd::Bond { bond, .. } if self.selected_bonds.contains(&bond) => true,
                     _ => e.atoms(&self.molecule).iter().any(|a| self.selected_atoms.contains(a)),
                 };
-                let tied: Vec<_> = [c.tail, c.head].into_iter().filter(|e| e.is_attached()).collect();
+                let tied: Vec<_> = [c.from, c.to].into_iter().filter(|e| e.is_attached()).collect();
                 !tied.is_empty() && tied.iter().all(goes)
             })
             .map(|c| c.id)
@@ -1672,28 +1686,23 @@ impl ChemStructEditor {
         self.change_selected_curly(|c| c.kind = kind)
     }
 
-    /// Show or hide the lone pair the selected curly arrows start from (those whose tail is on
-    /// an atom). One undo step; false when that changes nothing.
+    /// Show or hide the lone pair the selected curly arrows start from (those whose source is
+    /// a lone pair). One undo step; false when that changes nothing.
     pub fn set_selected_curly_dots(&mut self, dots: bool) -> bool {
-        self.change_selected_curly(|c| c.dots = dots && matches!(c.tail, crate::molecule::CurlyEnd::Atom(_)))
+        self.change_selected_curly(|c| c.dots = dots && matches!(c.from, crate::molecule::CurlyEnd::Atom(_)))
     }
 
-    /// Set how far the selected curly arrows turn, in degrees (the sign kept: each still bends
-    /// to its side), and make them plain arcs (a free shape is let go). One undo step; false when
-    /// that changes nothing.
-    pub fn set_selected_curly_angle(&mut self, degrees: f32) -> bool {
-        let degrees = crate::molecule::curly::clamp_angle(degrees.abs());
-        self.change_selected_curly(|c| {
-            c.angle = if c.angle < 0.0 { -degrees } else { degrees };
-            c.skew = 0.0;
-            c.path.clear();
-        })
-    }
-
-    /// Make the selected curly arrows plain arcs again, letting go of any free shape they were
-    /// given. One undo step; false when none had one.
+    /// Give the selected curly arrows back their automatic shape, letting go of any shape set
+    /// by hand. One undo step; false when none had one.
     pub fn reset_selected_curly_shapes(&mut self) -> bool {
         self.change_selected_curly(|c| c.path.clear())
+    }
+
+    /// What the lone selected curly arrow says, in words (`C=O → (O) → H`): for a status bar.
+    /// `None` unless one curly arrow, and nothing else, is selected.
+    pub fn selected_curly_description(&self) -> Option<String> {
+        let c = interact::lone_selected_curly(self)?;
+        Some(crate::molecule::curly::describe(&self.molecule, c))
     }
 
     /// Close the text box, keeping what was typed: a new text is added, an edited one changed,

@@ -251,10 +251,13 @@ impl PageObject {
             PageObject::Text(t) => reflect(&mut t.pos),
             PageObject::Table(t) => reflect(&mut t.pos),
             PageObject::Bracket(_) => {}
-            // A mirror image bends the other way.
+            // A hand-set shape is mirrored; an automatic one is laid out afresh from the
+            // mirrored atoms anyway.
             PageObject::Curly(c) => {
                 c.free_points_mut().into_iter().for_each(reflect);
-                c.flip();
+                if c.is_shaped() {
+                    c.flip();
+                }
             }
         }
     }
@@ -268,7 +271,7 @@ impl PageObject {
             PageObject::Text(t) => vec![t.pos],
             PageObject::Table(t) => vec![t.pos],
             PageObject::Bracket(_) => Vec::new(),
-            PageObject::Curly(c) => [c.tail, c.head]
+            PageObject::Curly(c) => [c.from, c.to]
                 .into_iter()
                 .filter_map(|e| match e {
                     CurlyEnd::Point(p) => Some(p),

@@ -415,7 +415,7 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
     // The handle that bends a lone selected curly arrow, in its middle.
     // The handles that shape a lone selected curly arrow: a line from each control point to the
     // end of the piece it pulls on, the control points as rings, the knots between pieces as
-    // squares, the ends (dragged onto something else) as diamonds, an arc's middle as a ring.
+    // squares, the ends (dragged onto something else) as diamonds.
     if let Some((_, h)) = super::interact::curly_handles(editor) {
         let thin = egui::Stroke::new(1.0, SELECTED.gamma_multiply(0.7));
         for &(_, p, base) in &h.controls {
@@ -433,13 +433,10 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
             let diamond = vec![c + egui::vec2(0.0, -4.5), c + egui::vec2(4.5, 0.0), c + egui::vec2(0.0, 4.5), c + egui::vec2(-4.5, 0.0)];
             painter.add(egui::Shape::convex_polygon(diamond, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED)));
         }
-        if let Some(p) = h.bend {
-            painter.circle(xf.apply(p), 4.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
-        }
     }
     // The curly arrow being drawn with the Curly arrow tool, bending as it will.
     if let Some(super::interact::ObjectDrag::NewCurly(drawing)) = editor.object_drag() {
-        let preview = scene::build_curly(&drawing.arrow(&editor.molecule), &editor.molecule, style, xf);
+        let preview = scene::build_curly(&drawing.arrow(), &editor.molecule, style, xf);
         paint(&preview, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
     }
     // The arrow being drawn with the Arrow tool.

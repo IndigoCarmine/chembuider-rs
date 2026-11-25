@@ -55,12 +55,13 @@ impl ToolBehavior for Curly {
             Hit::Object(_) => editor.hit_test_bond(origin, cx.center),
             _ => None,
         };
-        let tail = match (hit, bond) {
+        // The source: a lone pair, or a bond's electrons onto the atom nearer the press.
+        let source = match (hit, bond) {
             (Hit::Atom(a), _) => CurlyEnd::Atom(a),
-            (_, Some(bond)) => CurlyEnd::Bond { bond, side: interact::nearer_bond_atom(editor, bond, from)? },
+            (_, Some(bond)) => CurlyEnd::Bond { bond, onto: interact::nearer_bond_atom(editor, bond, from)? },
             (Hit::Object(_), None) => return default::on_drag_start(editor, cx, origin, at, hit),
             _ => CurlyEnd::Point(from),
         };
-        Some(Gesture::Object(ObjectDrag::NewCurly(CurlyDrag { tail, head: CurlyEnd::Point(from), kind: kind(editor) })))
+        Some(Gesture::Object(ObjectDrag::NewCurly(CurlyDrag { from: source, to: CurlyEnd::Point(from), kind: kind(editor) })))
     }
 }

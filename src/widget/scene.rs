@@ -416,7 +416,7 @@ pub fn build_curly(c: &CurlyArrow, mol: &Molecule, style: &StyleConfig, xf: Rend
         return SceneObject { object_id: c.id, strokes: Vec::new(), fills: Vec::new(), texts: Vec::new(), rect: Rect::NOTHING };
     };
     let points: Vec<Pos2> = path.points.iter().map(|p| xf.apply(*p)).collect();
-    let (strokes, mut fills) = curly_primitives(&points, c.kind, crate::molecule::curly::barb_left(c, &path), width);
+    let (strokes, mut fills) = curly_primitives(&points, c.kind, crate::molecule::curly::barb_left(&path), width);
     if let Some((middle, across)) = path.dots {
         let m = xf.apply(middle);
         let across = Vec2::new(across[0], across[1]) * (LONE_PAIR_DOT_SPACING * width * 0.5);

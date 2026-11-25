@@ -836,7 +836,7 @@ mod tests {
                     assert!((x.pos[0] - y.pos[0]).abs() < 1e-3 && (x.pos[1] - y.pos[1]).abs() < 1e-3, "{x:?} vs {y:?}");
                 }
                 (PageObject::Curly(x), PageObject::Curly(y)) => {
-                    assert!((x.angle - y.angle).abs() < 0.05 && x.kind == y.kind, "{x:?} vs {y:?}");
+                    assert_eq!(x.kind, y.kind, "{x:?} vs {y:?}");
                 }
                 (PageObject::Bracket(x), PageObject::Bracket(y)) => {
                     assert_eq!((x.usage, &x.label, x.atoms.len()), (y.usage, &y.label, y.atoms.len()), "{x:?} vs {y:?}");
@@ -908,15 +908,15 @@ mod tests {
         assert_eq!(arrows(&import.molecule).len(), 2, "only the two drawn ones");
         let curly: Vec<_> = import.molecule.curly_arrows().collect();
         assert_eq!(curly.len(), 1);
-        assert_eq!((curly[0].angle, curly[0].source), (90.0, Some(900)));
+        assert_eq!((curly[0].is_shaped(), curly[0].source), (true, Some(900)), "drawn as ChemDraw drew it");
         assert_eq!(import.other_objects, 2);
         let saved = cdx_codec::parse(&merge_into_cdx(&bytes, &import.molecule)).unwrap();
         for o in [hollow, resonance] {
             assert_eq!(find(&saved, o.id, o.tag), Some(o));
         }
-        // The curved arrow keeps its id, rewritten as a curly arrow.
-        let again = find(&saved, 900, OBJ_ARROW).expect("the curved arrow is kept");
-        assert_eq!(again.prop_int(PROP_ANGULAR_SIZE), Some(900));
+        // The curved arrow keeps its id, rewritten as the curve it is drawn as.
+        let again = find(&saved, 900, cdx_curly::OBJ_CURVE).expect("the curved arrow is kept");
+        assert!(again.prop(PROP_ARROWHEAD_HEAD).is_some());
     }
 
     /// The ChemDraw 25 reaction with one more text, made after the CDX specification (no
