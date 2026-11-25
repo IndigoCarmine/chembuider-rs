@@ -61,6 +61,157 @@ fn arriving(path: &CurlyPath) -> [f32; 2] {
     unit(sub(path.points[n - 1], path.points[n - 4])).unwrap()
 }
 
+/// The way the curve leaves its tail, by its first cubic piece (tail to first control point),
+/// checked against the drawn curve's first step.
+fn leaving(path: &CurlyPath) -> [f32; 2] {
+    let b = path.pieces[0];
+    assert!(close(b[0], path.tail), "{:?} {:?}", b[0], path.tail);
+    let d = unit(sub(b[1], b[0])).unwrap();
+    let step = unit(sub(path.points[1], path.points[0])).unwrap();
+    assert!(dot(d, step) > 0.995, "{d:?} {step:?}");
+    d
+}
+
+/// The way the curve comes into its head, by its last cubic piece (last control point to head).
+fn coming_in(path: &CurlyPath) -> [f32; 2] {
+    let b = path.pieces[path.pieces.len() - 1];
+    assert!(close(b[3], path.head), "{:?} {:?}", b[3], path.head);
+    unit(sub(b[3], b[2])).unwrap()
+}
+
+/// The unit direction of `bond`, and its middle.
+fn bond_line(m: &Molecule, bond: u32) -> ([f32; 2], [f32; 2]) {
+    let b = m.bond_by_id(bond).unwrap();
+    let (p, q) = (m.atom_by_id(b.begin).unwrap().pos, m.atom_by_id(b.end).unwrap().pos);
+    (unit(sub(q, p)).unwrap(), midpoint(p, q))
+}
+
+/// `arrow`, laid out as it is and flipped, leaves its source bond square to it, each on its own
+/// side, its tail off the bond on the side it leaves to; and returns the two.
+fn square_on_both_sides(m: &Molecule, arrow: &CurlyArrow) -> (CurlyPath, CurlyPath) {
+    let CurlyEnd::Bond { bond, .. } = arrow.from else { panic!("{arrow:?}") };
+    let (along, mid) = bond_line(m, bond);
+    let flipped = CurlyArrow { flip: true, ..arrow.clone() };
+    let (a, b) = (layout(m, arrow).unwrap(), layout(m, &flipped).unwrap());
+    let mut sides = Vec::new();
+    for path in [&a, &b] {
+        let d = leaving(path);
+        assert!(dot(d, along).abs() < 0.02, "square to the bond: {d:?} vs {along:?}");
+        let off = sub(path.tail, mid);
+        assert!(dot(off, d) > 0.1, "the tail stands off the bond on the side it leaves to: {off:?} {d:?}");
+        sides.push(d);
+    }
+    assert!(dot(sides[0], sides[1]) < -0.99, "flipped, the other side: {sides:?}");
+    (a, b)
+}
+
+#[test]
+fn an_arrow_leaves_its_bond_square_to_it_arc_s_or_curve() {
+    let s = sketch();
+    // The S from C=O through O to H, round either side of O.
+    let via = CurlyArrow::new(CurlyEnd::Bond { bond: s.co, onto: s.o }, CurlyEnd::Atom(s.h), CurlyKind::Pair);
+    let (a, b) = square_on_both_sides(&s.m, &via);
+    assert!(a.arc.is_none() && b.arc.is_none() && a.pieces.len() == 2, "the S");
+    // The C=O's π electrons onto O, and onto C: arcs, coming down beside the atom.
+    for onto in [s.o, s.c] {
+        let own = CurlyArrow::new(CurlyEnd::Bond { bond: s.co, onto }, CurlyEnd::Atom(onto), CurlyKind::Pair);
+        let (a, b) = square_on_both_sides(&s.m, &own);
+        assert!(a.arc.is_some() && b.arc.is_some(), "{:?} {:?}", a.arc, b.arc);
+    }
+    // C=O to the methoxide's O, which is no atom of it: an arc square to the bond.
+    let far = CurlyArrow::new(CurlyEnd::Bond { bond: s.co, onto: s.c }, CurlyEnd::Atom(s.nu), CurlyKind::Pair);
+    square_on_both_sides(&s.m, &far);
+    // To a free point straight out from the bond: not straight, but curved off it.
+    let (along, mid) = bond_line(&s.m, s.co);
+    let ahead = add_scaled(mid, right_of(along), 3.0);
+    let out = CurlyArrow::new(CurlyEnd::Bond { bond: s.co, onto: s.c }, CurlyEnd::Point(ahead), CurlyKind::Pair);
+    let (a, _) = square_on_both_sides(&s.m, &out);
+    assert!(turning(&a.points) > 45.0, "curly, not straight: {}", turning(&a.points));
+}
+
+#[test]
+fn heterolysis_leaves_square_and_stays_a_chemdraw_arc() {
+    let mut m = Molecule::default();
+    let c = m.add_atom("C".into(), [0.0, 0.0], 0);
+    let br = m.add_atom("Br".into(), [1.5, 0.0], 0);
+    m.add_atom("C".into(), [-0.75, 1.3], 0);
+    let cbr = m.add_bond(c, br, BondOrder::Single);
+    let arrow = CurlyArrow::new(CurlyEnd::Bond { bond: cbr, onto: br }, CurlyEnd::Atom(br), CurlyKind::Single);
+    let (a, b) = square_on_both_sides(&m, &arrow);
+    for path in [&a, &b] {
+        assert!(path.arc.is_some_and(|t| t.abs() > 60.0 && t.abs() < 180.0), "{:?}", path.arc);
+        // Down beside the bromine, on the side it left the bond to.
+        assert!(len(sub(path.head, [1.5, 0.0])) < 1.0 && path.head[1] * path.tail[1] > 0.0, "{:?} {:?}", path.tail, path.head);
+    }
+}
+
+#[test]
+fn an_arrow_comes_square_into_a_bond_or_a_gap() {
+    // The enolate again: O⁻–C1=C2, C2–C3; and a Br above C3.
+    let mut m = Molecule::default();
+    let o = m.add_atom("O".into(), [0.0, -1.5], -1);
+    let c1 = m.add_atom("C".into(), [0.0, 0.0], 0);
+    let c2 = m.add_atom("C".into(), [1.3, 0.75], 0);
+    let c3 = m.add_atom("C".into(), [2.6, 0.0], 0);
+    let br = m.add_atom("Br".into(), [3.6, -2.0], 0);
+    let oc = m.add_bond(o, c1, BondOrder::Single);
+    let cc = m.add_bond(c1, c2, BondOrder::Double);
+    let c23 = m.add_bond(c2, c3, BondOrder::Single);
+    let into = |path: &CurlyPath, line: [f32; 2], mid: [f32; 2]| {
+        let d = coming_in(path);
+        assert!(dot(d, line).abs() < 0.02, "square into it: {d:?} vs {line:?}");
+        assert!(dot(sub(mid, path.head), d) > 0.05, "short of its middle, pointing at it: {:?}", path.head);
+    };
+    // A lone pair into a bond: an arc.
+    let lp = CurlyArrow::new(CurlyEnd::Atom(o), CurlyEnd::Bond { bond: oc, onto: o }, CurlyKind::Pair);
+    let path = layout(&m, &lp).unwrap();
+    let (line, mid) = bond_line(&m, oc);
+    into(&path, line, mid);
+    assert!(path.arc.is_some() && path.dots.is_some());
+    // A bond into a bond, square at both ends, on either side.
+    let shift = CurlyArrow::new(CurlyEnd::Bond { bond: cc, onto: c2 }, CurlyEnd::Bond { bond: c23, onto: c2 }, CurlyKind::Pair);
+    let (a, b) = square_on_both_sides(&m, &shift);
+    let (line, mid) = bond_line(&m, c23);
+    into(&a, line, mid);
+    into(&b, line, mid);
+    let (_, crossings) = clearance(&m, &shift, &a);
+    assert_eq!(crossings, 0);
+    // A bond into the gap where a bond forms.
+    let gap = CurlyArrow::new(CurlyEnd::Bond { bond: c23, onto: c3 }, CurlyEnd::Between(c3, br), CurlyKind::Pair);
+    let (a, _) = square_on_both_sides(&m, &gap);
+    let (p, q) = (m.atom_by_id(c3).unwrap().pos, m.atom_by_id(br).unwrap().pos);
+    into(&a, unit(sub(q, p)).unwrap(), midpoint(p, q));
+}
+
+#[test]
+fn a_tail_on_a_double_bond_starts_clear_of_its_lines() {
+    let s = sketch();
+    let (along, mid) = bond_line(&s.m, s.co);
+    for flip in [false, true] {
+        let arrow = CurlyArrow { flip, ..CurlyArrow::new(CurlyEnd::Bond { bond: s.co, onto: s.o }, CurlyEnd::Atom(s.h), CurlyKind::Pair) };
+        let path = layout(&s.m, &arrow).unwrap();
+        // The C=O is drawn as two lines either side of its axis.
+        let off = dot(sub(path.tail, mid), right_of(along)).abs();
+        assert!(off > BOND_LINE_SPACING / 2.0 + 0.08, "{off}");
+    }
+}
+
+#[test]
+fn a_hand_set_shape_keeps_its_own_way_off_the_bond() {
+    let s = sketch();
+    // Leaving the C=O at a slant, as drawn by hand.
+    let arrow = CurlyArrow { path: vec![[0.5, -0.1], [0.9, -0.3]], ..CurlyArrow::new(CurlyEnd::Bond { bond: s.co, onto: s.o }, CurlyEnd::Atom(s.h), CurlyKind::Pair) };
+    let before = arrow.path.clone();
+    let path = geometry(&s.m, &arrow).unwrap();
+    assert_eq!(arrow.path, before);
+    let (along, _) = bond_line(&s.m, s.co);
+    assert!(dot(leaving(&path), along).abs() > 0.2, "not squared: {:?}", leaving(&path));
+    let (at, ah) = anchors(&s.m, &arrow).unwrap();
+    let whole = sample(&pieces_between(at, ah, &arrow.path));
+    let nearest = whole.iter().map(|p| len(sub(*p, path.tail))).fold(f32::INFINITY, f32::min);
+    assert!(nearest < 0.02, "its tail is on the curve set by hand: {nearest}");
+}
+
 #[test]
 fn a_bond_carried_by_its_atom_to_a_partner_is_an_s_round_that_atom() {
     let s = sketch();
@@ -68,10 +219,10 @@ fn a_bond_carried_by_its_atom_to_a_partner_is_an_s_round_that_atom() {
     assert_eq!(arrow.case(&s.m), CurlyCase::BondViaAtomToPartner);
     assert_eq!(describe(&s.m, &arrow), "C=O → (O) → H");
     let path = layout(&s.m, &arrow).unwrap();
-    // It starts just off the bond's middle, on the side the H is.
-    assert!(len(sub(path.tail, [0.0, -0.75])) < 0.2 && path.tail[0] > 0.0, "{:?}", path.tail);
-    // First a little back from O (down the page), the turn that makes it an S...
-    assert!(path.points[3][1] > path.tail[1], "{:?}", &path.points[..4]);
+    // It starts just off the bond's middle, clear of its lines, on the side the H is...
+    assert!(len(sub(path.tail, [0.0, -0.75])) < 0.3 && path.tail[0] > 0.0, "{:?}", path.tail);
+    // ... leaving it square, across the bond...
+    assert!(leaving(&path)[0] > 0.99, "{:?}", leaving(&path));
     // ... then past O on the outside, to its right, clear of its label...
     let o = s.m.atom_by_id(s.o).unwrap().pos;
     let beside = path.points.iter().filter(|p| (p[1] - o[1]).abs() < 0.3).map(|p| p[0] - o[0]).fold(f32::NEG_INFINITY, f32::max);

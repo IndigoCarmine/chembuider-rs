@@ -15,7 +15,8 @@
 //!
 //! The arrow is **drawn from that meaning** ([`layout`]), afresh each time, so it follows its
 //! atoms when they are moved, rotated, mirrored or cleaned up: a lone pair's arrow leaves from
-//! its dots on the side facing the target; a bond's leaves from just off its middle; an arrow
+//! its dots on the side facing the target; a bond's leaves it square, from just off its middle
+//! and clear of its lines, and an arrow into a bond or a gap comes into it square; an arrow
 //! carried by an atom swings round that atom on the outside and comes into its partner along the
 //! bond being made; and each bends the way that keeps it clear of the atoms, labels and bonds
 //! around it. Only when the user reshapes it by hand does it keep a shape of its own
@@ -248,14 +249,20 @@ const HEAD_PAST_LABEL: f32 = 0.12;
 const DOTS_BARE: f32 = 0.26;
 const TAIL_BARE: f32 = 0.44;
 const HEAD_GAP_BARE: f32 = 0.34;
-/// How far a tail on a bond is lifted off its line, and how far short of a bond's (or a gap's)
-/// middle a head stops.
+/// How far a tail on a bond is lifted off its lines, and how far short of a bond's (or a gap's)
+/// middle (a bond's lines) a head stops.
 const BOND_TAIL_LIFT: f32 = 0.12;
 const BOND_HEAD_GAP: f32 = 0.16;
 const BETWEEN_HEAD_GAP: f32 = 0.08;
 /// Where on a bond the tail of an arrow into a bond or a gap (or of a hand-shaped one) stands:
 /// this share of the bond's length from its `onto` atom.
 pub const BOND_TAIL_AT: f32 = 0.4;
+/// The most an arc square to a bond may turn (more is a loop); the least it turns before it
+/// reads as straight rather than curly; and how far off its chord the free end of the curve
+/// drawn instead of either turns.
+const MAX_TURN: f32 = 270.0;
+const FLAT_TURN: f32 = 60.0;
+const FLAT_BEND: f32 = 90.0;
 /// How many straight pieces an arc is drawn in, and each piece of a path.
 const CURVE_STEPS: usize = 48;
 const PIECE_STEPS: usize = 32;
@@ -263,6 +270,8 @@ const PIECE_STEPS: usize = 32;
 /// 1.04 units, its capitals about 0.75 high; a point is 1/9.6 of a unit.
 const LABEL_HALF_HEIGHT: f32 = 0.38;
 const UNITS_PER_POINT: f32 = 1.5 / 14.4;
+/// The spacing of a multiple bond's lines, as the style has it by default (2.6 pt).
+const BOND_LINE_SPACING: f32 = 2.6 * UNITS_PER_POINT;
 
 /// Where a curly arrow is drawn, in molecule units.
 #[derive(Debug, Clone, PartialEq)]
@@ -343,6 +352,18 @@ fn dot(a: [f32; 2], b: [f32; 2]) -> f32 {
 /// `d` turned a quarter to the right on a y-down page.
 fn right_of(d: [f32; 2]) -> [f32; 2] {
     [-d[1], d[0]]
+}
+
+/// `d` turned `degrees` toward its right on a y-down page.
+fn turned(d: [f32; 2], degrees: f32) -> [f32; 2] {
+    let (s, c) = degrees.to_radians().sin_cos();
+    let r = right_of(d);
+    [d[0] * c + r[0] * s, d[1] * c + r[1] * s]
+}
+
+/// The angle from `u` to `d`, in degrees, positive toward the right of `u` on a y-down page.
+fn angle_to(u: [f32; 2], d: [f32; 2]) -> f32 {
+    dot(d, right_of(u)).atan2(dot(d, u)).to_degrees()
 }
 
 /// The point `p` (`[along, across]` in the frame of the line from `from` to `to`, see
@@ -487,6 +508,41 @@ fn bond_ends(mol: &Molecule, bond: u32, onto: u32) -> Option<([f32; 2], [f32; 2]
     let b = mol.bond_by_id(bond)?;
     let (p, q) = (pos(mol, b.begin)?, pos(mol, b.end)?);
     Some(if onto == b.end { (q, p) } else { (p, q) })
+}
+
+/// How far the lines of bond `bond` reach from its axis to the side `n` (a unit normal), as
+/// they are drawn: a double bond's second line on its inner side, both of a centred one's, a
+/// triple bond's outer two.
+fn bond_reach(mol: &Molecule, bond: u32, n: [f32; 2]) -> f32 {
+    use crate::widget::scene::{chosen_double_placement, double_bond_placement, DoubleBondPlacement};
+    let Some(b) = mol.bond_by_id(bond) else { return 0.0 };
+    match b.order {
+        super::BondOrder::Single => 0.0,
+        super::BondOrder::Triple => BOND_LINE_SPACING,
+        super::BondOrder::Quadruple => 1.5 * BOND_LINE_SPACING,
+        super::BondOrder::Double if b.stereo != super::BondStereo::None => BOND_LINE_SPACING / 2.0,
+        super::BondOrder::Double => {
+            let (Some(p), Some(q)) = (pos(mol, b.begin), pos(mol, b.end)) else { return 0.0 };
+            let Some(right) = unit(sub(q, p)).map(right_of) else { return 0.0 };
+            let neighbours: Vec<egui::Pos2> = mol
+                .bonds
+                .iter()
+                .filter(|o| o.id != b.id)
+                .filter_map(|o| match (o.begin, o.end) {
+                    (x, y) | (y, x) if (x == b.begin || x == b.end) && y != b.begin && y != b.end => pos(mol, y),
+                    _ => None,
+                })
+                .map(|a| egui::pos2(a[0], a[1]))
+                .collect();
+            let placement = chosen_double_placement(b.double_position)
+                .unwrap_or_else(|| double_bond_placement(egui::pos2(p[0], p[1]), egui::pos2(q[0], q[1]), (right[0], right[1]), &neighbours));
+            match placement {
+                DoubleBondPlacement::Symmetric => BOND_LINE_SPACING / 2.0,
+                DoubleBondPlacement::Centered(side) if dot(n, right) * side > 0.0 => BOND_LINE_SPACING,
+                DoubleBondPlacement::Centered(_) => 0.0,
+            }
+        }
+    }
 }
 
 /// The point the source is laid on: an atom's centre, a point of a bond (`at` of its length
@@ -659,21 +715,142 @@ fn arc_candidate(mol: &Molecule, arrow: &CurlyArrow, from_at: [f32; 2], to_at: [
     Some(CurlyPath { tail, head, points, dots, pieces: arc_pieces(tail, head, angle), arc: Some(angle) })
 }
 
+/// The ways a tail on the source can leave it square: off a bond, along its normal on either
+/// side (to the right of the bond's line from its `onto` atom first). `None` for any other end.
+fn square_leaves(mol: &Molecule, end: &CurlyEnd) -> Option<[[f32; 2]; 2]> {
+    let CurlyEnd::Bond { bond, onto } = *end else { return None };
+    let (near, far) = bond_ends(mol, bond, onto)?;
+    let n = right_of(unit(sub(far, near))?);
+    Some([n, [-n[0], -n[1]]])
+}
+
+/// The ways a head can come square into the target: into a bond, or the gap between two atoms,
+/// across its line from either side (from its right first). `None` for any other end.
+fn square_arrivals(mol: &Molecule, end: &CurlyEnd) -> Option<[[f32; 2]; 2]> {
+    let (p, q) = match *end {
+        CurlyEnd::Bond { bond, .. } => {
+            let b = mol.bond_by_id(bond)?;
+            (pos(mol, b.begin)?, pos(mol, b.end)?)
+        }
+        CurlyEnd::Between(a, b) => (pos(mol, a)?, pos(mol, b)?),
+        CurlyEnd::Atom(_) | CurlyEnd::Point(_) => return None,
+    };
+    let n = right_of(unit(sub(q, p))?);
+    Some([[-n[0], -n[1]], n])
+}
+
+/// A curve's cubic pieces, and the turn of the circular arc they follow when they do.
+type Shape = (Vec<[[f32; 2]; 4]>, Option<f32>);
+
+/// The curve from `tail` to `head` that leaves along `leave` and arrives along `arrive` (unit
+/// vectors, at least one given): the circular arc that does, when one is given or the two
+/// agree, and its turn; else one cubic, each handle as long as an arc's would be for the angle
+/// its end makes with the chord. `None` for an arc that would turn more than [`MAX_TURN`].
+fn square_curve(tail: [f32; 2], leave: Option<[f32; 2]>, head: [f32; 2], arrive: Option<[f32; 2]>) -> Option<Shape> {
+    let u = unit(sub(head, tail))?;
+    // An arc leaves and arrives at the same angle to its chord, half its turn.
+    let by_leave = leave.map(|d| 2.0 * angle_to(u, d));
+    let by_arrive = arrive.map(|d| -2.0 * angle_to(u, d));
+    let arc = match (by_leave, by_arrive) {
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (Some(a), Some(b)) if (a - b).abs() < 4.0 => Some(a),
+        (Some(_), Some(_)) => None,
+        (None, None) => return None,
+    };
+    if let Some(a) = arc {
+        return (a.abs() <= MAX_TURN).then(|| (arc_pieces(tail, head, a), Some(a)));
+    }
+    let (d0, d1) = (leave?, arrive?);
+    let c = len(sub(head, tail));
+    // A cubic through an arc whose ends make angle α with its chord: handles of c / (3 cos²(α/2)).
+    let handle = |d: [f32; 2]| {
+        let half = dot(d, u).clamp(-1.0, 1.0).acos() / 2.0;
+        (c / (3.0 * half.cos().powi(2))).min(1.2 * c)
+    };
+    Some((vec![[tail, add_scaled(tail, d0, handle(d0)), add_scaled(head, d1, -handle(d1)), head]], None))
+}
+
+/// An arrow with an end on a bond (or a gap) square to it: its tail stands off the source bond
+/// along `leave`, the bond's normal on the side it is drawn, and leaves along it; its head stops
+/// short of the target's middle, coming in along `arrive`. An end on anything else is placed as
+/// on an arc ([`arc_candidate`]), the way the curve leaves or arrives there: the arc square to
+/// the other end — or, with `bend`, for one too nearly straight to read as curly, a cubic whose
+/// free end turns `bend` degrees off its chord.
+fn square_candidate(
+    mol: &Molecule,
+    arrow: &CurlyArrow,
+    from_at: [f32; 2],
+    to_at: [f32; 2],
+    leave: Option<[f32; 2]>,
+    arrive: Option<[f32; 2]>,
+    bend: Option<f32>,
+) -> Option<CurlyPath> {
+    let lift = |n: [f32; 2]| match arrow.from {
+        CurlyEnd::Bond { bond, .. } => bond_reach(mol, bond, n) + BOND_TAIL_LIFT,
+        _ => BOND_TAIL_LIFT,
+    };
+    let mut tail = leave.map_or(from_at, |n| add_scaled(from_at, n, lift(n)));
+    let gap = |d: [f32; 2]| match arrow.to {
+        CurlyEnd::Bond { bond, .. } => bond_reach(mol, bond, [-d[0], -d[1]]) + BOND_HEAD_GAP,
+        _ => BETWEEN_HEAD_GAP,
+    };
+    let mut head = arrive.map_or(to_at, |d| add_scaled(to_at, d, -gap(d)));
+    // The way the free end goes: its arc's mirror of the square end's, or `bend` off the chord.
+    let u = unit(sub(head, tail))?;
+    let free = |square: Option<[f32; 2]>| bend.map_or_else(|| square.map(|d| turned(u, -angle_to(u, d))), |b| Some(turned(u, b)));
+    let mut dots = None;
+    if leave.is_none() {
+        let d = free(arrive)?;
+        if let CurlyEnd::Atom(a) = arrow.from {
+            let (room, t) = tail_room(mol, a, d);
+            if arrow.dots {
+                dots = Some((add_scaled(from_at, d, room), right_of(d)));
+            }
+            tail = add_scaled(from_at, d, t);
+        }
+    }
+    if arrive.is_none() {
+        let d = free(leave)?;
+        let close = len(sub(to_at, from_at)) < 1.1;
+        head = match (arrow.to, leave) {
+            // Onto an atom of its own bond: down beside it, on the side the tail leaves to.
+            (CurlyEnd::Atom(a), Some(n)) if close => add_scaled(to_at, n, head_room(mol, a, n)),
+            (CurlyEnd::Atom(a), _) => add_scaled(to_at, d, -head_room(mol, a, [-d[0], -d[1]])),
+            _ => to_at,
+        };
+    }
+    if len(sub(head, tail)) < 0.2 {
+        return None;
+    }
+    let u = unit(sub(head, tail))?;
+    let bent = bend.map(|b| turned(u, b));
+    let (pieces, arc) = square_curve(tail, leave.or(bent), head, arrive.or(bent))?;
+    let points = match arc {
+        Some(a) => (0..=CURVE_STEPS).map(|k| curve_point(tail, head, a, k as f32 / CURVE_STEPS as f32)).collect(),
+        None => sample(&pieces),
+    };
+    Some(CurlyPath { tail, head, points, dots, pieces, arc })
+}
+
+/// How far the curve `points` turns, all told, in degrees.
+fn turning(points: &[[f32; 2]]) -> f32 {
+    let steps: Vec<[f32; 2]> = points.windows(2).filter_map(|w| unit(sub(w[1], w[0]))).collect();
+    steps.windows(2).map(|w| angle_to(w[0], w[1]).abs()).sum()
+}
+
 /// The S an arrow takes from a bond's electrons, carried by its `onto` atom, to a new partner
-/// `target` (the π electrons of C=O, through O, to H): it leaves the bond's middle on `side`
-/// (+1 or −1 across the bond from its other atom to `onto`, +1 to the right), first a little
-/// back from `onto` — the turn that makes it an S — then swings up past `onto` on that side,
-/// outside its label, and comes into the partner along the bond being made, its head short of
-/// the partner's label.
+/// `target` (the π electrons of C=O, through O, to H): it leaves the bond's middle square to
+/// it on `side` (+1 or −1 across the bond from its other atom to `onto`, +1 to the right),
+/// turns up along the bond past `onto` on that side, outside its label — the turn that makes it
+/// an S — and comes into the partner along the bond being made, its head short of the
+/// partner's label.
 fn via_candidate(mol: &Molecule, bond: u32, onto: u32, target: u32, side: f32) -> Option<CurlyPath> {
     let (b, a) = bond_ends(mol, bond, onto)?;
     let t = pos(mol, target)?;
     let ub = unit(sub(b, a))?;
     let r = right_of(ub);
     let n = [r[0] * side, r[1] * side];
-    let p0 = add_scaled(midpoint(a, b), n, BOND_TAIL_LIFT);
-    // Out, and back from `onto`.
-    let d0 = unit(add_scaled(n, ub, -0.9))?;
+    let p0 = add_scaled(midpoint(a, b), n, bond_reach(mol, bond, n) + BOND_TAIL_LIFT);
     // Beside `onto`, well outside its label.
     let room = label_reach(mol, onto, n).unwrap_or(0.15) + 0.45;
     let w = add_scaled(b, n, room);
@@ -686,7 +863,7 @@ fn via_candidate(mol: &Molecule, bond: u32, onto: u32, target: u32, side: f32) -
     let tw = unit(add_scaled(ub, v, 0.6))?;
     let (l1, l2) = (len(sub(w, p0)), len(sub(q, w)));
     let pieces = vec![
-        [p0, add_scaled(p0, d0, 0.95 * l1), add_scaled(w, tw, -0.5 * l1), w],
+        [p0, add_scaled(p0, n, 0.5 * l1), add_scaled(w, tw, -0.5 * l1), w],
         [w, add_scaled(w, tw, 0.4 * l2), add_scaled(q, v, -0.4 * l2), q],
     ];
     let points = sample(&pieces);
@@ -708,12 +885,16 @@ fn sample(pieces: &[[[f32; 2]; 4]]) -> Vec<[f32; 2]> {
 /// than away from them), the least costly drawn — or, with
 /// [`CurlyArrow::flip`], the least costly bending the other way.
 ///
-/// - **A lone pair to an atom or a gap; a bond into a bond or a gap:** an arc from the source
-///   (its dots on the side facing the target; a bond's tail just off it, toward `onto`) to the
-///   target, turning 60° to 150° either way.
-/// - **A lone pair into a bond:** the same, turning 120° to 180°, as the two are close.
-/// - **A bond onto one of its own atoms:** an arc from just off the bond's middle, turning 120°
-///   to 180°, coming down beside the atom.
+/// An arrow leaves a bond square to it, on either side, and comes square into a bond or a gap
+/// ([`square_candidate`]): the arc that does so, or, between two such ends, the curve that does
+/// at both.
+///
+/// - **A lone pair to an atom:** an arc from the source (its dots on the side facing the
+///   target) to the target, turning 60° to 150° either way.
+/// - **A lone pair into a bond or a gap; a bond into a bond or a gap:** square to each bond and
+///   gap.
+/// - **A bond onto one of its own atoms:** an arc square to the bond from its middle, coming down
+///   beside the atom on the same side.
 /// - **A bond to a new partner by way of `onto`:** the S of [`via_candidate`], on either side of
 ///   the bond.
 ///
@@ -731,12 +912,47 @@ pub fn layout(mol: &Molecule, arrow: &CurlyArrow) -> Option<CurlyPath> {
     let obstacles = Obstacles::around(mol, midpoint(from_at, to_at), len(chord) / 2.0 + 2.5);
     let comfort = if len(chord) > 3.0 { 90.0 } else { 120.0 };
     let mut candidates: Vec<Candidate> = Vec::new();
+    let weigh = |path: &CurlyPath| {
+        let turn = path.arc.map_or_else(|| turning(&path.points), f32::abs);
+        obstacles.cost(&path.points, &own) + obstacles.inward(path) + (turn - comfort).abs() / 60.0 * 0.4
+    };
+    // Square to a bond or a gap at either end, on each side of it.
+    let sides = |ways: Option<[[f32; 2]; 2]>| match ways {
+        Some([right, left]) => vec![(1.0f32, Some(right)), (-1.0, Some(left))],
+        None => vec![(0.0, None)],
+    };
+    let (leaves, arrivals) = (square_leaves(mol, &arrow.from), square_arrivals(mol, &arrow.to));
+    let square = leaves.is_some() || arrivals.is_some();
     let arcs = |angles: &[f32], candidates: &mut Vec<Candidate>| {
+        if square {
+            for (s0, leave) in sides(leaves) {
+                for &(s1, arrive) in &sides(arrivals) {
+                    // Its side: the side of the source bond it leaves, else of the target's line.
+                    let side = if leave.is_some() { s0 } else { s1 };
+                    let path = square_candidate(mol, arrow, from_at, to_at, leave, arrive, None);
+                    // An arc too nearly straight, or one that would loop: a curve bent at its
+                    // free end instead.
+                    let bent = path.as_ref().is_none_or(|p| p.arc.is_some_and(|a| a.abs() < FLAT_TURN));
+                    if let Some(path) = path {
+                        candidates.push(Candidate { cost: weigh(&path), path, side });
+                    }
+                    if bent && (leave.is_none() || arrive.is_none()) {
+                        for bend in [FLAT_BEND, -FLAT_BEND] {
+                            if let Some(path) = square_candidate(mol, arrow, from_at, to_at, leave, arrive, Some(bend)) {
+                                candidates.push(Candidate { cost: weigh(&path), path, side });
+                            }
+                        }
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                return;
+            }
+        }
         for &a in angles {
             for sign in [1.0f32, -1.0] {
                 if let Some(path) = arc_candidate(mol, arrow, from_at, to_at, a * sign) {
-                    let cost = obstacles.cost(&path.points, &own) + obstacles.inward(&path) + (a - comfort).abs() / 60.0 * 0.4;
-                    candidates.push(Candidate { path, side: sign, cost });
+                    candidates.push(Candidate { cost: weigh(&path), path, side: sign });
                 }
             }
         }
