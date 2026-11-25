@@ -100,7 +100,7 @@ While hovering the canvas, single keys place elements, fragments, and templates.
 | `o` / `n` / `s` / `f` | OH · NH₂ · SH · F |
 | `O` / `N` | bare O · bare N atom |
 | `2` | carbonyl (=O) |
-| `a` | benzene ring |
+| `a` / `3` | benzene ring |
 | `4`–`8` | 4- to 8-membered ring |
 | `z` / `Z` | zig-zag chain |
 | `+` / `-` | increase / decrease charge |

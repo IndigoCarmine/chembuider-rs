@@ -1289,3 +1289,105 @@ fn undo_takes_an_expansion_back_to_its_label() {
     assert!(editor.redo());
     assert_eq!(editor.molecule, expanded);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// `3` on an atom is `a`
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Everything a press leaves behind that the next press, or undo, reads.
+fn after(seq: &str) -> (Molecule, Option<u32>, Option<u32>, usize, Option<u32>) {
+    let e = type_keys(seq);
+    let repeat = e.ring_repeat.as_ref().map(|r| r.atom);
+    (e.molecule, e.hotspot_atom, e.hotspot_bond, e.undo_stack.len(), repeat)
+}
+
+/// `3` on an atom draws the benzene `a` draws, in the same place and as one undo step, and
+/// pressed again goes on from the same atom as `a` does.
+#[test]
+fn three_on_an_atom_draws_what_a_draws() {
+    for (with_a, with_3) in [
+        ("c a", "c 3"),
+        ("c a a", "c 3 3"),
+        ("c a a a a", "c 3 3 3 3"),
+        ("c 1 a", "c 1 3"),
+        ("c a ArrowLeft a", "c a ArrowLeft 3"),
+        ("N a", "N 3"),
+        ("N + a", "N + 3"),
+    ] {
+        assert_eq!(after(with_3), after(with_a), "`{with_3}` should be `{with_a}`");
+    }
+    assert_eq!(type_keys("c 3").molecule.atoms.len(), 6, "a benzene, not a chain");
+    assert_eq!(count_order(&type_keys("c 3").molecule, BondOrder::Double), 3);
+    assert!(
+        is_isomorphic(&type_keys("N 3").molecule, &load_fixture("pyridine")),
+        "`N 3` should be pyridine",
+    );
+
+    // One press, one undo step: undo takes it back to the seed carbon.
+    let mut e = type_keys("c 3");
+    assert!(e.undo());
+    assert_eq!(e.molecule, type_keys("c").molecule);
+
+    // Pressed again it is the ring repeat, going on from the same atom as `a`.
+    let e = type_keys("c 3");
+    let repeat = e.ring_repeat.as_ref().expect("a ring from an atom sets up the repeat");
+    assert_eq!(repeat.key, "3");
+    assert_eq!(type_keys("c 3 3").molecule.atoms.len(), 10, "a second ring, fused on");
+}
+
+/// Off an atom nothing changed: `3` on empty canvas does nothing (as `a` does), and on a bond
+/// it still makes a triple bond where `a` fuses a benzene.
+#[test]
+fn three_off_an_atom_is_as_it_was() {
+    assert!(type_keys("3").molecule.atoms.is_empty(), "nothing to act on");
+
+    let triple = type_keys("c 1 Shift+ArrowLeft 3");
+    assert_eq!(triple.molecule.atoms.len(), 2);
+    assert_eq!(count_order(&triple.molecule, BondOrder::Triple), 1, "`3` on a bond is triple");
+
+    let ring = type_keys("c a Shift+ArrowRight 3");
+    assert_eq!(ring.molecule.atoms.len(), 6, "no ring fused on");
+    assert_eq!(count_order(&ring.molecule, BondOrder::Triple), 1);
+    assert_eq!(type_keys("c a Shift+ArrowRight a").molecule.atoms.len(), 10, "`a` there fuses");
+
+    // The keys round it are unchanged: `1` adds one carbon, `2` an oxo, `z` a zigzag.
+    assert_eq!(type_keys("c 1").molecule.atoms.len(), 2);
+    assert_eq!(count_order(&type_keys("c 1 2").molecule, BondOrder::Double), 1);
+    assert_eq!(type_keys("c z").molecule.atoms.len(), 3);
+}
+
+/// A `chembuilder_config.json` saved while `3` on an atom added three carbons replaces the
+/// defaults whole; read in, its `3` draws the benzene too.
+#[test]
+fn a_saved_config_with_the_old_3_draws_benzene() {
+    let mut old = serde_json::to_value(crate::Config::embedded()).unwrap();
+    for s in old["atom_shortcuts"].as_array_mut().unwrap() {
+        if s["key"] == "3" {
+            *s = serde_json::json!({ "key": "3", "chain": 3 });
+        }
+    }
+
+    // As it was saved, `3` is the old chain of three.
+    let mut unread = crate::widget::ChemStructEditor::default();
+    unread.config = serde_json::from_value(old.clone()).unwrap();
+    crate::testkit::type_keys_into(&mut unread, "c 3");
+    assert_eq!(unread.molecule.atoms.len(), 4, "the old binding was a chain of three");
+
+    let mut read = crate::widget::ChemStructEditor::default();
+    read.config = crate::Config::from_saved(&old.to_string()).unwrap();
+    crate::testkit::type_keys_into(&mut read, "c 3");
+    assert_eq!(read.molecule, type_keys("c a").molecule, "read in, `3` is `a`");
+    crate::testkit::type_keys_into(&mut read, "Shift+ArrowRight 3");
+    assert_eq!(count_order(&read.molecule, BondOrder::Triple), 1, "and on a bond still triple");
+
+    // A `3` of the user's own stays theirs.
+    for s in old["atom_shortcuts"].as_array_mut().unwrap() {
+        if s["key"] == "3" {
+            *s = serde_json::json!({ "key": "3", "ring": 5 });
+        }
+    }
+    let mut custom = crate::widget::ChemStructEditor::default();
+    custom.config = crate::Config::from_saved(&old.to_string()).unwrap();
+    crate::testkit::type_keys_into(&mut custom, "c 3");
+    assert_eq!(custom.molecule.atoms.len(), 5, "a five-ring, as the user bound it");
+}
