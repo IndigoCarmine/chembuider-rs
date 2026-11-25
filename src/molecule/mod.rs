@@ -15,7 +15,9 @@ pub mod elements;
 pub mod depict;
 pub mod page;
 pub mod bracket;
+pub mod curly;
 pub(crate) mod cdx_bracket;
+pub(crate) mod cdx_curly;
 pub(crate) mod cdx_appearance;
 pub(crate) mod lookup;
 #[cfg(test)]
@@ -33,6 +35,7 @@ use std::collections::BTreeSet;
 
 pub use page::{ArrowKind, PageArrow, PageObject, PageText, ReactionTable, TableEntry, TextAlign};
 pub use bracket::{Bracket, BracketShape, BracketUsage, RepeatPattern};
+pub use curly::{CurlyArrow, CurlyEnd, CurlyKind};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum BondStereo {
@@ -496,6 +499,7 @@ impl Molecule {
     }
 
     pub fn remove_atom(&mut self, id: u32) {
+        self.detach_curly_from_atom(id);
         self.atoms.retain(|a| a.id != id);
         self.bonds.retain(|b| b.begin != id && b.end != id);
         self.press_leftovers.remove(&id);
@@ -534,6 +538,7 @@ impl Molecule {
     }
 
     pub fn remove_bond(&mut self, id: u32) {
+        self.detach_curly_from_bond(id);
         if let Some(bond) = self.bond_by_id(id) {
             let (begin, end) = (bond.begin, bond.end);
             self.press_leftovers.remove(&begin);

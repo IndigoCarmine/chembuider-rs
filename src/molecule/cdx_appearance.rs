@@ -62,7 +62,7 @@ pub(crate) const SHADOW_TAG: &str = "ChemBuilder/Shadow";
 const VERTEX_TOLERANCE: f32 = 0.02;
 
 /// An object tag named `name`, persistent, with the text `value` when there is one.
-fn object_tag(id: u32, name: &str, value: Option<&str>) -> CdxObject {
+pub(crate) fn object_tag(id: u32, name: &str, value: Option<&str>) -> CdxObject {
     let mut tag = CdxObject::new(OBJ_OBJECT_TAG, id);
     tag.set(PROP_NAME, name.as_bytes().to_vec());
     tag.set(PROP_TAG_PERSISTENT, vec![1]);
@@ -75,11 +75,19 @@ fn object_tag(id: u32, name: &str, value: Option<&str>) -> CdxObject {
 
 /// `obj`'s first object tag named `name`. The name is taken as plain text, as ChemDraw writes
 /// it, or as a CDXString without style runs.
-fn tag_named<'a>(obj: &'a CdxObject, name: &str) -> Option<&'a CdxObject> {
-    obj.children.iter().find(|c| {
-        c.tag == OBJ_OBJECT_TAG
-            && c.prop(PROP_NAME).is_some_and(|v| v == name.as_bytes() || v.strip_prefix(&[0, 0][..]) == Some(name.as_bytes()))
-    })
+pub(crate) fn tag_named<'a>(obj: &'a CdxObject, name: &str) -> Option<&'a CdxObject> {
+    obj.children.iter().find(|c| is_tag_named(c, name))
+}
+
+/// Whether `obj` is an object tag named `name`.
+pub(crate) fn is_tag_named(obj: &CdxObject, name: &str) -> bool {
+    obj.tag == OBJ_OBJECT_TAG
+        && obj.prop(PROP_NAME).is_some_and(|v| v == name.as_bytes() || v.strip_prefix(&[0, 0][..]) == Some(name.as_bytes()))
+}
+
+/// The text an object tag holds, if it holds one.
+pub(crate) fn tag_text(tag: &CdxObject) -> Option<String> {
+    cdx::parse_cdx_string(tag.prop(PROP_TAG_VALUE)?).map(|(_, text)| text)
 }
 
 /// Whether `obj` is the curve of a ring fill written here.

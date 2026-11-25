@@ -412,6 +412,33 @@ pub fn draw_page_objects(editor: &ChemStructEditor, painter: &egui::Painter, cen
             painter.circle(sp, 4.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
         }
     }
+    // The handle that bends a lone selected curly arrow, in its middle.
+    // The handles that shape a lone selected curly arrow: a line from each control point to the
+    // end of the piece it pulls on, the control points as rings, the knots between pieces as
+    // squares, the ends (dragged onto something else) as diamonds.
+    if let Some((_, h)) = super::interact::curly_handles(editor) {
+        let thin = egui::Stroke::new(1.0, SELECTED.gamma_multiply(0.7));
+        for &(_, p, base) in &h.controls {
+            painter.line_segment([xf.apply(base), xf.apply(p)], thin);
+        }
+        for &(_, p, _) in &h.controls {
+            painter.circle(xf.apply(p), 3.5, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED));
+        }
+        for &(_, p) in &h.knots {
+            let r = egui::Rect::from_center_size(xf.apply(p), egui::vec2(7.0, 7.0));
+            painter.rect(r, 0.0, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED), egui::StrokeKind::Middle);
+        }
+        for p in [h.tail, h.head] {
+            let c = xf.apply(p);
+            let diamond = vec![c + egui::vec2(0.0, -4.5), c + egui::vec2(4.5, 0.0), c + egui::vec2(0.0, 4.5), c + egui::vec2(-4.5, 0.0)];
+            painter.add(egui::Shape::convex_polygon(diamond, egui::Color32::WHITE, egui::Stroke::new(1.5, SELECTED)));
+        }
+    }
+    // The curly arrow being drawn with the Curly arrow tool, bending as it will.
+    if let Some(super::interact::ObjectDrag::NewCurly(drawing)) = editor.object_drag() {
+        let preview = scene::build_curly(&drawing.arrow(), &editor.molecule, style, xf);
+        paint(&preview, egui::Color32::from_rgba_unmultiplied(80, 140, 255, 180));
+    }
     // The arrow being drawn with the Arrow tool.
     if let Some(&super::interact::ObjectDrag::NewArrow { tail, head, kind }) = editor.object_drag() {
         let preview = PageObject::Arrow(crate::molecule::PageArrow { id: 0, tail, head, kind, source: None });

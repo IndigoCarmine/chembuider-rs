@@ -17,7 +17,7 @@
 //! onto ChemDraw's 14.4 pt one.
 
 use super::cdx_codec::{self, CdxObject};
-use super::{cdx_appearance, cdx_bracket, cdx_colors, cdx_fonts, cdx_page, cdx_table};
+use super::{cdx_appearance, cdx_bracket, cdx_colors, cdx_curly, cdx_fonts, cdx_page, cdx_table};
 use super::cdx_colors::ColorTable;
 use super::lookup::{AtomLookup, MolIndex};
 use super::{elements, BondOrder, BondStereo, DoublePosition, Molecule, PageObject};
@@ -609,7 +609,7 @@ fn molecule_document(mol: &Molecule) -> CdxObject {
     page.children = fragments_mapped(mol, shift, &mut next, &mut ids, &mut colors);
     let mut owned = cdx_page::Owned::new();
     let mut fonts = cdx_fonts::FontTable::of(&doc);
-    let objects = cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts, &mut colors);
+    let objects = cdx_page::write_objects(mol, &ids, &mut owned, shift, &mut next, &mut fonts, &mut colors);
     fonts.store(&mut doc);
     page.children.extend(objects);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut page.children);
@@ -675,7 +675,7 @@ pub fn merge_into_cdx(original: &[u8], mol: &Molecule) -> Vec<u8> {
     let shift = shift_onto_page(mol, 0.0);
     let mut ids = WrittenIds::default();
     let mut new = fragments_mapped(mol, shift, &mut next, &mut ids, &mut colors);
-    new.extend(cdx_page::write_objects(mol, &ids.fragment_of, &mut owned, shift, &mut next, &mut fonts, &mut colors));
+    new.extend(cdx_page::write_objects(mol, &ids, &mut owned, shift, &mut next, &mut fonts, &mut colors));
     fonts.store(&mut doc);
     let brackets = cdx_bracket::write_brackets(mol, &ids, &mut owned, shift, &mut next, &mut new);
     new.extend(brackets);
@@ -1003,7 +1003,13 @@ fn read_document(doc: &CdxObject) -> Option<CdxImport> {
         cdx_appearance::read_ring_fills(page, &colors, &mut fills);
         taken.extend(fills[before..].iter().map(|(id, _)| *id));
         read_container(page, &mut molecule, &mut other_objects, &taken, &mut first_atom, &mut atoms_of, &colors);
+        let mut bonds = HashMap::new();
+        cdx_curly::bond_nodes(page, &mut bonds);
         for mut c in converted {
+            // A curly arrow's ends go onto the atoms and bonds they stand on, now they are read.
+            if let (PageObject::Curly(a), Some(links)) = (&mut c.object, &c.links) {
+                cdx_curly::link(a, links, &molecule, &cdx_curly::ReadIds { atoms_of: &atoms_of, bonds: &bonds });
+            }
             // A bracket's ids are its nodes': it encloses the atoms they became, when there are any.
             if let PageObject::Bracket(b) = &mut c.object {
                 cdx_bracket::link(b, &atoms_of);

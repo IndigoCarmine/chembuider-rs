@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::bracket::Bracket;
+use super::curly::{CurlyArrow, CurlyEnd};
 use crate::widget::rich_text::RichText;
 
 /// What an arrow means, which decides how it is drawn and written to ChemDraw.
@@ -160,6 +161,9 @@ pub enum PageObject {
     /// Polymer / repeating-unit brackets around some atoms ([`super::bracket`]). They have no
     /// position of their own: they stand where their atoms are.
     Bracket(Bracket),
+    /// An electron-pushing arrow of a mechanism ([`super::curly`]). It stands where the atoms
+    /// and bonds its ends name are; only its free ends have positions of their own.
+    Curly(CurlyArrow),
 }
 
 impl PageObject {
@@ -169,6 +173,7 @@ impl PageObject {
             PageObject::Text(t) => t.id,
             PageObject::Table(t) => t.id,
             PageObject::Bracket(b) => b.id,
+            PageObject::Curly(c) => c.id,
         }
     }
 
@@ -179,6 +184,7 @@ impl PageObject {
             PageObject::Text(t) => t.id = id,
             PageObject::Table(t) => t.id = id,
             PageObject::Bracket(b) => b.id = id,
+            PageObject::Curly(c) => c.id = id,
         }
     }
 
@@ -189,6 +195,7 @@ impl PageObject {
             PageObject::Text(t) => t.source,
             PageObject::Table(t) => t.source,
             PageObject::Bracket(b) => b.source,
+            PageObject::Curly(c) => c.source,
         }
     }
 
@@ -207,6 +214,7 @@ impl PageObject {
             PageObject::Text(t) => shift(&mut t.pos),
             PageObject::Table(t) => shift(&mut t.pos),
             PageObject::Bracket(_) => {}
+            PageObject::Curly(c) => c.free_points_mut().into_iter().for_each(shift),
         }
     }
 
@@ -226,6 +234,7 @@ impl PageObject {
             PageObject::Text(t) => rot(&mut t.pos),
             PageObject::Table(t) => rot(&mut t.pos),
             PageObject::Bracket(_) => {}
+            PageObject::Curly(c) => c.free_points_mut().into_iter().for_each(rot),
         }
     }
 
@@ -242,18 +251,33 @@ impl PageObject {
             PageObject::Text(t) => reflect(&mut t.pos),
             PageObject::Table(t) => reflect(&mut t.pos),
             PageObject::Bracket(_) => {}
+            // A hand-set shape is mirrored; an automatic one is laid out afresh from the
+            // mirrored atoms anyway.
+            PageObject::Curly(c) => {
+                c.free_points_mut().into_iter().for_each(reflect);
+                if c.is_shaped() {
+                    c.flip();
+                }
+            }
         }
     }
 
     /// The points that stand for the object in a lasso or a bounding box: an arrow's two ends,
-    /// a text's anchor, a table's top-left corner. Brackets have none (their atoms stand for
-    /// them).
+    /// a text's anchor, a table's top-left corner, a curly arrow's free ends. Brackets have none
+    /// (their atoms stand for them), nor do the ends of a curly arrow that stand on atoms.
     pub fn key_points(&self) -> Vec<[f32; 2]> {
         match self {
             PageObject::Arrow(a) => vec![a.tail, a.head],
             PageObject::Text(t) => vec![t.pos],
             PageObject::Table(t) => vec![t.pos],
             PageObject::Bracket(_) => Vec::new(),
+            PageObject::Curly(c) => [c.from, c.to]
+                .into_iter()
+                .filter_map(|e| match e {
+                    CurlyEnd::Point(p) => Some(p),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 
@@ -281,6 +305,13 @@ impl PageObject {
     pub fn as_bracket(&self) -> Option<&Bracket> {
         match self {
             PageObject::Bracket(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn as_curly(&self) -> Option<&CurlyArrow> {
+        match self {
+            PageObject::Curly(c) => Some(c),
             _ => None,
         }
     }

@@ -124,6 +124,8 @@ impl App for EditorApp {
                     (Tool::Arrow(chembuider_rs::molecule::ArrowKind::Reaction), "→ Arrow"),
                     (Tool::Arrow(chembuider_rs::molecule::ArrowKind::Equilibrium), "⇌ Equilibrium"),
                     (Tool::Text, "T Text"),
+                    (Tool::CurlyArrow(chembuider_rs::molecule::CurlyKind::Pair), "↷ Curly"),
+                    (Tool::CurlyArrow(chembuider_rs::molecule::CurlyKind::Single), "⇀ Fish-hook"),
                 ] {
                     if ui.selectable_label(self.editor.tool == tool, label).clicked() {
                         self.editor.set_tool(tool.clone());
@@ -339,6 +341,7 @@ fn tool_status(tool: Tool) -> String {
         Tool::Eraser => "Eraser: click an atom, bond, arrow or text to remove it.".to_string(),
         Tool::Arrow(_) => "Arrow: drag from tail to head (Shift: any angle), or click for a default arrow.".to_string(),
         Tool::Text => "Text: click to type (Enter commits, Shift+Enter new line), click a text to edit it.".to_string(),
+        Tool::CurlyArrow(_) => "Curly arrow: drag from an atom (lone pair) or a bond to an atom or bond (Shift at the release: between two atoms); drag the handle to bend it, click an arrow to flip it.".to_string(),
     }
 }
 

@@ -8,9 +8,9 @@
 //!
 //! | input | default | overridden by |
 //! |---|---|---|
-//! | click | toggle what is under the pointer in the selection; on empty canvas, clear it | Bond (draw), Eraser (erase), Arrow (place), Text (type) |
+//! | click | toggle what is under the pointer in the selection; on empty canvas, clear it | Bond (draw), Eraser (erase), Arrow (place), Text (type), Curly arrow (select one) |
 //! | double-click | an atom or bond: select its molecule; a text or table cell: edit it | Bond, Eraser, Arrow (a second click) |
-//! | drag | from an atom, object or arrow end: move it; from empty canvas: lasso | Bond (from an atom: draw a bond), Arrow (draw an arrow) |
+//! | drag | from an atom, object, arrow end or a curly arrow's handle: move it (reshape or re-point the arrow); from empty canvas: lasso | Bond (from an atom: draw a bond), Arrow (draw an arrow), Curly arrow (draw one) |
 //! | keys | the drawing shortcuts, Delete, Escape, arrows | — |
 //!
 //! Some things belong to no tool and are not overridable: the selection's rotation handle and
@@ -34,6 +34,7 @@
 
 mod arrow;
 mod bond;
+mod curly;
 pub(crate) mod default;
 mod eraser;
 mod text;
@@ -138,6 +139,7 @@ impl Tool {
             Tool::Eraser => &eraser::Eraser,
             Tool::Arrow(_) => &arrow::Arrow,
             Tool::Text => &text::Text,
+            Tool::CurlyArrow(_) => &curly::Curly,
         }
     }
 }
@@ -170,7 +172,12 @@ impl Gesture {
             self,
             Gesture::MoveAtom { .. }
                 | Gesture::Rotate(_)
-                | Gesture::Object(ObjectDrag::Move { .. } | ObjectDrag::ArrowEnd { .. })
+                | Gesture::Object(
+                    ObjectDrag::Move { .. }
+                        | ObjectDrag::ArrowEnd { .. }
+                        | ObjectDrag::CurlyPoint { .. }
+                        | ObjectDrag::CurlyRepoint { .. }
+                )
         )
     }
 }
@@ -338,8 +345,18 @@ fn pointer_input(editor: &mut ChemStructEditor, cx: &Cx, tool: &dyn ToolBehavior
         cx.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
+    // A press on the canvas, this frame: what makes the clicks and drags that follow this
+    // editor's.
+    if cx.ui.input(|i| i.pointer.any_pressed())
+        && cx.ui.input(|i| i.pointer.press_origin()).is_some_and(|p| response.rect.contains(p))
+    {
+        editor.press_seen = true;
+    }
+    let seen = editor.press_seen;
+
     // ── Clicks ───────────────────────────────────────────────────────────────
     if (response.clicked() || response.double_clicked())
+        && seen
         && let Some(at) = at
     {
         if on_flip(at) {
@@ -348,6 +365,15 @@ fn pointer_input(editor: &mut ChemStructEditor, cx: &Cx, tool: &dyn ToolBehavior
             // A double-click on the handle asks for the angle instead of a drag.
             if response.double_clicked() {
                 editor.open_rotate_input();
+            }
+        } else if interact::curly_handle_at(editor, at, cx.center).is_some()
+            || (response.double_clicked() && is_curly_at(editor, at, cx.center))
+        {
+            // A curly arrow's handles are dragged, not clicked: a click on one keeps the
+            // selection, and a double-click there, or on a curly arrow's curve, shapes it.
+            if response.double_clicked() {
+                let (_, shaped) = as_one_step(editor, |editor| interact::curly_double_click(editor, at, cx.center));
+                changed |= shaped;
             }
         } else {
             let hit = editor.hit_at(at, cx.center);
@@ -364,6 +390,7 @@ fn pointer_input(editor: &mut ChemStructEditor, cx: &Cx, tool: &dyn ToolBehavior
 
     // ── Drags ────────────────────────────────────────────────────────────────
     if drag.started
+        && seen
         && let Some(at) = at
     {
         // What the drag acts on is picked at the press: by the time `drag_started()` fires the
@@ -403,11 +430,20 @@ fn pointer_input(editor: &mut ChemStructEditor, cx: &Cx, tool: &dyn ToolBehavior
         }
     }
 
+    if cx.ui.input(|i| i.pointer.any_released()) && !cx.ui.input(|i| i.pointer.any_down()) {
+        editor.press_seen = false;
+    }
+
     // Keyboard focus comes to the canvas pressed on: away from a host's text field, and onto
     // the canvas, so a Tab or an arrow does not move it on to a button that Space or Enter would
     // then press.
     canvas_focus(cx);
     (aborted, changed)
+}
+
+/// Whether a curly arrow is what is under screen point `at`.
+fn is_curly_at(editor: &ChemStructEditor, at: egui::Pos2, center: egui::Pos2) -> bool {
+    matches!(editor.hit_at(at, center), Hit::Object(id) if editor.molecule.object_by_id(id).is_some_and(|o| o.as_curly().is_some()))
 }
 
 /// The pointer moved to `at` during the drag.
@@ -427,6 +463,12 @@ fn drag_on(editor: &mut ChemStructEditor, cx: &Cx, at: egui::Pos2) {
             }
         }
         Gesture::MoveAtom { atom } => interact::drag_atom(editor, atom, delta),
+        Gesture::Object(ObjectDrag::NewCurly(mut drawing)) => {
+            drawing.to = interact::curly_target(editor, &drawing.from, at, cx.center, shift);
+            if let Some(Gesture::Object(ObjectDrag::NewCurly(d))) = editor.gesture_mut() {
+                *d = drawing;
+            }
+        }
         Gesture::Object(drag) => {
             let drag = interact::drag_object(editor, drag, delta, editor.screen_to_mol(at, cx.center), shift);
             if let Some(Gesture::Object(d)) = editor.gesture_mut() {
@@ -448,6 +490,10 @@ fn finish(editor: &mut ChemStructEditor, cx: &Cx, gesture: Gesture) {
         Gesture::DrawBond { from, end } => interact::finish_bond(editor, from, end, cx.center),
         Gesture::Lasso { path } => interact::lasso_select(editor, &path, cx.center),
         Gesture::Object(ObjectDrag::NewArrow { tail, head, kind }) => interact::finish_arrow(editor, tail, head, kind),
+        Gesture::Object(ObjectDrag::NewCurly(drag)) => interact::finish_curly(editor, &drag),
+        Gesture::Object(ObjectDrag::CurlyRepoint { id, target, at }) => {
+            interact::finish_curly_repoint(editor, id, target, at, cx.center, cx.shift())
+        }
         Gesture::MoveAtom { .. } | Gesture::Object(_) | Gesture::Rotate(_) => {}
     }
 }

@@ -12,6 +12,8 @@ mod keyboard_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]
+mod curly_tests;
+#[cfg(test)]
 mod render_tests;
 #[cfg(test)]
 mod appearance_tests;
@@ -98,6 +100,41 @@ struct ClipText {
     color: Option<[u8; 4]>,
 }
 
+/// One end of a curly arrow on the clipboard: what [`CurlyEnd`](crate::molecule::CurlyEnd) is,
+/// with atom *indices* into `ClipMol::atoms` for ids, and a bond named by its two atoms.
+#[derive(Serialize, Deserialize)]
+enum ClipCurlyEnd {
+    Atom(usize),
+    Bond {
+        begin: usize,
+        end: usize,
+        #[serde(alias = "side")]
+        onto: usize,
+    },
+    Between(usize, usize),
+    Point([f32; 2]),
+}
+
+/// A curly arrow on the clipboard: what a [`CurlyArrow`](crate::molecule::CurlyArrow) is, its
+/// ends tied to the copied atoms.
+#[derive(Serialize, Deserialize)]
+struct ClipCurly {
+    #[serde(alias = "tail")]
+    from: ClipCurlyEnd,
+    #[serde(alias = "head")]
+    to: ClipCurlyEnd,
+    #[serde(default)]
+    flip: bool,
+    #[serde(default)]
+    kind: crate::molecule::CurlyKind,
+    #[serde(default)]
+    dots: bool,
+    /// The free shape ([`CurlyArrow::path`](crate::molecule::CurlyArrow::path)): relative to the
+    /// ends, so it pastes as it was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path: Vec<[f32; 2]>,
+}
+
 /// A self-contained copy of a sub-structure (atoms + the bonds among them), used for
 /// clipboard copy/paste. Atom indices in bonds are positions within `atoms`.
 #[derive(Serialize, Deserialize)]
@@ -112,6 +149,9 @@ struct ClipMol {
     /// reads and writes as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     texts: Vec<ClipText>,
+    /// Curly arrows, as for `texts`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    curly: Vec<ClipCurly>,
 }
 pub const SCALE_FACTOR: f32 = 50.0;
 pub const NODE_HIT_RADIUS_PX: f32 = 15.0;
@@ -129,6 +169,18 @@ pub enum Tool {
     /// click a text to edit it. Enter or a click elsewhere commits, Shift+Enter starts a new
     /// line, Escape cancels; a text left empty is removed.
     Text,
+    /// Draw a curly (electron-pushing) arrow: press on an atom (a lone pair) or a bond (its
+    /// electrons; the tail stands on the side of the atom nearer the press), drag to the atom or
+    /// bond the electrons go to, and release. Shift at the release on an atom points the head
+    /// between that atom and the one the electrons come from: the bond being made. The new arrow
+    /// is left selected. Its meaning — the source (a lone pair, or a bond with the atom its
+    /// electrons move onto: the one nearer the press), and the target — is what is stored; the
+    /// arrow is drawn from it automatically ([`crate::molecule::curly::layout`]). Its handles
+    /// reshape it by hand: the Bézier control points give it any shape, a double-click on the
+    /// curve adds a knot (on a knot takes it out, on a control point gives the automatic shape
+    /// back), and the ends can be dragged onto another atom, bond or empty space, which changes
+    /// its roles. A click on an arrow selects it.
+    CurlyArrow(crate::molecule::CurlyKind),
 }
 
 impl std::fmt::Display for Tool {
@@ -140,6 +192,8 @@ impl std::fmt::Display for Tool {
             Tool::Arrow(ArrowKind::Reaction) => write!(f, "Reaction Arrow"),
             Tool::Arrow(ArrowKind::Equilibrium) => write!(f, "Equilibrium Arrow"),
             Tool::Text => write!(f, "Text"),
+            Tool::CurlyArrow(crate::molecule::CurlyKind::Pair) => write!(f, "Curly Arrow"),
+            Tool::CurlyArrow(crate::molecule::CurlyKind::Single) => write!(f, "Fish-hook Arrow"),
         }
     }
 }
@@ -295,6 +349,12 @@ pub struct ChemStructEditor {
     /// Previous-frame state of the "V" key (Windows OS-level Ctrl+V edge detection).
     last_v_down: bool,
 
+    /// Whether this editor saw the press of the pointer button now down (or just released) on
+    /// its canvas. A click or a drag whose press it never saw — one that began on a dialog or a
+    /// menu before this editor was shown, or on another document's canvas in the same place —
+    /// is not its to act on.
+    pub(crate) press_seen: bool,
+
     /// The angle box, while it is open: the selection is turned by the angle typed into it
     /// (see [`open_rotate_input`](Self::open_rotate_input)).
     rotate_edit: Option<RotateEdit>,
@@ -380,6 +440,7 @@ impl Default for ChemStructEditor {
             cleanup_job: None,
             cleanup_engine: Box::new(crate::molecule::cleanup::DefaultCleanupEngine),
             last_v_down: false,
+            press_seen: false,
             rotate_edit: None,
             rotate_last_text: "90".to_string(),
             last_label_rects: std::collections::HashMap::new(),
@@ -804,11 +865,42 @@ impl ChemStructEditor {
                 _ => None,
             })
             .collect();
-        if ids.is_empty() && texts.is_empty() {
-            return None;
-        }
         let index: std::collections::HashMap<u32, usize> =
             ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        // Curly arrows go when all the atoms they stand on go: chosen with them, or chosen
+        // themselves (or everything is copied).
+        let curly: Vec<ClipCurly> = self.molecule.curly_arrows()
+            .filter(|c| {
+                let atoms = c.atoms(&self.molecule);
+                atoms.iter().all(|a| index.contains_key(a))
+                    && (everything || self.selected_objects.contains(&c.id) || !atoms.is_empty())
+            })
+            .filter_map(|c| {
+                let end = |e: &crate::molecule::CurlyEnd| -> Option<ClipCurlyEnd> {
+                    use crate::molecule::CurlyEnd;
+                    Some(match *e {
+                        CurlyEnd::Atom(a) => ClipCurlyEnd::Atom(index[&a]),
+                        CurlyEnd::Bond { bond, onto } => {
+                            let b = self.molecule.bond_by_id(bond)?;
+                            ClipCurlyEnd::Bond { begin: index[&b.begin], end: index[&b.end], onto: *index.get(&onto)? }
+                        }
+                        CurlyEnd::Between(a, b) => ClipCurlyEnd::Between(index[&a], index[&b]),
+                        CurlyEnd::Point(p) => ClipCurlyEnd::Point(p),
+                    })
+                };
+                Some(ClipCurly {
+                    from: end(&c.from)?,
+                    to: end(&c.to)?,
+                    flip: c.flip,
+                    kind: c.kind,
+                    dots: c.dots,
+                    path: c.path.clone(),
+                })
+            })
+            .collect();
+        if ids.is_empty() && texts.is_empty() && curly.is_empty() {
+            return None;
+        }
 
         // A copied part of a shadowed structure is shadowed too: it was drawn so.
         let shadows: std::collections::HashMap<u32, crate::molecule::Shadow> = self
@@ -840,7 +932,7 @@ impl ChemStructEditor {
             Some(ClipRingFill { atoms: atoms?, color: rf.color })
         }).collect();
 
-        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills, texts })
+        serde_json::to_string(&ClipMol { atoms, bonds, ring_fills, texts, curly })
             .ok()
             .map(|json| format!("{CLIP_PREFIX}{json}"))
     }
@@ -896,7 +988,7 @@ impl ChemStructEditor {
             None => return false, // not our format
         };
         let Ok(clip) = serde_json::from_str::<ClipMol>(json) else { return false };
-        if clip.atoms.is_empty() && clip.texts.is_empty() {
+        if clip.atoms.is_empty() && clip.texts.is_empty() && clip.curly.is_empty() {
             return false;
         }
         // The pasted atoms join the molecule a running cleanup is rewriting; stop it first.
@@ -943,9 +1035,34 @@ impl ChemStructEditor {
                 color: t.color,
             }))
         }).collect();
+        let mut new_objects = new_texts;
+        for c in &clip.curly {
+            let end = |e: &ClipCurlyEnd| -> Option<crate::molecule::CurlyEnd> {
+                use crate::molecule::CurlyEnd;
+                let atom = |i: usize| new_ids.get(i).copied();
+                Some(match *e {
+                    ClipCurlyEnd::Atom(i) => CurlyEnd::Atom(atom(i)?),
+                    ClipCurlyEnd::Bond { begin, end, onto } => CurlyEnd::Bond {
+                        bond: self.molecule.bond_between(atom(begin)?, atom(end)?)?.id,
+                        onto: atom(onto)?,
+                    },
+                    ClipCurlyEnd::Between(a, b) => CurlyEnd::Between(atom(a)?, atom(b)?),
+                    ClipCurlyEnd::Point(p) => CurlyEnd::Point([p[0] + OFFSET[0], p[1] + OFFSET[1]]),
+                })
+            };
+            if let (Some(from), Some(to)) = (end(&c.from), end(&c.to)) {
+                let arrow = crate::molecule::CurlyArrow {
+                    flip: c.flip,
+                    dots: c.dots,
+                    path: c.path.clone(),
+                    ..crate::molecule::CurlyArrow::new(from, to, c.kind)
+                };
+                new_objects.push(self.molecule.add_curly_arrow(arrow));
+            }
+        }
         self.selected_atoms = new_ids.into_iter().collect();
         self.selected_bonds.clear();
-        self.selected_objects = new_texts.into_iter().collect();
+        self.selected_objects = new_objects.into_iter().collect();
         true
     }
 
@@ -1427,6 +1544,21 @@ impl ChemStructEditor {
             return false;
         }
         self.push_undo();
+        // A curly arrow goes with what all of its tied ends stand on.
+        let gone: Vec<u32> = self
+            .molecule
+            .curly_arrows()
+            .filter(|c| {
+                let goes = |e: &crate::molecule::CurlyEnd| match *e {
+                    crate::molecule::CurlyEnd::Bond { bond, .. } if self.selected_bonds.contains(&bond) => true,
+                    _ => e.atoms(&self.molecule).iter().any(|a| self.selected_atoms.contains(a)),
+                };
+                let tied: Vec<_> = [c.from, c.to].into_iter().filter(|e| e.is_attached()).collect();
+                !tied.is_empty() && tied.iter().all(goes)
+            })
+            .map(|c| c.id)
+            .collect();
+        self.selected_objects.extend(gone);
         for id in std::mem::take(&mut self.selected_bonds) {
             self.molecule.remove_bond(id);
         }
@@ -1513,6 +1645,64 @@ impl ChemStructEditor {
             b.shape = shape;
         }
         true
+    }
+
+    /// The curly arrows that are selected.
+    pub fn selected_curly_arrows(&self) -> Vec<u32> {
+        self.molecule.curly_arrows().filter(|c| self.selected_objects.contains(&c.id)).map(|c| c.id).collect()
+    }
+
+    /// Change the selected curly arrows, as one undo step: `change` is given each in turn.
+    /// False when none is selected or nothing changed.
+    fn change_selected_curly(&mut self, change: impl Fn(&mut crate::molecule::CurlyArrow)) -> bool {
+        let ids = self.selected_curly_arrows();
+        if ids.is_empty() {
+            return false;
+        }
+        let before = self.molecule.clone();
+        for id in ids {
+            if let Some(PageObject::Curly(c)) = self.molecule.object_by_id_mut(id) {
+                change(c);
+            }
+        }
+        if self.molecule == before {
+            return false;
+        }
+        let after = std::mem::replace(&mut self.molecule, before);
+        self.push_undo();
+        self.molecule = after;
+        true
+    }
+
+    /// Make the selected curly arrows bend the other way. One undo step; false when no curly
+    /// arrow is selected.
+    pub fn flip_selected_curly_arrows(&mut self) -> bool {
+        self.change_selected_curly(|c| c.flip())
+    }
+
+    /// Make the selected curly arrows move an electron pair (a full head) or a single electron
+    /// (a fish-hook). One undo step; false when that changes nothing.
+    pub fn set_selected_curly_kind(&mut self, kind: crate::molecule::CurlyKind) -> bool {
+        self.change_selected_curly(|c| c.kind = kind)
+    }
+
+    /// Show or hide the lone pair the selected curly arrows start from (those whose source is
+    /// a lone pair). One undo step; false when that changes nothing.
+    pub fn set_selected_curly_dots(&mut self, dots: bool) -> bool {
+        self.change_selected_curly(|c| c.dots = dots && matches!(c.from, crate::molecule::CurlyEnd::Atom(_)))
+    }
+
+    /// Give the selected curly arrows back their automatic shape, letting go of any shape set
+    /// by hand. One undo step; false when none had one.
+    pub fn reset_selected_curly_shapes(&mut self) -> bool {
+        self.change_selected_curly(|c| c.path.clear())
+    }
+
+    /// What the lone selected curly arrow says, in words (`C=O → (O) → H`): for a status bar.
+    /// `None` unless one curly arrow, and nothing else, is selected.
+    pub fn selected_curly_description(&self) -> Option<String> {
+        let c = interact::lone_selected_curly(self)?;
+        Some(crate::molecule::curly::describe(&self.molecule, c))
     }
 
     /// Close the text box, keeping what was typed: a new text is added, an edited one changed,
@@ -1658,6 +1848,13 @@ impl ChemStructEditor {
                     Some(r) => r.contains(screen),
                     None => view.mol_to_screen(t.pos).distance(screen) <= NODE_HIT_RADIUS_PX,
                 },
+                // Near its curve, or on its lone pair.
+                PageObject::Curly(c) => crate::molecule::curly::geometry(&self.molecule, c).is_some_and(|path| {
+                    let near_curve = path.points.windows(2).any(|w| {
+                        point_to_segment_dist(screen, view.mol_to_screen(w[0]), view.mol_to_screen(w[1])) <= BOND_HIT_THRESHOLD_PX
+                    });
+                    near_curve || path.dots.is_some_and(|(m, _)| view.mol_to_screen(m).distance(screen) <= BOND_HIT_THRESHOLD_PX)
+                }),
                 // On a bracket mark, or on its label.
                 PageObject::Bracket(b) => {
                     self.last_object_rects.get(&b.id).is_some_and(|r| r.expand(2.0).contains(screen))
