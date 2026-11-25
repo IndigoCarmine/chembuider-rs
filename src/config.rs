@@ -276,10 +276,31 @@ impl Config {
     }
 
     /// The text of a saved `chembuilder_config.json` as a config, brought up to date.
-    fn from_saved(text: &str) -> serde_json::Result<Self> {
+    pub(crate) fn from_saved(text: &str) -> serde_json::Result<Self> {
         let mut cfg: Config = serde_json::from_str(text)?;
         cfg.add_shift_a_on_bonds();
+        cfg.make_3_on_atoms_benzene();
         Ok(cfg)
+    }
+
+    /// Give a config saved while `3` on an atom added three carbons the benzene `3` draws now,
+    /// the same as `a`.
+    ///
+    /// A saved config replaces the defaults whole, so without this `3` would go on adding a chain
+    /// for anyone who had ever saved. Only the old default itself, a plain `3` bound to a chain of
+    /// three, is changed: any other binding of `3` on an atom is the user's own and stays. There
+    /// is no telling the old default kept on purpose from one never touched, so to keep the chain
+    /// bind it to another key. `3` on a bond (a triple bond) is not touched.
+    fn make_3_on_atoms_benzene(&mut self) {
+        for s in &mut self.atom_shortcuts {
+            if s.key == "3"
+                && !s.ctrl
+                && !s.alt
+                && matches!(s.action, AtomAction::Chain { chain: 3 })
+            {
+                s.action = AtomAction::Fragment { fragment: "benzene".into() };
+            }
+        }
     }
 
     /// Give a config saved before `A` drew a benzene on a bond that binding.
@@ -673,6 +694,81 @@ mod tests {
             .filter(|s| s.key == "A" && !s.ctrl && !s.alt)
             .count();
         assert_eq!(plain, 1);
+    }
+
+    /// The shipped shortcuts as a config saved while `3` on an atom added three carbons holds
+    /// them, with `3` on atoms bound to `action` instead of the old chain if one is given.
+    fn saved_with_old_3_on_atoms(action: Option<serde_json::Value>) -> serde_json::Value {
+        let mut saved: serde_json::Value = serde_json::from_str(DEFAULT_SHORTCUTS).unwrap();
+        let atoms = saved["atom_shortcuts"].as_array_mut().unwrap();
+        let three = atoms.iter_mut().find(|s| s["key"] == "3").expect("the defaults bind `3` on an atom");
+        *three = action.unwrap_or_else(|| serde_json::json!({ "key": "3", "chain": 3 }));
+        saved
+    }
+
+    fn atom_actions(cfg: &Config, key: &str) -> Vec<String> {
+        cfg.atom_shortcuts
+            .iter()
+            .filter(|s| s.key == key && !s.ctrl && !s.alt)
+            .map(|s| format!("{:?}", s.action))
+            .collect()
+    }
+
+    /// `3` on an atom ships as the benzene `a` draws, and on a bond still as a triple bond.
+    #[test]
+    fn the_shipped_3_on_an_atom_is_a() {
+        let cfg = cfg();
+        assert_eq!(atom_actions(&cfg, "3"), atom_actions(&cfg, "a"));
+        assert_eq!(
+            bond_actions(&cfg, "3"),
+            vec![format!("{:?}", BondAction::Order { order: BondOrder::Triple })]
+        );
+    }
+
+    /// A config saved while `3` on an atom was a chain of three gets the benzene, like the
+    /// defaults, and nothing else in it changes.
+    #[test]
+    fn a_config_saved_with_the_old_3_gets_benzene() {
+        let old = saved_with_old_3_on_atoms(None);
+        let saved = Config::from_saved(&old.to_string()).unwrap();
+        assert_eq!(atom_actions(&saved, "3"), atom_actions(&saved, "a"));
+        assert_eq!(atom_actions(&saved, "3"), atom_actions(&cfg(), "3"));
+
+        let shipped = cfg();
+        let all = |c: &Config| {
+            let atoms = c.atom_shortcuts.iter().map(|s| format!("{} {} {} {:?}", s.key, s.ctrl, s.alt, s.action));
+            let bonds = c.bond_shortcuts.iter().map(|s| format!("{} {} {} {:?}", s.key, s.ctrl, s.alt, s.action));
+            atoms.chain(bonds).collect::<Vec<_>>()
+        };
+        assert_eq!(all(&saved), all(&shipped), "the rest is the defaults as they were");
+    }
+
+    /// Any other binding of `3` on an atom is the user's own, and stays as it is; so does a
+    /// chain of three on a chord of `3`, or on another key.
+    #[test]
+    fn a_custom_3_on_an_atom_stays() {
+        for custom in [
+            serde_json::json!({ "key": "3", "ring": 5 }),
+            serde_json::json!({ "key": "3", "chain": 2 }),
+            serde_json::json!({ "key": "3", "fragment": "OMe" }),
+            serde_json::json!({ "key": "3", "ctrl": true, "chain": 3 }),
+        ] {
+            let saved = saved_with_old_3_on_atoms(Some(custom.clone()));
+            let ours: Config = serde_json::from_value(saved.clone()).unwrap();
+            let saved = Config::from_saved(&saved.to_string()).unwrap();
+            let three = |c: &Config| {
+                c.atom_shortcuts.iter().filter(|s| s.key == "3").map(|s| format!("{} {} {:?}", s.ctrl, s.alt, s.action)).collect::<Vec<_>>()
+            };
+            assert_eq!(three(&saved), three(&ours), "{custom}");
+        }
+
+        let mut elsewhere = saved_with_old_3_on_atoms(Some(serde_json::json!({ "key": "3", "ring": 5 })));
+        elsewhere["atom_shortcuts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "key": "t", "chain": 3 }));
+        let saved = Config::from_saved(&elsewhere.to_string()).unwrap();
+        assert_eq!(atom_actions(&saved, "t"), vec![format!("{:?}", AtomAction::Chain { chain: 3 })]);
     }
 
     /// The editor draws in ChemDraw's proportions — what a ChemDraw document holds: 10 pt
